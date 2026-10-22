@@ -1,0 +1,33 @@
+# Trusted companion deployment boundary. Gene's feature deployer never uses this file.
+name: fri
+services:
+  runtime:
+    image: ${FRI_RUNTIME_IMAGE:?Set the immutable Fri image}
+    env_file: ${FRI_ENV_FILE:?Set the existing private Fri environment file}
+    environment:
+      GENE_CONTROLLER_URL: ${FRI_CONTROLLER_URL:-http://controller:8787}
+      FRI_RELEASE_SHA: ${FRI_RELEASE_SHA:?Set the full Fri commit}
+      FRI_DATA: /data
+      FRI_CHATGPT_AUTH: /auth/session.json
+    volumes:
+      - ${FRI_DATA_DIR:?Set the durable data directory}:/data
+      - ${FRI_AUTH_DIR:?Set the existing subscription directory}:/auth
+    networks: [controller]
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 384m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,time; h=json.load(open('/data/fri-health.json')); assert h['guild_connected'] and time.time()-h['at']<30"]
+      interval: 20s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+networks:
+  controller:
+    external: true
+    name: ${FRI_NETWORK:-gene_default}
