@@ -88,6 +88,26 @@ transfer the entire identity/session bundle securely. Set `legacy_container` to 
 empty string in the installation JSON when no earlier companion exists. Adapt all
 paths/network names to the installation; do not expose controller access publicly.
 
+For a **new subscription connection**, run `uv run --no-sync python
+scripts/connect_chatgpt.py` on the trusted workstation. Its local outputs map to the
+private host directory as follows:
+
+| Workstation file | Host file inside `auth_dir` |
+| --- | --- |
+| `.secrets/fri-chatgpt.json` | `session.json` (the runtime reads this exact name) |
+| `.secrets/fri-chatgpt-registration.json` | `fri-chatgpt-registration.json` |
+| `.secrets/fri-hostinger-id.json` | `fri-hostinger-id.json` |
+
+Transfer these over authenticated SSH, set the directory to `0700`, files to `0600`,
+and ownership to `10001:10001`. Keep the registration and host identity for future
+reconnection. When reconnecting, stop only Fri, securely copy the **current** host
+session/identity bundle back to the corresponding workstation filenames, and reuse
+those identities during login. Install the verified replacement atomically as
+`session.json`, retain its existing lock inode, then restart Fri and check health.
+Do not run two processes against copies of the same rotating session or replace a
+working connection when login fails. This procedure is unnecessary for the repository
+migration: the existing auth directory is mounted in place.
+
 Start with `FRI_PRESENCE=invisible` in a test server. Configure read, write, learning,
 meme and Lab channel scope in the Gene controller, then explicitly enable behavior
 and visibility when ready. The bot's Discord permissions alone do not enable access.
