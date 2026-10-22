@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fri-agent"
+version = "0.1.0"
+description = "Private Discord companion using a bounded Gene controller contract"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "discord.py==2.7.1", "aiohttp==3.9.5", "httpx==0.28.1",
+    "pydantic==2.11.10", "pyjwt[crypto]==2.15.1", "pillow==13.0.0",
+]
+
+[dependency-groups]
+dev = ["pytest==8.4.2", "ruff==0.17.1"]
+
+[project.scripts]
+fri = "fri.fri:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fri"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
