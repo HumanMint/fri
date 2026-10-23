@@ -38,6 +38,8 @@ class Actions:
         self.search_count = 0
         self.image_context = {}
         self.media_allowed = False
+        self.invitation = None
+        self.turn_context = None
         from .fri_image_share import ImageShare
         self.image_share = ImageShare(self)
         self.history = HistorySearch(self)
@@ -102,6 +104,18 @@ class Actions:
         return result
 
     async def available(self):
+        if self.invitation and self.invitation.outside:
+            if not await self.invitation.current():
+                return {}
+            actions = {}
+            if self.agent.state.get('web_search_enabled'):
+                actions['web_search'] = {'description': 'Look up current public facts with sources. '
+                    'query must be a short exact public question from the current message. '
+                    'Never export nearby chat, captions, images, member details or private context.'}
+            if self.web_research:
+                actions['web_sources'] = {'description': 'Show retained public sources in this conversation. '
+                    'query="" means latest; otherwise use an exact saved query. No new search.'}
+            return actions
         channels = await self.channels()
         if not channels:
             return {}
@@ -109,6 +123,12 @@ class Actions:
                                                 for k, v in channels.items()],
                     'default_channel_id': next(iter(channels)), 'limit': 20, 'max_age_days': 7,
                     'description': 'Read one small recent text batch when asked. No images or saved personal notes.'}}
+        if self.invitation:
+            actions['read_recent'].update(limit=12, max_age_days=30/(24*60),
+                description='Read up to twelve preceding same-channel messages from the last thirty minutes '
+                'when this mention needs nearby conversation or meme context. Can inspect one attributed '
+                'small still-image post, up to two attachments. This read disables persistent writes '
+                'and external image selection for this turn; complete current requests need no read.')
         if isinstance(self.event, discord.Message) and history_requested(self.message):
             actions['history_search'] = self.history.descriptor(channels)
         if self.owner:
@@ -177,6 +197,10 @@ class Actions:
             'history_channels': [c for c in overview['history_channels'] if c in channels]}
 
     async def execute(self, action):
+        if self.invitation:
+            await self.invitation.require_current()
+            if self.invitation.outside:
+                return await self.invited_web(action)
         if self.private_evidence and action.get('kind') in PERSISTENT_MODEL_WRITES:
             return {'blocked': 'Read member evidence cannot be copied into a persistent draft, post or setting. '
                     'Provide the request in a fresh message.'}
@@ -288,6 +312,8 @@ class Actions:
         channel_id = action.get('channel_id') or next(iter(channels))
         if channel_id not in channels:
             return {'blocked': 'That channel is outside this conversation’s readable scope.'}
+        if self.invitation:
+            return await self.invited_context(channel_id)
         channel = channels[channel_id]
         self.sources.add(channel_id)
         scope = getattr(channel, 'parent_id', None) or channel.id
@@ -311,6 +337,21 @@ class Actions:
         return {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
                 'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': after,
                 'images_inspected': False, 'personal_notes_saved': 0}
+
+    async def invited_context(self, channel_id):
+        """An explicit configured-channel read introduces ephemeral evidence only now."""
+        from .fri_images import attach
+        invitation = self.invitation
+        if self.turn_context is None or str(channel_id) != str(self.event.channel.id):
+            return {'blocked': 'Nearby mention context stays in this exact message channel.'}
+        await invitation.collect()
+        context = self.turn_context
+        context.update(invitation.context())
+        await attach(context, self.event, self.message, source=invitation.image, invitation=invitation)
+        self.image_context = {key: context[key] for key in ('image_sources', 'image_event', 'image_invitation') if key in context}
+        return {'kind': 'read_recent', 'channel_id': str(channel_id), 'messages': invitation.rows,
+                'images_inspected': bool(context.get('images')), 'personal_notes_saved': 0,
+                'ambiguous_context_images': invitation.ambiguous_images}
 
     async def control(self, action, channels):
         if self.guild != self.fri.guild_id or not isinstance(self.event, discord.Message):
@@ -438,6 +479,11 @@ class Actions:
     async def valid(self):
         """Fail closed if access or source privacy changed while the model was answering."""
         try:
+            if self.invitation:
+                if not await self.invitation.current():
+                    return False
+                if self.invitation.outside:
+                    return True
             if self.conversation and (self.conversation.get('message_burst') or self.conversation.get('reply_target')):
                 from .fri_conversation import unchanged
                 if not await unchanged(self.agent, self.event, self.conversation):
@@ -464,3 +510,34 @@ class Actions:
             return True
         except (commands.UserFeedbackCheckFailure, discord.HTTPException, TimeoutError):
             return False
+
+    async def invited_web(self, action):
+        """Only public excerpts of this event can leave an outside invitation."""
+        kind = action.get('kind')
+        if kind == 'web_sources':
+            matches = [r for r in self.web_research if not action.get('query') or r['query'] == action['query']]
+            return {'kind': kind, **matches[0]} if matches else {'blocked': 'That search is no longer retained here. Ask for a fresh lookup.'}
+        if not self.agent.state.get('web_search_enabled'):
+            return {'blocked': 'Public lookup is currently disabled.'}
+        if kind == 'web_search':
+            query = action.get('query')
+            if self.search_count or not public_query(query, self.message):
+                return {'blocked': 'Provide a short public question in this message; nearby chat cannot be sent to search.'}
+            await self.fri.api('POST', '/chat/research/start', {**self.scope, 'revision': self.revision,
+                'input': self.message, 'query': query})
+            self.search_count = 1
+            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort)
+        elif kind == 'web_refine':
+            if not self.research or self.search_count != 1 or action.get('query') not in ('', self.research['query']):
+                return {'blocked': 'There is no current public lookup to refine.'}
+            self.search_count = 2
+            query = self.research['query']
+            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort, previous=self.research)
+        else:
+            return {'blocked': 'That action is unavailable in a one-message invitation.'}
+        await self.agent.record('web_search', self.model, self.effort, counters, status)
+        await self.invitation.require_current()
+        if status == 'completed' and result.get('answer') and result.get('sources'):
+            result['query'] = query
+            self.research = {k: result[k] for k in ('query', 'answer', 'sources', 'checked_at')}
+        return result

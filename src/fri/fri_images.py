@@ -38,11 +38,15 @@ async def select_source(event):
     return None
 
 
-async def attach(context, event, text, *, source=None):
+async def attach(context, event, text, *, source=None, invitation=None):
     """An already addressed chat turn can use its attachments with any caption."""
     source = source or event
     if not text.strip() or not has_attachments(source):
         return
+    if invitation:
+        await invitation.require_current()
+        if source is not event and source is not invitation.image:
+            raise commands.UserFeedbackCheckFailure(CHANGED)
     attachments = source.attachments
     # In normal chat accept only the requester's own attachments, not arbitrary
     # external embeds, referenced posts, or images from recent channel context.
@@ -58,11 +62,18 @@ async def attach(context, event, text, *, source=None):
         raise commands.UserFeedbackCheckFailure('I couldn’t inspect that image. Try a small PNG, JPEG or WebP attachment.') from None
     context['image_sources'] = urls
     context['image_event'] = source
+    if invitation:
+        from .fri_context import discord_source
+        context['image_provenance'] = discord_source(source).evidence()
+        context['image_invitation'] = invitation
 
 
 async def unchanged(context, event):
     if not context.get('image_sources'):
         return True
+    invitation = context.get('image_invitation')
+    if invitation and not await invitation.current():
+        return False
     try:
         current = await event.channel.fetch_message(event.id)
         if (current.author.id != event.author.id or current.webhook_id or
@@ -70,7 +81,8 @@ async def unchanged(context, event):
             return False
         source = context.get('image_event', event)
         image = current if source.id == event.id else await event.channel.fetch_message(source.id)
-        return (image.author.id == event.author.id and not image.webhook_id and
+        return ((image.author.id == event.author.id or
+                 (invitation and image.author.id == source.author.id)) and not getattr(image.author, 'bot', False) and not image.webhook_id and
                 image.channel.id == event.channel.id and image.content == source.content and
                 image.edited_at == source.edited_at and sources(image) == context['image_sources'])
     except discord.HTTPException:

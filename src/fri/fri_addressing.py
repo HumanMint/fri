@@ -7,11 +7,27 @@ import discord
 from .fri_context import addressed_content
 
 
+def visible_content(content):
+    # Mirror the controller's deterministic invitation gate, including unfinished quotes/code.
+    visible = re.sub(r'(?ms)^[ \t]*>>>.*\Z', '', content)
+    visible = re.sub(r'(?m)^[ \t]*>[^\n]*', '', visible)
+    visible = re.sub(r'(?s)(`{3,}|~{3,}).*?(?:\1|\Z)', '', visible)
+    visible = re.sub(r'(?s)(`+).*?(?:\1|\Z)', '', visible)
+    visible = re.sub(r'(?i)https?://\S+', '', visible)
+    return re.sub(r'"[^"\n]*"|“[^”\n]*”|(?<!\w)\'[^\'\n]*\'', '', visible)
+
+
+def explicit_mention(message, bot_id):
+    mentions = getattr(message, 'mentions', ())
+    return bool(bot_id and isinstance(mentions, (list, tuple)) and bot_id in {user.id for user in mentions} and
+                re.search(r'(?<!\\)<@!?'+re.escape(str(bot_id))+r'>', visible_content(message.content or '')))
+
+
 async def addressed_text(message, bot_id):
     content = message.content or ''
-    explicit = bot_id in {user.id for user in message.mentions}
+    explicit = explicit_mention(message, bot_id)
     # Quoted messages, code, URLs and Friday should not wake Fri by accident.
-    visible = re.sub(r'```[\s\S]*?```|`[^`]*`|https?://\S+|(?m:^>.*$)', '', content)
+    visible = visible_content(content)
     named = re.search(r'(?<![\w@/#])fri(?!\w)', visible, re.IGNORECASE)
     reference = getattr(message, 'reference', None)
     responding = False

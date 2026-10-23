@@ -108,6 +108,8 @@ async def _run(fri, actions, text, context, result, progress):
             offered.pop('reminder_prepare', None)
             offered.pop('plan_prepare', None)
             offered.pop('reminder_cancel', None)
+            if getattr(actions, 'invitation', None):
+                offered.pop('image_search', None)
         if len(seen) == MAX_STEPS:
             offered = {}
         await require_current_images(context, getattr(actions, 'event', None))
