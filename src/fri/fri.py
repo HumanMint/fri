@@ -212,7 +212,8 @@ class Fri(discord.Client):
                         raise commands.UserFeedbackCheckFailure(str(exc)) from None
                     context.update(conversation)
                 if invitation:
-                    await invitation.collect()
+                    if event.reference and event.reference.message_id:
+                        await invitation.collect(include_recent=False)
                     context.update(invitation.context())
                 context['source'] = source.evidence()
                 from .fri_addressing import explicit_mention
@@ -221,7 +222,9 @@ class Fri(discord.Client):
                      any(explicit_mention(row[1], getattr(self.user, 'id', 0)) for row in burst)))
                 context['acknowledgments_enabled'] = bool(self.agent and source.kind == 'discord_message' and not context['force_text_reply'])
                 from .fri_images import select_source
-                image_source = invitation.image if invitation else await select_source(event) if inspect_images else None
+                image_source = ((invitation.image if invitation else None) or await select_source(event)) if inspect_images else None
+                if invitation and image_source:
+                    invitation.image = image_source
                 if image_source is None and quick_closure(
                         text, {**context, 'recent': self.agent.messages(channel_id) if self.agent else []}):
                     result = ChatResult(status='completed', response_kind='react', reaction='👍')
@@ -264,6 +267,7 @@ class Fri(discord.Client):
                 actions = Actions(self.agent, user_id, channel_id, visibility == 'public') if self.agent else None
                 if actions:
                     actions.invitation = invitation
+                    actions.turn_context = context
                     actions.event, actions.scope, actions.revision = event, scope, context['revision']
                     actions.message, actions.model, actions.effort = clean(text, 4000), context['model'], context['effort']
                     actions.web_research = context.get('web_research', [])
@@ -315,6 +319,8 @@ class Fri(discord.Client):
                         raise commands.UserFeedbackCheckFailure('That action is not available here.')
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
+                    if actions.private_evidence:
+                        result.draft, result.notes = None, []
                     if invitation:
                         await invitation.require_current()
                     if context.get('force_text_reply'):
@@ -414,6 +420,8 @@ class Fri(discord.Client):
         expected = addressed_content(event.content, self.user.id) or 'hey'
         if text != expected or not 1 <= len(text) <= 4000:
             raise commands.UserFeedbackCheckFailure('Keep each message between 1 and 4000 characters.')
+        # Match the raw live event first; only minimized text may reach a model or tool.
+        text = clean(text, 4000)
         if user in self.busy:
             raise ReplyInProgress()
         self.busy.add(user)

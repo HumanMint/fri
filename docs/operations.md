@@ -26,10 +26,12 @@ public question from the current request, never surrounding chat or image captio
 
 Context from other members keeps its actual author and privacy revision and stays
 ephemeral. Saved conversation uses a neutral breadcrumb; no derived personal notes,
-drafts or posts are retained. Complete requests in configured channels retain their
-normal capabilities by omitting unrelated surroundings for current image attachments,
-explicit artwork requests and self-contained persistence/feature requests. Explicit
-reply references still retain their source and persistence guards.
+drafts or posts are retained. Configured-channel mentions start with their normal
+capabilities. The existing `read_recent` tool can fetch the bounded nearby text and
+image context on demand; only after that read are persistent writes and external
+image selection removed for that turn. Explicit reply references load only their
+direct target initially, and keep their source and persistence guards. The current
+attachments and existing immediate own-photo pairing remain available directly.
 
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.

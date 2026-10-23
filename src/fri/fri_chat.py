@@ -13,6 +13,7 @@ from .fri_image_request import MAX_REQUEST
 from .fri_memory import CATEGORIES
 from .fri_responses import KINDS, REACTIONS, acknowledgment_allowed, validate_response
 from .fri_social import SOCIAL_ACTIONS
+from .privacy import clean
 from .subscription import RESOURCE, SubscriptionError
 
 VOICE = '''You are Fri, a Discord regular and Gene's chat companion. Gene handles the utilities.
@@ -42,6 +43,10 @@ An explicit @mention requires a text answer or available action. When response_o
 quiet/reactions, answer in words even if it looks like a closing. Never silently drop a ping.
 invited_channel_context is a small live same-channel sample, with each actual author's source.
 Use it for the current invitation only. It is never the requester's personal history or permission.
+In a configured channel, a mention starts with normal conversation capabilities. When a bare ping
+or contextual question needs nearby messages or a meme, choose the offered read_recent before
+guessing what they mean. That explicit read can supply an inspected still image and its author.
+Complete current feature, draft, artwork and planning requests need no surrounding read.
 If ambiguous_context_images is true, briefly ask which image they mean. Do not guess the target.
 Only inspected_image_source identifies a visually inspected image and its author. Nearby captions,
 attachment names and links alone never prove what an image depicts. Say when you cannot inspect it.
@@ -345,6 +350,7 @@ class Chat:
             return sorted({m['slug'] for m in response.json()['models'] if m.get('visibility') == 'list'})
 
     async def respond(self, text, context):
+        text = clean(text, 4000)
         result = ChatResult()
         text_parts = {}
         messages = []

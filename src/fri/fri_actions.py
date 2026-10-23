@@ -39,6 +39,7 @@ class Actions:
         self.image_context = {}
         self.media_allowed = False
         self.invitation = None
+        self.turn_context = None
         from .fri_image_share import ImageShare
         self.image_share = ImageShare(self)
         self.history = HistorySearch(self)
@@ -122,6 +123,12 @@ class Actions:
                                                 for k, v in channels.items()],
                     'default_channel_id': next(iter(channels)), 'limit': 20, 'max_age_days': 7,
                     'description': 'Read one small recent text batch when asked. No images or saved personal notes.'}}
+        if self.invitation:
+            actions['read_recent'].update(limit=12, max_age_days=30/(24*60),
+                description='Read up to twelve preceding same-channel messages from the last thirty minutes '
+                'when this mention needs nearby conversation or meme context. Can inspect one attributed '
+                'small still-image post, up to two attachments. This read disables persistent writes '
+                'and external image selection for this turn; complete current requests need no read.')
         if isinstance(self.event, discord.Message) and history_requested(self.message):
             actions['history_search'] = self.history.descriptor(channels)
         if self.owner:
@@ -305,6 +312,8 @@ class Actions:
         channel_id = action.get('channel_id') or next(iter(channels))
         if channel_id not in channels:
             return {'blocked': 'That channel is outside this conversation’s readable scope.'}
+        if self.invitation:
+            return await self.invited_context(channel_id)
         channel = channels[channel_id]
         self.sources.add(channel_id)
         scope = getattr(channel, 'parent_id', None) or channel.id
@@ -328,6 +337,21 @@ class Actions:
         return {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
                 'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': after,
                 'images_inspected': False, 'personal_notes_saved': 0}
+
+    async def invited_context(self, channel_id):
+        """An explicit configured-channel read introduces ephemeral evidence only now."""
+        from .fri_images import attach
+        invitation = self.invitation
+        if self.turn_context is None or str(channel_id) != str(self.event.channel.id):
+            return {'blocked': 'Nearby mention context stays in this exact message channel.'}
+        await invitation.collect()
+        context = self.turn_context
+        context.update(invitation.context())
+        await attach(context, self.event, self.message, source=invitation.image, invitation=invitation)
+        self.image_context = {key: context[key] for key in ('image_sources', 'image_event', 'image_invitation') if key in context}
+        return {'kind': 'read_recent', 'channel_id': str(channel_id), 'messages': invitation.rows,
+                'images_inspected': bool(context.get('images')), 'personal_notes_saved': 0,
+                'ambiguous_context_images': invitation.ambiguous_images}
 
     async def control(self, action, channels):
         if self.guild != self.fri.guild_id or not isinstance(self.event, discord.Message):

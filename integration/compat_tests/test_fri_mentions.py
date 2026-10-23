@@ -49,7 +49,7 @@ def environment(monkeypatch, tmp_path, *, channel_id=8):
         yield
     async def history(**kwargs):
         candidates = [m for m in rows.values() if m.id < kwargs['before'].id and
-                      discord.utils.snowflake_time(m.id) > kwargs['after']]
+                      ('after' not in kwargs or discord.utils.snowflake_time(m.id) > kwargs['after'])]
         for item in sorted(candidates, key=lambda m: m.id, reverse=True)[:kwargs['limit']]:
             yield item
     channel = SimpleNamespace(id=channel_id, guild=guild, parent_id=None, nsfw=False,
@@ -113,9 +113,20 @@ def test_ping_after_another_members_meme_gets_text_without_ambient_expansion(mon
         fri, agent, store, _, channel, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1 if configured_channel else 8)
         meme = message('public meme caption', user=30, age=15*60, attachments=[attachment(channel.id)])
         event = message('<@99> what do you think of that meme?')
-        fri.chat_once.return_value = ChatResult(status='completed', response_kind=model_kind,
+        final = ChatResult(status='completed', response_kind=model_kind,
             reaction='👍' if model_kind == 'react' else None,
             reply='that meme is doing a lot of work' if model_kind == 'reply' else '')
+        if configured_channel:
+            async def respond(_, context):
+                if not context.get('action_result'):
+                    assert not context['invited_context'] and 'work_save' in context['actions']
+                    return ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': str(channel.id)})
+                assert context['images'] and 'work_save' not in context['actions']
+                assert 'image_search' not in context['actions']
+                return final
+            fri.chat_once.side_effect = respond
+        else:
+            fri.chat_once.return_value = final
         monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(return_value='data:image/png;base64,aGVsbG8='))
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
@@ -222,20 +233,24 @@ def test_outside_invitation_preserves_cooldown_and_blocks_all_nonweb_actions(mon
 
 
 @pytest.mark.parametrize('current_request', ['show a random sfw image featuring hatsune miku',
-                                    'add a stopwatch command', 'save a draft called weekend plan'])
-def test_configured_complete_requests_keep_existing_capabilities(monkeypatch, tmp_path, current_request):
+    'add a stopwatch command', 'save a draft called weekend plan', 'can you make a stopwatch command',
+    'please add a command that flips a coin', 'can you please save a draft called weekend plan',
+    'organize a game night tomorrow at 7pm'])
+@pytest.mark.parametrize('has_surrounding', [False, True])
+def test_configured_complete_requests_keep_existing_capabilities(monkeypatch, tmp_path, current_request, has_surrounding):
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
-        message('an unrelated conversation', user=30, age=20)
+        if has_surrounding:
+            message('an unrelated conversation', user=30, age=20)
         event = message('<@99> '+current_request)
-        draft = 'Add a stopwatch command for the server.' if current_request.startswith('add') else None
+        draft = 'Add a stopwatch command for the server.' if not current_request.startswith('show') else None
         fri.chat_once.return_value = ChatResult(status='completed', reply='here’s the draft' if draft else 'checking that', draft=draft)
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
             context = fri.chat_once.await_args.args[1]
             assert not context['invited_context']
-            assert 'work_save' in context['actions'] and context['requests_enabled']
+            assert {'work_save', 'plan_prepare'} <= set(context['actions']) and context['requests_enabled']
             if current_request.startswith('show'):
                 assert 'image_search' in context['actions']
             if draft:
@@ -323,4 +338,71 @@ def test_provider_response_has_text_only_schema_and_honest_fallback(response_kin
         assert schema['properties']['response_kind']['enum'] == ['reply']
         options = json.loads(captured[0]['input'][-1]['content'])['response_options']
         assert options == {'quiet': False, 'reactions': []}
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_current_message_secrets_are_redacted_before_real_provider_request(monkeypatch, tmp_path, channel_id):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        captured = []
+        canary = 'sk-SYNTHETICREVIEWKEY123456789'
+        def transport(request):
+            captured.append(json.loads(request.content))
+            reply = {'response_kind': 'reply', 'reaction': None, 'reply': 'check the key locally',
+                     'request_draft': None, 'action': None, 'notes': [], 'allow_closing': False}
+            return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(reply)))+'\n\n')
+        chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(transport))
+        fri.chat_once.side_effect = chat.respond
+        event = message('<@99> why is '+canary+' rejected?')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert len(captured) == 1 and canary not in json.dumps(captured)
+            assert '[REDACTED]' in json.dumps(captured)
+            event.reply.assert_awaited_once()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['none', 'privacy', 'source', 'permission'])
+def test_on_demand_meme_read_checks_sources_before_reply_and_prevents_persistence(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        meme = message('another member caption', user=30, age=60, attachments=[attachment(1)])
+        event = message('<@99> what do you think of that meme?')
+        contexts = []
+        async def respond(_, context):
+            contexts.append(context)
+            if len(contexts) == 1:
+                assert not context['invited_context'] and not context.get('images')
+                assert 'work_save' in context['actions']
+                return ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': '1'})
+            assert context['images'] and context['image_provenance']['user_id'] == '30'
+            assert not {'work_save', 'prepare_post', 'preview_voice', 'reminder_prepare', 'plan_prepare', 'image_search'} & set(context['actions'])
+            if change == 'privacy':
+                store.personal_control('30', 'disable')
+            elif change == 'source':
+                changed = copy.copy(meme)
+                changed.attachments = []
+                rows[meme.id] = changed
+            elif change == 'permission':
+                channel.permissions_for = lambda _: discord.Permissions.none()
+            return ChatResult(status='completed', reply='checked that image', draft='Save a derived third-party feature request.')
+        fri.chat_once.side_effect = respond
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(return_value='data:image/png;base64,aGVsbG8='))
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert len(contexts) == 2
+            if change == 'none':
+                event.reply.assert_awaited_once()
+                assert event.reply.await_args.kwargs['view'] is None
+                assert 'another member caption' not in str(store.chat_context('123', 'public:1', '20'))
+            else:
+                event.reply.assert_not_awaited()
+                assert not any(path == '/chat/turn' for path, _ in calls)
+        finally:
+            await fri.close()
     asyncio.run(scenario())

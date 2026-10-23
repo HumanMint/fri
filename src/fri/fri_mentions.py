@@ -2,14 +2,13 @@
 
 import copy
 import datetime as dt
-import re
 import time
 
 import discord
 
 from . import feedback as commands
 from .fri_addressing import explicit_mention
-from .fri_context import addressed_content, discord_source
+from .fri_context import discord_source
 from .fri_meme_media import sources
 from .privacy import clean
 
@@ -23,25 +22,6 @@ def fingerprint(message):
     return (discord_source(message).model_dump(), message.content, message.edited_at,
             tuple((str(a.url), a.content_type, a.size, a.width, a.height, a.is_spoiler())
                   for a in message.attachments))
-
-
-def wants_surroundings(event, bot_id):
-    if event.reference and event.reference.message_id:
-        return True
-    if event.attachments:
-        return False
-    from .fri_image_share import requested as image_requested
-    text = addressed_content(event.content, bot_id).casefold().strip()
-    if image_requested(text):
-        return False
-    # A complete current request can retain its existing persistence capabilities.
-    # Ambiguous pronouns and explicit references still need live context and its guards.
-    prefix = r'(?:(?:hey|yo|hi|fri|please)[\s,.!?]+)*(?:(?:can|could|would|will) (?:you|u) )?'
-    persistent = r'(?:save|keep|store|draft|update|edit|change|mark|cancel|complete|remind|schedule|plan|add|build|implement|create|fix|repair)\b'
-    if (re.match(prefix+persistent, text) and
-            not re.search(r'\b(?:it|this|that|these|those|above|earlier|previous)\b', text)):
-        return False
-    return True
 
 
 class Invitation:
@@ -142,13 +122,10 @@ class Invitation:
             'evidence': [discord_source(event).model_dump() for event in events]})
         return result['profiles']
 
-    async def collect(self):
+    async def collect(self, *, include_recent=True):
         """Read once on this invitation, retaining no channel cache or learned facts."""
         await self.require_current()
         event, candidates, reference_id = self.event, {}, None
-        if not self.outside and not wants_surroundings(event, self.fri.user.id):
-            self.image = event if event.attachments else None
-            return
         reference = event.reference
         if reference and reference.message_id and getattr(reference, 'channel_id', event.channel.id) in (None, event.channel.id):
             reference_id = reference.message_id
@@ -156,9 +133,10 @@ class Invitation:
                 candidates[reference_id] = await event.channel.fetch_message(reference_id)
             except discord.HTTPException:
                 pass
-        after = dt.datetime.fromtimestamp(time.time()-NEARBY_SECONDS, dt.timezone.utc)
-        async for cached in event.channel.history(limit=MAX_MESSAGES, before=event, after=after, oldest_first=False):
-            candidates[cached.id] = cached
+        if include_recent:
+            after = dt.datetime.fromtimestamp(time.time()-NEARBY_SECONDS, dt.timezone.utc)
+            async for cached in event.channel.history(limit=MAX_MESSAGES, before=event, after=after, oldest_first=False):
+                candidates[cached.id] = cached
         accepted = []
         for mid, item in candidates.items():
             age = (event.id-item.id)/(1 << 22)/1000
@@ -176,8 +154,10 @@ class Invitation:
             self.profiles[user] = profile
             self.events[item.id] = item
             self.snapshots[item.id] = fingerprint(item)
+            self.rows = [row for row in self.rows if row['source']['id'] != str(item.id)]
             self.rows.append({'source': discord_source(item).evidence(), 'text': clean(item.content, 500),
                               'privacy_revision': profile['revision'], 'referenced': item.id == reference_id})
+        self.rows.sort(key=lambda row: int(row['source']['id']))
         own = event if event.attachments else None
         referenced = self.events.get(reference_id)
         images = [m for m in self.events.values() if m.attachments]
