@@ -38,6 +38,7 @@ class Actions:
         self.search_count = 0
         self.image_context = {}
         self.media_allowed = False
+        self.invitation = None
         from .fri_image_share import ImageShare
         self.image_share = ImageShare(self)
         self.history = HistorySearch(self)
@@ -102,6 +103,18 @@ class Actions:
         return result
 
     async def available(self):
+        if self.invitation and self.invitation.outside:
+            if not await self.invitation.current():
+                return {}
+            actions = {}
+            if self.agent.state.get('web_search_enabled'):
+                actions['web_search'] = {'description': 'Look up current public facts with sources. '
+                    'query must be a short exact public question from the current message. '
+                    'Never export nearby chat, captions, images, member details or private context.'}
+            if self.web_research:
+                actions['web_sources'] = {'description': 'Show retained public sources in this conversation. '
+                    'query="" means latest; otherwise use an exact saved query. No new search.'}
+            return actions
         channels = await self.channels()
         if not channels:
             return {}
@@ -177,6 +190,10 @@ class Actions:
             'history_channels': [c for c in overview['history_channels'] if c in channels]}
 
     async def execute(self, action):
+        if self.invitation:
+            await self.invitation.require_current()
+            if self.invitation.outside:
+                return await self.invited_web(action)
         if self.private_evidence and action.get('kind') in PERSISTENT_MODEL_WRITES:
             return {'blocked': 'Read member evidence cannot be copied into a persistent draft, post or setting. '
                     'Provide the request in a fresh message.'}
@@ -438,6 +455,11 @@ class Actions:
     async def valid(self):
         """Fail closed if access or source privacy changed while the model was answering."""
         try:
+            if self.invitation:
+                if not await self.invitation.current():
+                    return False
+                if self.invitation.outside:
+                    return True
             if self.conversation and (self.conversation.get('message_burst') or self.conversation.get('reply_target')):
                 from .fri_conversation import unchanged
                 if not await unchanged(self.agent, self.event, self.conversation):
@@ -464,3 +486,34 @@ class Actions:
             return True
         except (commands.UserFeedbackCheckFailure, discord.HTTPException, TimeoutError):
             return False
+
+    async def invited_web(self, action):
+        """Only public excerpts of this event can leave an outside invitation."""
+        kind = action.get('kind')
+        if kind == 'web_sources':
+            matches = [r for r in self.web_research if not action.get('query') or r['query'] == action['query']]
+            return {'kind': kind, **matches[0]} if matches else {'blocked': 'That search is no longer retained here. Ask for a fresh lookup.'}
+        if not self.agent.state.get('web_search_enabled'):
+            return {'blocked': 'Public lookup is currently disabled.'}
+        if kind == 'web_search':
+            query = action.get('query')
+            if self.search_count or not public_query(query, self.message):
+                return {'blocked': 'Provide a short public question in this message; nearby chat cannot be sent to search.'}
+            await self.fri.api('POST', '/chat/research/start', {**self.scope, 'revision': self.revision,
+                'input': self.message, 'query': query})
+            self.search_count = 1
+            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort)
+        elif kind == 'web_refine':
+            if not self.research or self.search_count != 1 or action.get('query') not in ('', self.research['query']):
+                return {'blocked': 'There is no current public lookup to refine.'}
+            self.search_count = 2
+            query = self.research['query']
+            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort, previous=self.research)
+        else:
+            return {'blocked': 'That action is unavailable in a one-message invitation.'}
+        await self.agent.record('web_search', self.model, self.effort, counters, status)
+        await self.invitation.require_current()
+        if status == 'completed' and result.get('answer') and result.get('sources'):
+            result['query'] = query
+            self.research = {k: result[k] for k in ('query', 'answer', 'sources', 'checked_at')}
+        return result

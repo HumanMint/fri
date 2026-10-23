@@ -1,5 +1,40 @@
 # Fri operations
 
+## Explicit mention invitations
+
+The `event-mention-chat` controller capability is required. A real, visible Discord
+mention can invite a reply in an accessible text channel or public thread in the
+configured main guild. Quoted/code/URL tokens, webhooks, bots, stale events and mass
+mentions do not qualify. The separate Lab scope remains its exact configured channel.
+Outside configured chat channels, plain `fri` and unmentioned follow-ups do nothing.
+
+An outside invitation permits one textual conversation reply and optional public web
+research or retained public sources. It grants no operations, admin, workspace,
+posting or learning permission, and never adds a channel to an ambient allowlist.
+The controller applies the existing member allowance. Disabled mode and in-progress
+reply notices keep their existing behavior. The runtime rechecks the current event,
+member roles, channel/thread permissions, source contents and privacy before output.
+
+Each invitation can use at most twelve preceding messages from the same channel in
+the last thirty minutes and a direct reference up to seven days old. At most one
+image post is inspected, preferring the current attachments, then the reference,
+then a single nearby candidate. Multiple candidates need clarification. Existing
+limits remain two non-spoiler PNG/JPEG/WebP attachments, 4 MB each, twenty million
+pixels; external embeds, GIFs and videos are not inspected by this path. Captions
+and filenames are never visual evidence. Public research only exports an exact
+public question from the current request, never surrounding chat or image captions.
+
+Context from other members keeps its actual author and privacy revision and stays
+ephemeral. Saved conversation uses a neutral breadcrumb; no derived personal notes,
+drafts or posts are retained. Complete requests in configured channels retain their
+normal capabilities by omitting unrelated surroundings for current image attachments,
+explicit artwork requests and self-contained persistence/feature requests. Explicit
+reply references still retain their source and persistence guards.
+
+Offline synthetic integration checks cover handler replies, image provenance,
+privacy/access revocation, expiry, allowances and the real controller wire contract.
+They do not prove Discord delivery or live model interpretation of a particular meme.
+
 ## Deployment boundary
 
 The companion runs in its own `fri` Compose project using `fri-runtime:<full Fri SHA>`.

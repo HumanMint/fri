@@ -19,7 +19,7 @@ SERIOUS = re.compile(
 
 
 def acknowledgment_allowed(context):
-    return bool(context.get('acknowledgments_enabled') and
+    return bool(not context.get('force_text_reply') and context.get('acknowledgments_enabled') and
                 context.get('source', {}).get('kind') == 'discord_message' and
                 not context.get('pending') and not context.get('action_result') and
                 not context.get('action_results'))

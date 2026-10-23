@@ -161,7 +161,9 @@ class Fri(discord.Client):
             raise commands.UserFeedbackCheckFailure(result.error or 'Fri could not complete that reply. Try again shortly.')
         return result
 
-    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True):
+    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None):
+        if invitation and invitation.outside:
+            return await self.invited_talk(invitation, text)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
         channel = self.get_channel(channel_id) if self.agent else None
         source_channel = (getattr(channel, 'parent_id', None) or channel_id) if visibility == 'public' and self.agent else self.workshop_id
@@ -196,6 +198,10 @@ class Fri(discord.Client):
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
+                if invitation:
+                    admission = await invitation.admit()
+                    if not admission['allowed']:
+                        return self.mention_cooldown(admission)
                 context = await self.api('POST', '/chat/context', scope)
                 conversation = {}
                 if self.agent and source.kind == 'discord_message':
@@ -205,10 +211,17 @@ class Fri(discord.Client):
                     except ValueError as exc:
                         raise commands.UserFeedbackCheckFailure(str(exc)) from None
                     context.update(conversation)
+                if invitation:
+                    await invitation.collect()
+                    context.update(invitation.context())
                 context['source'] = source.evidence()
-                context['acknowledgments_enabled'] = bool(self.agent and source.kind == 'discord_message')
+                from .fri_addressing import explicit_mention
+                context['force_text_reply'] = bool(source.kind == 'discord_message' and
+                    (explicit_mention(event, getattr(self.user, 'id', 0)) or
+                     any(explicit_mention(row[1], getattr(self.user, 'id', 0)) for row in burst)))
+                context['acknowledgments_enabled'] = bool(self.agent and source.kind == 'discord_message' and not context['force_text_reply'])
                 from .fri_images import select_source
-                image_source = await select_source(event) if inspect_images else None
+                image_source = invitation.image if invitation else await select_source(event) if inspect_images else None
                 if image_source is None and quick_closure(
                         text, {**context, 'recent': self.agent.messages(channel_id) if self.agent else []}):
                     result = ChatResult(status='completed', response_kind='react', reaction='👍')
@@ -237,7 +250,7 @@ class Fri(discord.Client):
                             LOG.warning('Tool result preserved; chat recording unavailable')
                             return ChatResult(reply=unrecorded([operation.tool_receipt]), status='completed')
                     return operation.result
-                if self.agent and self.agent.config['enabled'] and not operation.continuation:
+                if self.agent and self.agent.config['enabled'] and not operation.continuation and not invitation:
                     admission = await self.api('POST', '/agent/admit', {**self.agent.identity(user_id, guild_id),
                         'channel_id': str(source_channel),
                         'space': 'dm' if visibility == 'private' else 'public'})
@@ -250,13 +263,14 @@ class Fri(discord.Client):
                     context.update(await self.agent.extra_context(channel_id, user_id, visibility == 'public'))
                 actions = Actions(self.agent, user_id, channel_id, visibility == 'public') if self.agent else None
                 if actions:
+                    actions.invitation = invitation
                     actions.event, actions.scope, actions.revision = event, scope, context['revision']
                     actions.message, actions.model, actions.effort = clean(text, 4000), context['model'], context['effort']
                     actions.web_research = context.get('web_research', [])
                     actions.pending = context.get('pending')
                     actions.continuation_only = actions.pending['goal'] if operation.continuation else None
                     actions.conversation = conversation
-                    actions.private_evidence = bool(conversation.get('reply_target'))
+                    actions.private_evidence = bool(conversation.get('reply_target') or context.get('invited_context'))
                     actions.media_allowed = inspect_images
                 context['actions'] = await actions.available() if actions else {}
                 if operation.continuation:
@@ -272,9 +286,9 @@ class Fri(discord.Client):
                 context['requester_is_owner'] = user_id == self.owner_id
                 from .fri_images import attach as attach_images
                 if inspect_images:
-                    await attach_images(context, event, text, source=image_source)
+                    await attach_images(context, event, text, source=image_source, invitation=invitation)
                 if actions:
-                    actions.image_context = {key: context[key] for key in ('image_sources', 'image_event') if key in context}
+                    actions.image_context = {key: context[key] for key in ('image_sources', 'image_event', 'image_invitation') if key in context}
                 if actions and guild_id == self.guild_id:
                     recent = await self.api('POST', '/controls/recent', scope)
                     readable = await actions.channels(fresh=True)
@@ -284,6 +298,8 @@ class Fri(discord.Client):
                     actions.music_context = current_music_context(context['gene_receipts'])
                 text = clean(text, 4000)
                 result = await self.chat_once(text, context)
+                if invitation:
+                    await invitation.require_current()
                 if conversation and (conversation.get('message_burst') or conversation.get('reply_target')):
                     from .fri_conversation import unchanged
                     if not await unchanged(self.agent, event, conversation):
@@ -299,6 +315,11 @@ class Fri(discord.Client):
                         raise commands.UserFeedbackCheckFailure('That action is not available here.')
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
+                    if invitation:
+                        await invitation.require_current()
+                    if context.get('force_text_reply'):
+                        from .fri_mentions import force_text
+                        result = force_text(result)
                     await require_current_images(context, event)
                     receipt = receipts[-1]
                     action_kind = receipt['kind']
@@ -353,11 +374,14 @@ class Fri(discord.Client):
             self.busy.discard(user_id)
 
     async def save_response(self, scope, source, text, context, result, *, model=None):
+        if context.get('force_text_reply'):
+            from .fri_mentions import force_text
+            result = force_text(result)
         if context.get('message_burst'):
             text = context['message_burst'][-1]['text']
         # A reply to someone else can quote their words. Keep the live answer on
         # Discord, but never preserve derived copies in this member's memory.
-        referenced = bool(context.get('reply_target'))
+        referenced = bool(context.get('reply_target') or context.get('invited_context'))
         if referenced:
             result.draft, result.notes = None, []
         stored_reply = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
@@ -374,6 +398,72 @@ class Fri(discord.Client):
             result.reply += ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
                              'or say “forget me” any time.')
         return result
+
+    @staticmethod
+    def mention_cooldown(admission):
+        minutes = max(1, int((admission.get('until', time.time())-time.time()+59)//60))
+        return ChatResult(reply=(f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
+                                f'back in about {minutes} mins') if admission.get('notice') else '', status='cooldown')
+
+    async def invited_talk(self, invitation, text):
+        """Outside the ambient scope, one ping has only conversation and public research."""
+        from .fri_context import addressed_content
+        from .fri_images import attach, require_current
+        from .fri_mentions import force_text
+        event, user = invitation.event, invitation.event.author.id
+        expected = addressed_content(event.content, self.user.id) or 'hey'
+        if text != expected or not 1 <= len(text) <= 4000:
+            raise commands.UserFeedbackCheckFailure('Keep each message between 1 and 4000 characters.')
+        if user in self.busy:
+            raise ReplyInProgress()
+        self.busy.add(user)
+        try:
+            async with self.chat_slots:
+                admission = await invitation.admit()
+                if not admission['allowed']:
+                    return self.mention_cooldown(admission)
+                scope = invitation.granted_scope()
+                context = await self.api('POST', '/chat/context', scope)
+                await invitation.collect()
+                context.update(invitation.context())
+                context.update(source=discord_source(event).evidence(), requests_enabled=False,
+                               requester_is_owner=user == self.owner_id,
+                               speaker={'user_id': str(user), 'display_name': clean(event.author.display_name, 80)})
+                actions = Actions(self.agent, user, event.channel.id, True)
+                actions.invitation, actions.event, actions.scope = invitation, event, scope
+                actions.revision = context['revision']
+                actions.web_research = context.get('web_research', [])
+                actions.message, actions.model, actions.effort = clean(text, 4000), context['model'], context['effort']
+                actions.private_evidence = True
+                context['actions'] = await actions.available()
+                await attach(context, event, text, source=invitation.image, invitation=invitation)
+                actions.image_context = {k: context[k] for k in ('image_sources', 'image_event', 'image_invitation') if k in context}
+                result = await self.chat_once(text, context)
+                research = None
+                if result.action:
+                    if result.action['kind'] not in context['actions']:
+                        raise commands.UserFeedbackCheckFailure('That action is not available here.')
+                    from .fri_runner import run
+                    result, receipts, research = await run(self, actions, text, context, result)
+                    receipt = research or receipts[-1]
+                    if receipt.get('sources'):
+                        from .fri_web import cite_reply, links_requested
+                        result.reply = cite_reply(result.reply, receipt,
+                            include_sources=receipts[-1]['kind'] == 'web_sources' or links_requested(text))
+                result = force_text(result)
+                result.draft, result.notes = None, []
+                await invitation.require_current()
+                await require_current(context, event)
+                await self.api('POST', '/chat/turn', {**scope, 'revision': context['revision'],
+                    'input': text, 'reply': result.reply, 'source': invitation.source,
+                    'model': context['model'], 'effort': context['effort'], 'notes': [],
+                    'burst': [], 'clarification': None,
+                    'response_kind': 'reply', 'reaction': None, 'allow_closing': False,
+                    'input_tokens': result.counters.get('input_tokens'), 'output_tokens': result.counters.get('output_tokens'),
+                    'web_receipt': research})
+                return result
+        finally:
+            self.busy.discard(user)
 
     async def chat_interaction(self, interaction, text):
         if memory_intent(text) == 'show':

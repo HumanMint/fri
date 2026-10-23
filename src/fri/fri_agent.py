@@ -16,7 +16,7 @@ import discord
 from discord.ext import tasks
 
 from . import feedback as commands
-from .fri_addressing import addressed_text
+from .fri_addressing import addressed_text, explicit_mention
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
@@ -289,6 +289,13 @@ class Agent:
             if message.author.bot or not self.config['support_dms'] or not await self.member(message.author.id):
                 return
         elif not self.allowed(message.channel):
+            # An outside ping is one event, never a new ambient/active channel.
+            if message.guild.id != self.fri.guild_id or not explicit_mention(message, self.fri.user.id):
+                return
+            from .fri_mentions import Invitation
+            invitation = await Invitation.create(self, message)
+            if invitation:
+                await self.respond(message, await addressed_text(message, self.fri.user.id), invitation=invitation)
             return
         channel = message.channel.id
         parent = getattr(message.channel, 'parent_id', None) or channel
@@ -311,6 +318,12 @@ class Agent:
                         (dm or message.guild.id == self.fri.guild_id) and usage_requested(directed or text))
         if not self.config['enabled'] and not privacy and not owner_report:
             return
+        invitation = None
+        if self.config['enabled'] and not dm and message.guild.id == self.fri.guild_id and explicit_mention(message, self.fri.user.id):
+            from .fri_mentions import Invitation
+            invitation = await Invitation.create(self, message)
+            if invitation is None:
+                return
         if privacy:
             self.forget(message.author.id)
         if not dm and not message.author.bot:
@@ -351,15 +364,15 @@ class Agent:
         self.pending.pop(key, None)
         burst = self.bursts.take(message)
         if len(burst) > 1:
-            await self.respond(message, directed or text, dm, burst=burst)
+            await self.respond(message, directed or text, dm, burst=burst, **({'invitation': invitation} if invitation else {}))
         else:
-            await self.respond(message, directed or text, dm)
+            await self.respond(message, directed or text, dm, **({'invitation': invitation} if invitation else {}))
 
     def ambient_ready(self, channel, user):
         return (user not in self.fri.busy and (channel, user) not in self.pending and
                 time.time()-self.last_spoke.get(channel, 0) >= 600)
 
-    async def respond(self, message, text, dm=False, *, burst=(), ambient=False):
+    async def respond(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None):
         try:
             async with message.channel.typing():
                 # Entering Discord's typing context itself awaits an HTTP request.
@@ -367,15 +380,24 @@ class Agent:
                     return
                 result = await self.fri.talk(self.fri.guild_id if dm else message.guild.id, message.channel.id, message.author.id,
                     text, 'private' if dm else 'public', message.author.display_name, event=message,
-                    burst=burst, inspect_images=not ambient)
+                    burst=burst, inspect_images=not ambient, **({'invitation': invitation} if invitation else {}))
         except ReplyInProgress:
+            if invitation and not await invitation.current():
+                return
             if not ambient:
                 await self.fri.waiting_notices.send(message)
             return
         except commands.UserFeedbackCheckFailure as exc:
+            if invitation and not await invitation.current():
+                return
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             await self.fri.waiting_notices.clear(message.author.id)
             return
+        if invitation:
+            if not await invitation.current():
+                return
+            from .fri_mentions import force_text
+            result = force_text(result)
         if result.response_kind in ('react', 'quiet'):
             if result.status == 'completed' and result.response_kind == 'react':
                 await self.acknowledge(message, result.reaction)
@@ -409,7 +431,7 @@ class Agent:
             result.reply = view.content
         await send_reply(message, result, view=view, mention_author=False,
                          allowed_mentions=NO_MENTIONS, suppress_embeds=True)
-        if result.status == 'completed':
+        if result.status == 'completed' and not (invitation and invitation.outside):
             self.active[(message.channel.id, message.author.id)] = time.time()+(300 if result.clarification else 120)
         self.last_spoke[message.channel.id] = time.time()
         await self.fri.waiting_notices.clear(message.author.id)
