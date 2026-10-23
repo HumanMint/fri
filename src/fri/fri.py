@@ -198,10 +198,6 @@ class Fri(discord.Client):
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
-                if invitation:
-                    admission = await invitation.admit()
-                    if not admission['allowed']:
-                        return self.mention_cooldown(admission)
                 context = await self.api('POST', '/chat/context', scope)
                 conversation = {}
                 if self.agent and source.kind == 'discord_message':
@@ -211,10 +207,6 @@ class Fri(discord.Client):
                     except ValueError as exc:
                         raise commands.UserFeedbackCheckFailure(str(exc)) from None
                     context.update(conversation)
-                if invitation:
-                    if event.reference and event.reference.message_id:
-                        await invitation.collect(include_recent=False)
-                    context.update(invitation.context())
                 context['source'] = source.evidence()
                 from .fri_addressing import explicit_mention
                 context['force_text_reply'] = bool(source.kind == 'discord_message' and
@@ -253,15 +245,23 @@ class Fri(discord.Client):
                             LOG.warning('Tool result preserved; chat recording unavailable')
                             return ChatResult(reply=unrecorded([operation.tool_receipt]), status='completed')
                     return operation.result
-                if self.agent and self.agent.config['enabled'] and not operation.continuation and not invitation:
-                    admission = await self.api('POST', '/agent/admit', {**self.agent.identity(user_id, guild_id),
-                        'channel_id': str(source_channel),
-                        'space': 'dm' if visibility == 'private' else 'public'})
+                if self.agent and self.agent.config['enabled'] and not operation.continuation:
+                    # Existing local/operational work keeps its own admission and
+                    # allowance. A mention charges social budget only for new chat.
+                    admission = (await invitation.admit() if invitation else
+                        await self.api('POST', '/agent/admit', {**self.agent.identity(user_id, guild_id),
+                            'channel_id': str(source_channel),
+                            'space': 'dm' if visibility == 'private' else 'public'}))
                     if not admission['allowed']:
                         minutes = max(1, int((admission['until']-time.time()+59)//60))
                         notice = (f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
                                   f'back in about {minutes} mins') if admission.get('notice') else ''
                         return ChatResult(reply=notice, status='cooldown')
+                if invitation:
+                    if invitation.grant and event.reference and event.reference.message_id:
+                        await invitation.collect(include_recent=False)
+                    context.update(invitation.context())
+                    image_source = invitation.image or image_source
                 if self.agent:
                     context.update(await self.agent.extra_context(channel_id, user_id, visibility == 'public'))
                 actions = Actions(self.agent, user_id, channel_id, visibility == 'public') if self.agent else None

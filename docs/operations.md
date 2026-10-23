@@ -14,6 +14,10 @@ posting or learning permission, and never adds a channel to an ambient allowlist
 The controller applies the existing member allowance. Disabled mode and in-progress
 reply notices keep their existing behavior. The runtime rechecks the current event,
 member roles, channel/thread permissions, source contents and privacy before output.
+In configured channels, local privacy/usage utilities, exact controls and accepted
+operational follow-ups retain their existing admission before any social allowance.
+New conversation and on-demand surrounding context still need normal chat admission;
+an outside mention always keeps its separate one-event social admission.
 
 Each invitation can use at most twelve preceding messages from the same channel in
 the last thirty minutes and a direct reference up to seven days old. At most one

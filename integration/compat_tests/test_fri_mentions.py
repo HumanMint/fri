@@ -18,6 +18,7 @@ from gene.fri_agent_store import AgentStore
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import CONTEXT, response_event
+from compat_tests.test_fri_continuity import arm, origin
 from compat_tests.test_fri_runtime import configured
 from fri.fri_actions import Actions
 from fri.fri_addressing import explicit_mention
@@ -403,6 +404,94 @@ def test_on_demand_meme_read_checks_sources_before_reply_and_prevents_persistenc
             else:
                 event.reply.assert_not_awaited()
                 assert not any(path == '/chat/turn' for path, _ in calls)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('prefix', ['fri', '<@99>'])
+@pytest.mark.parametrize('utility,expected,user', [
+    ('controls', 'music controls:', 20),
+    ('what do you remember about me?', 'memory is on', 20),
+    ('forget me', 'erased our saved chats', 20),
+    ('show usage', 'nothing recorded', 10),
+])
+def test_configured_local_utilities_keep_addressing_parity_during_cooldown(monkeypatch, tmp_path, prefix, utility, expected, user):
+    async def scenario():
+        fri, _, _, controller, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        for _ in range(controller.state()['config']['public_turns']+1):
+            controller.admit(str(user), 'public', '123')
+        event = message(prefix+' '+utility, user=user)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await fri.on_message(event)
+            event.reply.assert_awaited_once()
+            assert expected in event.reply.await_args.args[0].lower()
+            fri.chat_once.assert_not_awaited()
+            paths = [path for path, _ in calls]
+            assert not {'/chat/mentions/admit', '/agent/admit'} & set(paths)
+            assert ('/chat/operations/admit' in paths) == (utility == 'controls')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('prefix', ['fri', '<@99>'])
+@pytest.mark.parametrize('cancel', [False, True])
+def test_configured_accepted_followups_keep_addressing_parity_during_cooldown(monkeypatch, tmp_path, prefix, cancel):
+    async def scenario():
+        fri, _, store, controller, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        question = 'what is the current Python release?'
+        original = message(question, age=60)
+        body = origin(goal='web', text=question)
+        body['source'].update(id=str(original.id), display_name=original.author.display_name)
+        arm(store, body, topic=question)
+        for _ in range(controller.state()['config']['public_turns']+1):
+            controller.admit('20', 'public', '123')
+        event = message(prefix+(' never mind' if cancel else ' the stable one'))
+        receipt = {'kind': 'web_search', 'query': question, 'answer': 'Public facts only.',
+            'sources': ['https://www.python.org/downloads/'], 'checked_at': dt.datetime.now(dt.timezone.utc).isoformat()}
+        lookup = AsyncMock(return_value=(receipt, {}, 'completed'))
+        monkeypatch.setattr('fri.fri_actions.lookup', lookup)
+        if not cancel:
+            fri.chat_once.side_effect = [ChatResult(status='completed', action={'kind': 'web_search', 'query': question}),
+                                        ChatResult(status='completed', reply='Public facts only.')]
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await fri.on_message(event)
+            event.reply.assert_awaited_once()
+            paths = [path for path, _ in calls]
+            assert not {'/chat/mentions/admit', '/agent/admit'} & set(paths)
+            assert store.chat_context('123', 'public:1', '20')['pending'] is None
+            if cancel:
+                assert 'dropped that pending' in event.reply.await_args.args[0]
+                fri.chat_once.assert_not_awaited()
+                lookup.assert_not_awaited()
+            else:
+                assert paths.count('/chat/operations/admit') == 1
+                assert set(fri.chat_once.await_args_list[0].args[1]['actions']) == {'web_search'}
+                lookup.assert_awaited_once()
+                assert lookup.await_args.args[1] == question
+                assert store.chat_context('123', 'public:1', '20')['web_research']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel_id,prefix', [(1, 'fri'), (1, '<@99>'), (8, '<@99>')])
+def test_new_chat_stays_socially_bounded_after_operational_bypass_fix(monkeypatch, tmp_path, channel_id, prefix):
+    async def scenario():
+        fri, _, _, controller, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        for _ in range(controller.state()['config']['public_turns']+1):
+            controller.admit('20', 'public', '123')
+        event = message(prefix+' how is it going?')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await fri.on_message(event)
+            fri.chat_once.assert_not_awaited()
+            paths = [path for path, _ in calls]
+            assert ('/chat/mentions/admit' if prefix == '<@99>' else '/agent/admit') in paths
+            assert '/chat/operations/admit' not in paths
         finally:
             await fri.close()
     asyncio.run(scenario())

@@ -124,6 +124,8 @@ class Invitation:
 
     async def collect(self, *, include_recent=True):
         """Read once on this invitation, retaining no channel cache or learned facts."""
+        if not self.grant:
+            raise commands.UserFeedbackCheckFailure('Nearby mention context needs a fresh conversation admission.')
         await self.require_current()
         event, candidates, reference_id = self.event, {}, None
         reference = event.reference
