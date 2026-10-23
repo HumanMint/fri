@@ -66,6 +66,11 @@ The Gene feature deployer still activates only Red and does not read Fri release
      -t fri-runtime:<full-reviewed-sha> .
    ```
 
+   The image makes its root-owned checked-in `/app/src` readable and traversable
+   by UID `10001`, including when the source archive was extracted with restrictive
+   permissions. CI builds from owner-only source and imports the image as that UID
+   without network access. Auth and state mounts retain their separate permissions.
+
 3. Create `/srv/fri/install.json`, owned by the trusted maintainer and mode `0600`.
    On the current installation the values are:
 

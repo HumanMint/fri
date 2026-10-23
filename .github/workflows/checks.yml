@@ -16,5 +16,6 @@ jobs:
       - run: uv sync --frozen
       - run: uv run --no-sync pytest -q
       - run: uv run --no-sync ruff check .
+      - run: chmod -R go-rwx src
       - run: docker build -f ops/Dockerfile --build-arg FRI_RELEASE_SHA=${{ github.sha }} -t fri-runtime:check .
-      - run: docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true fri-runtime:check python -c "import importlib,pkgutil,fri; [importlib.import_module('fri.'+m.name) for m in pkgutil.iter_modules(fri.__path__)]; assert importlib.util.find_spec('gene') is None; assert importlib.util.find_spec('redbot') is None"
+      - run: docker run --rm --user 10001:10001 --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true fri-runtime:check python -c "import importlib,pkgutil,fri; [importlib.import_module('fri.'+m.name) for m in pkgutil.iter_modules(fri.__path__)]; assert importlib.util.find_spec('gene') is None; assert importlib.util.find_spec('redbot') is None"

@@ -3,6 +3,7 @@ RUN pip install --no-cache-dir uv==0.11.30
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY src ./src
+RUN chmod -R a+rX /app/src
 RUN uv sync --frozen --no-dev
 RUN useradd --uid 10001 --create-home fri
 ENV PATH="/app/.venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
