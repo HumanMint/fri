@@ -5,7 +5,7 @@ import time
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .fri_context import ChatSource, addressed_content, discord_source
+from .fri_context import ChatSource, addressed_content, discord_source, same_source
 from .gene_controls import arguments, requested
 from .privacy import clean
 
@@ -140,7 +140,8 @@ async def live_rows(agent, message, burst):
             if (current.author.id != message.author.id or current.author.bot or current.webhook_id or
                     current.content != original or current.channel.id != message.channel.id):
                 raise ValueError('A message in that burst changed. Send a fresh request.')
-            rows.append({'source': discord_source(current).model_dump(), 'text': clean(original, MAX_TEXT)})
+            # A fetch has no server nickname; the arriving event's source matches the turn's own.
+            rows.append({'source': discord_source(event).model_dump(), 'text': clean(original, MAX_TEXT)})
         return checked_burst(rows, discord_source(message), clean(message.content, MAX_TEXT), fresh=True)
     except (discord.HTTPException, commands.UserFeedbackCheckFailure):
         raise ValueError('A message in that burst is no longer available. Send a fresh request.') from None
@@ -199,7 +200,7 @@ async def unchanged(agent, message, context):
             return False
         for row in context.get('message_burst', []):
             current = await message.channel.fetch_message(int(row['source']['id']))
-            if (discord_source(current).model_dump() != row['source'] or
+            if (not same_source(discord_source(current), row['source']) or
                     clean(current.content, MAX_TEXT) != row['text'] or current.webhook_id):
                 return False
         return True

@@ -8,7 +8,7 @@ import discord
 
 from . import feedback as commands
 from .fri_addressing import explicit_mention
-from .fri_context import discord_source
+from .fri_context import discord_source, source_identity
 from .fri_meme_media import sources
 from .privacy import clean
 
@@ -19,7 +19,7 @@ CHANGED = 'That mention or its context changed while I was replying. Ask again f
 
 
 def fingerprint(message):
-    return (discord_source(message).model_dump(), message.content, message.edited_at,
+    return (source_identity(discord_source(message)), message.content, message.edited_at,
             tuple((str(a.url), a.content_type, a.size, a.width, a.height, a.is_spoiler())
                   for a in message.attachments))
 

@@ -183,6 +183,53 @@ def test_invalid_invitation_fails_before_model(monkeypatch, tmp_path, failure):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('configured_channel', [False, True])
+def test_nicknamed_members_mention_matches_its_fetched_copy(monkeypatch, tmp_path, configured_channel):
+    # The gateway event carries the author's server member, so it shows their nickname. A REST
+    # fetch has no member data and Fri caches no members, so it shows their global name.
+    async def scenario():
+        fri, agent, _, _, channel, message, calls, rows = environment(
+            monkeypatch, tmp_path, channel_id=1 if configured_channel else 8)
+        event = message('<@99> you there?')
+        event.author = SimpleNamespace(id=20, display_name='server nickname', bot=False)
+        fetched = copy.copy(event)
+        fetched.author = SimpleNamespace(id=20, display_name='global name', bot=False)
+        rows[event.id] = fetched
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            event.reply.assert_awaited_once()
+            assert event.reply.await_args.args[0] == 'that meme is doing a lot of work'
+            assert sum(path == '/chat/mentions/admit' for path, _ in calls) == 1
+            assert sum(path == '/chat/turn' for path, _ in calls) == 1
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_nicknamed_members_burst_matches_its_fetched_copies(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('fri yo', age=1), message('you around?')
+        for event in (first, second):
+            event.author = SimpleNamespace(id=20, display_name='server nickname', bot=False)
+            fetched = copy.copy(event)
+            fetched.author = SimpleNamespace(id=20, display_name='global name', bot=False)
+            rows[event.id] = fetched
+        try:
+            await asyncio.gather(agent.handle(first), agent.handle(second))
+            first.reply.assert_not_awaited()
+            second.reply.assert_awaited_once()
+            assert second.reply.await_args.args[0] == 'that meme is doing a lot of work'
+            burst = fri.chat_once.await_args.args[1]['message_burst']
+            assert [row['source']['display_name'] for row in burst] == ['server nickname']*2
+            saved = store.chat_context('123', 'public:1', '20')['turns'][-1]
+            assert [row['source']['id'] for row in saved['burst']] == [str(first.id), str(second.id)]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('change', ['privacy', 'source_edit', 'permission', 'settings'])
 def test_revocation_during_answer_never_sends_or_saves_context(monkeypatch, tmp_path, change):
     async def scenario():
