@@ -19,6 +19,11 @@ from .gene_controls import COMMANDS, arguments, grounded, music_control_intent, 
 from .privacy import clean
 from .web_policy import public_query
 
+CATCH_UP_MESSAGES, CATCH_UP_SECONDS = 100, 12 * 3600
+RETURN_SECONDS = 5 * 60  # The speaker's own recent messages ("yo", "back") are part of coming back.
+CATCH_UP = ('Only when the speaker asks what they missed: other members\' text in that channel since '
+            'the speaker\'s last message there, up to 100 messages or 12 hours. No images.')
+
 
 class Actions:
     def __init__(self, agent, user, channel, public):
@@ -137,7 +142,8 @@ class Actions:
         actions = {'read_recent': {'channels': [{'channel_id': k, 'name': clean(v.name, 60)}
                                                 for k, v in channels.items()],
                     'default_channel_id': next(iter(channels)), 'limit': 20, 'max_age_days': 7,
-                    'description': 'Read one small recent text batch when asked. No images or saved personal notes.'}}
+                    'description': 'Read one small recent text batch when asked. No images or saved personal notes.',
+                    'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
         if self.invitation:
             actions['read_recent'].update(limit=12, max_age_days=30/(24*60),
                 description='Read up to twelve preceding same-channel messages from the last thirty minutes '
@@ -327,31 +333,61 @@ class Actions:
         channel_id = action.get('channel_id') or next(iter(channels))
         if channel_id not in channels:
             return {'blocked': 'That channel is outside this conversation’s readable scope.'}
-        if self.invitation:
+        catch_up = action.get('window') == 'since_my_last_message'
+        if self.invitation and not catch_up:
             return await self.invited_context(channel_id)
         channel = channels[channel_id]
         self.sources.add(channel_id)
         scope = getattr(channel, 'parent_id', None) or channel.id
         after = time.time()-min(7, self.agent.config['history_days'])*86400
+        if catch_up:
+            after = max(after, time.time()-CATCH_UP_SECONDS)
         if channel.id == self.agent.dedicated:
             after = max(after, self.agent.state.get('started', time.time()))
+        options = {'limit': 20, 'after': dt.datetime.fromtimestamp(after, dt.timezone.utc), 'oldest_first': False}
+        if catch_up:
+            options['limit'] = CATCH_UP_MESSAGES
+            if isinstance(self.event, discord.Message):
+                options['before'] = self.event
+        # A catch-up stops at the speaker's last message before anyone else spoke. Messages
+        # they sent just now, or that only bots answered, are them coming back, not leaving.
+        returned, others, left = time.time()-RETURN_SECONDS, False, None
         records, scanned, profiles = [], 0, {}
-        async for message in channel.history(limit=20, after=dt.datetime.fromtimestamp(after, dt.timezone.utc), oldest_first=False):
+        async for message in channel.history(**options):
             scanned += 1
-            if message.author.bot or message.webhook_id or not message.content.strip():
+            if message.author.bot or message.webhook_id:
                 continue
             user = message.author.id
+            if catch_up and user == self.user:
+                if others and message.created_at.timestamp() < returned:
+                    left = message
+                    break
+                continue
+            others = True
+            if not message.content.strip():
+                continue
             if user not in profiles:
                 profiles[user] = await self.agent.profile(scope, user)
             profile = profiles[user]
             if not profile['enabled']:
                 continue
             self.observe(scope, user, profile['revision'])
+            if catch_up:  # Up to 100 rows, so drop the links and keep each line short.
+                records.append({'user_id': user, 'name': clean(message.author.display_name, 60),
+                                'at': message.created_at.isoformat(timespec='minutes'),
+                                'text': clean(message.content, 300)})
+                continue
             records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
                             'at': message.created_at.isoformat(), 'text': clean(message.content, 500)})
-        return {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
-                'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': after,
-                'images_inspected': False, 'personal_notes_saved': 0}
+        result = {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
+                  'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': after,
+                  'images_inspected': False, 'personal_notes_saved': 0}
+        if catch_up:
+            result.update(window='since_my_last_message',
+                your_last_message_at=left.created_at.isoformat(timespec='minutes') if left else None,
+                stopped_at='your_last_message' if left else
+                    'message_limit' if scanned >= CATCH_UP_MESSAGES else 'time_limit')
+        return result
 
     async def invited_context(self, channel_id):
         """An explicit configured-channel read introduces ephemeral evidence only now."""

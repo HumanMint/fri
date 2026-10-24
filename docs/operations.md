@@ -20,7 +20,8 @@ New conversation and on-demand surrounding context still need normal chat admiss
 an outside mention always keeps its separate one-event social admission.
 
 Each invitation can use at most twelve preceding messages from the same channel in
-the last thirty minutes and a direct reference up to seven days old. At most one
+the last thirty minutes and a direct reference up to seven days old. A catch-up in a
+configured channel uses its own read instead (see "Catching up"). At most one
 image post is inspected, preferring the current attachments, then the reference,
 then a single nearby candidate. Multiple candidates need clarification. Existing
 limits remain two non-spoiler PNG/JPEG/WebP attachments, 4 MB each, twenty million
@@ -40,6 +41,25 @@ attachments and existing immediate own-photo pairing remain available directly.
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.
 They do not prove Discord delivery or live model interpretation of a particular meme.
+
+## Catching up
+
+"fri what did i miss", or any ask to be caught up, has the model call `read_recent` with
+`window=since_my_last_message`. Fri reads that channel back from the request, up to 100 messages
+or 12 hours, and stops at the speaker's last message there. Their own messages from the last five
+minutes ("back", "yo") and ones only bots answered count as them coming back, not where they left.
+The receipt says where the read stopped (`your_last_message`, `message_limit` or `time_limit`) and
+when the speaker last spoke, so Fri can say a recap only covers the latest stretch. Rows carry the
+author, minute and text cut to 300 characters, without jump links.
+
+It is the same tool, scope and fences as any `read_recent`: one channel the member can read (the
+current one in public, an approved one from a DM), no bots, webhooks, empty messages or members with
+memory off, each author's privacy revision rechecked before delivery, the history-days and
+dedicated-channel start floors, no images, no extra model call, only the conversation allowance,
+and a neutral breadcrumb in saved history. A configured-channel mention that asks to catch up gets
+this read rather than the twelve-message nearby context. Outside invitations don't offer it.
+`python -m fri.fri_eval --suite controls` includes catch-up cases: choosing the window, a short
+attributed recap, an empty read and a partial one.
 
 ## Conversation continuity and provenance
 

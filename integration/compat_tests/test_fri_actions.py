@@ -17,7 +17,7 @@ from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_runtime import configured, event
 from fri.fri_actions import Actions
 from fri.fri_agent import Agent
-from fri.fri_chat import Chat, ChatResult
+from fri.fri_chat import SCHEMA, Chat, ChatResult
 
 
 def test_owner_learning_endpoints_reject_other_roles_and_forged_owners(setup_agent):
@@ -156,6 +156,112 @@ def test_recent_fri_chat_excludes_old_startup_archive(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
+def catch_up_channel(channels, reads, rows):
+    """Channel 1 holds rows of (user, text, age in seconds); bot and empty rows look like Discord's."""
+    now = time.time()
+    messages = [SimpleNamespace(author=SimpleNamespace(id=user, bot=user == 99, display_name=f'member {user}'),
+        webhook_id=None, content=text, jump_url=f'https://discord.com/channels/123/1/{age}',
+        created_at=dt.datetime.fromtimestamp(now-age, dt.timezone.utc)) for user, text, age in rows]
+    async def history(**kwargs):
+        reads.append(kwargs)
+        newest = sorted((m for m in messages if m.created_at > kwargs['after']), key=lambda m: m.created_at, reverse=True)
+        for message in newest[:kwargs['limit']]:
+            yield message
+    channels[1].history = history
+    return messages
+
+
+CATCH_UP = {'kind': 'read_recent', 'channel_id': '1', 'window': 'since_my_last_message'}
+
+
+def test_catch_up_reads_what_others_said_since_the_speaker_left(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, reads = harness(monkeypatch, tmp_path)
+        async def profile(channel, user):
+            return {'enabled': user != 30, 'revision': 0}
+        agent.profile.side_effect = profile
+        messages = catch_up_channel(channels, reads, [
+            (10, 'back', 60), (20, 'wb', 90), (99, 'now playing', 100), (20, 'ash found a modpack', 3600),
+            (30, 'opted out', 3700), (40, '', 3800), (20, 'bo blamed lag', 4000), (10, 'gn', 7200),
+            (20, 'said before they left', 8000)])
+        actions = Actions(agent, 10, 1, True)
+        offered = (await actions.available())['read_recent']
+        assert 'since_my_last_message' in offered['windows']
+        actions.event = event(channel=1, content='fri what did i miss')
+        receipt = await actions.execute(CATCH_UP)
+        assert [row['text'] for row in receipt['messages']] == ['bo blamed lag', 'ash found a modpack', 'wb']
+        assert all(set(row) == {'user_id', 'name', 'at', 'text'} for row in receipt['messages'])
+        assert receipt['stopped_at'] == 'your_last_message' and receipt['window'] == 'since_my_last_message'
+        assert receipt['your_last_message_at'] == messages[7].created_at.isoformat(timespec='minutes')
+        assert receipt['scanned'] == 8 and not receipt['images_inspected']
+        assert reads[0]['limit'] == 100 and reads[0]['before'] is actions.event
+        assert abs(time.time()-reads[0]['after'].timestamp()-12*3600) < 5
+        assert set(actions.revisions) == {(1, 20)} and await actions.valid()
+        agent.profile.side_effect = lambda channel, user: {'enabled': True, 'revision': int(user == 20)}
+        assert not await actions.valid()
+        await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('rows,stopped,texts', [
+    # Never spoke here: everything in the window, up to the time floor.
+    ([(20, 'one', 600), (30, 'two', 900)], 'time_limit', ['two', 'one']),
+    # Their own messages from the last few minutes are them coming back, not leaving.
+    ([(10, 'yo', 30), (20, 'sup', 60), (10, 'back', 120), (20, 'earlier', 1200)], 'time_limit', ['earlier', 'sup']),
+    # Nobody but a bot answered their older message, so they didn't leave there either.
+    ([(99, 'skipped', 850), (10, 'fri skip', 900), (20, 'earlier', 1200)], 'time_limit', ['earlier']),
+    # A busy channel stops at the message cap.
+    ([(20, f'line {i}', 60+i) for i in range(150)], 'message_limit', None),
+])
+def test_catch_up_without_a_departure_says_where_it_stopped(monkeypatch, tmp_path, rows, stopped, texts):
+    async def scenario():
+        fri, agent, channels, reads = harness(monkeypatch, tmp_path)
+        catch_up_channel(channels, reads, rows)
+        actions = Actions(agent, 10, 1, True)
+        receipt = await actions.execute(CATCH_UP)
+        assert receipt['stopped_at'] == stopped and receipt['your_last_message_at'] is None
+        assert 'before' not in reads[0]  # No Discord message to anchor on, e.g. a panel turn.
+        if texts is None:
+            assert receipt['scanned'] == len(receipt['messages']) == 100
+        else:
+            assert [row['text'] for row in receipt['messages']] == texts
+        await fri.close()
+    asyncio.run(scenario())
+
+
+def test_catch_up_keeps_the_dedicated_channel_start_floor(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, reads = harness(monkeypatch, tmp_path)
+        channels[3].history = channels[1].history
+        await Actions(agent, 10, 999, False).execute({**CATCH_UP, 'channel_id': '3'})
+        assert abs(reads[0]['after'].timestamp()-agent.state['started']) < .001
+        await fri.close()
+    asyncio.run(scenario())
+
+
+def test_configured_mention_catch_up_reads_the_channel_not_nearby_context(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, reads = harness(monkeypatch, tmp_path)
+        catch_up_channel(channels, reads, [(20, 'ash found a modpack', 600), (10, 'gn', 3600)])
+        actions = Actions(agent, 10, 1, True)
+        actions.invitation = SimpleNamespace(outside=False, require_current=AsyncMock(),
+                                             current=AsyncMock(return_value=True))
+        actions.invited_context = AsyncMock(return_value={'kind': 'read_recent', 'messages': []})
+        offered = (await actions.available())['read_recent']
+        assert offered['limit'] == 12 and 'since_my_last_message' in offered['windows']
+        await actions.execute(RECENT)
+        actions.invited_context.assert_awaited_once()
+        assert not reads
+        receipt = await actions.execute(CATCH_UP)
+        actions.invited_context.assert_awaited_once()
+        assert [row['text'] for row in receipt['messages']] == ['ash found a modpack']
+        assert actions.private_evidence and await actions.valid()
+        actions.invitation.current.return_value = False
+        assert not await actions.valid()
+        await fri.close()
+    asyncio.run(scenario())
+
+
 def test_report_erasure_during_response_invalidates_owner_answer(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, _, _ = harness(monkeypatch, tmp_path)
@@ -187,21 +293,34 @@ def test_learning_questions_are_not_settings_commands(monkeypatch, tmp_path, tex
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('offered,reply,kind,expected', [
-    (True, '', 'read_recent', 'completed'),
-    (False, '', 'read_recent', 'invalid_output'),
-    (True, 'I already did it', 'read_recent', 'invalid_output'),
-    (True, '', 'shell', 'invalid_output'),
+RECENT = {'kind': 'read_recent', 'channel_id': '1', 'window': 'recent'}
+
+
+@pytest.mark.parametrize('offered,reply,action,expected', [
+    (True, '', RECENT, 'completed'),
+    (True, '', {**RECENT, 'window': 'since_my_last_message'}, 'completed'),
+    (False, '', RECENT, 'invalid_output'),
+    (True, 'I already did it', RECENT, 'invalid_output'),
+    (True, '', {'kind': 'read_recent', 'channel_id': '1'}, 'invalid_output'),
+    (True, '', {**RECENT, 'window': 'everything'}, 'invalid_output'),
+    (True, '', {'kind': 'shell', 'channel_id': '1'}, 'invalid_output'),
 ])
-def test_action_parser_accepts_only_offered_complete_requests(offered, reply, kind, expected):
+def test_action_parser_accepts_only_offered_complete_requests(offered, reply, action, expected):
     async def scenario():
-        output = {'reply': reply, 'notes': [], 'request_draft': None, 'action': {'kind': kind, 'channel_id': '1'}}
+        output = {'reply': reply, 'notes': [], 'request_draft': None, 'action': action}
         def handler(request):
             return httpx.Response(200, text='data: '+json.dumps(response_event('completed', json.dumps(output)))+'\n\n')
         chat = Chat(SimpleNamespace(access_token=lambda: 'test'), httpx.MockTransport(handler))
         result = await chat.respond('look around', {**CONTEXT, 'actions': {'read_recent': {}} if offered else {}})
         assert result.status == expected
     asyncio.run(scenario())
+
+
+def test_read_recent_schema_always_names_a_window():
+    branches = [branch for branch in SCHEMA['properties']['action']['anyOf']
+                if 'read_recent' in branch.get('properties', {}).get('kind', {}).get('enum', [])]
+    assert len(branches) == 1 and branches[0]['required'] == ['kind', 'channel_id', 'window']
+    assert branches[0]['properties']['window']['enum'] == ['recent', 'since_my_last_message']
 
 
 @pytest.mark.parametrize('outcome', ['completed', 'failed', 'second_action', 'erased'])
