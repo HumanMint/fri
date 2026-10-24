@@ -421,6 +421,56 @@ def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('when', ['profile', 'burst', 'reply', 'cancelled'])
+def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tmp_path, caplog, when):
+    # Discord can deliver the same event twice. The first copy, or the burst holding it, answers.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event, later = message('<@99> hey', age=1), message('you around?')
+        held, release, profile = asyncio.Event(), asyncio.Event(), agent.profile
+        async def slow_profile(*args):
+            if when == 'profile' and not held.is_set():
+                held.set()
+                await release.wait()
+            return await profile(*args)
+        agent.profile = slow_profile
+        async def slow_reply(content, **kwargs):
+            held.set()
+            await release.wait()
+            return SimpleNamespace(id=later.id+1, content=content)
+        later.reply.side_effect = slow_reply
+        tasks = [asyncio.create_task(agent.handle(event))]
+        try:
+            if when == 'profile':
+                await asyncio.wait_for(held.wait(), 5)
+            else:
+                while not agent.bursts.group(event):
+                    await asyncio.sleep(0.01)
+            if when == 'reply':  # The burst's last message is replying for both.
+                tasks.append(asyncio.create_task(agent.handle(later)))
+                await asyncio.wait_for(held.wait(), 5)
+            await asyncio.wait_for(agent.handle(copy.copy(event)), 1)  # Ignored at once.
+            if when == 'cancelled':
+                tasks[0].cancel()
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if when == 'cancelled':
+                event.reply.assert_not_awaited()
+                assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: CancelledError']
+            else:
+                (later if when == 'reply' else event).reply.assert_awaited_once()
+                assert fri.chat_once.await_count == 1 and mention_lines(caplog) == []
+                if when == 'reply':
+                    event.reply.assert_not_awaited()
+            assert agent.misses == {} and not agent.handling
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_an_answered_mention_logs_nothing(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():

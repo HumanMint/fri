@@ -9,7 +9,7 @@ import os
 import re
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import closing
 
 import discord
@@ -81,6 +81,7 @@ class Agent:
         self.recent = defaultdict(lambda: deque(maxlen=30))
         self.active = {}
         self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
+        self.handling = Counter()  # Discord message IDs being handled now, burst members included.
         self.recording = {}  # (channel, member): set once a delivered reply is recorded.
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
         self.pending = {}
@@ -320,6 +321,17 @@ class Agent:
                      self.misses.pop(event.id) or reason or 'no reply')
 
     async def handle(self, message):
+        # Discord can redeliver an event. While its first delivery, or the burst holding it, is still
+        # being handled, that answers for both; a later copy meets the reply guards and spent grants.
+        if message.id in self.handling or self.bursts.group(message) is not None:
+            return
+        self.handling[message.id] += 1
+        try:
+            await self.watch(message)
+        finally:
+            self.handling -= Counter([message.id])
+
+    async def watch(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
         # A redelivered event is left to the delivery that watched it first.
         if (message.guild is None or message.author.bot or getattr(message, 'webhook_id', None) or
@@ -456,6 +468,7 @@ class Agent:
             self.pending.pop(key, None)
         burst = self.bursts.take(message)
         earlier = [event for _, event, _ in burst if event is not message]
+        self.handling.update(event.id for event in earlier)  # Until this reply answers for them too.
         try:
             if len(burst) > 1:
                 await self.respond(message, directed or text, dm, burst=burst, **({'invitation': invitation} if invitation else {}))
@@ -466,6 +479,7 @@ class Agent:
                 self.miss(event, type(exc).__name__)
             raise
         finally:
+            self.handling -= Counter(event.id for event in earlier)
             for event in earlier:
                 self.settle(event)
 
