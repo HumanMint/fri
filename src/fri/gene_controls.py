@@ -47,8 +47,10 @@ def own_words(argument, text):
 
 
 def grounded(receipts):
-    """A legacy companion's command argument may quote anyone; show only that a command ran."""
-    return [r if r.get('grounded') or not r.get('argument') else {**r, 'argument': '[not kept]'} for r in receipts]
+    """A legacy companion's argument may quote anyone, and Red's output can echo it: show only that it ran."""
+    return [r if r.get('grounded') or not r.get('argument') else
+            {**r, 'argument': '[not kept]', 'result': {'done': r.get('result', {}).get('done'), 'output': '[not kept]'}}
+            for r in receipts]
 
 
 def words(text):

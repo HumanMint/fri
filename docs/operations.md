@@ -46,6 +46,9 @@ They do not prove Discord delivery or live model interpretation of a particular 
 Requires the controller's `turn-provenance` capability. Fri starts only against a controller that
 advertises it, so the controller must be released first.
 
+- **One reply per message.** A message's direct reply holds it until Discord accepts the reply and
+  the turn is recorded, so a redelivered event can't produce a second answer while the first is
+  still sending.
 - **Saved only after delivery.** A turn is staged while Fri composes the reply. Just before
   delivery, `/chat/turn/check` runs the save's privacy fence without writing: the speaker's
   revision, plus every referenced member's revision and memory setting. Only after Discord
@@ -71,7 +74,7 @@ advertises it, so the controller must be released first.
   rollout or after a Fri-only rollback, may quote other members with no record of whom. The
   controller marks them, and Fri shows the model only that an earlier reply existed. Pending
   questions saved without provenance are ignored. A legacy command receipt shows that a command ran,
-  not its argument. A request draft carries its
+  not its argument or Gene's output, which can echo it. A request draft carries its
   turn's fence: preview, every page turn and submission re-run `/chat/turn/check` and refuse once
   any source changed. A submitted request carries those sources and the requester's revision. The
   controller checks them as it creates the job and withdraws the job, even mid-build, if any source

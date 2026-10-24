@@ -79,6 +79,7 @@ class Agent:
         self.state = {'config': dict(DEFAULTS), 'version': 0, 'channels': [], 'history_channels': []}
         self.recent = defaultdict(lambda: deque(maxlen=30))
         self.active = {}
+        self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
         self.pending = {}
         self.bursts = Bursts()
         self.seen = {}
@@ -390,7 +391,21 @@ class Agent:
         return (user not in self.fri.busy and (channel, user) not in self.pending and
                 time.time()-self.last_spoke.get(channel, 0) >= 600)
 
-    async def respond(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None):
+    async def respond(self, message, text, dm=False, **options):
+        # The turn, and an invitation's grant, are consumed only by the save after delivery, so a
+        # redelivered event must wait out the whole reply, not just inference. Ambient attention
+        # already yields to direct replies itself (ambient_ready) and never blocks one.
+        if options.get('ambient'):
+            return await self.reply_once(message, text, dm, **options)
+        if message.id in self.replying:
+            return
+        self.replying.add(message.id)
+        try:
+            await self.reply_once(message, text, dm, **options)
+        finally:
+            self.replying.discard(message.id)
+
+    async def reply_once(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None):
         try:
             async with message.channel.typing():
                 # Entering Discord's typing context itself awaits an HTTP request.

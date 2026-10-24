@@ -128,7 +128,7 @@ def test_lab_reply_dispatch_preserves_actual_guild(monkeypatch, tmp_path):
         channel = SimpleNamespace(id=789)
         from unittest.mock import MagicMock
         channel.typing = MagicMock(return_value=AsyncMock())
-        message = SimpleNamespace(guild=SimpleNamespace(id=999), channel=channel,
+        message = SimpleNamespace(id=100000000000000002, guild=SimpleNamespace(id=999), channel=channel,
             author=SimpleNamespace(id=20, display_name='friend'), reply=AsyncMock())
         await agent.respond(message, 'hi')
         assert fri.talk.await_args.args[0] == 999

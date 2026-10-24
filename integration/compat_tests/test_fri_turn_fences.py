@@ -443,7 +443,7 @@ def test_submitted_derived_draft_keeps_its_sources(monkeypatch, tmp_path, erasur
                 bodies = [row[0] for row in db.execute('SELECT body FROM jobs')]
             assert all(MARKER not in body for body in bodies)
             assert bodies == ([] if erasure == 'between_fence_and_write' else
-                              ['[Request withdrawn: someone it drew on erased their data]'])
+                              ['[Request withdrawn: someone it drew on changed their privacy settings]'])
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -589,12 +589,15 @@ def test_history_saved_without_provenance_is_withheld(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
-def test_receipts_from_a_legacy_companion_hide_their_argument():
+def test_receipts_from_a_legacy_companion_hide_their_argument_and_output():
     from fri.gene_controls import grounded
-    legacy = {'action': 'play', 'argument': MARKER, 'grounded': False}
-    assert grounded([legacy, {**legacy, 'argument': 'sandstorm', 'grounded': True}, {'action': 'skip', 'argument': ''}]) == [
-        {**legacy, 'argument': '[not kept]'}, {**legacy, 'argument': 'sandstorm', 'grounded': True},
-        {'action': 'skip', 'argument': ''}]
+    # Red's no-match output echoes the argument, which a legacy companion may have copied from anyone.
+    legacy = {'action': 'play', 'argument': MARKER, 'grounded': False,
+              'result': {'done': True, 'output': 'No tracks found for `'+MARKER+'`.'}}
+    capable = {**legacy, 'argument': 'sandstorm', 'grounded': True, 'result': {'done': True, 'output': 'Track Enqueued'}}
+    skip = {'action': 'skip', 'argument': '', 'result': {'done': True, 'output': 'Skipped'}}
+    assert grounded([legacy, capable, skip]) == [
+        {**legacy, 'argument': '[not kept]', 'result': {'done': True, 'output': '[not kept]'}}, capable, skip]
 
 
 def test_a_later_history_page_cannot_relabel_an_earlier_one(monkeypatch, tmp_path):
@@ -630,5 +633,36 @@ def test_a_later_history_page_cannot_relabel_an_earlier_one(monkeypatch, tmp_pat
             assert MARKER not in event.reply.await_args.args[0]
             assert MARKER not in str(store.chat_context('123', 'public:1', '20')['turns'])
         finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+
+def test_a_redelivered_mention_waits_for_the_first_reply_to_be_delivered_and_recorded(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=8)
+        event = message('<@99> hello')
+        in_send, release, sends = asyncio.Event(), asyncio.Event(), []
+
+        async def reply(content, **kwargs):
+            sends.append(content)
+            in_send.set()
+            await release.wait()
+            return SimpleNamespace(id=event.id+len(sends), content=content)
+        event.reply.side_effect = reply
+        first = asyncio.create_task(agent.handle(event))
+        try:
+            await asyncio.wait_for(in_send.wait(), 5)
+            await asyncio.wait_for(agent.handle(event), 5)  # Discord redelivers while the first send waits.
+            release.set()
+            await asyncio.wait_for(first, 5)
+            assert len(sends) == 1 and fri.chat_once.await_count == 1
+            assert sum(path == '/chat/turn' for path, _ in calls) == 1
+            await agent.handle(event)  # After it's recorded, the consumed grant refuses a repeat.
+            assert fri.chat_once.await_count == 1 and sends[0] not in sends[1:]
+            assert all('cannot renew its mention invitation' in text for text in sends[1:])
+        finally:
+            release.set()
+            await first
             await fri.close()
     asyncio.run(scenario())
