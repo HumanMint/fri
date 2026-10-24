@@ -40,6 +40,11 @@ def answered(replay, label):
     return replay.step(label).answered()
 
 
+def placeholder_only(replay, label):
+    """No retained turn for this event keeps a derived reply; only neutral placeholders remain."""
+    return all(turn['reply'].startswith(('Earlier ', '[')) for turn in replay.retained(label))
+
+
 CLOSING = Scenario(
     'closing_after_completed_answer',
     'A completed answer followed by an exact closing gets a local reaction, not another model call.',
@@ -151,7 +156,7 @@ ERASURE = Scenario(
      Check('the derived answer is stored verbatim', lambda r: route(r, 'ask')['stored'] == ['reply-text'],
            scripted_only=True),
      Check('erased member\'s details do not survive in another member\'s saved chat',
-           lambda r: 'denver' not in json.dumps(r.stored(BO)).lower(),
+           lambda r: placeholder_only(r, 'ask'),
            known_gap='Replies built from recent channel context are saved verbatim and survive the source '
                      'author\'s erasure; only reply-target/invited context is fenced (fri.py:390).')])
 
@@ -163,7 +168,9 @@ REPLY_TARGET = Scenario(
     {'conversation': [reply('ash said denver, next month')]},
     [Check('reply-target answer is generated and delivered', lambda r: answered(r, 'ask')),
      Check('reply-target turn is stored as a breadcrumb', lambda r: route(r, 'ask')['stored'] == ['breadcrumb']),
-     Check('referenced details are not stored', lambda r: 'denver' not in json.dumps(r.stored(BO)).lower())])
+     Check('referenced answer is retained only as a placeholder', lambda r: placeholder_only(r, 'ask')),
+     Check('referenced details are not stored', lambda r: 'denver' not in json.dumps(r.stored(BO)).lower(),
+           scripted_only=True)])
 
 DELIVERY_FAILURE = Scenario(
     'delivery_failure_after_save',
@@ -172,8 +179,7 @@ DELIVERY_FAILURE = Scenario(
     {'conversation': [reply('yo')]},
     [Check('the reply was generated', lambda r: route(r, 'yo')['inference'] == ['completed']),
      Check('failed delivery is observed', lambda r: route(r, 'yo')['outcome'] == 'delivery-failed'),
-     Check('no stored turn claims an undelivered reply',
-           lambda r: 'yo' not in [turn['reply'] for turn in r.stored(BO)['turns']],
+     Check('no stored turn claims an undelivered reply', lambda r: not r.retained('yo'),
            known_gap='The turn is saved before Discord delivery (fri.py:378, fri_agent.py:432).')])
 
 SCENARIOS = [CLOSING, OPEN_QUESTION, WEB_CLARIFICATION, OUTSIDE_MENTION, KEYWORDS, ERASURE, REPLY_TARGET,

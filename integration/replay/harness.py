@@ -540,10 +540,22 @@ class Replay:
     def stored(self, user, channel=CONFIGURED):
         return self.store.chat_context(str(GUILD), f'public:{channel}', str(user))
 
+    def retained(self, label):
+        """Turns the controller still holds for one step's source event, independent of wording."""
+        step, source = self.step(label), str(self.world.labels[label])
+        return [turn for turn in self.stored(step.actor, step.channel)['turns']
+                if (turn.get('source') or {}).get('id') == source]
+
     def run(self):
-        clock = Clock(time.time())
+        real_time = time.time
+        clock = Clock(real_time())
         thread = threading.get_ident()
         real_sleep = asyncio.sleep
+        # Subscription expiry and refresh bookkeeping persist to disk: keep them on real time.
+        import fri.subscription
+        subscription_time = types.ModuleType('time')
+        subscription_time.__dict__.update(vars(time))
+        subscription_time.time = real_time
 
         async def sleep(delay, result=None):
             if threading.get_ident() == thread:
@@ -561,9 +573,11 @@ class Replay:
             stack.enter_context(patch.dict(os.environ, environment))
             stack.enter_context(patch.object(time, 'time', clock))
             stack.enter_context(patch.object(asyncio, 'sleep', sleep))
+            stack.enter_context(patch.object(fri.subscription, 'time', subscription_time))
             for item in clock_patches(clock):
                 stack.enter_context(item)
             asyncio.run(self._run(clock))
+            self.results = self.evaluate()  # Store reads purge by TTL, so judge on the virtual clock.
         return self
 
     async def _run(self, clock):
@@ -638,16 +652,18 @@ class Replay:
                                        if c.inference and c.inference != 'completed'],
                 'prompt_versions': sorted({m['prompt_version'] for s in self.steps for m in s.model}),
                 'tokens': {key: sum(s['tokens'][key] for s in steps) for key in ('input_tokens', 'output_tokens')},
-                'steps': steps, 'checks': self.evaluate()}
+                'steps': steps, 'checks': self.results}
 
 
 def failures(reports):
-    """A failed ordinary check, unexpected controller rejection or failed inference fails a run."""
+    """The single validity rule shared by pytest and the CLI; any entry makes a run unsuccessful."""
     return [item for report in reports if 'checks' in report for item in
             [c['name'] for c in report['checks'] if not c['passed'] and not c['known_gap']] +
+            [f'controller error for {path}' for path in report['controller_errors']] +
             [f'controller {status} for {path} in {label}' for label, path, status in report['unexpected_rejections']] +
             [f'rejected save in {label}' for label in report['rejected_saves']] +
-            [f'inference {status} in {label}' for label, status in report['inference_failures']]]
+            [f'inference {status} in {label}' for label, status in report['inference_failures']] +
+            [f'unused scripted {kind} responses: {count}' for kind, count in report['unused_script'].items()]]
 
 
 def run(scenario, root=None, **kwargs):

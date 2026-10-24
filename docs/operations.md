@@ -195,15 +195,20 @@ error notice is never counted as an answer. A turn counts as stored only if it's
 the synthetic store by its source event. A run is unsuccessful, and the CLI exits non-zero, if
 it has:
 
+- a controller 5xx;
 - a controller 4xx the scenario didn't declare in `expected_rejections`;
 - a rejected save;
 - a failed inference;
+- unused scripted responses;
 - a failed ordinary check.
 
-Live transports are created and closed per scenario from a factory.
+pytest and the CLI share this single rule (`failures()`). Checks run before real time is restored.
+Live transports are created and closed per scenario from a factory, and subscription expiry
+bookkeeping stays on real time.
 
-`known_gap` checks run as strict xfails. They count only when the gap check itself fails with an
-`AssertionError`, after every other precondition has passed. When a fix makes one pass, the suite
+`known_gap` checks run as strict xfails. They count only when the final gap assertion raises
+`KnownGapPresent`, after every other precondition has passed. Gap checks inspect stored turns by
+source event, not by model wording. When a fix makes one pass, the suite
 fails until the marker is removed, so a documented gap can't silently disappear or come back.
 
 Print reports offline with `python -m replay` (run from `integration/` with the same

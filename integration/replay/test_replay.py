@@ -10,6 +10,7 @@ from starlette.testclient import TestClient
 
 import fri.fri_image_share
 from replay.harness import (
+    Check,
     Inspect,
     Replay,
     Say,
@@ -20,7 +21,14 @@ from replay.harness import (
     reply,
     run,
 )
-from replay.scenarios import CLOSING, DELIVERY_FAILURE, ERASURE, OUTSIDE_MENTION, SCENARIOS
+from replay.scenarios import (
+    CLOSING,
+    DELIVERY_FAILURE,
+    ERASURE,
+    OUTSIDE_MENTION,
+    SCENARIOS,
+    WEB_CLARIFICATION,
+)
 
 
 def rejecting(path):
@@ -35,12 +43,13 @@ def rejecting(path):
     return patch.object(TestClient, 'request', request)
 
 
+class KnownGapPresent(Exception):
+    """Raised only by the final gap assertion; no other failure can satisfy a known-gap xfail."""
+
+
 def preconditions(report):
-    """Raise a non-assertion error so a broken run can never pass as a reproduced known gap."""
+    """Raise a non-gap error so a broken run can never pass as a reproduced known gap."""
     problems = failures([report])
-    for key in ('unused_script', 'controller_errors'):
-        if report[key]:
-            problems.append(f'{key}: {report[key]}')
     if problems:
         raise RuntimeError(problems)
 
@@ -53,19 +62,20 @@ def test_scenario_routes_and_checks(scenario, tmp_path):
 
 
 GAPS = [pytest.param(scenario, check.name, id=f'{scenario.name}:{check.name}',
-                     marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason=check.known_gap))
+                     marks=pytest.mark.xfail(strict=True, raises=KnownGapPresent, reason=check.known_gap))
         for scenario in SCENARIOS for check in scenario.checks if check.known_gap]
 
 
 @pytest.mark.parametrize('scenario,name', GAPS)
 def test_known_gap_still_reproduces(scenario, name, tmp_path):
-    """Strict xfail on AssertionError only: fixing the gap fails the suite until the marker is removed."""
+    """Strict xfail on KnownGapPresent only: fixing the gap fails the suite until the marker is removed."""
     report = run(scenario, tmp_path)
     preconditions(report)
     result = next(c for c in report['checks'] if c['name'] == name)
     if result['detail']:
         raise RuntimeError(result['detail'])  # An erroring check is not a reproduction.
-    assert result['passed'], result
+    if not result['passed']:
+        raise KnownGapPresent(result)
 
 
 def test_manifests_and_routes_never_copy_member_text(tmp_path):
@@ -180,3 +190,68 @@ def test_live_factory_transport_is_created_and_closed_per_scenario(tmp_path):
         report = run(scenario, tmp_path/str(index), live=factory, max_calls=1)
         preconditions(report)
     assert len(made) == 2 and all(transport.closed for transport in made)
+
+
+def test_live_delivery_gap_does_not_depend_on_scripted_wording(tmp_path):
+    """Round-3 finding: any retained turn for the failed send reproduces the gap, whatever it says."""
+    report = run(DELIVERY_FAILURE, tmp_path, live=httpx.MockTransport(live_reply('hey there')), max_calls=1)
+    preconditions(report)
+    gap = next(c for c in report['checks'] if c['known_gap'])
+    assert not gap['passed'] and not gap['detail']
+
+
+def test_known_gap_xfail_cannot_be_satisfied_by_other_assertions(tmp_path):
+    """Round-3 finding: an unrelated AssertionError surfaces instead of counting as the gap."""
+    from replay.harness import ModelTransport
+
+    async def broken(self, request):
+        raise AssertionError('synthetic provider invariant failure')
+
+    name = next(c.name for c in ERASURE.checks if c.known_gap)
+    with patch.object(ModelTransport, 'handle_async_request', broken), \
+            pytest.raises(AssertionError, match='synthetic provider invariant'):
+        test_known_gap_still_reproduces(ERASURE, name, tmp_path)
+
+
+def test_controller_errors_fail_cli_and_pytest_alike(tmp_path):
+    """Round-3 finding: failures() is the one validity rule, including controller 5xx."""
+    original = TestClient.request
+
+    def request(self, method, url, *args, **kwargs):
+        if url == '/chat/usage/report':
+            return httpx.Response(500, text='synthetic', request=httpx.Request(method, 'http://testserver'+url))
+        return original(self, method, url, *args, **kwargs)
+
+    with patch.object(TestClient, 'request', request):
+        report = run(CLOSING, tmp_path)
+    assert report['controller_errors'] and any('controller error' in item for item in failures([report]))
+
+
+def test_checks_are_judged_on_the_virtual_clock(tmp_path):
+    """Round-3 finding: TTL-sensitive store reads happen before real time is restored."""
+    scenario = Scenario('ttl', 'A clarification left for 1000 virtual seconds expires.',
+                        WEB_CLARIFICATION.steps[:1] + [Wait(1000)],
+                        {'conversation': WEB_CLARIFICATION.script['conversation'][:1]},
+                        [Check('pending expired', lambda r: r.stored(20)['pending'] is None)])
+    report = run(scenario, tmp_path)
+    preconditions(report)
+
+
+def test_subscription_expiry_stays_on_real_time(tmp_path):
+    """Round-3 finding: refreshed token expiry must not inherit the virtual clock's offset."""
+    import time
+
+    from fri.subscription import PLAN_SCOPE, Subscription
+    auth = tmp_path/'session.json'
+    auth.write_text(json.dumps({'access_token': 'synthetic-old', 'refresh_token': 'synthetic-refresh',
+                                'client_id': 'eval', 'ext_agent_host_id': 'eval', 'scopes': [PLAN_SCOPE],
+                                'expires_at': time.time()+60}))
+    refresh = httpx.MockTransport(lambda request: httpx.Response(200, json={
+        'access_token': 'synthetic-new', 'refresh_token': 'synthetic-rotated', 'token_type': 'bearer',
+        'expires_in': 3600, 'scope': PLAN_SCOPE}))
+    scenario = Scenario('auth', 'A refresh after virtual waits.', [Wait(600), Say(20, 'fri hi', label='hi')])
+    run(scenario, tmp_path/'run', live=httpx.MockTransport(live_reply('hi')),
+        subscription=Subscription(auth, refresh), max_calls=1)
+    saved = json.loads(auth.read_text())
+    assert saved['access_token'] == 'synthetic-new'
+    assert abs(saved['expires_at'] - (time.time()+3600)) < 60
