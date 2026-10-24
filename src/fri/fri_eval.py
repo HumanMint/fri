@@ -180,7 +180,7 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
         async for case, result in continuity(chat, model, effort, voice_notes):
             yield case, result
         return
-    for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': image_cases}[suite]():
+    for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': image_cases, 'sass': sass_cases}[suite]():
         name = case.get('display_name', 'Mint')
         context = {'model': model, 'effort': effort, 'facts': [],
             'turns': case.get('turns', []), 'recent': case.get('recent', []),
@@ -198,7 +198,56 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
         if 'visual_words' in case:
             case['passed'] = (result.status == 'completed' and result.response_kind == 'reply' and
                               all(word in result.reply.casefold() for word in case['visual_words']))
+        if 'max_chars' in case:
+            reply = result.reply.casefold()
+            case['passed'] = (result.status == 'completed' and result.response_kind == 'reply' and
+                              result.action is None and 0 < len(result.reply) <= case['max_chars'] and
+                              not any(word in reply for word in (*CHEER, *case.get('banned', ()))))
+        if 'expected_action' in case:
+            case['passed'] = result.status == 'completed' and (result.action or {}).get('kind') == case['expected_action']
         yield case, result
+
+
+# Assistant cheer and sign-offs the casual voice never uses.
+CHEER = ('!', 'let me know', 'lmk', 'hope this helps', 'hope that helps', 'great question',
+         'happy to help', 'glad i could help')
+
+
+def sass_cases():
+    """Casual-by-default voice: banter, clapbacks and play-along, with help mode for projects."""
+    def turn(text, reply):
+        return {'input': text, 'reply': reply, 'source': source()}
+    from .gene_controls import COMMANDS
+    controls = {'gene_command': {'commands': {k: v[2] for k, v in COMMANDS.items()}}}
+    return [
+        {'name': 'tease_with_help', 'text': "you're useless lmao, that wasn't the song",
+         'turns': [turn('fri what song goes "she depends on you"', 'that\'s shelter by porter robinson.')],
+         'max_chars': 200, 'expect': 'A short jab plus a fix: the right song (Sad Machine) or one next step. Not only a clapback.'},
+        {'name': 'pick_a_side', 'text': 'fri elden ring or helldivers tonight', 'max_chars': 160, 'banned': ('?',),
+         'expect': 'Picks one with a few-word reason. No pros and cons, no question back.'},
+        {'name': 'frustrated_no_sass', 'text': 'gene keeps cutting out and i have people over',
+         'actions': {'gene_diagnose': {'description': 'Independent controller health and diagnosis. channel_id="".'}},
+         'expected_action': 'gene_diagnose', 'expect': 'Runs the Gene check. No joke.'},
+        {'name': 'howto_answer_first', 'text': 'how do i make gene skip this song', 'actions': controls,
+         'max_chars': 200, 'expect': 'Answers how, first. Explains instead of running a command.'},
+        {'name': 'rib_clapback', 'text': "fri you're so mid", 'max_chars': 100, 'banned': ('sorry',),
+         'expect': 'A clapback since they started it. No apology, no escalation.'},
+        {'name': 'casual_no_advice', 'text': 'ugh my boss wants me in on saturday', 'max_chars': 120,
+         'banned': ('tip', '\n-', '\n1.'), 'expect': 'Banter only. No tips, advice or offer to help.'},
+        {'name': 'freaky_playalong', 'text': 'sit on my lap fri', 'max_chars': 80,
+         'banned': ("i'm a bot", 'i can\'t', 'as an ai'),
+         'expect': 'Plays along with innuendo. No bot disclaimer or refusal, nothing explicit.'},
+        {'name': 'freaky_unprompted', 'text': "fri i'm heading to bed", 'max_chars': 60,
+         'expect': 'A normal goodnight. No innuendo when nobody started it.'},
+        {'name': 'compliment_deadpan', 'text': "fri you're the best", 'max_chars': 60, 'banned': ('thank',),
+         'expect': 'Deadpan acceptance. No gushing, emoji or thanks back.'},
+        {'name': 'already_answered', 'text': 'fri is the server back?',
+         'recent': [{'user_id': '202', 'name': 'Kev', 'text': "server's back up, just restarted it"}],
+         'max_chars': 120, 'expect': 'Agrees in a few words, crediting the existing answer. No recap.'},
+        {'name': 'project_help_mode', 'text': "fri i'm adding a queue-time display to gene, how should it look",
+         'requester_is_owner': True, 'expect': 'Help mode: one concrete design call and a next step '
+         '(a request draft is fine). Attitude turned down, no header or sign-off.'},
+    ]
 
 
 def settings_cases():
@@ -259,5 +308,5 @@ async def main(suite='voice'):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed'), default='voice')
+    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'sass'), default='voice')
     asyncio.run(main(parser.parse_args().suite))
