@@ -20,7 +20,7 @@ from .fri_addressing import addressed_text, explicit_mention
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
-from .fri_errors import ControllerRejected
+from .fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
 from .fri_memory import memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
@@ -101,6 +101,7 @@ class Agent:
         self.presence = None
         self.heartbeat_started = self.heartbeat_finished = 0
         self.heartbeat_status = 'starting'
+        self.unreachable_notices = {}  # channel: when Fri last said it can't reach the controller.
 
     @property
     def config(self):
@@ -241,6 +242,11 @@ class Agent:
             return False
         if message.guild and message.guild.id != self.fri.guild_id:
             return False  # Lab is for conversation; administrative output stays in FF/owner DMs.
+        from .fri_watch import health_requested
+        if health_requested(text):  # Before any controller read: it has to work while the controller doesn't.
+            report = await self.fri.watcher.report() if not message.guild else 'dm me for that one.'
+            await message.reply(report, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+            return True
         if usage_requested(text):
             return False  # Keep reports in the normal attributed conversation and privacy flow.
         lower = text.lower()
@@ -304,6 +310,31 @@ class Agent:
         return True
 
     async def handle(self, message):
+        try:
+            await self._handle(message)
+        except ControllerUnavailable:
+            await self.unreachable(message)
+            raise  # on_message still logs it.
+
+    async def unreachable(self, message):
+        """A message Fri would answer, read while the controller is down: say so instead of going silent."""
+        if message.author.bot or getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:
+            return
+        # A DM only reaches a controller read after its member check; an outside ping keeps its own gates.
+        if message.guild and (not self.allowed(message.channel) or
+                              await addressed_text(message, self.fri.user.id) is None):
+            return
+        now = time.time()
+        self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if now-v < 300}
+        if message.channel.id in self.unreachable_notices:
+            return
+        self.unreachable_notices[message.channel.id] = now
+        try:
+            await message.reply(UNREACHABLE, allowed_mentions=NO_MENTIONS, mention_author=False)
+        except discord.HTTPException:
+            LOG.info('Controller outage notice was not delivered')
+
+    async def _handle(self, message):
         arrived = time.monotonic()  # Bursts group by arrival, even if this waits for an earlier reply.
         forgotten = self.forgotten.get(message.author.id, 0)
         if getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:

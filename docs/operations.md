@@ -121,6 +121,34 @@ copy of `ops/compose.yml` here documents the runtime; the coordinator uses its o
 reviewed `Gene/ops/fri-compose.yml`. Fri's feature code cannot select service mounts.
 The Gene feature deployer still activates only Red and does not read Fri release pins.
 
+## Watching Gene and the controller
+
+Fri can't restart anything. It only notices and says so.
+
+- **Owner DM per outage.** Fri's own `watch` loop reads `/controls/health` every 2 minutes, with
+  no model call, apart from the agent heartbeat and owner DM loop. After 3 bad reads in a row it
+  DMs the owner once. A bad read is one of: Gene's heartbeat missing or at least 60 s old, Gene
+  not connected to Discord, Gene's command runner stopped, the controller unreachable (transport
+  error, 5xx, or no answer in 10 s), or the controller rejecting the read (4xx, such as a contract
+  mismatch). A stale command poll alone is a busy Gene, not an outage. Recovery edits the same DM
+  with the outage length. A new outage within 30 minutes of the last DM edits that DM again instead
+  of sending another. State lives in the private `fri-watch.json` in the data directory, so a
+  restart mid-outage neither repeats nor forgets the DM.
+- **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
+  command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
+  there, the member gets a fixed "gene isn't taking commands right now" at once, plus "owner
+  already knows" while a Gene outage DM is open, and nothing is queued. A command Gene accepts and
+  then hangs on still waits out the controller's 115 s; that needs a controller change.
+- **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed
+  to Fri in a configured channel) whose controller read fails gets one fixed notice per channel
+  per 5 minutes instead of silence. Mentions outside configured channels keep their own gates
+  and stay silent. The same text replaces the old "workshop controller is temporarily
+  unavailable" wherever that error was shown.
+- **`fri health`.** Owner DM only; in a server channel Fri says to DM. It works while the
+  controller is down and records no turn. It shows Fri's release, Discord connection, heartbeat
+  status and age, loop states, waiting usage receipts, live `/status` and `/controls/health`
+  (4 s each, failures shown as "unreachable" or "rejected"), and the watch state.
+
 ## Existing installation migration
 
 1. Deploy a reviewed Gene controller supporting `/fri/contract` and `gene-fri/1`.

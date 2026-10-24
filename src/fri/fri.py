@@ -18,7 +18,7 @@ from .fri_actions import Actions
 from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
-from .fri_errors import ControllerRejected
+from .fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
 from .fri_memory import describe_memory, memory_intent
 from .fri_notices import ReplyInProgress, WaitingNotices, notice_text
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
@@ -131,6 +131,8 @@ class Fri(discord.Client):
         self.chat_slots = asyncio.Semaphore(2)
         self.session = None
         self.agent = None
+        from .fri_watch import Watch
+        self.watcher = Watch(self)
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
@@ -155,6 +157,7 @@ class Fri(discord.Client):
         await self.tree.sync(guild=discord.Object(id=self.guild_id))
         self.health.start()
         self.owner_reviews.start()
+        self.watch.start()
 
     def dispatch(self, event, /, *args, **kwargs):
         if event == 'interaction' and args:
@@ -194,10 +197,10 @@ class Fri(discord.Client):
                 if 400 <= response.status < 500:
                     raise ControllerRejected(str(data.get('detail', 'Controller rejected this request')))
                 if response.status >= 400:
-                    raise commands.UserFeedbackCheckFailure(str(data.get('detail', 'Controller rejected this request')))
+                    raise ControllerUnavailable(str(data.get('detail', 'Controller rejected this request')))
                 return data
         except (aiohttp.ClientError, TimeoutError):
-            raise commands.UserFeedbackCheckFailure('The workshop controller is temporarily unavailable.') from None
+            raise ControllerUnavailable(UNREACHABLE) from None
 
     async def flush_usage(self):
         async with self.usage_lock:
@@ -672,6 +675,14 @@ class Fri(discord.Client):
     async def before_reviews(self):
         await self.wait_until_ready()
 
+    @tasks.loop(seconds=120)
+    async def watch(self):
+        await self.watcher.check()  # Its own loop: a stuck heartbeat or owner DM can't hide an outage.
+
+    @watch.before_loop
+    async def before_watch(self):
+        await self.wait_until_ready()
+
     @tasks.loop(seconds=10)
     async def health(self):
         guild = self.get_guild(self.guild_id)
@@ -702,6 +713,7 @@ class Fri(discord.Client):
             self.agent.close()
         self.health.cancel()
         self.owner_reviews.cancel()
+        self.watch.cancel()
         await sessions(self).close_all()
         if self.session:
             await self.session.close()
