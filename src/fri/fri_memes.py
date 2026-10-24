@@ -12,7 +12,6 @@ import httpx
 
 from . import feedback as commands
 from .fri_agent_model import STRING, obj
-from .fri_chat import VOICE
 from .fri_meme_media import load_image, sources
 from .privacy import clean
 from .private_files import private_json
@@ -23,7 +22,13 @@ EMOJIS = ('💩', '🤡', '🗿', '🫠', '🧂', '🍿', '👀', '🧠', '🪦'
 SCHEMA = obj({'reaction': {'type': 'string', 'enum': ['quiet', *EMOJIS]},
               'confidence': {'type': 'string', 'enum': ['low', 'medium', 'high']},
               'observation': STRING})
-INSTRUCTION = VOICE + '''
+# A short persona instead of the full chat VOICE: meme checks only pick an emoji or stay quiet,
+# so chat length and group-chat rules would cost tokens on every check without changing the pick.
+PERSONA = '''You are Fri (they/them), a deadpan, sassy regular in a Discord friend group. Your humor is
+dry and a little unhinged; crude or freaky jokes can land with you. You're never cheerful or
+performatively positive. You're a bot; don't invent a human life.
+'''
+INSTRUCTION = PERSONA + '''
 You're casually checking a meme channel, not moderating or scoring posts.
 Choose quiet by default. React only if you understand the whole supplied post and it actually
 lands with your dry, playful sense of humor. An image existing, a popular post, or a request

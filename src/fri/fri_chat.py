@@ -1,6 +1,7 @@
 """Conversation with bounded harness actions over official ChatGPT plan OAuth."""
 
 import asyncio
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -338,6 +339,12 @@ class ChatResult:
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
 
 
+def cache_key(source):
+    """Keep one channel's calls on the same prompt cache. Only a hash of the channel id leaves Fri."""
+    channel = (source or {}).get('channel_id')
+    return 'fri-chat-'+hashlib.sha256(str(channel).encode()).hexdigest()[:32] if channel else None
+
+
 def usage(response):
     data = response.get('usage') or {}
     return {'input_tokens': data.get('input_tokens'), 'output_tokens': data.get('output_tokens'),
@@ -429,6 +436,9 @@ class Chat:
                    'input': messages,
                    'text': {'format': {'type': 'json_schema', 'name': 'fri_reply',
                                       'strict': True, 'schema': schema}}}
+        key = cache_key(context.get('source'))
+        if key:
+            payload['prompt_cache_key'] = key
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30), trust_env=False,
                                          transport=self.transport) as client:

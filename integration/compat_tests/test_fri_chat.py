@@ -43,6 +43,20 @@ def test_stream_requires_completion_and_records_usage_even_for_bad_outputs(kind)
         assert result.counters['reasoning_output_tokens'] == 5
 
 
+def test_prompt_cache_key_is_a_stable_channel_hash():
+    keys = []
+
+    def handler(request):
+        keys.append(json.loads(request.content).get('prompt_cache_key'))
+        return httpx.Response(200, text='data: ' + json.dumps(response_event()) + '\n\n')
+    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
+    for channel in ('123456789012345678', '123456789012345678', '123456789012345679'):
+        asyncio.run(chat.respond('hi', {**CONTEXT, 'source': {'channel_id': channel, 'user_id': '1'}}))
+    asyncio.run(chat.respond('hi', CONTEXT))
+    assert keys[0] == keys[1] != keys[2] and keys[3] is None
+    assert keys[0].startswith('fri-chat-') and '123456789012345678' not in keys[0]
+
+
 def test_model_refresh_reads_subscription_visible_catalog():
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json={'models': [
         {'slug': 'gpt-6.1-sol', 'visibility': 'list'}, {'slug': 'hidden', 'visibility': 'hide'}]}))
