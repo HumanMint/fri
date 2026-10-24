@@ -47,8 +47,20 @@ def test_report_counts_input_and_output_once_and_labels_missing_counts(tmp_path)
     assert 'incomplete' in reply and 'cumulative' in reply and 'coding usage is separate' in reply
     assert '```' not in reply and 'input_tokens' not in reply and len(reply) < 1950
     assert 'nothing recorded' in describe_usage([])
+    assert '- chat: 120 tokens · 2 calls (70% of input cached, 75% of output reasoning)' in reply
     by_model = describe_usage(rows, by_model=True)
     assert 'model / high: 120 tokens' in by_model and '- chat:' not in by_model
+    assert '70% of input cached' in by_model
+
+
+def test_report_skips_shares_the_provider_did_not_report_and_folds_them_into_other_tasks():
+    rows = [{'role': role, 'model': 'model', 'effort': 'low', 'attempts': 1, 'input_tokens': 100 - index,
+             'output_tokens': 10, 'unknown_attempts': 0, 'cached_tokens': 50 if role == 'meme' else None,
+             'reasoning_tokens': None} for index, role in enumerate(
+                 ('conversation', 'web_search', 'attention', 'summary', 'status', 'history', 'meme'))]
+    reply = describe_usage(rows)
+    assert '- chat: 110 tokens · 1 calls\n' in reply and 'reasoning' not in reply
+    assert '- other tasks: 104 tokens · 1 calls (53% of input cached)' in reply
 
 
 def conversation(monkeypatch, tmp_path):
