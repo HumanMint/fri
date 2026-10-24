@@ -182,7 +182,8 @@ and Red are **test-only** dependencies; the Fri wheel and runtime image contain 
 A Python audit-hook guard denies non-loopback connections and DNS in every Python process. On
 macOS, `sandbox-exec` also denies outbound IP; on Linux, `unshare -rn` does when available.
 Inside an existing sandbox where nesting fails, for example a Codex reviewer, the guard alone is
-used. Every run first proves each active layer with a canary connection, prints the isolation it
+used. The guard covers only Python's socket layer. Non-Python subprocesses and native code are
+covered only by an OS layer: the script's own, or the outer sandbox's. Every run first proves each active layer with a canary connection, prints the isolation it
 used, and exits non-zero on any failure.
 
 Overrides:
