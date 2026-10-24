@@ -705,3 +705,101 @@ def test_an_answer_sent_while_the_question_is_being_saved_is_not_lost(monkeypatc
             await task
             await fri.close()
     asyncio.run(scenario())
+
+
+def hold_first_save(fri):
+    saving, release = asyncio.Event(), asyncio.Event()
+    controller = fri.api
+
+    async def api(method, path, body=None):
+        if path == '/chat/turn' and not saving.is_set():
+            saving.set()
+            await release.wait()
+        return await controller(method, path, body)
+    fri.api = api
+    return saving, release
+
+
+def test_a_redelivered_event_never_waits_its_way_past_the_reply_guard(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event, sends = message('fri hello'), []
+        saving, release = hold_first_save(fri)
+
+        async def send(content, **kwargs):
+            sends.append(content)
+            return SimpleNamespace(id=event.id+len(sends), content=content)
+        event.reply.side_effect = send
+        first = asyncio.create_task(agent.handle(event))
+        try:
+            await asyncio.wait_for(saving.wait(), 5)
+            await asyncio.wait_for(agent.handle(event), 5)  # Ignored at once, not queued behind the save.
+            release.set()
+            await asyncio.wait_for(first, 5)
+            assert len(sends) == 1 and fri.chat_once.await_count == 1
+            assert sum(path == '/chat/turn' for path, _ in calls) == 1
+        finally:
+            release.set()
+            await first
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_ambient_attention_never_answers_a_direct_reply_that_is_still_saving(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        original, sends = message('fri hello'), []
+        saving, release = hold_first_save(fri)
+
+        async def send(content, **kwargs):
+            sends.append(content)
+            return SimpleNamespace(id=original.id+len(sends), content=content)
+        original.reply.side_effect = send
+        agent.run = AsyncMock(return_value=({'action': 'reply', 'source_id': str(original.id)}, {}, 'completed'))
+        task = asyncio.create_task(agent.handle(original))
+        try:
+            await asyncio.wait_for(saving.wait(), 5)
+            await asyncio.wait_for(agent.attend(), 5)
+            release.set()
+            await asyncio.wait_for(task, 5)
+            assert len(sends) == 1 and fri.chat_once.await_count == 1
+        finally:
+            release.set()
+            await task
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_answer_sent_before_discord_confirms_the_question_is_not_lost(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, answer = message('fri play'), message('blind melon no rain')
+        accepted, release = asyncio.Event(), asyncio.Event()
+        fri.chat_once.return_value = ChatResult(status='completed', action={
+            'kind': 'clarify', 'goal': 'play', 'topic': '', 'question': 'what song?'})
+
+        async def send(content, **kwargs):
+            accepted.set()  # Discord shows the question; its HTTP response hasn't returned yet.
+            await release.wait()
+            return SimpleNamespace(id=first.id+1, content=content)
+        first.reply.side_effect = send
+        talk, talked = fri.talk, []
+        async def spy(*args, **kwargs):
+            talked.append(args[3])
+            return await talk(*args, **kwargs)
+        fri.talk = spy
+        task = asyncio.create_task(agent.handle(first))
+        try:
+            await asyncio.wait_for(accepted.wait(), 5)
+            pending = asyncio.create_task(agent.handle(answer))
+            await asyncio.sleep(0.05)
+            assert talked == ['fri play']
+            release.set()
+            await asyncio.wait_for(task, 5)
+            await asyncio.wait_for(pending, 5)
+            assert talked == ['fri play', 'blind melon no rain']
+        finally:
+            release.set()
+            await task
+            await fri.close()
+    asyncio.run(scenario())

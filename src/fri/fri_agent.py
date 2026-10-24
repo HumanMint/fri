@@ -356,6 +356,8 @@ class Agent:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})
             return
+        if message.id in self.replying:
+            return  # A redelivered event: its reply is already being delivered or recorded.
         recording = self.recording.get((channel, message.author.id))
         if recording and not privacy:
             # Fri's reply was delivered but isn't saved yet, so a question it asked isn't pending
@@ -404,10 +406,10 @@ class Agent:
         # The turn, and an invitation's grant, are consumed only by the save after delivery, so a
         # redelivered event must wait out the whole reply, not just inference. Ambient attention
         # already yields to direct replies itself (ambient_ready) and never blocks one.
+        if message.id in self.replying:
+            return  # Including ambient attention picking a message whose direct reply is still saving.
         if options.get('ambient'):
             return await self.reply_once(message, text, dm, **options)
-        if message.id in self.replying:
-            return
         self.replying.add(message.id)
         try:
             await self.reply_once(message, text, dm, **options)
@@ -472,14 +474,17 @@ class Agent:
         from .fri_image_share import send_reply
         if result.settings_preview:
             result.reply = view.content
-        sent = await send_reply(message, result, view=view, mention_author=False,
-                                allowed_mentions=NO_MENTIONS, suppress_embeds=True)
-        if sent is None:  # Nothing was delivered, so nothing is recorded as said.
-            await self.fri.waiting_notices.clear(message.author.id)
-            return
         echo, key = result.echo, (message.channel.id, message.author.id)
-        recorded = self.recording[key] = asyncio.Event()  # The member may already be answering.
+        # Discord can show the reply before its send call returns, so the member may answer from
+        # then on. Their next message waits through delivery and recording.
+        recorded = self.recording[key] = asyncio.Event()
         try:
+            sent = await send_reply(message, result, view=view, mention_author=False,
+                                    allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+            if sent is None:  # Nothing was delivered, so nothing is recorded as said.
+                await self.fri.waiting_notices.clear(message.author.id)
+                return
+            self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
             await self.fri.record_turn(result, sent)
             if echo and message.guild and self.allowed(message.channel):
                 text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']  # As shown.
@@ -492,7 +497,6 @@ class Agent:
             recorded.set()
             if self.recording.get(key) is recorded:
                 del self.recording[key]
-        self.last_spoke[message.channel.id] = time.time()
         await self.fri.waiting_notices.clear(message.author.id)
 
     async def acknowledge(self, message, emoji):
