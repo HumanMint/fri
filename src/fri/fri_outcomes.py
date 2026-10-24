@@ -50,8 +50,8 @@ def one(last):
     if outcome == Outcome.FAILED:
         return 'that check failed: '+notice_text(clean(str(last['error']), 1200))
     if outcome == Outcome.UNCERTAIN:
-        return ('completion is uncertain. '+notice_text(clean(str(last.get('uncertain', '')), 1000))+
-                ' i have not retried it. check its current status before sending another request.')
+        return ('not sure that went through. '+notice_text(clean(str(last.get('uncertain', '')), 1000))+
+                ' it was not retried, so check it before asking again.')
     kind = last['kind']
     if kind == 'gene_command':
         return 'gene returned:\n'+clean(str(last['output']), 1600)
@@ -63,7 +63,7 @@ def one(last):
         return clean(str(last['answer']), 1700)
     if kind == 'image_search' and last.get('image_status') == 'prepared':
         return 'found one that fits.'
-    return 'that check completed, but i couldn’t finish explaining it. no action was repeated; ask for current details.'
+    return 'that check completed but i lost my words explaining it. nothing was repeated, so ask me where it’s at.'
 
 
 def unrecorded(receipts, *, reason='i couldn’t save this chat record.'):
