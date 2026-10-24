@@ -168,8 +168,35 @@ Run with both source trees available, credentials removed and network access den
 
 ```sh
 PYTHONPATH="$PWD/src:$PWD/integration:/path/to/gene/src:/path/to/gene" \
-  /path/to/gene/.venv/bin/python -m pytest -q -p no:cacheprovider integration/compat_tests
+  /path/to/gene/.venv/bin/python -m pytest -q -p no:cacheprovider integration/compat_tests integration/replay
 ```
+
+### Replay harness
+
+`integration/replay/` drives synthetic multi-message scenarios through the unmodified
+`Fri.on_message` pipeline and the real Gene controller in-process. It fakes Discord, the
+controller transport (an aiohttp-shaped adapter, so `Fri.api` runs unchanged) and the provider
+transport. A virtual wall clock controls message IDs, follow-up windows and controller TTLs.
+
+Each step records:
+
+- the observed route: local intercept, admission, model, tools, outcome, and how the turn was
+  stored;
+- a context manifest: field sizes, offered actions, prompt version, model and effort, with no raw
+  member text;
+- token usage.
+
+Production code is not instrumented. All scenario members and messages are invented.
+
+`known_gap` checks run as strict xfails. When a fix makes one pass, the suite fails until the
+marker is removed, so a documented gap can't silently disappear or come back.
+
+Print reports offline with `python -m replay` (run from `integration/` with the same
+`PYTHONPATH`). `--live-model --auth SESSION --max-calls N` runs the same scenarios against the
+real provider with a hard call budget, and is never part of offline checks. It needs network access
+and a subscription session dedicated to evaluation, because refreshes rewrite the session. Never
+use the production session or a copy of its rotating refresh token. Nothing is posted to Discord,
+and live controller state is never touched.
 
 The maintainer runs this inside an OS network-denied environment or disposable
 container without credential mounts. Ordinary runtime tests need only Fri's own

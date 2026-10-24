@@ -1,0 +1,554 @@
+"""Synthetic full-handler replay: real Fri pipeline and Gene controller, fake Discord and model.
+
+Nothing here touches production code, live Discord or live state. Scripted mode is offline.
+Heartbeat work (attention, learning, memes, outbox delivery) is not driven yet; steps are messages.
+"""
+
+import asyncio
+import contextlib
+import datetime as dt
+import hashlib
+import json
+import os
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import aiohttp
+import discord
+import httpx
+from fastapi.testclient import TestClient
+from gene.api import create_app
+from gene.config import Settings
+from gene.fri_agent_store import AgentStore
+
+from fri.fri_chat import Chat
+from fri.fri_protocol import compatible
+
+GUILD, OWNER, FRI = 123, 10, 99
+WORKSHOP, CONFIGURED, OUTSIDE = 456, 1, 8
+TOKEN = 'fri-' + 'x' * 32
+BASE = 'http://controller.replay'
+ADMISSION = ('/agent/admit', '/chat/mentions/admit', '/chat/operations/admit')
+NAMES = {OWNER: 'owner', 20: 'bo', 30: 'ash', 40: 'kit'}
+
+
+class BudgetExhausted(httpx.TransportError):
+    """Raised before sending; production code treats it as an interrupted connection."""
+
+
+class UnscriptedCall(AssertionError):
+    pass
+
+
+class Clock:
+    """Virtual wall clock for Fri and the controller. Monotonic time stays real for asyncio."""
+
+    def __init__(self, start):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += max(0.0, seconds)
+
+
+@dataclass
+class Call:
+    method: str
+    path: str
+    status: int
+    payload_keys: list
+    allowed: bool | None = None
+    saved: dict | None = None
+    tokens: dict | None = None
+
+
+@dataclass
+class Delivery:
+    kind: str
+    channel: int
+    target: int
+    text: str = ''
+    view: bool = False
+    failed: bool = False
+
+
+@dataclass
+class Step:
+    index: int
+    label: str
+    actor: int | None
+    channel: int | None
+    controller: list = field(default_factory=list)
+    model: list = field(default_factory=list)
+    deliveries: list = field(default_factory=list)
+
+    def conversation(self):
+        return [m for m in self.model if m['kind'] == 'conversation']
+
+    def route(self):
+        """Classify the decision from observable effects only; production code is not instrumented."""
+        paths = [c.path for c in self.controller]
+        saved = [c.saved for c in self.controller if c.saved]
+        sent = [d for d in self.deliveries if not d.failed]
+        local = next((s['model'] for s in saved if s['model'].startswith('local-')), None)
+        conversation = self.conversation()
+        if any(c.allowed is False for c in self.controller):
+            kind = 'cooldown'
+        elif local:
+            kind = local
+        elif '/chat/memory/control' in paths:
+            kind = 'local-privacy'
+        elif conversation:
+            kind = 'model'
+        elif self.model and sent:
+            kind = 'owner-control'
+        elif sent and not saved and any(d.view for d in sent) and '/chat/context' in paths:
+            kind = 'local-memory'
+        elif sent:
+            kind = 'notice'
+        elif self.controller:
+            kind = 'observed'
+        else:
+            kind = 'ignored'
+        if any(d.kind == 'reply' for d in sent):
+            outcome = 'reply'
+        elif any(d.kind == 'reaction' for d in sent):
+            outcome = 'react'
+        elif any(d.failed for d in self.deliveries):
+            outcome = 'delivery-failed'
+        else:
+            outcome = 'silent'
+        texts = [d.text for d in self.deliveries if d.kind == 'reply']
+        stored = []
+        for item in saved:
+            reply = item['reply']
+            if item['response_kind'] != 'reply':
+                stored.append(item['response_kind'])
+            elif reply.startswith('Earlier '):
+                stored.append('breadcrumb')
+            elif any(reply and text.startswith(reply) for text in texts):
+                stored.append('reply-text')
+            else:
+                stored.append('other')
+        receipts = conversation[-1]['receipts'] if conversation else []
+        return {'kind': kind, 'outcome': outcome, 'admission': sorted({p for p in paths if p in ADMISSION}),
+                'model_calls': len(self.model), 'conversation_calls': len(conversation),
+                'tools': receipts, 'stored': stored,
+                'clarification': any(item.get('clarification') for item in saved),
+                'reaction': next((d.text for d in sent if d.kind == 'reaction'), None)}
+
+    def tokens(self):
+        rows = [c.tokens for c in self.controller if c.tokens]
+        return {key: sum(row.get(key) or 0 for row in rows) for key in ('input_tokens', 'output_tokens')}
+
+    def report(self):
+        return {'label': self.label, 'actor': self.actor, 'channel': self.channel, 'route': self.route(),
+                'model': self.model, 'controller_paths': [c.path for c in self.controller],
+                'deliveries': [d.__dict__ for d in self.deliveries], 'tokens': self.tokens()}
+
+
+def size(value):
+    if isinstance(value, bool) or value is None:
+        return bool(value)
+    if isinstance(value, (list, dict, str)):
+        return len(value)
+    return value
+
+
+def manifest(payload, kind):
+    """Context shape and versions without raw member text."""
+    instructions = payload.get('instructions', '')
+    result = {'kind': kind, 'model': payload.get('model'),
+              'effort': (payload.get('reasoning') or {}).get('effort'),
+              'prompt_version': hashlib.sha256(instructions.encode()).hexdigest()[:12],
+              'input_chars': len(json.dumps(payload.get('input', [])))}
+    if kind != 'conversation':
+        return result
+    messages = payload['input']
+    content, images = messages[-1]['content'], 0
+    if isinstance(content, list):
+        images = sum(part.get('type') == 'input_image' for part in content)
+        content = next(part['text'] for part in content if part.get('type') == 'input_text')
+    data = json.loads(content)
+    schema = payload['text']['format']['schema']['properties']['response_kind']
+    recent = data.get('recent_channel_context') or []
+    result.update(prior_turns=(len(messages)-1)//2, images=images,
+                  fields={key: size(value) for key, value in data.items() if key != 'message'},
+                  recent_authors=len({row.get('user_id') for row in recent if isinstance(row, dict)}),
+                  offered_actions=sorted(data.get('available_actions') or {}),
+                  receipts=[row.get('kind') for row in data.get('action_results_untrusted') or []],
+                  quiet_allowed=data['response_options']['quiet'],
+                  text_only=schema.get('enum') == ['reply'])
+    return result
+
+
+def classify(request, payload):
+    if request.method == 'GET':
+        return 'catalog'
+    if any(tool.get('type') == 'web_search' for tool in payload.get('tools', [])):
+        return 'web'
+    name = ((payload.get('text') or {}).get('format') or {}).get('name')
+    return 'conversation' if name == 'fri_reply' else 'internal'
+
+
+def reply(text, *, allow_closing=False, draft=None):
+    return {'response_kind': 'reply', 'allow_closing': allow_closing, 'reaction': None, 'reply': text,
+            'request_draft': draft, 'notes': [], 'action': None}
+
+
+def react(emoji='👍'):
+    return {**reply(''), 'response_kind': 'react', 'reaction': emoji}
+
+
+def quiet():
+    return {**reply(''), 'response_kind': 'quiet'}
+
+
+def act(kind, **fields):
+    return {**reply(''), 'action': {'kind': kind, **fields}}
+
+
+def web(answer, url):
+    return {'answer': answer, 'url': url}
+
+
+def _stream(output, payload):
+    estimate = len(json.dumps(payload.get('input', [])))//4
+    event = {'type': 'response.completed', 'response': {'output': output, 'usage': {
+        'input_tokens': estimate, 'output_tokens': 40, 'input_tokens_details': {'cached_tokens': 0},
+        'output_tokens_details': {'reasoning_tokens': 0}}}}
+    return httpx.Response(200, text='data: '+json.dumps(event)+'\n\n',
+                          headers={'content-type': 'text/event-stream'})
+
+
+class ModelTransport(httpx.AsyncBaseTransport):
+    """Records every provider request; answers from a script or forwards to a live transport."""
+
+    def __init__(self, steps, script=None, live=None, max_calls=None):
+        self.steps, self.live, self.max_calls = steps, live, max_calls
+        self.script = {kind: list(rows) for kind, rows in (script or {}).items()}
+        self.calls = 0
+
+    async def handle_async_request(self, request):
+        payload = json.loads(await request.aread() or b'{}')
+        kind = classify(request, payload)
+        if self.max_calls is not None and self.calls >= self.max_calls:
+            raise BudgetExhausted('replay model budget exhausted', request=request)
+        self.calls += 1
+        self.steps[-1].model.append(manifest(payload, kind))
+        if self.live is not None:
+            return await self.live.handle_async_request(request)
+        rows = self.script.get(kind) or []
+        if not rows:
+            raise UnscriptedCall(f'unscripted {kind} model call in step {self.steps[-1].label!r}')
+        row = rows.pop(0)
+        if kind == 'web':
+            return _stream([{'id': 'ws_1', 'type': 'web_search_call', 'status': 'completed'},
+                            {'id': 'msg_1', 'type': 'message', 'content': [{
+                                'type': 'output_text', 'text': row['answer'],
+                                'annotations': [{'type': 'url_citation', 'url': row['url']}]}]}], payload)
+        return _stream([{'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(row)}]}],
+                       payload)
+
+    def unused(self):
+        return {kind: len(rows) for kind, rows in self.script.items() if rows}
+
+
+class _Response:
+    def __init__(self, response):
+        self.status, self._response = response.status_code, response
+
+    async def json(self):
+        try:
+            return self._response.json()
+        except ValueError:
+            raise aiohttp.ClientError('non-JSON controller response') from None  # aiohttp's mapping
+
+
+class ControllerSession:
+    """aiohttp-shaped adapter: Fri.api's real headers and error mapping run unchanged."""
+
+    def __init__(self, client, steps):
+        self.client, self.steps = client, steps
+
+    @contextlib.asynccontextmanager
+    async def _exchange(self, method, url, payload, headers):
+        path = url.removeprefix(BASE)
+        response = self.client.request(method, path, json=payload, headers=headers)
+        call = Call(method, path, response.status_code, sorted(payload or {}))
+        body = response.json() if response.headers.get('content-type', '').startswith('application/json') else {}
+        if path in ADMISSION and isinstance(body, dict):
+            call.allowed = body.get('allowed')
+        if path == '/chat/turn' and payload:
+            call.saved = {key: payload.get(key) for key in ('model', 'response_kind', 'reaction', 'reply',
+                                                            'clarification')}
+            call.saved['reply'] = call.saved['reply'] or ''
+            call.saved['response_kind'] = call.saved['response_kind'] or 'reply'
+        if path == '/chat/usage/report' and payload:
+            call.tokens = payload.get('counters') or {}
+        self.steps[-1].controller.append(call)
+        yield _Response(response)
+
+    def request(self, method, url, *, json=None, headers=None):
+        return self._exchange(method, url, json, headers)
+
+    async def close(self):
+        pass
+
+
+class World:
+    """Fake Discord guild, channels, members and messages with virtual-clock snowflakes."""
+
+    def __init__(self, fri, clock, steps):
+        self.fri, self.clock, self.steps = fri, clock, steps
+        self.rows, self.labels, self.channels, self.denied = {}, {}, {}, set()
+        self.fail_next_delivery = False
+        self.last_id = 0
+        self.guild = SimpleNamespace(id=GUILD, me=fri.user, unavailable=False, filesize_limit=8 << 20)
+        self.guild.fetch_channel = AsyncMock(side_effect=lambda cid: self.channels[cid])
+        self.guild.fetch_member = AsyncMock(side_effect=self.member)
+        self.guild.fetch_roles = AsyncMock(return_value=[])
+        for cid, name in ((WORKSHOP, 'workshop'), (CONFIGURED, 'general'), (OUTSIDE, 'memes')):
+            self.add_channel(cid, name)
+        fri.get_channel = lambda cid: self.channels.get(cid)
+        fri.get_guild = lambda gid: self.guild if gid == GUILD else None
+
+    async def member(self, user):
+        return SimpleNamespace(id=user, bot=user == FRI, roles=[], display_name=NAMES.get(user, f'member {user}'))
+
+    def add_channel(self, cid, name):
+        world = self
+
+        @contextlib.asynccontextmanager
+        async def typing():
+            yield
+
+        async def history(*, limit=100, before=None, after=None, oldest_first=None, around=None):
+            items = [m for m in world.rows.values() if m.channel.id == cid]
+            if before is not None:
+                items = [m for m in items if m.id < getattr(before, 'id', before)]
+            if isinstance(after, dt.datetime):
+                items = [m for m in items if m.created_at > after]
+            elif after is not None:
+                items = [m for m in items if m.id > after.id]
+            oldest = oldest_first if oldest_first is not None else after is not None
+            for item in sorted(items, key=lambda m: m.id, reverse=not oldest)[:limit]:
+                yield item
+
+        async def fetch_message(mid):
+            if mid not in world.rows or world.rows[mid].channel.id != cid:
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+            return world.rows[mid]
+
+        def permissions_for(member):
+            denied = (cid, getattr(member, 'id', None)) in world.denied
+            return discord.Permissions.none() if denied else discord.Permissions.all()
+
+        channel = SimpleNamespace(id=cid, guild=self.guild, parent_id=None, nsfw=False, name=name,
+                                  typing=typing, history=history, permissions_for=permissions_for)
+        async def send(content=None, **kwargs):
+            return await world._sent(None, channel, content, kwargs)
+
+        channel.fetch_message = fetch_message
+        channel.send = AsyncMock(side_effect=send)
+        self.channels[cid] = channel
+        return channel
+
+    def message(self, user, text, channel, *, reference=None, label=''):
+        mid = discord.utils.time_snowflake(dt.datetime.fromtimestamp(self.clock.now, dt.timezone.utc))
+        mid = max(mid, self.last_id+1)
+        self.last_id = mid
+        author = SimpleNamespace(id=user, display_name=NAMES.get(user, f'member {user}'), bot=user == FRI,
+                                 name=NAMES.get(user, str(user)))
+        target = self.rows.get(self.labels.get(reference)) if reference else None
+        item = Mock(spec=discord.Message, id=mid, content=text, channel=self.channels[channel],
+                    guild=self.guild, author=author, webhook_id=None, attachments=[], embeds=[],
+                    stickers=[], reactions=[], edited_at=None, created_at=discord.utils.snowflake_time(mid),
+                    mentions=[self.fri.user] if f'<@{FRI}>' in text or f'<@!{FRI}>' in text else [],
+                    jump_url=f'https://discord.com/channels/{GUILD}/{channel}/{mid}',
+                    reference=SimpleNamespace(message_id=target.id, channel_id=channel, resolved=target)
+                    if target else None)
+        async def respond(content=None, **kwargs):
+            return await self._sent(item, item.channel, content, kwargs)
+
+        async def reaction(emoji):
+            return await self._reacted(item, emoji)
+
+        item.reply = AsyncMock(side_effect=respond)
+        item.add_reaction = AsyncMock(side_effect=reaction)
+        item.delete = AsyncMock()
+        self.rows[mid] = item
+        if label:
+            self.labels[label] = mid
+        return item
+
+    async def _sent(self, target, channel, content, kwargs):
+        delivery = Delivery('reply', channel.id, target.id if target else 0, content or '',
+                            view=kwargs.get('view') is not None)
+        self.steps[-1].deliveries.append(delivery)
+        if self.fail_next_delivery:
+            self.fail_next_delivery, delivery.failed = False, True
+            raise discord.HTTPException(SimpleNamespace(status=503, reason='synthetic'), 'synthetic delivery failure')
+        return self.message(FRI, content or '', channel.id, reference=None)
+
+    async def _reacted(self, target, emoji):
+        self.steps[-1].deliveries.append(Delivery('reaction', target.channel.id, target.id, emoji))
+        target.reactions.append(SimpleNamespace(emoji=emoji, me=True))
+
+
+@dataclass
+class Say:
+    actor: int
+    text: str
+    channel: int = CONFIGURED
+    label: str = ''
+    reply_to: str = ''
+
+
+@dataclass
+class Wait:
+    seconds: float
+
+
+@dataclass
+class FailNextDelivery:
+    pass
+
+
+@dataclass
+class Deny:
+    """Remove a member's permissions in one channel (fresh fetches observe it)."""
+    channel: int
+    actor: int
+
+
+@dataclass
+class Check:
+    name: str
+    test: object
+    scripted_only: bool = False
+    known_gap: str = ''
+
+
+@dataclass
+class Scenario:
+    name: str
+    description: str
+    steps: list
+    script: dict = field(default_factory=dict)
+    checks: list = field(default_factory=list)
+
+
+class Replay:
+    """One scenario run. Exposes the trace plus the synthetic controller store for checks."""
+
+    def __init__(self, scenario, root, *, live=None, subscription=None, max_calls=None, chat_model=None):
+        self.scenario, self.root, self.chat_model = scenario, Path(root), chat_model
+        self.steps = [Step(0, 'setup', None, None)]
+        self.transport = ModelTransport(self.steps, None if live else scenario.script, live, max_calls)
+        self.subscription = subscription or SimpleNamespace(access_token=lambda: 'synthetic-plan-token')
+        self.mode = 'live' if live else 'scripted'
+
+    def step(self, label):
+        return next(step for step in self.steps if step.label == label)
+
+    def stored(self, user, channel=CONFIGURED):
+        return self.store.chat_context(str(GUILD), f'public:{channel}', str(user))
+
+    def run(self):
+        clock = Clock(time.time())
+        thread = threading.get_ident()
+        real_sleep = asyncio.sleep
+
+        async def sleep(delay, result=None):
+            if threading.get_ident() == thread:
+                clock.advance(delay)
+                return await real_sleep(0, result)
+            return await real_sleep(delay, result)
+
+        environment = {'GENE_GUILD_ID': str(GUILD), 'GENE_OWNER_ID': str(OWNER),
+                       'GENE_WORKSHOP_CHANNEL_ID': str(WORKSHOP), 'GENE_FRI_TOKEN': TOKEN,
+                       'GENE_CONTROLLER_URL': BASE, 'FRI_DATA': str(self.root/'data'),
+                       'FRI_CHATGPT_AUTH': str(self.root/'unused-session.json'), 'FRI_PRESENCE': 'invisible',
+                       'GENE_BOT_ID': '0', 'FRI_CHAT_CHANNEL_ID': '0',
+                       'XDG_CONFIG_HOME': str(self.root/'config')}
+        with patch.dict(os.environ, environment), patch.object(time, 'time', clock), \
+                patch.object(asyncio, 'sleep', sleep):
+            asyncio.run(self._run(clock))
+        return self
+
+    async def _run(self, clock):
+        from fri.fri import Fri
+        from fri.fri_agent import Agent
+        settings = Settings(self.root/'controller.sqlite3', str(GUILD), str(OWNER), 'runtime-'+'x'*32,
+                            'worker-'+'x'*32, 'deploy-'+'x'*32, workshop_channel_id=str(WORKSHOP),
+                            fri_token=TOKEN, agent_channels=str(CONFIGURED), web_search_enabled=True)
+        self.client = TestClient(create_app(settings), raise_server_exceptions=False)
+        self.store = self.client.app.state.store
+        AgentStore(self.store, settings).update({'enabled': True}, 0, str(OWNER))
+        if self.chat_model:
+            model, effort = self.chat_model
+            self.store.update_chat_models([model])
+            self.store.select_chat_model(model, effort, str(OWNER))
+        self.fri = fri = Fri()
+        fri._connection.user = SimpleNamespace(id=FRI, display_name='Fri', bot=True, name='fri')
+        fri.session = ControllerSession(self.client, self.steps)
+        fri.chat = Chat(self.subscription, self.transport)
+        self.world = World(fri, clock, self.steps)
+        try:
+            if not compatible(await fri.api('GET', '/fri/contract')):
+                raise RuntimeError('synthetic controller contract is incompatible')
+            self.agent = fri.agent = Agent(fri)
+            self.agent.state = await fri.api('GET', '/agent/state')
+            for index, action in enumerate(self.scenario.steps, 1):
+                if isinstance(action, Wait):
+                    clock.advance(action.seconds)
+                elif isinstance(action, FailNextDelivery):
+                    self.world.fail_next_delivery = True
+                elif isinstance(action, Deny):
+                    self.world.denied.add((action.channel, action.actor))
+                else:
+                    self.steps.append(Step(index, action.label or f'step-{index}', action.actor, action.channel))
+                    event = self.world.message(action.actor, action.text, action.channel,
+                                               reference=action.reply_to, label=action.label)
+                    await fri.on_message(event)
+                    clock.advance(1)
+        finally:
+            await fri.close()
+
+    def evaluate(self):
+        results = []
+        for check in self.scenario.checks:
+            if check.scripted_only and self.mode == 'live':
+                continue
+            try:
+                passed, detail = bool(check.test(self)), ''
+            except Exception as exc:  # A failing check reports, never aborts the report.
+                passed, detail = False, f'{type(exc).__name__}: {exc}'
+            results.append({'name': check.name, 'passed': passed, 'known_gap': check.known_gap,
+                            'detail': detail})
+        return results
+
+    def report(self):
+        steps = [step.report() for step in self.steps]
+        return {'scenario': self.scenario.name, 'mode': self.mode, 'synthetic': True,
+                'model_calls': self.transport.calls, 'unused_script': self.transport.unused(),
+                'controller_errors': [c.path for s in self.steps for c in s.controller if c.status >= 500],
+                'prompt_versions': sorted({m['prompt_version'] for s in self.steps for m in s.model}),
+                'tokens': {key: sum(s['tokens'][key] for s in steps) for key in ('input_tokens', 'output_tokens')},
+                'steps': steps, 'checks': self.evaluate()}
+
+
+def run(scenario, root=None, **kwargs):
+    """Run one scenario and return its JSON-serializable report (checks evaluated in place)."""
+    if root is not None:
+        return Replay(scenario, root, **kwargs).run().report()
+    with tempfile.TemporaryDirectory(prefix='fri-replay-') as directory:
+        return Replay(scenario, directory, **kwargs).run().report()
