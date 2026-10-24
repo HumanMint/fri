@@ -318,3 +318,92 @@ def test_invalidated_fri_reply_is_pruned_from_the_raw_channel_cache(monkeypatch,
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_draft_paging_rechecks_the_fence(monkeypatch, tmp_path):
+    from fri.fri_requests import DraftView
+    async def scenario():
+        fri, _, store, _, channel, _, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        try:
+            store.save_chat('123', 'public:1', '20', 0, 'fri what did ash say?', MARKER, 'm', 'high',
+                            source=history_source(), provenance=[{'user_id': '30', 'revision': 0}])
+            fence = {'guild_id': '123', 'conversation_id': 'public:1', 'user_id': '20', 'revision': 0,
+                     'provenance': [{'user_id': '30', 'revision': 0}]}
+            view = DraftView(fri, 20, 'Add a checklist. '+'ordinary detail '*50+'\n'+MARKER,
+                             reviewed=True, fence=fence)
+            assert len(view.pages) > 1 and MARKER not in view.content
+            click = SimpleNamespace(user=SimpleNamespace(id=20), guild_id=123, channel_id=1, channel=channel,
+                message=SimpleNamespace(author=fri.user), response=SimpleNamespace(edit_message=AsyncMock()))
+            store.erase_user('30')
+            before = len(calls)
+            with pytest.raises(ControllerRejected):
+                await view.next(click)
+            click.response.edit_message.assert_not_awaited()
+            assert view.page == 0 and [p for p, _ in calls[before:]] == ['/chat/turn/check']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def history_source():
+    from compat_tests.test_fri_endings import source
+    return source(age=25, channel='1')
+
+
+def queue_play(store, argument_seen):
+    from gene.control_store import Controls
+    controls = Controls(store)
+    controls.poll(['play', 'volume'])  # Gene is online, so commands are offered.
+
+    async def deliver(_):
+        claim = controls.poll(['play', 'volume'])
+        if claim:
+            argument_seen.append(claim['argument'])
+            controls.finish(claim['id'], claim['lease'], {'output': 'queued it'})
+    return controls, deliver
+
+
+def test_history_derived_command_argument_is_refused(monkeypatch, tmp_path):
+    async def scenario():
+        fri, _, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        seen = []
+        controls, deliver = queue_play(store, seen)
+        store.save_chat('123', 'public:1', '20', 0, 'fri what did ash say?', MARKER, 'm', 'high',
+                        source=history_source(), provenance=[{'user_id': '30', 'revision': 0}])
+        event = message('fri play their recommendation')
+        fri.chat_once.side_effect = [
+            ChatResult(status='completed', action={'kind': 'gene_command', 'action': 'play', 'argument': MARKER}),
+            ChatResult(status='completed', reply='say the song name and ill queue it')]
+        try:
+            with patch('fri.fri_actions.asyncio.sleep', new=deliver):
+                result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
+            receipt = fri.chat_once.await_args.args[1]['action_results'][-1]
+            assert 'own message' in str(receipt)
+            assert not seen and not controls.recent('20', '123', 'public:1')
+            assert result.reply == 'say the song name and ill queue it'
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(('text', 'action', 'argument'), [
+    ('fri play never gonna give you up by rick astley', 'play', 'Never Gonna Give You Up - Rick Astley'),
+    ('fri turn it up', 'volume', '70')])
+def test_own_command_words_still_run_with_peers_in_context(monkeypatch, tmp_path, text, action, argument):
+    async def scenario():
+        fri, _, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        seen = []
+        _, deliver = queue_play(store, seen)
+        store.save_chat('123', 'public:1', '20', 0, 'fri what did ash say?', MARKER, 'm', 'high',
+                        source=history_source(), provenance=[{'user_id': '30', 'revision': 0}])
+        event = message(text)
+        fri.chat_once.side_effect = [
+            ChatResult(status='completed', action={'kind': 'gene_command', 'action': action, 'argument': argument}),
+            ChatResult(status='completed', reply='done')]
+        try:
+            with patch('fri.fri_actions.asyncio.sleep', new=deliver):
+                result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
+            assert seen == [argument] and result.turn['provenance'] == [{'user_id': '30', 'revision': 0}]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

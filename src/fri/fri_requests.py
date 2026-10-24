@@ -106,6 +106,10 @@ class DraftView(PagedPreview):
         if self.fence:
             await self.cog.api('POST', '/chat/turn/check', self.fence)
 
+    async def recheck(self):
+        # Paging reveals more of the draft, so it needs the same fence as preview and submit.
+        await self.fenced()
+
     async def on_timeout(self):
         from .fri_panel import sessions
         await sessions(self.cog).close((self.cog.guild_id, self.user_id), self)

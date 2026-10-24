@@ -38,6 +38,13 @@ def arguments(action, value):
     return value
 
 
+def own_words(argument, text):
+    """Every word of a command argument comes from the member's own message."""
+    if argument.casefold() in text.casefold():
+        return True
+    return set(re.findall(r'\w+', argument.casefold())) <= set(re.findall(r'\w+', text.casefold()))
+
+
 VERBS = {'play': r'play|queue|put on|add', 'pause': r'pause', 'resume': r'resume|unpause',
          'skip': r'skip', 'stop': r'stop', 'volume': r'volume|turn (?:it|the music) (?:up|down)',
          'queue': r'queue|queued', 'now_playing': r'playing|song is this|track is this',

@@ -15,7 +15,7 @@ from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
-from .gene_controls import COMMANDS, arguments, music_control_intent, requested
+from .gene_controls import COMMANDS, arguments, music_control_intent, own_words, requested
 from .privacy import clean
 from .web_policy import public_query
 
@@ -59,6 +59,11 @@ class Actions:
             action.get('argument'), discord_source(self.event).model_dump(),
             str(self.guild), self.scope.get('conversation_id', ''), str(self.user), self.revision,
             str(getattr(getattr(self.fri, 'user', None), 'id', ''))))
+
+    def derived(self):
+        """Other members' words are in this turn's context, so they could reach a write."""
+        from .fri import turn_provenance
+        return bool(self.turn_context is not None and turn_provenance(self.turn_context, self.user, self))
 
     def burst_permission(self, action):
         rows = self.conversation.get('message_burst', [])
@@ -367,8 +372,12 @@ class Actions:
         burst = self.burst_permission(action) if continued else None
         if continued and not burst and not await self.pending_unchanged():
             return {'blocked': 'The earlier music request changed. Ask again with the song included.'}
-        if self.private_evidence and argument and not (continued or argument.casefold() in self.message.casefold()):
-            return {'blocked': 'Provide the song or volume in your own fresh message; referenced words cannot be saved in a command.'}
+        # A command receipt outlives erasure and returns as context, so it may hold only the
+        # member's own words. A 0-100 volume carries none of anyone's, except from read evidence.
+        if argument and not continued and not own_words(argument, self.message) and (
+                self.private_evidence or (verb == 'play' and self.derived())):
+            return {'blocked': 'Name the song or volume in your own message; words from other people or earlier '
+                    'context cannot be saved in a Gene command.'}
         original = await self.event.channel.fetch_message(self.event.id)
         if original.author.id != self.user or original.webhook_id or original.content != self.event.content:
             return {'blocked': 'The original request changed. Send a fresh request.'}

@@ -64,8 +64,8 @@ advertises it, so the controller must be released first.
   - configured-channel nearby context and read evidence.
 
   More than 200 sources refuses the reply rather than dropping any. A request draft carries its
-  turn's fence: preview and submission re-run `/chat/turn/check` and refuse once any source
-  changed. Preview cards are recorded as soon as Discord accepts them, even if binding fails. The controller rejects stale provenance, deletes dependent turns
+  turn's fence: preview, every page turn and submission re-run `/chat/turn/check` and refuse once
+  any source changed. Preview cards are recorded as soon as Discord accepts them, even if binding fails. The controller rejects stale provenance, deletes dependent turns
   when any listed member turns memory off, is erased or clears chats, and drops turns whose
   sources' revisions moved. Over-inclusion is deliberate: anyone in the context can erase the
   derived copy.
@@ -76,6 +76,10 @@ advertises it, so the controller must be released first.
   nested in an uncertain Gene command. The recorded and echoed text is what Discord actually
   showed, for example an attachment fallback. Outside invitations
   keep the controller's mention placeholder.
+- **Other stores take only the member's own words.** Command receipts, saved public work and
+  game-night cards don't track provenance, so another member's words never enter them. A song
+  argument must use only words from the member's message or verified clarification answer whenever
+  other members' words are in context. A 0-100 volume is exempt unless it came from read evidence.
 - **Group view.** Fri's delivered public replies join the in-memory channel view, tagged with the
   speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
