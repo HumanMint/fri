@@ -81,6 +81,7 @@ class Agent:
         self.active = {}
         self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
         self.recording = {}  # (channel, member): set once a delivered reply is recorded.
+        self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
         self.pending = {}
         self.bursts = Bursts()
         self.seen = {}
@@ -210,6 +211,7 @@ class Agent:
         return accepted
 
     def forget(self, user):
+        self.forgotten[user] = self.forgotten.get(user, 0)+1
         self.bursts.forget(user)
         for key in list(self.pending):
             if key[1] == user:
@@ -303,6 +305,7 @@ class Agent:
 
     async def handle(self, message):
         arrived = time.monotonic()  # Bursts group by arrival, even if this waits for an earlier reply.
+        forgotten = self.forgotten.get(message.author.id, 0)
         if getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:
             return
         dm = message.guild is None
@@ -367,6 +370,8 @@ class Agent:
                 await asyncio.wait_for(recording.wait(), 30)
             except TimeoutError:
                 pass
+            if self.forgotten.get(message.author.id, 0) != forgotten:
+                return  # They asked to be forgotten meanwhile: drop it, as forget() drops a burst.
         active = (self.active.get((channel, message.author.id), 0) > time.time() or
                   self.bursts.has(channel, message.author.id))
         if not active and directed is None and not dm and not message.author.bot:

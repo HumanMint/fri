@@ -887,3 +887,41 @@ def test_messages_queued_behind_a_delivery_still_get_answered(monkeypatch, tmp_p
             await asyncio.gather(*tasks, return_exceptions=True)
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_message_waiting_behind_a_delivery_is_dropped_if_its_author_erases(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        initial, queued, privacy = message('fri hello'), message('fri play old marker'), message('fri forget me')
+        sending, release = asyncio.Event(), asyncio.Event()
+
+        async def send(content, **kwargs):
+            sending.set()
+            await release.wait()
+            return SimpleNamespace(id=initial.id+100, content=content)
+        initial.reply.side_effect = send
+        real_sleep = asyncio.sleep
+        async def no_debounce(*args, **kwargs):
+            await real_sleep(0)
+        monkeypatch.setattr('fri.fri_agent.asyncio.sleep', no_debounce)
+        async def answer(text, context):
+            if 'old marker' in text:
+                return ChatResult(status='completed', action={'kind': 'clarify', 'goal': 'play', 'topic': '',
+                                                             'question': 'which version of old marker?'})
+            return ChatResult(status='completed', reply='hello')
+        fri.chat_once.side_effect = answer
+        tasks = [asyncio.create_task(agent.handle(initial))]
+        try:
+            await asyncio.wait_for(sending.wait(), 5)
+            tasks.append(asyncio.create_task(agent.handle(queued)))  # Waits behind the delivery.
+            await real_sleep(0.05)
+            await agent.handle(privacy)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert store.chat_context('123', 'public:1', '20')['pending'] is None
+            assert all('old marker' not in call.args[0] for call in fri.chat_once.await_args_list)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
