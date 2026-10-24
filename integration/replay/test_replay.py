@@ -20,7 +20,19 @@ from replay.harness import (
     reply,
     run,
 )
-from replay.scenarios import CLOSING, DELIVERY_FAILURE, ERASURE, SCENARIOS
+from replay.scenarios import CLOSING, DELIVERY_FAILURE, ERASURE, OUTSIDE_MENTION, SCENARIOS
+
+
+def rejecting(path):
+    """Make the synthetic controller answer one route with HTTP 403."""
+    original = TestClient.request
+
+    def request(self, method, url, *args, **kwargs):
+        if url == path:
+            return httpx.Response(403, json={'detail': 'synthetic rejection'},
+                                  request=httpx.Request(method, 'http://testserver'+url))
+        return original(self, method, url, *args, **kwargs)
+    return patch.object(TestClient, 'request', request)
 
 
 def preconditions(report):
@@ -102,15 +114,7 @@ def test_provider_error_notice_never_counts_as_an_answer(tmp_path):
 
 def test_rejected_save_is_not_reported_as_stored(tmp_path):
     """Review finding: only controller-accepted saves count, and the gap check reads the real store."""
-    original = TestClient.request
-
-    def rejecting(self, method, url, *args, **kwargs):
-        if url == '/chat/turn':
-            request = httpx.Request(method, 'http://testserver'+url)
-            return httpx.Response(403, json={'detail': 'synthetic rejection'}, request=request)
-        return original(self, method, url, *args, **kwargs)
-
-    with patch.object(TestClient, 'request', rejecting):
+    with rejecting('/chat/turn'):
         report = run(DELIVERY_FAILURE, tmp_path)
     assert report['rejected_saves'] == ['yo'] and report['steps'][1]['route']['stored'] == []
     gap = next(c for c in report['checks'] if c['known_gap'])
@@ -133,3 +137,46 @@ def test_production_datetime_reads_follow_the_virtual_clock(tmp_path):
     replay = Replay(scenario, tmp_path).run()
     assert -5 <= replay.inspections['skew'] <= 5
     preconditions(replay.report())
+
+
+def test_rejected_erasure_can_never_reproduce_the_privacy_gap(tmp_path):
+    """Re-review finding: a refused "forget me" must fail the run before the gap check counts."""
+    with rejecting('/chat/memory/control'):
+        report = run(ERASURE, tmp_path)
+    assert report['unexpected_rejections'] == [['erase', '/chat/memory/control', 403]]
+    persisted = next(c for c in report['checks'] if c['name'].startswith('forget me persisted'))
+    assert not persisted['passed'] and failures([report])
+    with pytest.raises(RuntimeError):
+        preconditions(report)
+
+
+def test_stored_reflects_what_the_controller_retained(tmp_path):
+    """Re-review finding: storage is read back from the store, not inferred from the request."""
+    ping = run(OUTSIDE_MENTION, tmp_path/'mention')['steps'][2]['route']
+    assert ping['stored'] == ['breadcrumb']  # The controller keeps a neutral mention placeholder.
+    scenario = Scenario('memory-off', 'Turns are accepted but not retained after forget me.',
+                        [Say(20, 'fri forget me', label='erase'), Say(20, 'fri yo', label='yo')],
+                        {'conversation': [reply('yo')]})
+    replay = Replay(scenario, tmp_path/'off').run()
+    assert replay.step('yo').route()['stored'] == ['not-retained'] and not replay.stored(20)['turns']
+
+
+def test_live_factory_transport_is_created_and_closed_per_scenario(tmp_path):
+    """Re-review finding: a live transport must not outlive its scenario's event loop."""
+    made = []
+
+    class Tracked(httpx.MockTransport):
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    def factory():
+        made.append(Tracked(live_reply('live yo')))
+        return made[-1]
+
+    scenario = Scenario('factory', 'One live turn.', [Say(20, 'fri yo', label='yo')])
+    for index in range(2):
+        report = run(scenario, tmp_path/str(index), live=factory, max_calls=1)
+        preconditions(report)
+    assert len(made) == 2 and all(transport.closed for transport in made)

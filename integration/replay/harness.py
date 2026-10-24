@@ -105,7 +105,7 @@ class Call:
     status: int
     payload_keys: list
     allowed: bool | None = None
-    saved: dict | None = None  # Only saves the controller accepted.
+    saved: dict | None = None  # An accepted save request, plus what the store actually retained.
     rejected: bool = False  # A /chat/turn save the controller refused.
     tokens: dict | None = None
     inference: str | None = None  # Provider attempt status from Fri's own usage receipt.
@@ -170,11 +170,14 @@ class Step:
         texts = [d.text for d in self.deliveries if d.kind == 'reply']
         stored = []
         for item in saved:
-            reply = item['reply']
-            if item['response_kind'] != 'reply':
-                stored.append(item['response_kind'])
-            elif reply.startswith('Earlier '):
-                stored.append('breadcrumb')
+            kept = item['retained']
+            reply = (kept or {}).get('reply') or ''
+            if kept is None:
+                stored.append('not-retained')
+            elif kept.get('response_kind', 'reply') != 'reply':
+                stored.append(kept['response_kind'])
+            elif reply.startswith(('Earlier ', '[')):
+                stored.append('breadcrumb')  # Neutral placeholders, including the controller's own.
             elif any(reply and text.startswith(reply) for text in texts):
                 stored.append('reply-text')
             else:
@@ -338,10 +341,8 @@ class ControllerSession:
         if path == '/chat/turn' and payload and response.status_code >= 400:
             call.rejected = True
         elif path == '/chat/turn' and payload:
-            call.saved = {key: payload.get(key) for key in ('model', 'response_kind', 'reaction', 'reply',
-                                                            'clarification')}
-            call.saved['reply'] = call.saved['reply'] or ''
-            call.saved['response_kind'] = call.saved['response_kind'] or 'reply'
+            call.saved = {'model': payload.get('model') or '', 'clarification': payload.get('clarification'),
+                          'retained': self._retained(payload)}
         if path == '/chat/usage/report' and payload:
             call.tokens = payload.get('counters') or {}
             call.inference = payload.get('status') or 'unknown'
@@ -350,6 +351,17 @@ class ControllerSession:
 
     def request(self, method, url, *, json=None, headers=None):
         return self._exchange(method, url, json, headers)
+
+    def _retained(self, payload):
+        """Read back what the controller actually kept for this source event (None if nothing)."""
+        try:
+            turns = self.client.app.state.store.chat_context(
+                payload['guild_id'], payload['conversation_id'], payload['user_id'])['turns']
+        except (KeyError, ValueError):
+            return None
+        source = (payload.get('source') or {}).get('id')
+        turn = next((t for t in reversed(turns) if source and (t.get('source') or {}).get('id') == source), None)
+        return {'reply': turn['reply'], 'response_kind': turn.get('response_kind', 'reply')} if turn else None
 
     async def close(self):
         pass
@@ -503,15 +515,21 @@ class Scenario:
     steps: list
     script: dict = field(default_factory=dict)
     checks: list = field(default_factory=list)
+    expected_rejections: list = field(default_factory=list)  # Controller paths allowed to return 4xx.
 
 
 class Replay:
     """One scenario run. Exposes the trace plus the synthetic controller store for checks."""
 
     def __init__(self, scenario, root, *, live=None, subscription=None, max_calls=None, chat_model=None):
-        self.scenario, self.root, self.chat_model = scenario, Path(root), chat_model
+        """live: a transport instance, or a zero-argument factory (e.g. httpx.AsyncHTTPTransport).
+
+        A factory's transport is created and closed inside this run's event loop, so pooled
+        connections never outlive it. Prefer a factory when running several scenarios.
+        """
+        self.scenario, self.root, self.chat_model, self.live = scenario, Path(root), chat_model, live
         self.steps = [Step(0, 'setup', None, None)]
-        self.transport = ModelTransport(self.steps, None if live else scenario.script, live, max_calls)
+        self.transport = ModelTransport(self.steps, None if live else scenario.script, None, max_calls)
         self.subscription = subscription or SimpleNamespace(access_token=lambda: 'synthetic-plan-token')
         self.mode = 'live' if live else 'scripted'
         self.inspections = {}
@@ -564,6 +582,8 @@ class Replay:
         self.fri = fri = Fri()
         fri._connection.user = SimpleNamespace(id=FRI, display_name='Fri', bot=True, name='fri')
         fri.session = ControllerSession(self.client, self.steps)
+        owned = callable(self.live) and not isinstance(self.live, httpx.AsyncBaseTransport)
+        self.transport.live = self.live() if owned else self.live
         fri.chat = Chat(self.subscription, self.transport)
         self.world = World(fri, clock, self.steps)
         try:
@@ -588,6 +608,8 @@ class Replay:
                     clock.advance(1)
         finally:
             await fri.close()
+            if owned:
+                await self.transport.live.aclose()
 
     def evaluate(self):
         results = []
@@ -609,6 +631,8 @@ class Replay:
                 'model_calls': self.transport.calls, 'unused_script': self.transport.unused(),
                 'controller_errors': [c.path for _, c in calls if c.status >= 500],
                 'controller_rejections': [[label, c.path, c.status] for label, c in calls if 400 <= c.status < 500],
+                'unexpected_rejections': [[label, c.path, c.status] for label, c in calls if 400 <= c.status < 500
+                                          and c.path not in self.scenario.expected_rejections],
                 'rejected_saves': [label for label, c in calls if c.rejected],
                 'inference_failures': [[label, c.inference] for label, c in calls
                                        if c.inference and c.inference != 'completed'],
@@ -618,9 +642,10 @@ class Replay:
 
 
 def failures(reports):
-    """Any failed ordinary check, rejected save or failed inference makes a run unsuccessful."""
+    """A failed ordinary check, unexpected controller rejection or failed inference fails a run."""
     return [item for report in reports if 'checks' in report for item in
             [c['name'] for c in report['checks'] if not c['passed'] and not c['known_gap']] +
+            [f'controller {status} for {path} in {label}' for label, path, status in report['unexpected_rejections']] +
             [f'rejected save in {label}' for label in report['rejected_saves']] +
             [f'inference {status} in {label}' for label, status in report['inference_failures']]]
 

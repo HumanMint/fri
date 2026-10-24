@@ -34,7 +34,8 @@ def main(argv=None):
         import httpx
 
         from fri.subscription import Subscription
-        options.update(live=httpx.AsyncHTTPTransport(), subscription=Subscription(args.auth))
+        # A factory: each scenario creates and closes its transport inside its own event loop.
+        options.update(live=httpx.AsyncHTTPTransport, subscription=Subscription(args.auth))
     if args.model:
         options['chat_model'] = (args.model, args.effort)
     remaining, reports = args.max_calls, []

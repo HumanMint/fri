@@ -191,9 +191,16 @@ Each step records:
 Production code is not instrumented. All scenario members and messages are invented.
 
 Answer checks require completed inference, taken from Fri's own usage receipts. A provider
-error notice is never counted as an answer. Only saves the controller accepted count as stored.
-A run with a rejected save, a failed inference or a failed ordinary check is unsuccessful, and
-the CLI exits non-zero.
+error notice is never counted as an answer. A turn counts as stored only if it's read back from
+the synthetic store by its source event. A run is unsuccessful, and the CLI exits non-zero, if
+it has:
+
+- a controller 4xx the scenario didn't declare in `expected_rejections`;
+- a rejected save;
+- a failed inference;
+- a failed ordinary check.
+
+Live transports are created and closed per scenario from a factory.
 
 `known_gap` checks run as strict xfails. They count only when the gap check itself fails with an
 `AssertionError`, after every other precondition has passed. When a fix makes one pass, the suite

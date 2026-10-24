@@ -107,6 +107,7 @@ OUTSIDE_MENTION = Scenario(
            and first_call(r, 'ping')['fields']['invited_channel_context'] == 1),
      Check('outside channel never joins ambient scope',
            lambda r: OUTSIDE not in r.agent.recent and all(key[0] != OUTSIDE for key in r.agent.active)),
+     Check('controller keeps only a neutral mention placeholder', lambda r: route(r, 'ping')['stored'] == ['breadcrumb']),
      Check('nearby text is not stored', lambda r: 'patch notes' not in json.dumps(r.stored(BO, OUTSIDE))),
      Check('member without channel access gets nothing', lambda r: route(r, 'denied')['kind'] == 'ignored')])
 
@@ -145,6 +146,8 @@ ERASURE = Scenario(
      Check('the answer saw the other member\'s recent message',
            lambda r: first_call(r, 'ask')['recent_authors'] == 2),
      Check('erasure is handled locally', lambda r: route(r, 'erase')['kind'] == 'local-privacy'),
+     Check('forget me persisted: memory off, own chats erased',
+           lambda r: r.stored(ASH)['personal_memory']['enabled'] is False and not r.stored(ASH)['turns']),
      Check('the derived answer is stored verbatim', lambda r: route(r, 'ask')['stored'] == ['reply-text'],
            scripted_only=True),
      Check('erased member\'s details do not survive in another member\'s saved chat',
