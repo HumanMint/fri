@@ -147,7 +147,8 @@ of a member being unhappy with the reply and returns four labels from fixed list
 topic and suggested fix. There is no free-text field. Banter and roasting Fri back don't count. Usage
 is recorded as attention with a `reply_check` purpose: this controller reports it as “reply checks”,
 and an older one ignores the purpose and counts attention, so a receipt still queued when both sides
-roll back is delivered rather than blocking the queue. Usage delivery and owner notifications retry
+roll back is delivered rather than blocking the queue. The receipt is saved and left to the usage loop,
+so a slow backlog never delays finishing the batch. Usage delivery and owner notifications retry
 independently. Nothing is posted to Discord and no chat text is stored by Fri; the controller decides
 what is kept and fences it by everyone's privacy revision.
 

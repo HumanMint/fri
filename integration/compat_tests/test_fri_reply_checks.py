@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import json
 import time
+import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -91,7 +92,7 @@ def test_a_flagged_follow_up_becomes_a_labelled_finding(controller, monkeypatch)
     name, effort, schema, data = seen[0]
     assert (name, effort, schema) == ('gpt-6-luna', 'low', SCHEMA)
     agent.record.assert_awaited_once_with('attention', 'gpt-6-luna', 'low', {'input_tokens': 9}, 'completed',
-                                          'reply_check')
+                                          'reply_check', deliver=False)
     assert data['pairs'][0]['earlier']['member'] == 'whats the best class for the new raid'
     assert '"20"' not in json.dumps(data) and 'public:1' not in json.dumps(data)
     overview = client.post('/agent/reply-checks/overview', headers=headers('fri'),
@@ -129,6 +130,25 @@ def test_the_claim_waits_for_the_model_slot(controller, monkeypatch):
         agent.slots.release()
         return await task
     assert asyncio.run(scenario()) == {'kept': 0, 'pairs': 1}
+
+
+def test_the_batch_finishes_without_waiting_on_the_usage_backlog(controller, monkeypatch, tmp_path):
+    store, client = controller
+    save(store, 'remind me at 9', 'done.', ago=60)
+    save(store, 'you never set it', 'ugh. setting it now.')
+
+    async def model(*_, **__):
+        return {'findings': []}, {'input_tokens': 9}, 'completed'
+
+    agent = runtime(client, [], monkeypatch, model)
+    agent.record = types.MethodType(Agent.record, agent)
+    agent.fri.data = tmp_path
+    (tmp_path/'usage').mkdir()
+    agent.fri.flush_usage = AsyncMock(side_effect=AssertionError('the backlog is delivered later'))
+    assert asyncio.run(check(agent)) == {'kept': 0, 'pairs': 1}
+    receipt, = (json.loads(path.read_text()) for path in (tmp_path/'usage').iterdir())
+    assert (receipt['role'], receipt['purpose']) == ('attention', 'reply_check')
+    agent.fri.flush_usage.assert_not_awaited()
 
 
 def test_no_chat_is_claimed_while_the_subscription_sign_in_fails(controller, monkeypatch):
