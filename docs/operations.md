@@ -112,9 +112,12 @@ advertises it, so the controller must be released first.
 
 Each turn's chat context includes up to five of the speaker's own requests that are still open or
 settled within the last week, with their controller state (`your_gene_requests` for the model).
-Fri uses them to answer "is my fix done?" and to avoid duplicate drafts, and never claims progress
-beyond the recorded state. Request text appears only in the member's DM, never for drafts built
-from other members' words, and not at all while their memory is off.
+Fri uses them to answer "is my fix done?" and to avoid duplicate drafts, never claims progress
+beyond the recorded state, and in public mentions them only when the speaker asks. Request text
+appears only in the member's private conversation (DM or `/fri` panel), never for drafts built from
+other members' words, and not at all while their memory is off. Requests typed in the panel's form
+are sent with an empty source list, so they count as the member's own words. A request withdrawn
+after a privacy change is marked `withdrawn`, so Fri doesn't call it the owner's rejection.
 
 ## Deployment boundary
 

@@ -1,11 +1,20 @@
-"""Fri's model context carries the speaker's own requests: titles in their DM, states only in public."""
+"""Fri's model context carries the speaker's own requests: titles in private, states only in public."""
 
 import asyncio
+import datetime as dt
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
+import discord
+import httpx
 import pytest
 
+from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_mentions import environment
-from fri.fri_chat import ChatResult
+from fri.fri_chat import Chat, ChatResult
+from fri.fri_panel import InputModal
+from fri.fri_requests import DraftView
 
 
 @pytest.mark.parametrize(('channel', 'visibility', 'titled'), [(999, 'private', True), (1, 'public', False)])
@@ -26,3 +35,52 @@ def test_the_speakers_requests_reach_the_model(monkeypatch, tmp_path, channel, v
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_requests_submitted_from_the_panel_or_a_chat_draft_are_titled_in_private(monkeypatch, tmp_path):
+    async def scenario():
+        fri, _, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=999)
+        member = SimpleNamespace(id=20, display_name='bo')
+        panel = Mock(spec=discord.Interaction, id=100000000000000002, guild_id=123, channel_id=456,
+                     channel=SimpleNamespace(id=456, parent_id=None), user=member, message=None)
+        try:
+            modal = InputModal(fri, panel, 'request')
+            modal.value._value = 'Add a raid timer command\nthat pings the role'
+            with patch('fri.fri_panel.defer_panel', new=AsyncMock()), patch('fri.fri_panel.reply', new=AsyncMock()):
+                await modal.on_submit(panel)
+            fri.chat_once.return_value = ChatResult(status='completed', reply='drafted it, have a look',
+                                                    draft='Fix the modpack command\nwith details')
+            event = message('fri can you draft a modpack fix')
+            event.guild = None
+            drafted = await fri.talk(123, 999, 20, event.content, 'private', event=event)
+            view = DraftView(fri, 20, drafted.draft, reviewed=True, fence=drafted.turn)
+            view.interaction_check = AsyncMock(return_value=True)
+            button = SimpleNamespace(guild_id=None, user=member, response=SimpleNamespace(defer=AsyncMock()),
+                                     edit_original_response=AsyncMock())
+            await view.submit(button)
+            await fri.record_turn(drafted)
+            fri.chat_once.return_value = ChatResult(status='completed', reply='both are waiting on the owner')
+            event = message('fri are my requests done')
+            event.guild = None
+            await fri.talk(123, 999, 20, event.content, 'private', event=event)
+            titles = {row.get('title') for row in fri.chat_once.await_args.args[1]['requests']}
+            assert titles == {'Add a raid timer command', 'Fix the modpack command'}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_model_sees_dates_and_withdrawals_not_raw_rows(store):
+    store.request('123', '20', 'draft-1', '', 'Build what ash described', [{'user_id': '30', 'revision': 0}])
+    store.personal_control('30', 'disable')  # Ash's privacy change withdraws it; the owner never saw it.
+    sent = []
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, text='data: ' + json.dumps(response_event()) + '\n\n')
+    context = {**CONTEXT, 'requests': store.chat_context('123', 'private:9', '20')['requests']}
+    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
+    asyncio.run(chat.respond('fri what happened to my request', context))
+    [row] = json.loads(sent[0]['input'][-1]['content'])['your_gene_requests']
+    assert row['state'] == 'rejected' and row['withdrawn'] is True and 'title' not in row
+    assert dt.datetime.fromisoformat(row['created']).tzinfo == dt.timezone.utc
+    assert 'withdrawn means' in sent[0]['instructions']
