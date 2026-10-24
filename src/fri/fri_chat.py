@@ -362,22 +362,22 @@ class ChatResult:
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
 
 
-CACHE_KEY_REJECTION = re.compile(r'(?:unknown|unsupported|unrecognized|invalid)\b[^.]*\bprompt_cache_key|'
-                                 r'\bprompt_cache_key\b[^.]*\b(?:not supported|not allowed|not permitted|unknown|'
-                                 r'unrecognized|invalid)')
+# The field itself is named as the rejected parameter, e.g. "Unknown parameter: 'prompt_cache_key'"
+# or "prompt_cache_key is not supported". A message that merely mentions the field doesn't count.
+CACHE_KEY_REJECTION = re.compile(
+    r'(?:unknown|unsupported|unrecognized|invalid)\s+(?:request\s+)?(?:parameter|param|argument|field)s?'
+    r'(?:\s+supplied)?:?\s*[\'"`]?prompt_cache_key\b|'
+    r'\bprompt_cache_key[\'"`]?\s+(?:is\s+)?(?:not supported|not allowed|not permitted|unsupported|unknown|unrecognized)')
 
 
 def rejects_cache_key(error):
-    """An explicit unknown or unsupported parameter error about prompt_cache_key, nothing broader."""
+    """An error that names prompt_cache_key as the rejected parameter, nothing broader."""
     if isinstance(error, bytes):
         try:
             error = json.loads(error).get('error')
         except (ValueError, AttributeError):
             return False
     if not isinstance(error, dict):
-        return False
-    kind = f"{error.get('code') or ''} {error.get('type') or ''}".casefold()
-    if not any(word in kind for word in ('unknown', 'unsupported', 'unrecognized', 'invalid')):
         return False
     if error.get('param'):
         return error['param'] == 'prompt_cache_key'

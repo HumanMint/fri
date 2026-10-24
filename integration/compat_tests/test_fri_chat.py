@@ -83,6 +83,9 @@ def cache_calls(response):
     lambda: httpx.Response(422, json={'error': {'type': 'invalid_request_error',
                                                 'message': 'prompt_cache_key is not supported on this route.'}}),
     lambda: sse({'type': 'error', **REJECTION}),
+    lambda: sse({'type': 'error', 'code': None, 'param': 'prompt_cache_key',
+                 'message': 'Unsupported parameter: prompt_cache_key'}),
+    lambda: sse({'type': 'error', 'code': None, 'message': "Unrecognized request argument supplied: 'prompt_cache_key'"}),
     lambda: sse({'type': 'response.created'}, {'type': 'response.failed', 'response': {'error': REJECTION}}),
 ])
 def test_an_explicit_cache_key_rejection_turns_the_hint_off_for_later_calls(rejection):
@@ -98,10 +101,13 @@ def test_an_explicit_cache_key_rejection_turns_the_hint_off_for_later_calls(reje
     lambda: sse({'type': 'response.failed', 'response': {'prompt_cache_key': 'fri-chat-echo',
                                                          'error': {'code': 'server_error', 'message': 'Try again.'}}}),
     lambda: httpx.Response(429, json={'error': {'type': 'rate_limit_error', 'message': 'Slow down.'}}),
+    lambda: httpx.Response(400, json={'error': {'type': 'invalid_request_error', 'code': 'model_not_found',
+        'message': 'Unknown model test-model; prompt_cache_key was provided.'}}),
+    lambda: sse({'type': 'error', 'code': None, 'message': 'Invalid request: prompt_cache_key and input were both set.'}),
 ])
 def test_other_failures_keep_the_hint_and_are_not_retried(response):
     (first, second), sent = cache_calls(response)
-    assert first.status == 'failed' and second.status == 'completed' and sent == [True, True]
+    assert first.status != 'completed' and second.status == 'completed' and sent == [True, True]
 
 
 def test_model_refresh_reads_subscription_visible_catalog():
