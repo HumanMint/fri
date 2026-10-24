@@ -2,6 +2,7 @@
 
 import copy
 import datetime as dt
+import logging
 import time
 
 import discord
@@ -16,6 +17,11 @@ NEARBY_SECONDS = 30 * 60
 REFERENCE_SECONDS = 7 * 86400
 MAX_MESSAGES = 12
 CHANGED = 'That mention or its context changed while I was replying. Ask again for a fresh reply.'
+LOG = logging.getLogger('fri.mentions')
+
+
+def where(message):
+    return f'{message.channel.id}/{message.id}'
 
 
 def fingerprint(message):
@@ -36,35 +42,50 @@ class Invitation:
         self.rows, self.events, self.profiles, self.snapshots = [], {}, {}, {}
         self.image = None
         self.ambiguous_images = False
+        self.refusal = None  # Why the last check failed, for the log: a gate name, never content.
 
     @classmethod
     async def create(cls, agent, message):
-        if (not isinstance(message, discord.Message) or not message.guild or message.author.bot or
-                message.webhook_id or not explicit_mention(message, agent.fri.user.id) or
-                message.guild.id != agent.fri.guild_id):
+        if not isinstance(message, discord.Message) or not message.guild:
             return None
-        invitation = cls(agent, message)
-        return invitation if await invitation.current(check_evidence=False) else None
+        if message.author.bot or message.webhook_id or not explicit_mention(message, agent.fri.user.id):
+            reason = 'ineligible event'
+        elif message.guild.id != agent.fri.guild_id:
+            reason = 'outside the main server'
+        else:
+            invitation = cls(agent, message)
+            if await invitation.current(check_evidence=False):
+                return invitation
+            reason = invitation.refusal
+        LOG.info('Mention %s ignored: %s', where(message), reason)
+        return None
+
+    def refuse(self, reason):
+        self.refusal = reason
+        return False
+
+    def withheld(self):
+        LOG.info('Mention %s reply withheld: %s', where(self.event), self.refusal)
 
     async def access(self):
         """Fetch current overwrites and both members; cached channel access is insufficient."""
         event, guild = self.event, self.event.guild
         if not self.agent.config['enabled']:
-            return False
+            return self.refuse('fri disabled')
         if guild.id != self.fri.guild_id and not self.agent.allowed(event.channel):
-            return False
+            return self.refuse('outside the main server')
         channel = await guild.fetch_channel(event.channel.id)
         if channel.id != event.channel.id or channel.guild.id != guild.id:
-            return False
+            return self.refuse('channel changed')
         thread = isinstance(channel, discord.Thread)
         if thread:
             if channel.is_private() or channel.archived or channel.locked:
-                return False
+                return self.refuse('private, archived or locked thread')
             parent = await guild.fetch_channel(channel.parent_id)
         else:
             parent = channel
         if getattr(parent, 'nsfw', False):
-            return False
+            return self.refuse('nsfw channel')
         # Current role permissions matter as well as fresh channel overwrites.
         fresh_guild = copy.copy(guild)
         fresh_guild._roles = {role.id: role for role in await guild.fetch_roles()}
@@ -73,34 +94,34 @@ class Invitation:
         for user in (event.author.id, self.fri.user.id):
             member = await guild.fetch_member(user)
             if member.id != user or (user == event.author.id and member.bot):
-                return False
+                return self.refuse('member changed')
             permissions = parent.permissions_for(member)
             if not (permissions.view_channel and permissions.read_message_history and
                     (permissions.send_messages_in_threads if thread else permissions.send_messages)):
-                return False
+                return self.refuse('missing permissions')
         return True
 
     async def current(self, *, check_evidence=True):
         try:
             if not -5 <= time.time()-discord.utils.snowflake_time(self.event.id).timestamp() <= 300:
-                return False
+                return self.refuse('stale event')
             if not await self.access():
                 return False
             current = await self.event.channel.fetch_message(self.event.id)
             if (current.id != self.event.id or current.author.bot or current.webhook_id or
                     fingerprint(current) != self.original or not explicit_mention(current, self.fri.user.id)):
-                return False
+                return self.refuse('message changed')
             if check_evidence and self.grant:
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
-                    return False
+                    return self.refuse('nearby privacy changed')
                 for mid, event in self.events.items():
                     current = await self.event.channel.fetch_message(mid)
                     if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
-                        return False
+                        return self.refuse('nearby message changed')
             return True
-        except (discord.HTTPException, commands.UserFeedbackCheckFailure, ValueError, AttributeError, TypeError):
-            return False
+        except (discord.HTTPException, commands.UserFeedbackCheckFailure, ValueError, AttributeError, TypeError) as exc:
+            return self.refuse('check failed: '+type(exc).__name__)
 
     async def require_current(self):
         if not await self.current():

@@ -4,6 +4,7 @@ import asyncio
 import copy
 import datetime as dt
 import json
+import logging
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -90,7 +91,8 @@ def attachment(channel):
 @pytest.mark.parametrize('text', ['fri what do you think?', 'hey fri', '@everyone', '<@123>',
     '`<@99>`', '```<@99>```', '```\n<@99>', '> <@99>', '>>> quote\n<@99>',
     '"<@99>"', '“<@99>”', "'<@99>'", r'\<@99>', 'https://example.com/<@99>'])
-def test_outside_noninvitations_do_nothing(monkeypatch, tmp_path, text):
+def test_outside_noninvitations_do_nothing(monkeypatch, tmp_path, caplog, text):
+    caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, channel, message, calls, _ = environment(monkeypatch, tmp_path)
         event = message(text)
@@ -102,6 +104,27 @@ def test_outside_noninvitations_do_nothing(monkeypatch, tmp_path, text):
             assert not calls and not agent.recent and not agent.active
             fri.chat_once.assert_not_awaited()
             event.reply.assert_not_awaited()
+            assert f'Mention 8/{event.id} ignored: not a visible user mention' in caplog.messages
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('configured_channel', [False, True])
+def test_fris_role_pill_is_not_an_invitation_but_says_why(monkeypatch, tmp_path, caplog, configured_channel):
+    # Picking Fri's integration role from autocomplete looks like a ping but isn't a user mention.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, calls, _ = environment(
+            monkeypatch, tmp_path, channel_id=1 if configured_channel else 8)
+        event = message('<@&555> you there?')
+        event.role_mentions = [SimpleNamespace(id=555, tags=SimpleNamespace(bot_id=99))]
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/mentions/admit' for path, _ in calls)
+            assert f'Mention {channel.id}/{event.id} ignored: not a visible user mention' in caplog.messages
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -155,7 +178,8 @@ def test_ping_after_another_members_meme_gets_text_without_ambient_expansion(mon
 
 
 @pytest.mark.parametrize('failure', ['old', 'bot', 'webhook', 'foreign_guild', 'foreign_source', 'permission', 'disabled'])
-def test_invalid_invitation_fails_before_model(monkeypatch, tmp_path, failure):
+def test_invalid_invitation_fails_before_model(monkeypatch, tmp_path, caplog, failure):
+    caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, channel, message, calls, rows = environment(monkeypatch, tmp_path)
         event = message(age=301 if failure == 'old' else 0)
@@ -178,6 +202,13 @@ def test_invalid_invitation_fails_before_model(monkeypatch, tmp_path, failure):
             assert not calls
             fri.chat_once.assert_not_awaited()
             event.reply.assert_not_awaited()
+            # A member's dropped mention says why in the log, by message ID only. Webhooks aren't members.
+            reason = {'old': 'stale event', 'bot': 'ineligible event', 'webhook': None,
+                      'foreign_guild': 'outside the main server', 'foreign_source': 'message changed',
+                      'permission': 'missing permissions', 'disabled': 'fri disabled'}[failure]
+            logged = [line for line in caplog.messages if line.startswith('Mention ')]
+            assert logged == ([f'Mention {channel.id}/{event.id} ignored: {reason}'] if reason else [])
+            assert not any('what do you think' in line for line in caplog.messages)
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -231,7 +262,8 @@ def test_nicknamed_members_burst_matches_its_fetched_copies(monkeypatch, tmp_pat
 
 
 @pytest.mark.parametrize('change', ['privacy', 'source_edit', 'permission', 'settings'])
-def test_revocation_during_answer_never_sends_or_saves_context(monkeypatch, tmp_path, change):
+def test_revocation_during_answer_never_sends_or_saves_context(monkeypatch, tmp_path, caplog, change):
+    caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, store, controller, channel, message, calls, rows = environment(monkeypatch, tmp_path)
         previous = message('another member private phrase', user=30, age=60)
@@ -253,12 +285,17 @@ def test_revocation_during_answer_never_sends_or_saves_context(monkeypatch, tmp_
             await agent.handle(event)
             event.reply.assert_not_awaited()
             assert not any(path == '/chat/turn' for path, _ in calls)
+            reason = {'privacy': 'check failed: ControllerRejected', 'source_edit': 'nearby message changed',
+                      'permission': 'missing permissions', 'settings': 'check failed: ControllerRejected'}[change]
+            assert [line for line in caplog.messages if line.startswith('Mention ')] == [
+                f'Mention {channel.id}/{event.id} reply withheld: {reason}']
         finally:
             await fri.close()
     asyncio.run(scenario())
 
 
-def test_outside_invitation_preserves_cooldown_and_blocks_all_nonweb_actions(monkeypatch, tmp_path):
+def test_outside_invitation_preserves_cooldown_and_blocks_all_nonweb_actions(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
         event = message()
@@ -275,6 +312,10 @@ def test_outside_invitation_preserves_cooldown_and_blocks_all_nonweb_actions(mon
                 await agent.handle(item)
             assert fri.chat_once.await_count < 20
             assert any(e.reply.await_args and 'recharge' in e.reply.await_args.args[0] for e in events)
+            later = message()  # The notice shows once; the rest of the cooldown is quiet, but logged.
+            await agent.handle(later)
+            later.reply.assert_not_awaited()
+            assert f'Mention 8/{later.id} not answered: social cooldown' in caplog.messages
         finally:
             await fri.close()
     asyncio.run(scenario())

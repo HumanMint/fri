@@ -41,6 +41,12 @@ Freshness checks compare author and event IDs, never display names. A gateway ev
 the member's server nickname, but a fetched copy of the same message shows their global
 name, because Fri has no members intent or member cache.
 
+A mention Fri doesn't answer is logged at INFO with only its channel and message IDs:
+`Mention <channel>/<message> ignored: <reason>` when it never became an invitation (for
+example `not a visible user mention` for Fri's role pill, `message changed`, `stale event`,
+`missing permissions`), `reply withheld: <reason>` when a recheck failed after composing,
+and `not answered: social cooldown` once the cooldown notice has already shown.
+
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.
 They do not prove Discord delivery or live model interpretation of a particular meme.

@@ -16,7 +16,7 @@ import discord
 from discord.ext import tasks
 
 from . import feedback as commands
-from .fri_addressing import addressed_text, explicit_mention
+from .fri_addressing import addressed_text, explicit_mention, pinged
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
@@ -315,6 +315,10 @@ class Agent:
         elif not self.allowed(message.channel):
             # An outside ping is one event, never a new ambient/active channel.
             if message.guild.id != self.fri.guild_id or not explicit_mention(message, self.fri.user.id):
+                if pinged(message, self.fri.user.id):  # Shown as a ping, so say why it got no reply.
+                    LOG.info('Mention %s/%s ignored: %s', message.channel.id, message.id,
+                             'outside the main server' if message.guild.id != self.fri.guild_id
+                             else 'not a visible user mention')
                 return
             from .fri_mentions import Invitation
             invitation = await Invitation.create(self, message)
@@ -391,6 +395,8 @@ class Agent:
         if message.reference and directed is None:
             active = False
         if directed is None and not active and channel != self.dedicated:
+            if pinged(message, self.fri.user.id):
+                LOG.info('Mention %s/%s ignored: not a visible user mention', channel, message.id)
             return
         # Short bursts share context and produce one response to the newest message.
         key = (channel, message.author.id)
@@ -441,19 +447,19 @@ class Agent:
                     burst=burst, inspect_images=not ambient, **({'invitation': invitation} if invitation else {}))
         except ReplyInProgress:
             if invitation and not await invitation.current():
-                return
+                return invitation.withheld()
             if not ambient:
                 await self.fri.waiting_notices.send(message)
             return
         except commands.UserFeedbackCheckFailure as exc:
             if invitation and not await invitation.current():
-                return
+                return invitation.withheld()
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if invitation:
             if not await invitation.current():
-                return
+                return invitation.withheld()
             from .fri_mentions import force_text
             result = force_text(result)
         if result.response_kind in ('react', 'quiet'):
@@ -474,6 +480,9 @@ class Agent:
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if not result.reply:
+            if invitation:  # A cooldown's notice shows once; later mentions in it stay quiet.
+                LOG.info('Mention %s/%s not answered: %s', message.channel.id, message.id,
+                         'social cooldown' if result.status == 'cooldown' else 'empty reply')
             await self.fri.waiting_notices.clear(message.author.id)
             return
         view = None
