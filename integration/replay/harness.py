@@ -235,13 +235,23 @@ def size(value):
     return value
 
 
+def characters(messages):
+    """Characters of text the model reads, not the request's own JSON escaping of them."""
+    total = 0
+    for message in messages:
+        content = message.get('content', '')
+        parts = content if isinstance(content, list) else [{'type': 'input_text', 'text': content}]
+        total += sum(len(part.get('text', '')) for part in parts if part.get('type') == 'input_text')
+    return total
+
+
 def manifest(payload, kind):
     """Context shape and versions without raw member text."""
     instructions = payload.get('instructions', '')
     result = {'kind': kind, 'model': payload.get('model'),
               'effort': (payload.get('reasoning') or {}).get('effort'),
               'prompt_version': hashlib.sha256(instructions.encode()).hexdigest()[:12],
-              'input_chars': len(json.dumps(payload.get('input', [])))}
+              'input_chars': characters(payload.get('input', []))}
     if kind != 'conversation':
         return result
     messages = payload['input']

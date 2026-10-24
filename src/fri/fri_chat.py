@@ -15,7 +15,7 @@ from .fri_image_request import MAX_REQUEST
 from .fri_memory import CATEGORIES
 from .fri_responses import KINDS, REACTIONS, acknowledgment_allowed, validate_response
 from .fri_social import SOCIAL_ACTIONS
-from .privacy import clean
+from .privacy import clean, model_json
 from .subscription import RESOURCE, SubscriptionError
 
 WINDOWS = ('recent', 'since_my_last_message')  # read_recent: a small batch, or a catch-up.
@@ -426,15 +426,15 @@ class Chat:
         text_parts = {}
         messages = []
         for turn in context['turns']:
-            response = turn['reply'] if turn.get('response_kind', 'reply') == 'reply' else json.dumps({
+            response = turn['reply'] if turn.get('response_kind', 'reply') == 'reply' else model_json({
                 'response_decision': turn['response_kind'], 'reaction': turn.get('reaction'),
                 'text_sent': False, 'reaction_delivery': 'unverified'})
-            messages += [{'role': 'user', 'content': json.dumps({'message': turn['input'],
+            messages += [{'role': 'user', 'content': model_json({'message': turn['input'],
                           'source': turn.get('source', {'kind': 'legacy_unverified'}),
                           'message_burst': turn.get('burst', [])})},
                          {'role': 'assistant', 'content': response}]
         # Facts are data in a user message, never inserted into developer instructions.
-        messages.append({'role': 'user', 'content': json.dumps({
+        messages.append({'role': 'user', 'content': model_json({
             'approved_server_facts_for_reference': context['facts'],
             'personal_memory': context.get('personal_memory', {'enabled': False, 'notes': []}),
             'recent_channel_context': [{k: v for k, v in row.items() if k != 'provenance'}

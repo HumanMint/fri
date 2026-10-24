@@ -1,6 +1,8 @@
 """Conservative text minimization before storage or model input."""
 
+import json
 import re
+import unicodedata
 
 TOKEN_PATTERNS = [
     re.compile(r'(?i)\b(?:mfa\.[\w-]{20,}|[\w-]{23,28}\.[\w-]{6}\.[\w-]{25,})\b'),
@@ -38,3 +40,29 @@ def redact(text: str) -> str:
 
 def clean(text: str, limit: int = 6000) -> str:
     return redact(text.strip())[:limit]
+
+
+# Invisible (default-ignorable) letters and marks, plus every variation selector. The one exception is
+# an emoji's U+FE0E/U+FE0F straight after a visible character; a run of selectors can carry hidden text.
+INVISIBLE = re.compile('[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u3164\uffa0'
+                       '\ufe00-\ufe0f\U000e0100-\U000e01ef]')
+NOT_PRINTABLE_ASCII = re.compile(r'[^\x20-\x7e]')
+
+
+def visible(char, previous):
+    if char in '\ufe0e\ufe0f' and previous and not INVISIBLE.match(previous):
+        return visible(previous, '')
+    category = unicodedata.category(char)
+    return (category[0] in 'LMNPS' or category == 'Zs') and not INVISIBLE.match(char)
+
+
+def model_json(value):
+    """JSON for model input with visible text as written: emoji, curly quotes and non-English letters
+    stay raw instead of becoming \\u escapes. Controls, format and invisible characters (bidi, zero-width,
+    tags), line separators, surrogates, private-use and unassigned code points stay escaped."""
+    text = json.dumps(value, ensure_ascii=False)
+
+    def escape(match):
+        char, at = match.group(), match.start()
+        return char if visible(char, text[at-1] if at else '') else json.dumps(char)[1:-1]
+    return NOT_PRINTABLE_ASCII.sub(escape, text)

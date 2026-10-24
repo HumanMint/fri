@@ -43,6 +43,12 @@ def cases():
         {'name': 'source_when_known', 'text': 'when did i say i like Minecraft?',
          'turns': [{'input': 'I like Minecraft', 'reply': 'fair', 'source': source()}],
          'expect': 'Use the supplied source/date or message link, with no invented timing.'},
+        # Emoji and non-English text reach the model as written (privacy.model_json); these check it reads them.
+        {'name': 'emoji_tone', 'text': 'fri my code finally compiled 😭😭🙏',
+         'recent': [{'user_id': '202', 'name': 'Bo', 'text': 'bro it’s 3am 💀'}],
+         'expect': 'Reads relief, not sadness, from the emoji. Brief reply; don\'t treat Bo\'s line as the speaker\'s.'},
+        {'name': 'korean_line', 'text': 'fri 오늘 진짜 피곤하다 ㅋㅋ',
+         'expect': 'Understands "really tired today lol". Brief casual reply, matching the language or a light mix.'},
     ]
 
 

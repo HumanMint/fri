@@ -153,6 +153,13 @@ advertises it, so the controller must be released first.
   speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
+- **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
+  research) goes through `privacy.model_json`. Letters, marks, numbers, punctuation, symbols and
+  spaces arrive as written, so an emoji is one character instead of a 12-character `\u` escape.
+  Everything else stays escaped exactly as before: controls, format and invisible characters
+  (bidi overrides, zero-width characters, tag characters), line separators, surrogates,
+  private-use and unassigned code points, invisible letters and marks, and any variation selector
+  except one U+FE0E/U+FE0F after a visible character.
 
 ## Members' own requests
 
@@ -393,7 +400,8 @@ Each step records:
 - the observed route: local intercept, admission, model, tools, outcome, and how the turn was
   stored;
 - a context manifest: field sizes, offered actions, prompt version, model and effort, with no raw
-  member text;
+  member text; `input_chars` counts the characters of text the model reads, not the request's own
+  JSON escaping;
 - token usage.
 
 Production source is unchanged. Routes come from observable effects plus a pass-through spy on
