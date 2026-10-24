@@ -257,6 +257,8 @@ def manifest(payload, kind):
                   recent_authors=len({row.get('user_id') for row in recent if isinstance(row, dict)}),
                   offered_actions=sorted(data.get('available_actions') or {}),
                   receipts=[row.get('kind') for row in data.get('action_results_untrusted') or []],
+                  request_states=[row.get('state') for row in data.get('your_gene_requests') or []],
+                  request_titles=sum('title' in row for row in data.get('your_gene_requests') or []),
                   quiet_allowed=data['response_options']['quiet'],
                   text_only=schema.get('enum') == ['reply'])
     return result
