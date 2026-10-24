@@ -108,6 +108,26 @@ advertises it, so the controller must be released first.
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
 
+## Reply checks
+
+Needs a controller with reply checks; against an older one the heartbeat never claims a batch. Off
+until the owner applies `reply_check_enabled` through the usual settings preview (“enable reply
+checks”). The controller's operations guide describes the settings, retention and export.
+
+On the heartbeat, Fri claims at most one batch of up to 20 pairs: Fri's verbatim reply, then the same
+member's next turn in that conversation within 15 minutes. Pairs carry no member, channel or message
+identifiers. Luna/low (configurable) flags only clear cases of a member being unhappy with the reply
+and returns a category, a severity and two short abstract sentences. Banter and roasting Fri back
+don't count. Usage is recorded as “reply checks”. Nothing is posted to Discord and no chat text is
+stored by Fri; the controller decides what is kept and fences it by everyone's privacy revision.
+
+The owner can DM “show reply checks” for the last seven days: counts by category and the latest
+abstract findings. In a server channel Fri only points the owner to DMs.
+
+Offline checks cover the controller wire contract, privacy fences and failure retries with a
+substituted model. They don't measure how well a live model separates banter from real complaints;
+`python -m fri.fri_eval` has no reply-check suite yet.
+
 ## Deployment boundary
 
 The companion runs in its own `fri` Compose project using `fri-runtime:<full Fri SHA>`.
