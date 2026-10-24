@@ -13,6 +13,7 @@ from .harness import (
     Check,
     Deny,
     FailNextDelivery,
+    Inspect,
     Say,
     Scenario,
     Wait,
@@ -35,13 +36,17 @@ def first_call(replay, label):
     return replay.step(label).conversation()[0]
 
 
+def answered(replay, label):
+    return replay.step(label).answered()
+
+
 CLOSING = Scenario(
     'closing_after_completed_answer',
     'A completed answer followed by an exact closing gets a local reaction, not another model call.',
     [Say(BO, 'fri how do i see whats queued', label='ask'), Wait(20), Say(BO, 'gotcha', label='close')],
     {'conversation': [reply('say "fri controls" and hit queue', allow_closing=True)]},
     [Check('question gets a model text reply',
-           lambda r: route(r, 'ask')['kind'] == 'model' and route(r, 'ask')['outcome'] == 'reply'),
+           lambda r: route(r, 'ask')['kind'] == 'model' and answered(r, 'ask')),
      Check('completed answer is stored as the reply text',
            lambda r: route(r, 'ask')['stored'] == ['reply-text'], scripted_only=True),
      Check('exact closing skips inference with one reaction',
@@ -64,21 +69,23 @@ OPEN_QUESTION = Scenario(
 WEB_CLARIFICATION = Scenario(
     'web_clarification_followup',
     'One clarifying question, then an unaddressed answer continues the same public lookup.',
-    [Say(BO, 'fri how are the lakers doing', label='ask'), Wait(30), Say(BO, 'this season', label='answer')],
+    [Say(BO, 'fri how are the lakers doing', label='ask'),
+     Inspect('pending', lambda r: r.stored(BO)['pending'] is not None), Wait(30),
+     Say(BO, 'this season', label='answer')],
     {'conversation': [act('clarify', goal='web', topic='how are the lakers doing',
                           question='this season or last night?'),
                       act('web_search', query='this season'),
                       reply('30-12 so far, third in the west')],
      'web': [web('The Lakers are 30-12 this season, third in the West.', 'https://www.nba.com/standings')]},
-    [Check('ask gets a reply', lambda r: route(r, 'ask')['outcome'] == 'reply'),
-     Check('clarification is held for the follow-up', lambda r: route(r, 'ask')['clarification'],
-           scripted_only=True),
+    [Check('ask gets a reply', lambda r: answered(r, 'ask')),
+     Check('clarification is held for the follow-up',
+           lambda r: route(r, 'ask')['clarification'] and r.inspections['pending'], scripted_only=True),
      Check('unaddressed answer continues without new social admission',
            lambda r: route(r, 'answer')['admission'] == ['/chat/operations/admit'], scripted_only=True),
      Check('continuation offers only web_search',
            lambda r: first_call(r, 'answer')['offered_actions'] == ['web_search'], scripted_only=True),
      Check('one public lookup, then a text answer',
-           lambda r: route(r, 'answer')['tools'] == ['web_search'] and route(r, 'answer')['outcome'] == 'reply'
+           lambda r: route(r, 'answer')['tools'] == ['web_search'] and answered(r, 'answer')
            and sum(m['kind'] == 'web' for m in r.step('answer').model) == 1, scripted_only=True),
      Check('pending question is consumed and research retained',
            lambda r: r.stored(BO)['pending'] is None and bool(r.stored(BO)['web_research']), scripted_only=True)])
@@ -94,7 +101,7 @@ OUTSIDE_MENTION = Scenario(
            lambda r: route(r, 'before')['kind'] == 'ignored'),
      Check('ping is admitted once as a mention',
            lambda r: route(r, 'ping')['admission'] == ['/chat/mentions/admit']),
-     Check('mention gets text, never a reaction', lambda r: route(r, 'ping')['outcome'] == 'reply'),
+     Check('mention gets a generated text answer, never a reaction', lambda r: answered(r, 'ping')),
      Check('provider sees a text-only schema and the one nearby message',
            lambda r: first_call(r, 'ping')['text_only']
            and first_call(r, 'ping')['fields']['invited_channel_context'] == 1),
@@ -132,7 +139,8 @@ ERASURE = Scenario(
      Say(BO, 'fri where did ash say they were moving', label='ask'), Wait(30),
      Say(ASH, 'fri forget me', label='erase')],
     {'conversation': [reply('ash said denver, next month')]},
-    [Check('unaddressed chatter is observed, not answered',
+    [Check('bo gets a generated answer', lambda r: answered(r, 'ask')),
+     Check('unaddressed chatter is observed, not answered',
            lambda r: route(r, 'share')['kind'] == 'observed' and route(r, 'share')['outcome'] == 'silent'),
      Check('the answer saw the other member\'s recent message',
            lambda r: first_call(r, 'ask')['recent_authors'] == 2),
@@ -150,7 +158,7 @@ REPLY_TARGET = Scenario(
     [Say(ASH, 'heads up im moving to denver next month', label='share'), Wait(30),
      Say(BO, 'fri where is that', reply_to='share', label='ask')],
     {'conversation': [reply('ash said denver, next month')]},
-    [Check('reply-target answer is delivered', lambda r: route(r, 'ask')['outcome'] == 'reply'),
+    [Check('reply-target answer is generated and delivered', lambda r: answered(r, 'ask')),
      Check('reply-target turn is stored as a breadcrumb', lambda r: route(r, 'ask')['stored'] == ['breadcrumb']),
      Check('referenced details are not stored', lambda r: 'denver' not in json.dumps(r.stored(BO)).lower())])
 
@@ -159,8 +167,10 @@ DELIVERY_FAILURE = Scenario(
     'A Discord send failure after a model reply should not leave a stored turn claiming it was said.',
     [FailNextDelivery(), Say(BO, 'fri yo', label='yo')],
     {'conversation': [reply('yo')]},
-    [Check('failed delivery is observed', lambda r: route(r, 'yo')['outcome'] == 'delivery-failed'),
-     Check('no stored turn claims an undelivered reply', lambda r: not route(r, 'yo')['stored'],
+    [Check('the reply was generated', lambda r: route(r, 'yo')['inference'] == ['completed']),
+     Check('failed delivery is observed', lambda r: route(r, 'yo')['outcome'] == 'delivery-failed'),
+     Check('no stored turn claims an undelivered reply',
+           lambda r: 'yo' not in [turn['reply'] for turn in r.stored(BO)['turns']],
            known_gap='The turn is saved before Discord delivery (fri.py:378, fri_agent.py:432).')])
 
 SCENARIOS = [CLOSING, OPEN_QUESTION, WEB_CLARIFICATION, OUTSIDE_MENTION, KEYWORDS, ERASURE, REPLY_TARGET,

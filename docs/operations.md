@@ -176,7 +176,9 @@ PYTHONPATH="$PWD/src:$PWD/integration:/path/to/gene/src:/path/to/gene" \
 `integration/replay/` drives synthetic multi-message scenarios through the unmodified
 `Fri.on_message` pipeline and the real Gene controller in-process. It fakes Discord, the
 controller transport (an aiohttp-shaped adapter, so `Fri.api` runs unchanged) and the provider
-transport. A virtual wall clock controls message IDs, follow-up windows and controller TTLs.
+transport. A virtual wall clock controls message IDs, follow-up windows and controller TTLs:
+`time.time()` and every loaded `fri`/`gene` module's `dt.datetime.now()` follow it, while
+monotonic time stays real for asyncio. `Inspect` steps can record state mid-run.
 
 Each step records:
 
@@ -188,8 +190,14 @@ Each step records:
 
 Production code is not instrumented. All scenario members and messages are invented.
 
-`known_gap` checks run as strict xfails. When a fix makes one pass, the suite fails until the
-marker is removed, so a documented gap can't silently disappear or come back.
+Answer checks require completed inference, taken from Fri's own usage receipts. A provider
+error notice is never counted as an answer. Only saves the controller accepted count as stored.
+A run with a rejected save, a failed inference or a failed ordinary check is unsuccessful, and
+the CLI exits non-zero.
+
+`known_gap` checks run as strict xfails. They count only when the gap check itself fails with an
+`AssertionError`, after every other precondition has passed. When a fix makes one pass, the suite
+fails until the marker is removed, so a documented gap can't silently disappear or come back.
 
 Print reports offline with `python -m replay` (run from `integration/` with the same
 `PYTHONPATH`). `--live-model --auth SESSION --max-calls N` runs the same scenarios against the

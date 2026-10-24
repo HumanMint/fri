@@ -12,7 +12,7 @@ import argparse
 import json
 import sys
 
-from .harness import run
+from .harness import failures, run
 from .scenarios import SCENARIOS
 
 
@@ -52,8 +52,7 @@ def main(argv=None):
             handle.write(output+'\n')
     else:
         print(output)
-    failed = [c for r in reports for c in r.get('checks', []) if not c['passed'] and not c['known_gap']]
-    return 1 if failed else 0
+    return 1 if failures(reports) else 0
 
 
 if __name__ == '__main__':

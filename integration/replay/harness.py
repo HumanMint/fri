@@ -8,11 +8,15 @@ import asyncio
 import contextlib
 import datetime as dt
 import hashlib
+import importlib
 import json
 import os
+import pkgutil
+import sys
 import tempfile
 import threading
 import time
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,8 +45,8 @@ class BudgetExhausted(httpx.TransportError):
     """Raised before sending; production code treats it as an interrupted connection."""
 
 
-class UnscriptedCall(AssertionError):
-    pass
+class UnscriptedCall(RuntimeError):
+    """Not an AssertionError, so it can never satisfy a known-gap xfail."""
 
 
 class Clock:
@@ -58,6 +62,42 @@ class Clock:
         self.now += max(0.0, seconds)
 
 
+class _RealDatetime(type):
+    """isinstance/issubclass against the virtual class still accept real datetimes."""
+
+    def __instancecheck__(cls, value):
+        return isinstance(value, dt.datetime)
+
+    def __subclasscheck__(cls, value):
+        return issubclass(value, dt.datetime)
+
+
+def clock_patches(clock):
+    """Point every loaded fri/gene module's `dt` at a datetime module whose now() is virtual."""
+
+    class VirtualDatetime(dt.datetime, metaclass=_RealDatetime):
+        @classmethod
+        def now(cls, tz=None):
+            return dt.datetime.fromtimestamp(clock(), tz)
+
+        @classmethod
+        def utcnow(cls):
+            return dt.datetime.fromtimestamp(clock(), dt.timezone.utc).replace(tzinfo=None)
+
+        @classmethod
+        def today(cls):
+            return dt.datetime.fromtimestamp(clock())
+
+    import fri
+    for info in pkgutil.iter_modules(fri.__path__):
+        importlib.import_module('fri.'+info.name)  # Lazily imported modules must see the proxy too.
+    proxy = types.ModuleType('datetime')
+    proxy.__dict__.update({key: value for key, value in vars(dt).items() if not key.startswith('__')})
+    proxy.datetime = VirtualDatetime
+    return [patch.object(module, 'dt', proxy) for name, module in list(sys.modules.items())
+            if name.split('.')[0] in ('fri', 'gene') and getattr(module, 'dt', None) is dt]
+
+
 @dataclass
 class Call:
     method: str
@@ -65,8 +105,10 @@ class Call:
     status: int
     payload_keys: list
     allowed: bool | None = None
-    saved: dict | None = None
+    saved: dict | None = None  # Only saves the controller accepted.
+    rejected: bool = False  # A /chat/turn save the controller refused.
     tokens: dict | None = None
+    inference: str | None = None  # Provider attempt status from Fri's own usage receipt.
 
 
 @dataclass
@@ -140,9 +182,16 @@ class Step:
         receipts = conversation[-1]['receipts'] if conversation else []
         return {'kind': kind, 'outcome': outcome, 'admission': sorted({p for p in paths if p in ADMISSION}),
                 'model_calls': len(self.model), 'conversation_calls': len(conversation),
-                'tools': receipts, 'stored': stored,
+                'inference': [c.inference for c in self.controller if c.inference],
+                'tools': receipts, 'stored': stored, 'save_rejected': sum(c.rejected for c in self.controller),
                 'clarification': any(item.get('clarification') for item in saved),
                 'reaction': next((d.text for d in sent if d.kind == 'reaction'), None)}
+
+    def answered(self):
+        """A delivered text reply backed by completed inference, not an error notice."""
+        route = self.route()
+        return (route['outcome'] == 'reply' and bool(route['inference']) and
+                all(status == 'completed' for status in route['inference']))
 
     def tokens(self):
         rows = [c.tokens for c in self.controller if c.tokens]
@@ -286,13 +335,16 @@ class ControllerSession:
         body = response.json() if response.headers.get('content-type', '').startswith('application/json') else {}
         if path in ADMISSION and isinstance(body, dict):
             call.allowed = body.get('allowed')
-        if path == '/chat/turn' and payload:
+        if path == '/chat/turn' and payload and response.status_code >= 400:
+            call.rejected = True
+        elif path == '/chat/turn' and payload:
             call.saved = {key: payload.get(key) for key in ('model', 'response_kind', 'reaction', 'reply',
                                                             'clarification')}
             call.saved['reply'] = call.saved['reply'] or ''
             call.saved['response_kind'] = call.saved['response_kind'] or 'reply'
         if path == '/chat/usage/report' and payload:
             call.tokens = payload.get('counters') or {}
+            call.inference = payload.get('status') or 'unknown'
         self.steps[-1].controller.append(call)
         yield _Response(response)
 
@@ -430,6 +482,13 @@ class Deny:
 
 
 @dataclass
+class Inspect:
+    """Record fn(replay) mid-run, inside the virtual clock, for checks to read later."""
+    label: str
+    fn: object
+
+
+@dataclass
 class Check:
     name: str
     test: object
@@ -455,6 +514,7 @@ class Replay:
         self.transport = ModelTransport(self.steps, None if live else scenario.script, live, max_calls)
         self.subscription = subscription or SimpleNamespace(access_token=lambda: 'synthetic-plan-token')
         self.mode = 'live' if live else 'scripted'
+        self.inspections = {}
 
     def step(self, label):
         return next(step for step in self.steps if step.label == label)
@@ -479,8 +539,12 @@ class Replay:
                        'FRI_CHATGPT_AUTH': str(self.root/'unused-session.json'), 'FRI_PRESENCE': 'invisible',
                        'GENE_BOT_ID': '0', 'FRI_CHAT_CHANNEL_ID': '0',
                        'XDG_CONFIG_HOME': str(self.root/'config')}
-        with patch.dict(os.environ, environment), patch.object(time, 'time', clock), \
-                patch.object(asyncio, 'sleep', sleep):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, environment))
+            stack.enter_context(patch.object(time, 'time', clock))
+            stack.enter_context(patch.object(asyncio, 'sleep', sleep))
+            for item in clock_patches(clock):
+                stack.enter_context(item)
             asyncio.run(self._run(clock))
         return self
 
@@ -514,6 +578,8 @@ class Replay:
                     self.world.fail_next_delivery = True
                 elif isinstance(action, Deny):
                     self.world.denied.add((action.channel, action.actor))
+                elif isinstance(action, Inspect):
+                    self.inspections[action.label] = action.fn(self)
                 else:
                     self.steps.append(Step(index, action.label or f'step-{index}', action.actor, action.channel))
                     event = self.world.message(action.actor, action.text, action.channel,
@@ -538,12 +604,25 @@ class Replay:
 
     def report(self):
         steps = [step.report() for step in self.steps]
+        calls = [(s.label, c) for s in self.steps for c in s.controller]
         return {'scenario': self.scenario.name, 'mode': self.mode, 'synthetic': True,
                 'model_calls': self.transport.calls, 'unused_script': self.transport.unused(),
-                'controller_errors': [c.path for s in self.steps for c in s.controller if c.status >= 500],
+                'controller_errors': [c.path for _, c in calls if c.status >= 500],
+                'controller_rejections': [[label, c.path, c.status] for label, c in calls if 400 <= c.status < 500],
+                'rejected_saves': [label for label, c in calls if c.rejected],
+                'inference_failures': [[label, c.inference] for label, c in calls
+                                       if c.inference and c.inference != 'completed'],
                 'prompt_versions': sorted({m['prompt_version'] for s in self.steps for m in s.model}),
                 'tokens': {key: sum(s['tokens'][key] for s in steps) for key in ('input_tokens', 'output_tokens')},
                 'steps': steps, 'checks': self.evaluate()}
+
+
+def failures(reports):
+    """Any failed ordinary check, rejected save or failed inference makes a run unsuccessful."""
+    return [item for report in reports if 'checks' in report for item in
+            [c['name'] for c in report['checks'] if not c['passed'] and not c['known_gap']] +
+            [f'rejected save in {label}' for label in report['rejected_saves']] +
+            [f'inference {status} in {label}' for label, status in report['inference_failures']]]
 
 
 def run(scenario, root=None, **kwargs):
