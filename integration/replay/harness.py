@@ -608,7 +608,7 @@ class Replay:
             kind = action.get('kind') if isinstance(action, dict) else None
             try:
                 receipt = await execute(actions, action)
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:  # The runner's timeout cancels the tool.
                 steps[-1].actions.append({'kind': kind, 'outcome': type(exc).__name__})
                 raise
             outcome = next((key for key in ('blocked', 'uncertain') if key in receipt), 'returned')

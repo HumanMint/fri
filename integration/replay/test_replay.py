@@ -17,6 +17,7 @@ from replay.harness import (
     Scenario,
     UnscriptedCall,
     Wait,
+    act,
     failures,
     reply,
     run,
@@ -293,3 +294,29 @@ def test_early_return_tools_are_traced(tmp_path):
     ask = run(WEB_CLARIFICATION, tmp_path)['steps'][1]['route']
     assert ask['tools'] == ['clarify'] and ask['tool_outcomes'] == [{'kind': 'clarify', 'outcome': 'returned'}]
     assert ask['receipts'] == []
+
+
+def test_tool_cancelled_by_the_runner_timeout_is_traced(tmp_path):
+    """Final-review nit: CancelledError is a BaseException; the spy must still record the tool."""
+    import asyncio
+    import types
+
+    import fri.fri_runner
+    from fri.fri_actions import Actions
+
+    async def hang(self, action):
+        await asyncio.get_running_loop().create_future()
+
+    fast = types.ModuleType('asyncio')
+    fast.__dict__.update(vars(asyncio))
+    fast.timeout = lambda delay: asyncio.timeout(0.005 if delay == 300 else delay)  # Runner deadline only.
+    question = 'what is the current python release'
+    scenario = Scenario('timeout', 'A tool still running when the turn deadline passes.',
+                        [Say(20, 'fri '+question, label='ask')],
+                        {'conversation': [act('web_search', query=question)]})
+    with patch.object(Actions, 'execute', hang), patch.object(fri.fri_runner, 'asyncio', fast):
+        report = run(scenario, tmp_path)
+    preconditions(report)
+    ask = report['steps'][1]
+    assert ask['route']['tool_outcomes'] == [{'kind': 'web_search', 'outcome': 'CancelledError'}]
+    assert ask['route']['outcome'] == 'reply' and ask['deliveries'][0]['text']  # Honest timeout fallback.

@@ -189,7 +189,8 @@ Each step records:
 - token usage.
 
 Production source is unchanged. Routes come from observable effects plus a pass-through spy on
-`Actions.execute`, so tools that return early (for example a clarification) are traced too. All
+`Actions.execute`, so tools that return early (for example a clarification) or are cancelled by
+the turn deadline are traced too. All
 scenario members and messages are invented.
 
 Answer checks require completed inference, taken from Fri's own usage receipts. A provider
