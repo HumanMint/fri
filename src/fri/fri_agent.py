@@ -747,8 +747,8 @@ class Agent:
                     if self.memes is None:
                         self.memes = Memes(self)
                     await self.memes.check()
-                if self.config.get('reply_check_enabled'):
-                    from .fri_reply_checks import check
+                from .fri_reply_checks import CAPABILITY, check
+                if self.config.get('reply_check_enabled') and CAPABILITY in self.fri.capabilities:
                     await check(self)
             self.heartbeat_status = 'ok'
         except (commands.UserFeedbackCheckFailure, discord.HTTPException, TimeoutError, ValueError, KeyError):
