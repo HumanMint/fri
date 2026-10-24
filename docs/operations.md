@@ -192,6 +192,25 @@ lock prevents overlapping processes, but repeatedly restarting a retired service
 still an operational error. Do not remove the legacy image/container until a later,
 explicitly reviewed retirement step.
 
+## Background work and health
+
+The 30-second heartbeat fetches controller state first, and defers the whole tick
+when that fails. Every later stage (presence, posts, reminders, owner reports,
+learning, attention, memes) runs on its own: a failure is logged with the stage and
+exception class only, and never skips the stages after it. `fri-health.json` keeps
+`agent_heartbeat.running/failed/status` for the release coordinator and adds
+`agent_heartbeat.stages`, one `{at, last_ok, error}` entry per enabled stage.
+
+A usage receipt the controller refuses as invalid (HTTP 400 or 422), or one that
+can't be parsed, moves to `usage/rejected/` and stops blocking later receipts.
+`rejected_usage` in the health file counts them. Credential or contract refusals
+keep every receipt queued.
+
+A failed subscription renewal logs its cause: exception class, HTTP status and OAuth
+error code, never the response or tokens. Only a refused grant or a missing or incomplete
+saved sign-in is reported as needing a reconnect, and it sends the owner one DM until
+a token works again. Network, rate-limit and provider failures ask members to retry.
+
 ## New installations
 
 Install a compatible Gene controller first. Create a private Fri environment file

@@ -2,7 +2,9 @@
 
 import fcntl
 import json
+import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -15,10 +17,33 @@ ISSUER = 'https://auth.openai.com'
 TOKEN_URL = ISSUER + '/api/accounts/oauth/token'
 RESOURCE = 'https://api.openai.com/v1'
 PLAN_SCOPE = 'chatgpt.tokens.use.direct'
+LOG = logging.getLogger('fri.subscription')
 
 
 class SubscriptionError(RuntimeError):
-    pass
+    """The saved sign-in can't be used until the owner reconnects it."""
+
+
+class SubscriptionUnavailable(SubscriptionError):
+    """Renewal failed in a way a later call may not: network, rate limit or provider outage."""
+
+
+def refusal(exc):
+    """Only an incomplete saved sign-in or an explicit OAuth refusal needs the owner."""
+    return isinstance(exc, KeyError) or (isinstance(exc, httpx.HTTPStatusError) and
+                                         exc.response.status_code in (400, 401))
+
+
+def cause(exc):
+    """Class, HTTP status and OAuth error code only; never the response body or credentials."""
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return type(exc).__name__
+    try:
+        code = exc.response.json().get('error')
+    except (ValueError, AttributeError):
+        code = None
+    code = code if isinstance(code, str) and re.fullmatch(r'[a-z_]{1,40}', code) else ''
+    return f'HTTP {exc.response.status_code} {code}'.rstrip()
 
 
 def validate_identity(token, client_id, nonce, jwks, previous=None):
@@ -54,8 +79,20 @@ class Subscription:
     def __init__(self, path, transport=None):
         self.path = Path(path)
         self.transport = transport
+        self.rejected = False  # Set by a refusal that needs the owner, cleared by the next usable token.
 
     def access_token(self):
+        try:
+            token = self.current_token()
+        except SubscriptionUnavailable:
+            raise
+        except SubscriptionError:
+            self.rejected = True
+            raise
+        self.rejected = False
+        return token
+
+    def current_token(self):
         if not self.path.exists():
             raise SubscriptionError('Fri needs a ChatGPT subscription sign-in. Ask the owner to connect them.')
         with self.path.with_suffix('.lock').open('a') as lock:
@@ -76,5 +113,9 @@ class Subscription:
                                        host_id=saved['ext_agent_host_id'])
                 private_json(self.path, renewed)
                 return renewed['access_token']
-            except (httpx.HTTPError, KeyError, ValueError):
-                raise SubscriptionError('Fri could not renew their ChatGPT connection. Reconnect the subscription.') from None
+            except (httpx.HTTPError, KeyError, ValueError) as exc:
+                refused = refusal(exc)
+                LOG.warning('ChatGPT sign-in renewal %s: %s', 'rejected' if refused else 'failed', cause(exc))
+                if refused:
+                    raise SubscriptionError('Fri could not renew their ChatGPT connection. Reconnect the subscription.') from None
+                raise SubscriptionUnavailable('Fri couldn’t reach ChatGPT to renew their sign-in. Try again in a minute.') from None

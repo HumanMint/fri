@@ -35,6 +35,8 @@ from .subscription import Subscription, private_json
 
 LOG = logging.getLogger('fri')
 NO_MENTIONS = discord.AllowedMentions.none()
+SIGN_IN_NOTICE = ('heads up: my chatgpt sign-in stopped working, so every reply fails until you reconnect me. '
+                  'steps are in fri’s docs/operations.md under “New installations”.')
 FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
                 'or say “forget me” any time.')
 MAX_PROVENANCE = 200
@@ -129,6 +131,7 @@ class Fri(discord.Client):
         self.waiting_notices = WaitingNotices(self.busy)
         self.usage_lock = asyncio.Lock()
         self.chat_slots = asyncio.Semaphore(2)
+        self.subscription_noticed = False
         self.session = None
         self.agent = None
 
@@ -192,7 +195,7 @@ class Fri(discord.Client):
                     headers={'Authorization': 'Bearer ' + self.token, 'X-Fri-Contract': PROTOCOL}) as response:
                 data = await response.json()
                 if 400 <= response.status < 500:
-                    raise ControllerRejected(str(data.get('detail', 'Controller rejected this request')))
+                    raise ControllerRejected(str(data.get('detail', 'Controller rejected this request')), response.status)
                 if response.status >= 400:
                     raise commands.UserFeedbackCheckFailure(str(data.get('detail', 'Controller rejected this request')))
                 return data
@@ -206,8 +209,27 @@ class Fri(discord.Client):
                     report = json.loads(path.read_text())
                 except FileNotFoundError:
                     continue  # An isolated evaluation process may have delivered this receipt.
-                await self.api('POST', '/chat/usage/report', report)
+                except ValueError:
+                    self.set_aside(path, 'unreadable')
+                    continue
+                try:
+                    await self.api('POST', '/chat/usage/report', report)
+                except ControllerRejected as exc:
+                    if exc.status not in (400, 422):
+                        raise  # Credentials or contract: every receipt would fail alike, so all stay queued.
+                    self.set_aside(path, f'HTTP {exc.status}')
+                    continue
                 path.unlink(missing_ok=True)
+
+    def set_aside(self, path, cause):
+        """A receipt the controller refuses can never succeed; keep it for inspection without blocking later ones."""
+        rejected = path.parent / 'rejected'
+        rejected.mkdir(mode=0o700, exist_ok=True)
+        try:
+            path.replace(rejected / path.name)
+        except FileNotFoundError:
+            return
+        LOG.warning('Usage receipt set aside in usage/rejected: %s', cause)
 
     async def chat_once(self, text, context):
         result = await self.chat.respond(text, context)
@@ -525,8 +547,8 @@ class Fri(discord.Client):
                 payload['reply'] = clean(delivered, 3500)  # E.g. an attachment fallback replaced the answer.
         try:
             saved = await self.api('POST', '/chat/turn', payload)
-        except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError):
-            LOG.warning('Delivered turn was not recorded')  # Includes privacy changes mid-reply.
+        except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError) as exc:
+            LOG.warning('Delivered turn was not recorded: %s', type(exc).__name__)  # Includes privacy changes mid-reply.
             return None
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
             try:
@@ -634,8 +656,8 @@ class Fri(discord.Client):
         if self.agent:
             try:
                 await self.agent.handle(message)
-            except (commands.UserFeedbackCheckFailure, discord.HTTPException):
-                LOG.warning('Fri interaction could not complete')
+            except (commands.UserFeedbackCheckFailure, discord.HTTPException) as exc:
+                LOG.warning('Fri interaction could not complete: %s', type(exc).__name__)
             return
         if (message.author.bot or getattr(message, 'webhook_id', None) or not message.guild or
                 message.guild.id != self.guild_id):
@@ -660,13 +682,26 @@ class Fri(discord.Client):
             await message.reply(notice_text(str(exc))[:1800], mention_author=False, allowed_mentions=NO_MENTIONS)
             await self.waiting_notices.clear(message.author.id)
 
+    async def subscription_notice(self):
+        """One owner DM per refused sign-in. A usable token re-arms it."""
+        if not self.chat.subscription.rejected:
+            self.subscription_noticed = False
+        elif not self.subscription_noticed:
+            owner = self.get_user(self.owner_id) or await self.fetch_user(self.owner_id)
+            await owner.send(SIGN_IN_NOTICE, allowed_mentions=NO_MENTIONS)
+            self.subscription_noticed = True
+
     @tasks.loop(seconds=15)
     async def owner_reviews(self):
         try:
+            await self.subscription_notice()
+        except Exception as exc:  # Retried next tick; never holds up reviews or usage delivery.
+            LOG.warning('Owner sign-in notice pending: %s', type(exc).__name__)
+        try:
             await self.flush_usage()
             await notify_owner(self)
-        except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, TimeoutError):
-            LOG.warning('Owner notification or usage delivery pending')
+        except Exception as exc:  # Like the heartbeat, a bad tick never ends the loop.
+            LOG.warning('Owner notification or usage delivery pending: %s', type(exc).__name__)
 
     @owner_reviews.before_loop
     async def before_reviews(self):
@@ -685,7 +720,8 @@ class Fri(discord.Client):
             'meme_attention': self.agent.memes.status() if self.agent and self.agent.memes else None,
             'agent_heartbeat': {'running': self.agent.heartbeat.is_running(), 'failed': self.agent.heartbeat.failed(),
                 'started': self.agent.heartbeat_started, 'finished': self.agent.heartbeat_finished,
-                'status': self.agent.heartbeat_status} if self.agent else None,
+                'status': self.agent.heartbeat_status, 'stages': self.agent.stages} if self.agent else None,
+            'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,
             'test_scope': {**test, 'connected': bool(self.is_ready() and test_guild and not test_guild.unavailable),
