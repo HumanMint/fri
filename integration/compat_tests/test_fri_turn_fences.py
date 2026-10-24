@@ -803,3 +803,87 @@ def test_an_answer_sent_before_discord_confirms_the_question_is_not_lost(monkeyp
             await task
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['fri forget me', '<@99> forget me'])
+def test_privacy_requests_never_wait_for_an_earlier_delivery(monkeypatch, tmp_path, text):
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        initial, privacy = message('fri hello'), message(text)
+        sending, release = asyncio.Event(), asyncio.Event()
+
+        async def send(content, **kwargs):
+            sending.set()
+            await release.wait()
+            return SimpleNamespace(id=initial.id+100, content=content)
+        initial.reply.side_effect = send
+        real_sleep = asyncio.sleep
+        async def no_debounce(*args, **kwargs):
+            await real_sleep(0)
+        monkeypatch.setattr('fri.fri_agent.asyncio.sleep', no_debounce)
+        first = asyncio.create_task(agent.handle(initial))
+        second = None
+        try:
+            await asyncio.wait_for(sending.wait(), 5)
+            second = asyncio.create_task(agent.handle(privacy))
+            await real_sleep(0.1)
+            assert store.chat_context('123', 'public:1', '20')['revision'] == 1  # Erased at once.
+        finally:
+            release.set()
+            await first
+            if second:
+                await second
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_bursts_group_by_arrival_and_only_a_later_message_in_the_same_burst_supersedes():
+    from fri.fri_conversation import Bursts
+    def msg(mid):
+        return SimpleNamespace(id=mid, content='hi', author=SimpleNamespace(id=20), channel=SimpleNamespace(id=1))
+    bursts, (a, b, c) = Bursts(), (msg(1), msg(2), msg(3))
+    with patch('fri.fri_conversation.time.monotonic', return_value=100.0):
+        bursts.add(a, arrived=90.0)
+        bursts.add(b, arrived=96.1)  # Over five seconds later: its own burst, though processed together.
+        assert bursts.latest(a) and bursts.latest(b)
+        bursts.add(c, arrived=97.0)
+        assert bursts.latest(a) and not bursts.latest(b) and bursts.latest(c)
+        assert [row[1] for row in bursts.take(a)] == [a]
+        assert [row[1] for row in bursts.take(c)] == [b, c] and not bursts.rows
+
+
+def test_messages_queued_behind_a_delivery_still_get_answered(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        initial = message('fri hello')
+        sending, release = asyncio.Event(), asyncio.Event()
+
+        async def send(content, **kwargs):
+            sending.set()
+            await release.wait()
+            return SimpleNamespace(id=initial.id+100, content=content)
+        initial.reply.side_effect = send
+        # Sent 6.1 seconds apart, both while Fri's earlier reply was still being delivered.
+        first, second = message('fri first follow-up', age=6.2), message('fri second follow-up', age=0.1)
+        add = agent.bursts.add
+        def arrive(event, arrived=None):  # The second arrived over five seconds later: a separate burst.
+            return add(event, arrived+6.1 if event is second else arrived)
+        agent.bursts.add = arrive
+        tasks = [asyncio.create_task(agent.handle(initial))]
+        try:
+            await asyncio.wait_for(sending.wait(), 5)
+            tasks.append(asyncio.create_task(agent.handle(first)))
+            await asyncio.sleep(0.05)
+            tasks.append(asyncio.create_task(agent.handle(second)))
+            await asyncio.sleep(0.05)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            assert fri.chat_once.await_count >= 2  # Not dropped as one mismatched burst.
+            for event in (first, second):  # Each is answered, or told Fri is still replying.
+                assert event.reply.await_count >= 1
+                assert all('burst evidence' not in str(call) for call in event.reply.await_args_list)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())

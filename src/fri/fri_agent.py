@@ -302,6 +302,7 @@ class Agent:
         return True
 
     async def handle(self, message):
+        arrived = time.monotonic()  # Bursts group by arrival, even if this waits for an earlier reply.
         if getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:
             return
         dm = message.guild is None
@@ -333,7 +334,7 @@ class Agent:
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
         if owner_addressed and message.author.id == self.fri.owner_id and await self.owner_control(message, directed or text):
             return
-        privacy = memory_intent(text)
+        privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
         owner_report = (owner_addressed and message.author.id == self.fri.owner_id and
                         (dm or message.guild.id == self.fri.guild_id) and usage_requested(directed or text))
         if not self.config['enabled'] and not privacy and not owner_report:
@@ -382,16 +383,17 @@ class Agent:
         # Short bursts share context and produce one response to the newest message.
         key = (channel, message.author.id)
         try:
-            self.bursts.add(message)
+            self.bursts.add(message, arrived)
         except ValueError as exc:
             self.pending.pop(key, None)
             await message.reply(notice_text(str(exc)), allowed_mentions=NO_MENTIONS, mention_author=False)
             return
         self.pending[key] = message.id
         await asyncio.sleep(1.5)
-        if self.pending.get(key) != message.id:
-            return
-        self.pending.pop(key, None)
+        if not self.bursts.latest(message):
+            return  # A later message in the same burst answers for this one.
+        if self.pending.get(key) == message.id:
+            self.pending.pop(key, None)
         burst = self.bursts.take(message)
         if len(burst) > 1:
             await self.respond(message, directed or text, dm, burst=burst, **({'invitation': invitation} if invitation else {}))

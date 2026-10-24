@@ -50,7 +50,8 @@ advertises it, so the controller must be released first.
   the turn is recorded. A redelivered event, or ambient attention picking the same message, is
   ignored meanwhile. From the moment Fri starts sending until the turn is recorded, the member's
   next message waits (up to 30 seconds), so an answer to a question Fri just asked still finds it
-  pending. Privacy commands never wait.
+  pending. Waiting messages still group into bursts by when they arrived. Privacy commands, plain
+  or @mentioned, never wait.
 - **Saved only after delivery.** A turn is staged while Fri composes the reply. Just before
   delivery, `/chat/turn/check` runs the save's privacy fence without writing: the speaker's
   revision, plus every referenced member's revision and memory setting. Only after Discord
