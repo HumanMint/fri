@@ -1,6 +1,7 @@
 """Conversation with bounded harness actions over official ChatGPT plan OAuth."""
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -372,10 +373,27 @@ async def events(lines):
 class Chat:
     def __init__(self, subscription, transport=None):
         self.subscription, self.transport = subscription, transport
+        self.cache_keys = True
 
     async def headers(self):
         token = await asyncio.to_thread(self.subscription.access_token)
         return {'Authorization': 'Bearer ' + token}
+
+    @contextlib.asynccontextmanager
+    async def stream(self, client, payload):
+        """Open a Responses stream. If the plan route rejects the optional prompt_cache_key by name,
+        retry once without it and stop sending it, so a cache hint can never take chat down."""
+        async with client.stream('POST', RESOURCE + '/responses', json=payload,
+                                 headers=await self.headers()) as response:
+            if not (response.status_code == 400 and 'prompt_cache_key' in payload and
+                    b'prompt_cache_key' in await response.aread()):
+                yield response
+                return
+        self.cache_keys = False
+        del payload['prompt_cache_key']
+        async with client.stream('POST', RESOURCE + '/responses', json=payload,
+                                 headers=await self.headers()) as response:
+            yield response
 
     async def models(self):
         async with httpx.AsyncClient(timeout=30, trust_env=False, transport=self.transport) as client:
@@ -439,19 +457,18 @@ class Chat:
                    'text': {'format': {'type': 'json_schema', 'name': 'fri_reply',
                                       'strict': True, 'schema': schema}}}
         key = cache_key(context.get('source'))
-        if key:
+        if key and self.cache_keys:
             payload['prompt_cache_key'] = key
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30), trust_env=False,
                                          transport=self.transport) as client:
-                async with client.stream('POST', RESOURCE + '/responses', json=payload,
-                                         headers=await self.headers()) as response:
+                async with self.stream(client, payload) as response:
                     if response.status_code != 200:
                         result.status = 'failed'
                         if response.status_code == 429:
                             result.error = 'mint’s ai wallet is tapped out for now, plan or rate limit. check usage or try me again later.'
                         else:
-                            result.error = 'big ai wouldn’t give me a reply. probably my subscription or model setting, the owner can check.'
+                            result.error = 'big ai didn’t take that request. the owner can check my subscription connection and model setting.'
                         return result
                     async for event in events(response.aiter_lines()):
                         kind = event.get('type')

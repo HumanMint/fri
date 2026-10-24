@@ -57,6 +57,28 @@ def test_prompt_cache_key_is_a_stable_channel_hash():
     assert keys[0].startswith('fri-chat-') and '123456789012345678' not in keys[0]
 
 
+@pytest.mark.parametrize('names_the_key', [True, False])
+def test_a_rejected_cache_key_is_dropped_once_and_other_400s_are_not_retried(names_the_key):
+    sent = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        sent.append('prompt_cache_key' in payload)
+        if 'prompt_cache_key' in payload or not names_the_key:
+            param = 'prompt_cache_key' if names_the_key else 'input'
+            return httpx.Response(400, json={'error': {'message': f"Unknown parameter: '{param}'.",
+                                                       'param': param, 'code': 'unknown_parameter'}})
+        return httpx.Response(200, text='data: ' + json.dumps(response_event()) + '\n\n')
+    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
+    context = {**CONTEXT, 'source': {'channel_id': '123456789012345678', 'user_id': '1'}}
+    first = asyncio.run(chat.respond('hi', context))
+    if names_the_key:
+        assert first.status == 'completed' and sent == [True, False]
+        assert asyncio.run(chat.respond('hi', context)).status == 'completed' and sent == [True, False, False]
+    else:
+        assert first.status == 'failed' and 'subscription connection' in first.error and sent == [True]
+
+
 def test_model_refresh_reads_subscription_visible_catalog():
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json={'models': [
         {'slug': 'gpt-6.1-sol', 'visibility': 'list'}, {'slug': 'hidden', 'visibility': 'hide'}]}))
