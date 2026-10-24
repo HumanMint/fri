@@ -37,14 +37,26 @@ LOG = logging.getLogger('fri')
 NO_MENTIONS = discord.AllowedMentions.none()
 FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
                 'or say “forget me” any time.')
-MAX_PROVENANCE = 40
+MAX_PROVENANCE = 200
+UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
+                'no quoted findings are retained here.')
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
 
 
 def turn_provenance(context, speaker, actions=None):
-    """Other members whose messages shaped this turn, with the privacy revision observed."""
+    """Other members whose messages shaped this turn, with the privacy revision observed.
+
+    Every context source carrying another member's words contributes: the live channel view
+    (including Fri's own replies), saved history, a pending clarification, the channel summary,
+    reply targets (Fri's resolved to their sources), nearby invited context and read evidence.
+    """
     seen = {}
+    inherited = [item for turn in context.get('turns', []) for item in turn.get('provenance', [])]
+    inherited += (context.get('pending') or {}).get('provenance', [])
+    inherited += context.get('summary_provenance', []) + context.get('reference_provenance', [])
+    for item in inherited:
+        seen.setdefault(str(item['user_id']), item['revision'])
     for row in context.get('recent', []):
         if row.get('gene_error'):
             continue
@@ -232,6 +244,7 @@ class Fri(discord.Client):
                     except ValueError as exc:
                         raise commands.UserFeedbackCheckFailure(str(exc)) from None
                     context.update(conversation)
+                    await self.resolve_references(scope, context)
                 context['source'] = source.evidence()
                 from .fri_addressing import explicit_mention
                 context['force_text_reply'] = bool(source.kind == 'discord_message' and
@@ -245,7 +258,9 @@ class Fri(discord.Client):
                 if image_source is None and quick_closure(
                         text, {**context, 'recent': self.agent.messages(channel_id) if self.agent else []}):
                     result = ChatResult(status='completed', response_kind='react', reaction='👍')
-                    return self.stage_turn(scope, source, text, context, result, model='local-closing', derived=False)
+                    result = self.stage_turn(scope, source, text, context, result, model='local-closing', derived=False)
+                    await self.api('POST', '/chat/turn/check', result.turn)  # Fence even a reaction.
+                    return result
                 if user_id == self.owner_id and guild_id == self.guild_id and usage_requested(text):
                     usage = await self.api('POST', '/agent/usage',
                                            {'guild_id': str(guild_id), 'user_id': str(user_id)})
@@ -262,6 +277,7 @@ class Fri(discord.Client):
                                         if operation.tool_receipt else operation.result)
                         operation.result.turn = self.stage_turn(scope, source, text, context, saved_result,
                                                                 model='local-control', derived=False).turn
+                        operation.result.turn['verbatim'] = saved_result is operation.result
                         try:
                             await self.api('POST', '/chat/turn/check', operation.result.turn)
                         except commands.UserFeedbackCheckFailure:
@@ -388,11 +404,16 @@ class Fri(discord.Client):
                         'burst': context.get('message_burst', []),
                         'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
                                                                          result.post_preview or result.clarification),
-                        'provenance': turn_provenance(context, user_id, actions)}
+                        # A fixed harness question over referenced evidence derives nothing from it.
+                        'provenance': [] if result.clarification and actions.private_evidence
+                                      else turn_provenance(context, user_id, actions),
+                        'verbatim': stored == result.reply}
                     if len(result.turn['provenance']) > MAX_PROVENANCE:
-                        result.turn.update(reply='Earlier answer drew on too many members to retain. Fetch current evidence.',
-                                           provenance=[])
-                    if not private_read:
+                        return ChatResult(reply=unrecorded(receipts, reason='too many people were in that context to '
+                                                           'track safely.'), status='completed')
+                    if context.get('unattributed_reference'):
+                        result.turn.update(reply=UNATTRIBUTED, verbatim=False)
+                    elif not private_read:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored)
                     try:  # The save's privacy fence, applied before anything is shown.
                         await self.api('POST', '/chat/turn/check', result.turn)
@@ -420,19 +441,37 @@ class Fri(discord.Client):
         if context.get('reply_target') or context.get('invited_context'):
             result.draft, result.notes = None, []
         provenance = turn_provenance(context, scope['user_id'], actions) if derived else []
-        reply = result.reply
-        if len(provenance) > MAX_PROVENANCE:
-            reply, provenance, result.notes = ('Earlier answer drew on too many members to retain. '
-                                               'Fetch current evidence.'), [], []
+        if len(provenance) > MAX_PROVENANCE:  # Never drop dependencies; refuse instead.
+            raise commands.UserFeedbackCheckFailure('too many people were in that context for me to keep track '
+                                                    'of safely. ask again in a bit.')
+        reply, unattributed = result.reply, derived and context.get('unattributed_reference')
+        if unattributed:  # A referenced Fri message whose sources are unknown is never retained.
+            reply, result.notes = UNATTRIBUTED, []
         result.turn = {**scope, 'revision': context['revision'], 'source': source.model_dump(), 'input': text,
             'reply': reply, 'response_kind': result.response_kind, 'reaction': result.reaction,
             'allow_closing': result.allow_closing, 'burst': context.get('message_burst', []),
             'model': model or context['model'], 'effort': '' if model else context['effort'],
             'notes': result.notes, 'input_tokens': 0 if model else result.counters.get('input_tokens'),
-            'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance}
-        if derived and result.response_kind == 'reply':
+            'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
+            'verbatim': result.response_kind == 'reply' and reply == result.reply}
+        if derived and result.response_kind == 'reply' and not unattributed:
             result.echo = self.echo(scope, context, provenance, reply)
         return result
+
+    async def resolve_references(self, scope, context):
+        """Replace Fri-authored reply targets with the members those replies drew on."""
+        own = [row['source']['id'] for row in context.get('reply_target', [])
+               if row['source'].get('user_id') == str(getattr(self.user, 'id', ''))]
+        if not own:
+            return
+        try:
+            found = (await self.api('POST', '/chat/messages/sources',
+                                    {'guild_id': scope['guild_id'], 'message_ids': own}))['messages']
+        except commands.UserFeedbackCheckFailure:
+            found = {}
+        if any(mid not in found or not found[mid]['verbatim'] for mid in own):
+            context['unattributed_reference'] = True  # Fail closed: answer live, retain nothing derived.
+        context['reference_provenance'] = [item for mid in own for item in found.get(mid, {}).get('provenance', [])]
 
     @staticmethod
     def echo(scope, context, provenance, reply):
@@ -447,6 +486,8 @@ class Fri(discord.Client):
         payload, result.turn = result.turn, None
         if not payload:
             return None
+        if isinstance(getattr(sent, 'id', None), int) and payload.get('response_kind', 'reply') == 'reply':
+            payload = {**payload, 'reply_message_id': str(sent.id)}  # Later references resolve to its sources.
         try:
             saved = await self.api('POST', '/chat/turn', payload)
         except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError):
@@ -545,7 +586,8 @@ class Fri(discord.Client):
                 await reply(self, interaction, view.content, attachments=[], view=view, verbatim=True)
             else:
                 await reply(self, interaction, embed=card('Fri', result.reply), view=view)
-            saved = await self.record_turn(result)
+            # A newer panel interaction can supersede this one; record only what was displayed.
+            saved = await self.record_turn(result) if sessions(self).displayed(interaction) else None
             if saved and saved.get('first_memory') and not result.settings_preview:
                 await reply(self, interaction, embed=card('Fri', result.reply+FIRST_MEMORY), view=view)
         except commands.UserFeedbackCheckFailure as exc:

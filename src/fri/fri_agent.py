@@ -220,7 +220,8 @@ class Agent:
             parent = self.fri.get_channel(channel)
             scope = getattr(parent, 'parent_id', None) or channel
             profile = await self.profile(scope, user)
-            data.update(recent=await self.context_messages(channel), summary=profile['summary'])
+            data.update(recent=await self.context_messages(channel), summary=profile['summary'],
+                        summary_provenance=profile.get('summary_provenance', []))
             data['historical_topics'] = profile.get('historical_topics', [])
         return data
 

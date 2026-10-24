@@ -52,9 +52,18 @@ advertises it, so the controller must be released first.
   accepts the reply (or Fri records a reaction or quiet decision) is the turn saved. A failed send
   leaves no record claiming Fri said it. A refused check stops the reply. A failed save is
   logged; it never retracts a delivered message.
-- **Provenance.** Each saved turn lists the other members whose messages shaped it: recent
-  channel rows, reply targets, configured-channel nearby context and read evidence, each with the
-  privacy revision Fri observed. The controller rejects stale provenance, deletes dependent turns
+- **Provenance.** Each saved turn lists the other members whose messages shaped it, each with the
+  privacy revision Fri observed. Every context source counts:
+  - recent channel rows, including Fri's own replies with their sources;
+  - saved history turns;
+  - a pending clarification;
+  - the channel summary's authors;
+  - reply targets. A referenced Fri message is resolved through `/chat/messages/sources` to its
+    original sources and speaker. If that's unknown, or the message kept only a breadcrumb, the new
+    reply is still delivered but stored as a neutral breadcrumb.
+  - configured-channel nearby context and read evidence.
+
+  More than 200 sources refuses the reply rather than dropping any. The controller rejects stale provenance, deletes dependent turns
   when any listed member turns memory off, is erased or clears chats, and drops turns whose
   sources' revisions moved. Over-inclusion is deliberate: anyone in the context can erase the
   derived copy.

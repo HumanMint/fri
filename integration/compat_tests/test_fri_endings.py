@@ -172,6 +172,8 @@ def test_obvious_closing_avoids_model_and_records_typed_decision(monkeypatch):
                 return {'allowed': True}
             if path == '/chat/context':
                 return ctx
+            if path == '/chat/turn/check':
+                return {'ok': True}  # The closing reaction is fenced before delivery too.
             assert path == '/chat/turn'
             assert body['response_kind'] == 'react' and body['reply'] == ''
             assert body['model'] == 'local-closing' and body['output_tokens'] == 0

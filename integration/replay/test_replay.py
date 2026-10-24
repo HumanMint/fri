@@ -325,3 +325,21 @@ def test_tool_cancelled_by_the_runner_timeout_is_traced(tmp_path):
     ask = report['steps'][1]
     assert ask['route']['tool_outcomes'] == [{'kind': 'web_search', 'outcome': 'CancelledError'}]
     assert ask['route']['outcome'] == 'reply' and ask['deliveries'][0]['text']  # Honest timeout fallback.
+
+
+def test_closing_reaction_is_fenced_before_delivery(tmp_path):
+    """Continuity review finding: a privacy change before the local closing stops the reaction."""
+    from fri.fri_images import select_source
+
+    replay = Replay(CLOSING, tmp_path)
+
+    async def changed(event):
+        if event.content == 'gotcha':
+            replay.store.personal_control('20', 'disable')
+        return await select_source(event)
+
+    with patch('fri.fri_images.select_source', changed):
+        replay.run()
+    close = replay.step('close')
+    assert not [d for d in close.deliveries if d.kind == 'reaction']
+    assert [(c.path, c.status) for c in close.controller if c.path.startswith('/chat/turn')] == [('/chat/turn/check', 409)]
