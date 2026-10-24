@@ -362,6 +362,10 @@ class ChatResult:
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
 
 
+OUTPUT_EVENTS = ('response.output_', 'response.content_part.', 'response.reasoning', 'response.refusal.',
+                 'response.function_call')
+
+
 def cache_key(source):
     """Keep one channel's calls on the same prompt cache. Only a hash of the channel id leaves Fri."""
     channel = (source or {}).get('channel_id')
@@ -482,8 +486,10 @@ class Chat:
                         return result
                     async for event in events(response.aiter_lines()):
                         kind = event.get('type')
-                        produced = produced or kind not in (
-                            'response.created', 'response.in_progress', 'response.queued', 'error', 'response.failed')
+                        # Only real output counts: output and reasoning events, or a terminal response carrying
+                        # output. Status, error and unknown events don't, so they still drop the hint below.
+                        produced = produced or str(kind or '').startswith(OUTPUT_EVENTS) or bool(
+                            (event.get('response') or {}).get('output'))
                         key = (event.get('output_index', 0), event.get('content_index', 0))
                         if kind == 'response.output_text.delta':
                             text_parts[key] = text_parts.get(key, '') + event.get('delta', '')

@@ -87,6 +87,9 @@ def cache_calls(response):
     lambda: sse({'type': 'response.created'}, {'type': 'response.failed', 'response': {
         'error': {'code': 'invalid_request_error', 'message': 'Invalid request.'}}}),
     lambda: sse({'type': 'response.created'}),
+    lambda: sse({'type': 'response.incomplete', 'response': {}}),
+    lambda: sse({'code': 'unsupported_parameter', 'message': 'Unsupported parameter.'}, {'type': 'response.failed'}),
+    lambda: sse({'type': 'response.completed', 'response': {'output': []}}),
 ])
 def test_a_failure_before_any_output_drops_the_hint_without_replay(rejection):
     (first, second), sent = cache_calls(rejection)
