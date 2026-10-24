@@ -51,7 +51,8 @@ notice is deleted once that reply lands), `social cooldown` (after the cooldown'
 notice), `image share withdrawn`, `reply withheld: <recheck>` when a recheck failed after
 composing, and an exception type such as `Forbidden`. A burst's earlier messages are
 logged under the reason its last message got. A reply, a notice, a preview or a reaction
-counts as an answer. Bots, webhooks and DMs aren't logged.
+counts as an answer. Bots, webhooks and DMs aren't logged, and a redelivered event is
+logged only under its first delivery.
 
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.

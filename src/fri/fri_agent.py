@@ -34,7 +34,7 @@ from .subscription import private_json
 LOG = logging.getLogger('fri.agent')
 NO_MENTIONS = discord.AllowedMentions.none()
 GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
-DEFERRED = object()  # A later message in the burst answers, or explains, for this one.
+DEFERRED = object()  # The burst holding this message answers, or explains, for it.
 
 
 class BehaviorPreview(PagedPreview):
@@ -85,6 +85,7 @@ class Agent:
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
         self.pending = {}
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
+        self.watched = {}  # Recent pings already watched, oldest first, so a redelivery isn't again.
         self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
         self.seen = {}
         self.last_attention = {}
@@ -320,20 +321,25 @@ class Agent:
 
     async def handle(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
-        # A redelivered event is left to the delivery already watching it.
+        # A redelivered event is left to the delivery that watched it first.
         if (message.guild is None or message.author.bot or getattr(message, 'webhook_id', None) or
-                message.id in self.misses or message.id in self.replying or not pinged(message, self.fri.user.id)):
+                message.id in self.watched or message.id in self.misses or message.id in self.replying or
+                not pinged(message, self.fri.user.id)):
             await self.receive(message)
             return
-        self.misses[message.id] = None
-        deferred = False
+        self.watched[message.id] = self.misses[message.id] = None
+        if len(self.watched) > 1000:
+            del self.watched[next(iter(self.watched))]
+        owned = False  # By a burst: its last message answers, or its drop explains, for this one.
         try:
-            deferred = await self.receive(message) is DEFERRED
+            owned = await self.receive(message) is DEFERRED
         except BaseException as exc:
-            self.miss(message, type(exc).__name__)
+            owned = self.bursts.group(message) is not None
+            if not owned:
+                self.miss(message, type(exc).__name__)
             raise
         finally:
-            if not deferred:
+            if not owned:
                 self.settle(message)
 
     async def receive(self, message):
@@ -435,7 +441,14 @@ class Agent:
             await message.reply(notice_text(str(exc)), allowed_mentions=NO_MENTIONS, mention_author=False)
             return self.answered([message])
         self.pending[key] = message.id
-        await asyncio.sleep(1.5)
+        try:
+            await asyncio.sleep(1.5)
+        except BaseException as exc:
+            if self.bursts.latest(message):  # No later message will answer this burst now.
+                if self.pending.get(key) == message.id:
+                    self.pending.pop(key, None)
+                self.bursts.drop(message, type(exc).__name__)
+            raise
         if not self.bursts.latest(message):
             # A later message answers for this one, or the burst was dropped and said why.
             return DEFERRED
@@ -516,16 +529,18 @@ class Agent:
             # Neither outcome renews active attention or the ambient reply timer.
             await self.fri.waiting_notices.clear(message.author.id)
             return
+        async def delivered():  # A preview is answered once posted, even if binding it fails next.
+            self.answered(events)
+            await self.fri.record_turn(result)
+
         if result.post_preview:
             from .fri_workspace import show_preview
-            await show_preview(self.fri, message, result.post_preview, delivered=lambda: self.fri.record_turn(result))
-            self.answered(events)
+            await show_preview(self.fri, message, result.post_preview, delivered=delivered)
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if result.social_preview:
             from .fri_social import show_preview
-            await show_preview(self.fri, message, result.social_preview, delivered=lambda: self.fri.record_turn(result))
-            self.answered(events)
+            await show_preview(self.fri, message, result.social_preview, delivered=delivered)
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if not result.reply:  # A cooldown's notice shows once; later messages in it stay quiet.

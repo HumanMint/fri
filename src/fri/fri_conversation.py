@@ -126,6 +126,11 @@ class Bursts:
             del self.rows[key]
         return rows
 
+    def drop(self, message, reason):
+        """Nothing will answer this message's burst now, so report all of it."""
+        rows = self.take(message)
+        self.dropped([row[1] for row in rows], reason)
+
     def forget(self, user):
         for key in [key for key in self.rows if key[1] == user]:
             self.dropped([row[1] for rows in self.rows.pop(key) for row in rows], 'author privacy changed')

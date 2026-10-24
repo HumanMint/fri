@@ -278,11 +278,15 @@ def test_history_derived_draft_is_refused_after_its_source_erases(monkeypatch, t
     asyncio.run(scenario())
 
 
-def test_delivered_preview_is_recorded_even_if_binding_fails(monkeypatch, tmp_path):
+@pytest.mark.parametrize('ping', [False, True])
+def test_delivered_preview_is_recorded_even_if_binding_fails(monkeypatch, tmp_path, caplog, ping):
     import datetime as dt
+    caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
         event = message('fri plan minecraft tomorrow at 7 or 8 UTC')
+        if ping:  # A reply ping: the posted card answers it, so it isn't logged as unanswered.
+            event.mentions = [fri.user]
         event.reply.return_value = SimpleNamespace(id=event.id+1)
         day = dt.datetime.now(dt.timezone.utc)+dt.timedelta(days=2)
         times = '\n'.join(day.replace(hour=h, minute=0).strftime('%Y-%m-%dT%H:%M') for h in (19, 20))
@@ -301,6 +305,7 @@ def test_delivered_preview_is_recorded_even_if_binding_fails(monkeypatch, tmp_pa
                 await agent.handle(event)
             event.reply.assert_awaited_once()
             assert store.chat_context('123', 'public:1', '20')['turns']  # The delivered card is recorded.
+            assert not [line for line in caplog.messages if line.startswith('Mention ')] and not agent.misses
         finally:
             await fri.close()
     asyncio.run(scenario())

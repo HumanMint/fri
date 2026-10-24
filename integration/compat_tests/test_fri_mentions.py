@@ -379,6 +379,48 @@ def test_a_burst_that_fails_names_its_earlier_mention(monkeypatch, tmp_path, cap
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('cancelled', ['last', 'earlier'])
+def test_a_cancelled_burst_wait_settles_every_ping_once(monkeypatch, tmp_path, caplog, cancelled):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('<@99> hey', age=1), message('<@99> you around?')
+        try:
+            tasks = []
+            for event in (first, second):
+                tasks.append(asyncio.create_task(agent.handle(event)))
+                while not agent.bursts.group(event):
+                    await asyncio.sleep(0.01)
+            tasks[1 if cancelled == 'last' else 0].cancel()  # E.g. a shutdown, during the burst wait.
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if cancelled == 'last':  # Nothing will answer the burst now.
+                fri.chat_once.assert_not_awaited()
+                assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: CancelledError'
+                                                 for event in (first, second)]
+            else:  # The last message still answers for the whole burst.
+                second.reply.assert_awaited_once()
+                assert mention_lines(caplog) == []
+            assert agent.misses == {}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        agent.config['enabled'] = False
+        event = message('<@99> you there?')
+        try:
+            await agent.handle(event)
+            await agent.handle(event)  # Discord can deliver an event again, e.g. after a resume.
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: fri disabled']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_an_answered_mention_logs_nothing(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
