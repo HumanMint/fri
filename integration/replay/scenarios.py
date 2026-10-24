@@ -85,7 +85,8 @@ WEB_CLARIFICATION = Scenario(
      'web': [web('The Lakers are 30-12 this season, third in the West.', 'https://www.nba.com/standings')]},
     [Check('ask gets a reply', lambda r: answered(r, 'ask')),
      Check('clarification is held for the follow-up',
-           lambda r: route(r, 'ask')['clarification'] and r.inspections['pending'], scripted_only=True),
+           lambda r: route(r, 'ask')['tools'] == ['clarify'] and route(r, 'ask')['clarification']
+           and r.inspections['pending'], scripted_only=True),
      Check('unaddressed answer continues without new social admission',
            lambda r: route(r, 'answer')['admission'] == ['/chat/operations/admit'], scripted_only=True),
      Check('continuation offers only web_search',

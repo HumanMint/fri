@@ -188,7 +188,9 @@ Each step records:
   member text;
 - token usage.
 
-Production code is not instrumented. All scenario members and messages are invented.
+Production source is unchanged. Routes come from observable effects plus a pass-through spy on
+`Actions.execute`, so tools that return early (for example a clarification) are traced too. All
+scenario members and messages are invented.
 
 Answer checks require completed inference, taken from Fri's own usage receipts. A provider
 error notice is never counted as an answer. A turn counts as stored only if it's read back from
@@ -200,6 +202,7 @@ it has:
 - a rejected save;
 - a failed inference;
 - unused scripted responses;
+- a scenario skipped because the call budget ran out;
 - a failed ordinary check.
 
 pytest and the CLI share this single rule (`failures()`). Checks run before real time is restored.

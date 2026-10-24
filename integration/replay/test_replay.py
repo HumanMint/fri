@@ -276,3 +276,20 @@ def test_erroring_known_gap_check_fails_the_run(tmp_path):
     checks = [replace(c, test=broken) if c.known_gap else c for c in ERASURE.checks]
     report = run(replace(ERASURE, checks=checks), tmp_path)
     assert any(c['detail'] for c in report['checks']) and failures([report])
+
+
+def test_budget_skips_and_nonpositive_budgets_never_report_success(tmp_path):
+    """Round-5 nit: skipped scenarios fail the CLI result; non-positive budgets are rejected."""
+    from replay.__main__ import main
+    assert main(['--max-calls', '1', '--report', str(tmp_path/'one.json')]) == 1
+    skipped = json.loads((tmp_path/'one.json').read_text())['reports']
+    assert any('skipped' in r for r in skipped) and failures(skipped)
+    with pytest.raises(SystemExit):
+        main(['--max-calls', '0'])
+
+
+def test_early_return_tools_are_traced(tmp_path):
+    """Round-5 nit: a clarification returns without another model call but is still a tool run."""
+    ask = run(WEB_CLARIFICATION, tmp_path)['steps'][1]['route']
+    assert ask['tools'] == ['clarify'] and ask['tool_outcomes'] == [{'kind': 'clarify', 'outcome': 'returned'}]
+    assert ask['receipts'] == []

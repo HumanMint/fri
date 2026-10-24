@@ -1,6 +1,7 @@
 """Synthetic full-handler replay: real Fri pipeline and Gene controller, fake Discord and model.
 
 Nothing here touches production code, live Discord or live state. Scripted mode is offline.
+Routes come from observable effects plus a pass-through spy on Actions.execute; source is unchanged.
 Heartbeat work (attention, learning, memes, outbox delivery) is not driven yet; steps are messages.
 """
 
@@ -32,6 +33,7 @@ from gene.config import Settings
 from gene.fri_agent_store import AgentStore
 from gene.fri_mentions import BREADCRUMB_REPLY
 
+from fri.fri_actions import Actions
 from fri.fri_chat import Chat
 from fri.fri_protocol import compatible
 
@@ -146,6 +148,7 @@ class Step:
     controller: list = field(default_factory=list)
     model: list = field(default_factory=list)
     deliveries: list = field(default_factory=list)
+    actions: list = field(default_factory=list)  # Executed tools, including early-return ones.
 
     def conversation(self):
         return [m for m in self.model if m['kind'] == 'conversation']
@@ -202,7 +205,8 @@ class Step:
         return {'kind': kind, 'outcome': outcome, 'admission': sorted({p for p in paths if p in ADMISSION}),
                 'model_calls': len(self.model), 'conversation_calls': len(conversation),
                 'inference': [c.inference for c in self.controller if c.inference],
-                'tools': receipts, 'stored': stored, 'save_rejected': sum(c.rejected for c in self.controller),
+                'tools': [item['kind'] for item in self.actions], 'tool_outcomes': self.actions,
+                'receipts': receipts, 'stored': stored, 'save_rejected': sum(c.rejected for c in self.controller),
                 'clarification': any(item.get('clarification') for item in saved),
                 'reaction': next((d.text for d in sent if d.kind == 'reaction'), None)}
 
@@ -590,11 +594,27 @@ class Replay:
             stack.enter_context(patch.object(time, 'time', clock))
             stack.enter_context(patch.object(asyncio, 'sleep', sleep))
             stack.enter_context(patch.object(fri.subscription, 'time', subscription_time))
+            stack.enter_context(patch.object(Actions, 'execute', self._spy(Actions.execute)))
             for item in clock_patches(clock):
                 stack.enter_context(item)
             asyncio.run(self._run(clock))
             self.results = self.evaluate()  # Store reads purge by TTL, so judge on the virtual clock.
         return self
+
+    def _spy(self, execute):
+        steps = self.steps
+
+        async def spy(actions, action):
+            kind = action.get('kind') if isinstance(action, dict) else None
+            try:
+                receipt = await execute(actions, action)
+            except Exception as exc:
+                steps[-1].actions.append({'kind': kind, 'outcome': type(exc).__name__})
+                raise
+            outcome = next((key for key in ('blocked', 'uncertain') if key in receipt), 'returned')
+            steps[-1].actions.append({'kind': kind, 'outcome': outcome})
+            return receipt
+        return spy
 
     async def _run(self, clock):
         from fri.fri import Fri
@@ -673,7 +693,8 @@ class Replay:
 
 def failures(reports):
     """The single validity rule shared by pytest and the CLI; any entry makes a run unsuccessful."""
-    return [item for report in reports if 'checks' in report for item in
+    skipped = [f"{report['scenario']} skipped: {report['skipped']}" for report in reports if 'skipped' in report]
+    return skipped + [item for report in reports if 'checks' in report for item in
             [c['name'] for c in report['checks'] if c['detail'] or (not c['passed'] and not c['known_gap'])] +
             [f'controller error for {path}' for path in report['controller_errors']] +
             [f'controller {status} for {path} in {label}' for label, path, status in report['unexpected_rejections']] +

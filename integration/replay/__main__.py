@@ -26,10 +26,12 @@ def main(argv=None):
     parser.add_argument('--model')
     parser.add_argument('--effort', default='high')
     args = parser.parse_args(argv)
+    if args.max_calls is not None and args.max_calls < 1:
+        parser.error('--max-calls must be positive')
     selected = [s for s in SCENARIOS if not args.scenario or s.name in args.scenario]
     options = {}
     if args.live_model:
-        if not args.auth or not args.max_calls or args.max_calls < 1:
+        if not args.auth or not args.max_calls:
             parser.error('--live-model requires --auth and a positive --max-calls budget')
         import httpx
 
