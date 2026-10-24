@@ -889,7 +889,8 @@ def test_messages_queued_behind_a_delivery_still_get_answered(monkeypatch, tmp_p
     asyncio.run(scenario())
 
 
-def test_a_message_waiting_behind_a_delivery_is_dropped_if_its_author_erases(monkeypatch, tmp_path):
+@pytest.mark.parametrize('erase', ['spoken', 'clear_chats', 'erase_user', 'disable'])
+def test_a_message_waiting_behind_a_delivery_is_dropped_if_its_author_erases(monkeypatch, tmp_path, erase):
     async def scenario():
         fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         initial, queued, privacy = message('fri hello'), message('fri play old marker'), message('fri forget me')
@@ -915,7 +916,12 @@ def test_a_message_waiting_behind_a_delivery_is_dropped_if_its_author_erases(mon
             await asyncio.wait_for(sending.wait(), 5)
             tasks.append(asyncio.create_task(agent.handle(queued)))  # Waits behind the delivery.
             await real_sleep(0.05)
-            await agent.handle(privacy)
+            if erase == 'spoken':
+                await agent.handle(privacy)
+            elif erase == 'disable':
+                store.personal_control('20', 'disable')
+            else:  # The panel's "Forget my chats", or Gene/Red erasure through /privacy/erase.
+                getattr(store, erase)('20')
             release.set()
             await asyncio.wait_for(asyncio.gather(*tasks), 5)
             assert store.chat_context('123', 'public:1', '20')['pending'] is None

@@ -366,12 +366,15 @@ class Agent:
         if recording and not privacy:
             # Fri's reply was delivered but isn't saved yet, so a question it asked isn't pending
             # yet either. This message may be the answer: decide only after the save.
+            revision = (await self.profile(parent, message.author.id))['revision']
             try:
                 await asyncio.wait_for(recording.wait(), 30)
             except TimeoutError:
                 pass
-            if self.forgotten.get(message.author.id, 0) != forgotten:
-                return  # They asked to be forgotten meanwhile: drop it, as forget() drops a burst.
+            # Erased meanwhile, here or through the panel, Gene or Red: drop it, as forget() drops a burst.
+            if (self.forgotten.get(message.author.id, 0) != forgotten or
+                    (await self.profile(parent, message.author.id))['revision'] != revision):
+                return
         active = (self.active.get((channel, message.author.id), 0) > time.time() or
                   self.bursts.has(channel, message.author.id))
         if not active and directed is None and not dm and not message.author.bot:
