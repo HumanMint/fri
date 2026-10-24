@@ -72,6 +72,12 @@ class PrivatePanels:
                         pass
             return message
 
+    def displayed(self, interaction):
+        """Whether this interaction's content is the panel currently shown."""
+        key = self.key(interaction)
+        entry = self.entries.get(key)
+        return entry is not None and entry.interaction is interaction and self.latest.get(key) == interaction.id
+
     async def close(self, key, view):
         async with self.locks.setdefault(key, asyncio.Lock()):
             entry = self.entries.get(key)

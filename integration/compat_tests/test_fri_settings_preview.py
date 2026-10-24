@@ -37,6 +37,7 @@ def test_voice_clarification_prepares_settings_without_a_feature_job(monkeypatch
             action={'kind': 'preview_voice', 'voice_notes': 'Sharper dry humor. Keep replies brief.'}))
         result = await fri.talk(123, 999, 10, 'sharper to start', 'private',
                                event=event(channel=999, guild=None, content='sharper to start'))
+        await fri.record_turn(result)  # As after the preview is shown.
         assert result.settings_preview == {'changes': {'voice_notes': 'Sharper dry humor. Keep replies brief.'}, 'version': 0}
         assert result.draft is None and result.notes == []
         assert not any(path.startswith('/requests') or path == '/agent/settings' for path, _ in calls)

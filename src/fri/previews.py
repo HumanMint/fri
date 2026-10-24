@@ -55,12 +55,16 @@ class PagedPreview(discord.ui.View):
             progress += 'Read every page to enable approval. '
         return f'**{self.title}**\n\n{self.pages[self.page]}\n\n{progress}{self.note}'
 
+    async def recheck(self):
+        """Subclasses refuse to render another page here, e.g. once its sources changed."""
+
     async def move(self, interaction, offset):
         if not await self.interaction_check(interaction):
             return
         async with self.lock:
             if self.finished:
                 return
+            await self.recheck()
             old_page, old_seen = self.page, self.seen.copy()
             self.page = max(0, min(len(self.pages)-1, self.page+offset))
             self.seen.add(self.page)

@@ -24,8 +24,11 @@ def request_dm_component(interaction, bot_id):
 
 
 class DraftView(PagedPreview):
-    def __init__(self, cog, user_id, draft, *, public=False, reviewed=False, source_id=None):
+    def __init__(self, cog, user_id, draft, *, public=False, reviewed=False, source_id=None, fence=None):
         self.cog, self.user_id, self.draft = cog, user_id, draft
+        # The staged turn's privacy fence: a draft built from other members' words is never
+        # shown again or submitted once any of them erases or changes privacy.
+        self.fence = dict(fence) if fence else None
         self.source_id = source_id or uuid.uuid4().hex
         self.owner = user_id == cog.owner_id
         self.reviewed = reviewed
@@ -59,7 +62,9 @@ class DraftView(PagedPreview):
     async def preview(self, interaction):
         if not await self.interaction_check(interaction):
             return
-        view = DraftView(self.cog, self.user_id, self.draft, reviewed=True, source_id=self.source_id)
+        await self.fenced()
+        view = DraftView(self.cog, self.user_id, self.draft, reviewed=True, source_id=self.source_id,
+                         fence=self.fence)
         view.preview_interaction = interaction
         if interaction.guild_id is None or getattr(getattr(interaction.message, 'flags', None), 'ephemeral', False):
             await interaction.response.edit_message(content=view.content, embed=None, attachments=[], view=view,
@@ -75,10 +80,14 @@ class DraftView(PagedPreview):
         async with self.lock:
             if self.finished or self.confirm_button.disabled:
                 return
+            await self.fenced()
             channel = (getattr(interaction.channel, 'parent_id', None) or interaction.channel_id) if interaction.guild_id else self.cog.workshop_id
             identity = {'guild_id': str(self.cog.guild_id), 'user_id': str(self.user_id)}
+            # The controller rechecks the requester's revision and the draft's sources as it creates
+            # the job, and withdraws the job if any source later erases.
             job = await self.cog.api('POST', '/requests', {**identity,
-                'channel_id': str(channel), 'source_id': 'fri-draft:'+self.source_id, 'source_url': '', 'body': self.draft})
+                'channel_id': str(channel), 'source_id': 'fri-draft:'+self.source_id, 'source_url': '', 'body': self.draft,
+                **({'provenance': self.fence['provenance'], 'revision': self.fence['revision']} if self.fence else {})})
             # Never approve content differing from the full preview, even if a duplicate ID is returned.
             from .privacy import clean
             if job['body'] != clean(self.draft) or job['user_id'] != str(self.user_id):
@@ -95,6 +104,14 @@ class DraftView(PagedPreview):
                                                        allowed_mentions=NO_MENTIONS)
             self.finished = True
             self.stop()
+
+    async def fenced(self):
+        if self.fence:
+            await self.cog.api('POST', '/chat/turn/check', self.fence)
+
+    async def recheck(self):
+        # Paging reveals more of the draft, so it needs the same fence as preview and submit.
+        await self.fenced()
 
     async def on_timeout(self):
         from .fri_panel import sessions

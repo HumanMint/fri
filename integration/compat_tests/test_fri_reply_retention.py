@@ -70,6 +70,7 @@ def test_target_derived_clarifier_is_replaced_before_retention_and_own_music_req
             first = fri.chat.respond.await_args_list[0].args[1]
             assert first['reply_target'][0]['text'] == TARGET_TEXT
             assert not {'work_save', 'prepare_post', 'preview_voice'} & set(first['actions'])
+            await fri.record_turn(result)  # Delivered, then saved with the referenced member's provenance.
             controls.store.personal_control('30', 'disable')
             retained = controls.store.chat_context('123', 'public:1', '20')
             assert retained['pending']['request_text'] == message.content
@@ -101,10 +102,15 @@ def test_reply_turn_drops_notes_and_request_draft_before_any_saved_copy(monkeypa
             result = await fri.talk(123, 1, 20, message.content, 'public', event=message)
             assert result.draft is None and result.notes == []
             assert 'Paddington' in result.reply  # The live answer can discuss the current visible message.
+            await fri.record_turn(result)  # Kept with provenance until the referenced member erases.
             controls.store.personal_control('30', 'disable')
             retained = controls.store.chat_context('123', 'public:1', '20')
             assert retained['personal_memory']['notes'] == []
-            assert 'Paddington' not in str(retained) and 'Paddington' not in str(requests)
+            assert 'Paddington' not in str(retained)
+            # Only the turn itself carries the derived text, tagged so the erasure above removed it.
+            turns = [body for path, body in requests if path in ('/chat/turn/check', '/chat/turn')]
+            assert turns and all(body['provenance'] == [{'user_id': '30', 'revision': 0}] for body in turns)
+            assert 'Paddington' not in str([r for r in requests if r[0] not in ('/chat/turn/check', '/chat/turn')])
             with controls.store.connection() as db:
                 assert db.execute('SELECT count(*) FROM fri_work').fetchone()[0] == 0
                 assert db.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0

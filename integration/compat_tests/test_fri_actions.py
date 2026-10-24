@@ -226,6 +226,7 @@ def test_two_stage_reply_counts_both_calls_and_keeps_only_safe_breadcrumb(monkey
                        notes=[{'category': 'music', 'evidence': 'I love trance'}], counters={'input_tokens': 20})])
         if outcome != 'erased':
             result = await fri.talk(123, 999, 10, 'look around', 'private', event=event(channel=999, content='look around'))
+            await fri.record_turn(result)  # As after a successful Discord delivery.
             if outcome == 'completed':
                 assert result.reply.startswith('mostly music') and result.notes == []
             else:

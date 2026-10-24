@@ -79,7 +79,7 @@ def test_saved_work_remains_persisted_after_reply_or_recording_failure_and_resta
         calls = []
         async def api(method, path, body=None):
             calls.append(path)
-            if path == '/chat/turn' and failure_stage == 'recording':
+            if path in ('/chat/turn', '/chat/turn/check') and failure_stage == 'recording':
                 raise commands.UserFeedbackCheckFailure('Controller temporarily unavailable')
             if path == '/chat/context' and failure_stage == 'verification' and '/workspace/save' in calls:
                 raise commands.UserFeedbackCheckFailure('Controller temporarily unavailable')
@@ -105,6 +105,7 @@ def test_saved_work_remains_persisted_after_reply_or_recording_failure_and_resta
                 assert 'try again' not in result.reply.casefold()
             else:
                 assert result.reply == 'saved your work at version 1 (open).'
+                await fri.record_turn(result)  # The delivered reply is saved afterwards.
             restarted = Store(controls.store.path)
             from gene.fri_workspace_store import Workspace
             scope = {'guild_id': '123', 'user_id': '20', 'conversation_id': 'public:1'}
@@ -115,8 +116,8 @@ def test_saved_work_remains_persisted_after_reply_or_recording_failure_and_resta
             context = restarted.chat_context('123', 'public:1', '20')
             if failure_stage != 'none':
                 assert not context['turns']
-            else:
-                assert 'work_save' in context['turns'][-1]['reply']
+            else:  # The member's own saved-work answer is retained verbatim, not as a breadcrumb.
+                assert context['turns'][-1]['reply'] == 'saved your work at version 1 (open).'
                 assert 'milk and bread' not in context['turns'][-1]['reply']
         finally:
             await fri.close()
@@ -147,7 +148,7 @@ def test_rejected_chat_record_does_not_publish_retrieved_private_read_results(mo
                 return {**CONTEXT, 'revision': 0}
             if path == '/agent/admit':
                 return {'allowed': True}
-            if path == '/chat/turn':
+            if path in ('/chat/turn', '/chat/turn/check'):
                 raise ControllerRejected('Privacy changed: '+private_detail)
             return {'ok': True}
         fri.api = api
@@ -179,7 +180,7 @@ def test_reminder_cancel_retains_confirmed_outcome_across_combined_turn_failures
 
         async def api(method, path, body=None):
             calls.append(path)
-            if failure == 'recording' and path == '/chat/turn':
+            if failure == 'recording' and path in ('/chat/turn', '/chat/turn/check'):
                 raise ControllerRejected('Privacy changed')
             if failure == 'access' and path == '/chat/context' and cancel_path in calls:
                 raise commands.UserFeedbackCheckFailure('Controller unavailable')

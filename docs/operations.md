@@ -41,6 +41,73 @@ Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.
 They do not prove Discord delivery or live model interpretation of a particular meme.
 
+## Conversation continuity and provenance
+
+Requires the controller's `turn-provenance` capability. Fri starts only against a controller that
+advertises it, so the controller must be released first.
+
+- **One reply per message.** A message's direct reply holds it until Discord accepts the reply and
+  the turn is recorded. A redelivered event, or ambient attention picking the same message, is
+  ignored meanwhile. From the moment Fri starts sending until the turn is recorded, the member's
+  next message waits (up to 30 seconds), so an answer to a question Fri just asked still finds it
+  pending. Waiting messages still group into bursts by when they arrived. They are dropped if their
+  author's privacy revision moves meanwhile: "forget me", the panel's "Forget my chats", or Gene/Red
+  erasure. Privacy commands, plain or @mentioned, never wait.
+- **Saved only after delivery.** A turn is staged while Fri composes the reply. Just before
+  delivery, `/chat/turn/check` runs the save's privacy fence without writing: the speaker's
+  revision, plus every referenced member's revision and memory setting. Only after Discord
+  accepts the reply (or Fri records a reaction or quiet decision) is the turn saved. A failed send
+  leaves no record claiming Fri said it. A refused check stops the reply. A failed save is
+  logged; it never retracts a delivered message.
+- **Provenance.** Each saved turn lists the other members whose messages shaped it, each with the
+  privacy revision Fri observed. Every context source counts:
+  - recent channel rows, including Fri's own replies with their sources;
+  - saved history turns;
+  - a pending clarification;
+  - the channel summary's authors;
+  - reply targets. A referenced Fri message is resolved through `/chat/messages/sources` to its
+    original sources and speaker. If that's unknown, or the message kept only a breadcrumb, its text
+    is withheld from the model before inference and the new turn is stored as a neutral breadcrumb.
+  - configured-channel nearby context and read evidence.
+
+  More than 200 sources refuses the reply rather than dropping any. So does one member appearing with
+  two revisions: their privacy changed while the turn was read, and Fri never relabels the older
+  read. Repeated reads in one turn (history pages, channel reads) keep the first revision they saw,
+  so a change between them fails the final access check.
+- **Unattributed history.** Replies saved before this release, or by a legacy companion during
+  rollout or after a Fri-only rollback, may quote other members with no record of whom. The
+  controller marks them, and Fri shows the model only that an earlier reply existed. Pending
+  questions saved without provenance are ignored. A legacy command receipt shows that a command ran,
+  not its argument or Gene's output, which can echo it. A request draft carries its
+  turn's fence: preview, every page turn and submission re-run `/chat/turn/check` and refuse once
+  any source changed. A submitted request carries those sources and the requester's revision. The
+  controller checks them as it creates the job and withdraws the job, even mid-build, if any source
+  later erases. Preview cards are recorded as soon as Discord accepts them, even if binding fails. The controller rejects stale provenance, deletes dependent turns
+  when any listed member turns memory off, is erased or clears chats, and drops turns whose
+  sources' revisions moved. Over-inclusion is deliberate: anyone in the context can erase the
+  derived copy.
+- **Real replies.** With provenance, Fri keeps what they actually said instead of placeholder
+  breadcrumbs. This covers plain chat, reply targets, public research, image shares, Gene
+  command results and the member's own saved work or reminders. Reads of other channels,
+  archives, learning reports and diagnostics still keep neutral breadcrumbs, including a diagnosis
+  nested in an uncertain Gene command. The recorded and echoed text is what Discord actually
+  showed, for example an attachment fallback. Outside invitations
+  keep the controller's mention placeholder.
+- **Other stores take only the member's own words.** Command receipts, saved public work and
+  game-night cards don't track provenance, so another member's words never enter them. A song
+  argument must use only words from the member's message or verified clarification answer whenever
+  other members' words are in context. Case, accents and punctuation may differ. A 0-100 volume is exempt unless it came from read evidence.
+- **Gene's errors.** Gene's error text can quote whoever ran the command, and there's no way to
+  attribute it. Conversations see only that Gene posted an error. The owner's repair investigation
+  still reads the full text.
+- **Not yet covered.** Repair requests Fri files after noticing a Gene error quote Gene's raw error
+  text, and `gene_diagnose` reads them back. Replies built from that read keep only a breadcrumb,
+  but the stored repair text isn't attributed or erased yet. It's tracked for a follow-up.
+- **Group view.** Fri's delivered public replies join the in-memory channel view, tagged with the
+  speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
+  once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
+  attention.
+
 ## Deployment boundary
 
 The companion runs in its own `fri` Compose project using `fri-runtime:<full Fri SHA>`.

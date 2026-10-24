@@ -137,6 +137,7 @@ class Delivery:
     text: str = ''
     view: bool = False
     failed: bool = False
+    message_id: int = 0
 
 
 @dataclass
@@ -321,6 +322,9 @@ class ModelTransport(httpx.AsyncBaseTransport):
         if not rows:
             raise UnscriptedCall(f'unscripted {kind} model call in step {self.steps[-1].label!r}')
         row = rows.pop(0)
+        self.last_payload = payload  # Lets a scripted callable assert what the model was shown.
+        if callable(row):  # A scripted response may change the world mid-turn, e.g. an erasure.
+            row = row(self.replay)
         if kind == 'web':
             return _stream([{'id': 'ws_1', 'type': 'web_search_call', 'status': 'completed'},
                             {'id': 'msg_1', 'type': 'message', 'content': [{
@@ -451,7 +455,11 @@ class World:
         self.last_id = mid
         author = SimpleNamespace(id=user, display_name=NAMES.get(user, f'member {user}'), bot=user == FRI,
                                  name=NAMES.get(user, str(user)))
-        target = self.rows.get(self.labels.get(reference)) if reference else None
+        if reference and reference.startswith('@'):  # '@step' targets Fri's reply delivered in that step.
+            step = next(s for s in self.steps if s.label == reference[1:])
+            target = self.rows.get(next(d.message_id for d in step.deliveries if d.kind == 'reply' and not d.failed))
+        else:
+            target = self.rows.get(self.labels.get(reference)) if reference else None
         item = Mock(spec=discord.Message, id=mid, content=text, channel=self.channels[channel],
                     guild=self.guild, author=author, webhook_id=None, attachments=[], embeds=[],
                     stickers=[], reactions=[], edited_at=None, created_at=discord.utils.snowflake_time(mid),
@@ -480,7 +488,9 @@ class World:
         if self.fail_next_delivery:
             self.fail_next_delivery, delivery.failed = False, True
             raise discord.HTTPException(SimpleNamespace(status=503, reason='synthetic'), 'synthetic delivery failure')
-        return self.message(FRI, content or '', channel.id, reference=None)
+        sent = self.message(FRI, content or '', channel.id, reference=None)
+        delivery.message_id = sent.id
+        return sent
 
     async def _reacted(self, target, emoji):
         self.steps[-1].deliveries.append(Delivery('reaction', target.channel.id, target.id, emoji))
@@ -550,6 +560,7 @@ class Replay:
         self.scenario, self.root, self.chat_model, self.live = scenario, Path(root), chat_model, live
         self.steps = [Step(0, 'setup', None, None)]
         self.transport = ModelTransport(self.steps, None if live else scenario.script, None, max_calls)
+        self.transport.replay = self
         self.subscription = subscription or SimpleNamespace(access_token=lambda: 'synthetic-plan-token')
         self.mode = 'live' if live else 'scripted'
         self.inspections = {}

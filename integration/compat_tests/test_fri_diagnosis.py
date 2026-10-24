@@ -90,6 +90,7 @@ def test_diagnosis_is_available_with_empty_catalog_and_offers_real_review_withou
         receipt = {'kind': 'gene_diagnose', 'proposed_request': 'Investigate the missed command', 'diagnosis_status': 'completed'}
         with patch.object(Actions, 'execute', new=AsyncMock(return_value=receipt)):
             result = await fri.talk(123, 1, 20, source.content, 'public', event=source)
+        await fri.record_turn(result)  # As after a successful Discord delivery.
         assert result.draft == receipt['proposed_request']
         assert all(path not in ('/requests', '/controls') for path, _ in calls)
         saved = next(body for path, body in calls if path == '/chat/turn')

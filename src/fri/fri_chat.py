@@ -310,6 +310,8 @@ class ChatResult:
     reaction: str | None = None
     allow_closing: bool = False
     media: object = None  # Trusted ephemeral bytes only; never parsed from model output or stored.
+    turn: dict | None = None  # Staged /chat/turn record, saved only after Discord accepts delivery.
+    echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
 
 
 def usage(response):
@@ -366,7 +368,8 @@ class Chat:
         messages.append({'role': 'user', 'content': json.dumps({
             'approved_server_facts_for_reference': context['facts'],
             'personal_memory': context.get('personal_memory', {'enabled': False, 'notes': []}),
-            'recent_channel_context': context.get('recent', []),
+            'recent_channel_context': [{k: v for k, v in row.items() if k != 'provenance'}
+                                       for row in context.get('recent', [])],
             'message_burst': context.get('message_burst', []),
             'reply_target': context.get('reply_target', []),
             'invited_channel_context': context.get('invited_context', []),

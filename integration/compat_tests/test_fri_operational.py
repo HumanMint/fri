@@ -246,6 +246,7 @@ def test_accepted_web_clarification_uses_only_public_research_during_cooldown(mo
             with patch('fri.fri_actions.lookup', new=lookup):
                 result = await fri.talk(123, 1, 20, actual.content, 'public', event=actual)
             assert 'Public facts only.' in result.reply
+            await fri.record_turn(result)  # Delivered, then saved with its research receipt.
             assert '/agent/admit' not in paths
             assert set(fri.chat.respond.await_args_list[0].args[1]['actions']) == {'web_search'}
             assert lookup.await_args.args[1] == 'Python release'
@@ -374,9 +375,9 @@ def test_confirmed_exact_control_is_not_hidden_by_breadcrumb_recording_outage(mo
         paths = []
         async def api(method, path, value=None):
             paths.append(path)
-            if path == '/chat/turn' and record_failure == 'outage':
+            if path in ('/chat/turn', '/chat/turn/check') and record_failure == 'outage':
                 raise commands.UserFeedbackCheckFailure('controller unavailable while recording')
-            if path == '/chat/turn' and record_failure == 'revision':
+            if path in ('/chat/turn', '/chat/turn/check') and record_failure == 'revision':
                 raise ControllerRejected('Conversation changed')
             if path.startswith('/controls/') and path.endswith('/result'):
                 claim = controls.poll(['stop'])
@@ -397,7 +398,8 @@ def test_confirmed_exact_control_is_not_hidden_by_breadcrumb_recording_outage(mo
                 result = await fri.talk(123, 1, 20, actual.content, 'public', event=actual)
             assert ('confirmed command result' if record_failure != 'none' or not access_allowed else 'Stopped playback.') in result.reply
             assert 'try again' not in result.reply.casefold()
-            assert paths.count('/controls') == paths.count('/chat/turn') == 1
+            # One pre-delivery privacy check; the record itself waits for Discord delivery.
+            assert paths.count('/controls') == paths.count('/chat/turn/check') == 1 and '/chat/turn' not in paths
             fri.chat.respond.assert_not_awaited()
         finally:
             await fri.close()

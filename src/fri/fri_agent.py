@@ -33,6 +33,7 @@ from .subscription import private_json
 
 LOG = logging.getLogger('fri.agent')
 NO_MENTIONS = discord.AllowedMentions.none()
+GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
 
 
 class BehaviorPreview(PagedPreview):
@@ -78,6 +79,9 @@ class Agent:
         self.state = {'config': dict(DEFAULTS), 'version': 0, 'channels': [], 'history_channels': []}
         self.recent = defaultdict(lambda: deque(maxlen=30))
         self.active = {}
+        self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
+        self.recording = {}  # (channel, member): set once a delivered reply is recorded.
+        self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
         self.pending = {}
         self.bursts = Bursts()
         self.seen = {}
@@ -172,14 +176,27 @@ class Agent:
         self.recent[channel] = deque((r for r in self.recent[channel] if r['at'] > now-900), maxlen=30)
         return list(self.recent[channel])
 
-    async def context_messages(self, channel):
+    async def context_messages(self, channel, raw_errors=False):
         rows = self.messages(channel)
         source = self.fri.get_channel(channel)
         parent = getattr(source, 'parent_id', None) or channel
-        profiles, accepted = {}, []
+        profiles, accepted, stale = {}, [], set()
+        async def current(user, revision):
+            if user not in profiles:
+                profiles[user] = await self.profile(parent, user)
+            return profiles[user]['enabled'] and profiles[user]['revision'] == revision
+
         for row in rows:
             if row['gene_error']:
-                accepted.append(row)
+                # Gene's error text can quote whoever ran the command, with no way to attribute it.
+                # Conversations learn only that it happened; the owner's repair investigation reads it.
+                accepted.append(row if raw_errors else {**row, 'text': GENE_ERROR})
+                continue
+            if row.get('fri'):  # Fri's reply stays only while everyone it drew on still allows it.
+                if all([await current(item['user_id'], item['revision']) for item in row['provenance']]):
+                    accepted.append(row)
+                else:
+                    stale.add(row['id'])
                 continue
             user = row['user_id']
             if user not in profiles:
@@ -189,15 +206,19 @@ class Agent:
                 accepted.append(row)
             else:
                 self.forget(int(user))
+        if stale:  # Drop invalidated Fri replies from the raw cache too, not just from this context.
+            self.recent[channel] = deque((r for r in self.recent[channel] if r['id'] not in stale), maxlen=30)
         return accepted
 
     def forget(self, user):
+        self.forgotten[user] = self.forgotten.get(user, 0)+1
         self.bursts.forget(user)
         for key in list(self.pending):
             if key[1] == user:
                 del self.pending[key]
         for key, rows in self.recent.items():
-            self.recent[key] = deque((r for r in rows if r['user_id'] != str(user)), maxlen=30)
+            self.recent[key] = deque((r for r in rows if r['user_id'] != str(user) and str(user) not in
+                                      {p['user_id'] for p in r.get('provenance', [])}), maxlen=30)
         for key in list(self.active):
             if key[1] == user:
                 del self.active[key]
@@ -210,7 +231,8 @@ class Agent:
             parent = self.fri.get_channel(channel)
             scope = getattr(parent, 'parent_id', None) or channel
             profile = await self.profile(scope, user)
-            data.update(recent=await self.context_messages(channel), summary=profile['summary'])
+            data.update(recent=await self.context_messages(channel), summary=profile['summary'],
+                        summary_provenance=profile.get('summary_provenance', []))
             data['historical_topics'] = profile.get('historical_topics', [])
         return data
 
@@ -282,6 +304,8 @@ class Agent:
         return True
 
     async def handle(self, message):
+        arrived = time.monotonic()  # Bursts group by arrival, even if this waits for an earlier reply.
+        forgotten = self.forgotten.get(message.author.id, 0)
         if getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:
             return
         dm = message.guild is None
@@ -313,7 +337,7 @@ class Agent:
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
         if owner_addressed and message.author.id == self.fri.owner_id and await self.owner_control(message, directed or text):
             return
-        privacy = memory_intent(text)
+        privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
         owner_report = (owner_addressed and message.author.id == self.fri.owner_id and
                         (dm or message.guild.id == self.fri.guild_id) and usage_requested(directed or text))
         if not self.config['enabled'] and not privacy and not owner_report:
@@ -326,8 +350,10 @@ class Agent:
                 return
         if privacy:
             self.forget(message.author.id)
+        observed = None  # The author's privacy revision as first read for this message.
         if not dm and not message.author.bot:
             profile = await self.profile(parent, message.author.id)
+            observed = profile.get('revision', 0)
             if profile['enabled'] and not privacy:
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                     'name': clean(message.author.display_name, 60), 'text': text[:500], 'at': time.time(),
@@ -336,6 +362,23 @@ class Agent:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})
             return
+        if message.id in self.replying:
+            return  # A redelivered event: its reply is already being delivered or recorded.
+        recording = self.recording.get((channel, message.author.id))
+        if recording and not privacy:
+            # Fri's reply was delivered but isn't saved yet, so a question it asked isn't pending
+            # yet either. This message may be the answer: decide only after the save.
+            scope = self.fri.workshop_id if dm else parent  # The controller doesn't scope a DM channel.
+            if observed is None:
+                observed = (await self.profile(scope, message.author.id))['revision']
+            try:
+                await asyncio.wait_for(recording.wait(), 30)
+            except TimeoutError:
+                pass
+            # Erased meanwhile, here or through the panel, Gene or Red: drop it, as forget() drops a burst.
+            if (self.forgotten.get(message.author.id, 0) != forgotten or
+                    (await self.profile(scope, message.author.id))['revision'] != observed):
+                return
         active = (self.active.get((channel, message.author.id), 0) > time.time() or
                   self.bursts.has(channel, message.author.id))
         if not active and directed is None and not dm and not message.author.bot:
@@ -352,16 +395,17 @@ class Agent:
         # Short bursts share context and produce one response to the newest message.
         key = (channel, message.author.id)
         try:
-            self.bursts.add(message)
+            self.bursts.add(message, arrived)
         except ValueError as exc:
             self.pending.pop(key, None)
             await message.reply(notice_text(str(exc)), allowed_mentions=NO_MENTIONS, mention_author=False)
             return
         self.pending[key] = message.id
         await asyncio.sleep(1.5)
-        if self.pending.get(key) != message.id:
-            return
-        self.pending.pop(key, None)
+        if not self.bursts.latest(message):
+            return  # A later message in the same burst answers for this one.
+        if self.pending.get(key) == message.id:
+            self.pending.pop(key, None)
         burst = self.bursts.take(message)
         if len(burst) > 1:
             await self.respond(message, directed or text, dm, burst=burst, **({'invitation': invitation} if invitation else {}))
@@ -372,7 +416,21 @@ class Agent:
         return (user not in self.fri.busy and (channel, user) not in self.pending and
                 time.time()-self.last_spoke.get(channel, 0) >= 600)
 
-    async def respond(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None):
+    async def respond(self, message, text, dm=False, **options):
+        # The turn, and an invitation's grant, are consumed only by the save after delivery, so a
+        # redelivered event must wait out the whole reply, not just inference. Ambient attention
+        # already yields to direct replies itself (ambient_ready) and never blocks one.
+        if message.id in self.replying:
+            return  # Including ambient attention picking a message whose direct reply is still saving.
+        if options.get('ambient'):
+            return await self.reply_once(message, text, dm, **options)
+        self.replying.add(message.id)
+        try:
+            await self.reply_once(message, text, dm, **options)
+        finally:
+            self.replying.discard(message.id)
+
+    async def reply_once(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None):
         try:
             async with message.channel.typing():
                 # Entering Discord's typing context itself awaits an HTTP request.
@@ -401,17 +459,18 @@ class Agent:
         if result.response_kind in ('react', 'quiet'):
             if result.status == 'completed' and result.response_kind == 'react':
                 await self.acknowledge(message, result.reaction)
+            await self.fri.record_turn(result)  # Records the decision, never claimed reaction delivery.
             # Neither outcome renews active attention or the ambient reply timer.
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if result.post_preview:
             from .fri_workspace import show_preview
-            await show_preview(self.fri, message, result.post_preview)
+            await show_preview(self.fri, message, result.post_preview, delivered=lambda: self.fri.record_turn(result))
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if result.social_preview:
             from .fri_social import show_preview
-            await show_preview(self.fri, message, result.social_preview)
+            await show_preview(self.fri, message, result.social_preview, delivered=lambda: self.fri.record_turn(result))
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if not result.reply:
@@ -425,15 +484,33 @@ class Agent:
             view = MemoryLauncher(self.fri, result.memory_scope)
         elif result.draft:
             if dm or message.guild.id == self.fri.guild_id:
-                view = DraftView(self.fri, message.author.id, result.draft, public=True)
+                view = DraftView(self.fri, message.author.id, result.draft, public=True, fence=result.turn)
         from .fri_image_share import send_reply
         if result.settings_preview:
             result.reply = view.content
-        await send_reply(message, result, view=view, mention_author=False,
-                         allowed_mentions=NO_MENTIONS, suppress_embeds=True)
-        if result.status == 'completed' and not (invitation and invitation.outside):
-            self.active[(message.channel.id, message.author.id)] = time.time()+(300 if result.clarification else 120)
-        self.last_spoke[message.channel.id] = time.time()
+        echo, key = result.echo, (message.channel.id, message.author.id)
+        # Discord can show the reply before its send call returns, so the member may answer from
+        # then on. Their next message waits through delivery and recording.
+        recorded = self.recording[key] = asyncio.Event()
+        try:
+            sent = await send_reply(message, result, view=view, mention_author=False,
+                                    allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+            if sent is None:  # Nothing was delivered, so nothing is recorded as said.
+                await self.fri.waiting_notices.clear(message.author.id)
+                return
+            self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
+            await self.fri.record_turn(result, sent)
+            if echo and message.guild and self.allowed(message.channel):
+                text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']  # As shown.
+                self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
+                    'name': 'Fri', 'text': clean(text, 500), 'at': time.time(), 'gene_error': False,
+                    'fri': True, 'provenance': echo['provenance']})
+            if result.status == 'completed' and not (invitation and invitation.outside):
+                self.active[key] = time.time()+(300 if result.clarification else 120)
+        finally:
+            recorded.set()
+            if self.recording.get(key) is recorded:
+                del self.recording[key]
         await self.fri.waiting_notices.clear(message.author.id)
 
     async def acknowledge(self, message, emoji):
@@ -552,8 +629,8 @@ class Agent:
     async def attend(self):
         now = time.time()
         for channel_id in list(self.recent):
-            records = await self.context_messages(channel_id)
-            fresh = [r for r in records if int(r['id']) > self.seen.get(channel_id, 0)]
+            records = await self.context_messages(channel_id, raw_errors=True)
+            fresh = [r for r in records if not r.get('fri') and int(r['id']) > self.seen.get(channel_id, 0)]
             if not fresh or now-self.last_attention.get(channel_id, 0) < self.config['heartbeat_seconds']:
                 continue
             self.seen[channel_id] = max(int(r['id']) for r in fresh)

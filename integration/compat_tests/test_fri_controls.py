@@ -74,8 +74,11 @@ def test_web_to_gene_chain_is_bounded_and_requires_original_request(monkeypatch,
             if scenario == 'requested':
                 result = await fri.talk(123, 1, 20, text, 'public', event=event(user=20, channel=1, content=text))
                 assert result.reply == 'queued it'
+                assert not any(path == '/chat/turn' for path, _ in calls)  # Saved only after delivery.
+                await fri.record_turn(result)
                 saved = next(body for path, body in calls if path == '/chat/turn')
-                assert saved['web_receipt'] == RECEIPT and 'gene_command' in saved['reply']
+                # Public research and the member's own command result are retained verbatim.
+                assert saved['web_receipt'] == RECEIPT and saved['reply'] == 'queued it'
             elif scenario == 'hypothetical':
                 fri.chat.respond.side_effect = [
                     ChatResult(status='completed', action={'kind': 'web_search', 'query': 'Python release'}),

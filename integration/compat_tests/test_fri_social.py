@@ -331,6 +331,7 @@ def test_reminder_short_clarification_through_real_fri_talk(api, tmp_path, monke
             ChatResult(action=action, status='completed'), ChatResult(reply='Ask again with the reminder details.', status='completed')])
         try:
             first = await fri.talk(123, 999, 10, original.content, 'private', event=original)
+            await fri.record_turn(first)  # The delivered question arms the clarification.
             assert first.reply == '7 am or 7 pm?'
             if failure == 'edit':
                 original.content = 'changed request'

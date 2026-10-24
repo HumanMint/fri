@@ -35,7 +35,8 @@ def arm(store, body=None, topic=''):
     body = body or origin()
     question = {'goal': body['goal'], 'question': 'what song do you want?' if body['goal'] == 'play' else 'which one?', 'topic': topic}
     store.save_chat(body['guild_id'], body['conversation_id'], body['user_id'], body['revision'],
-        body['request_text'], question['question'], 'model', 'high', source=body['source'], clarification=question)
+        body['request_text'], question['question'], 'model', 'high', source=body['source'], clarification=question,
+        provenance=[])  # Armed by a companion that tracks sources.
     return store.chat_context(body['guild_id'], body['conversation_id'], body['user_id'])['pending']
 
 
@@ -58,7 +59,9 @@ def test_pending_request_survives_restart_and_only_one_answer_can_enqueue(store)
     with pytest.raises(ValueError):
         controls.enqueue(next_answer)
     claim = controls.poll(['play'])
-    assert claim['continuation'] == pending and claim['argument'] == 'blind melon no rain'
+    # Only member-authored authorization fields travel with the command, never the question.
+    assert claim['continuation'] == {k: pending[k] for k in ('goal', 'source', 'request_text', 'revision')}
+    assert claim['argument'] == 'blind melon no rain'
     assert controls.poll(['play']) is None
     with pytest.raises(ValueError):
         arm(restarted, {**origin(), 'source': pending['source']})
@@ -330,6 +333,7 @@ def test_real_clarification_to_red_command_keeps_voice_checks_and_receipts(monke
             controls.finish(claim['id'], claim['lease'], outcome)
         try:
             result = await fri.talk(123, 1, 20, initial['request_text'], 'public', event=original)
+            await fri.record_turn(result)  # The delivered question arms the clarification.
             assert result.reply == 'what song?' and calls == []
             assert client.app.state.store.chat_context('123', 'public:1', '20')['pending']
             with patch('fri.fri_actions.asyncio.sleep', new=deliver):

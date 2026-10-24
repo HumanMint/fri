@@ -1,6 +1,7 @@
 """Small audited command catalog. Model output cannot select arbitrary Red commands."""
 
 import re
+import unicodedata
 from urllib.parse import urlsplit
 
 COMMANDS = {
@@ -36,6 +37,26 @@ def arguments(action, value):
     elif value:
         raise ValueError('This Gene action does not accept arguments')
     return value
+
+
+def own_words(argument, text):
+    """Every word of a command argument comes from the member's own message."""
+    if argument.casefold() in text.casefold():
+        return True
+    return words(argument) <= words(text)
+
+
+def grounded(receipts):
+    """A legacy companion's argument may quote anyone, and Red's output can echo it: show only that it ran."""
+    return [r if r.get('grounded') or not r.get('argument') else
+            {**r, 'argument': '[not kept]', 'result': {'done': r.get('result', {}).get('done'), 'output': '[not kept]'}}
+            for r in receipts]
+
+
+def words(text):
+    # Case, accents and punctuation may differ ("Halo Beyonce" from "Halo by Beyoncé"); words may not.
+    folded = unicodedata.normalize('NFKD', text.casefold())
+    return set(re.findall(r'\w+', ''.join(c for c in folded if not unicodedata.combining(c))))
 
 
 VERBS = {'play': r'play|queue|put on|add', 'pause': r'pause', 'resume': r'resume|unpause',

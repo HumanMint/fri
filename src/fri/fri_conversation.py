@@ -75,27 +75,51 @@ def burst_continuation(origin, source, text, action, argument, revision, bot_id=
 
 
 class Bursts:
-    """Only hold in-flight events during the debounce, including when memory is off."""
+    """Only hold in-flight events during the debounce, including when memory is off.
+
+    Messages group by when they arrived, which can be well before they're processed: a member's
+    messages wait while Fri's previous reply is delivered and recorded.
+    """
 
     def __init__(self):
-        self.rows = {}
+        self.rows = {}  # (channel, member): bursts, oldest first, each [(arrived, message, text)].
 
     def has(self, channel, user):
-        rows = self.rows.get((channel, user), [])
-        return bool(rows and time.monotonic()-rows[0][0] <= BURST_SECONDS)
+        groups = self.rows.get((channel, user), [])
+        return bool(groups and time.monotonic()-groups[-1][0][0] <= BURST_SECONDS)
 
-    def add(self, message):
-        key = (message.channel.id, message.author.id)
-        if not self.has(*key):
-            self.rows.pop(key, None)
-        rows = self.rows.setdefault(key, [])
-        rows.append((time.monotonic(), message, message.content))
+    def add(self, message, arrived=None):
+        key, now = (message.channel.id, message.author.id), time.monotonic()
+        arrived = now if arrived is None else arrived
+        groups = [rows for rows in self.rows.get(key, []) if now-rows[0][0] <= 60]  # Abandoned ones expire.
+        if not groups or arrived-groups[-1][0][0] > BURST_SECONDS:
+            groups.append([])
+        groups[-1].append((arrived, message, message.content))
+        self.rows[key] = groups
+        rows = groups[-1]
         if len(rows) > MAX_MESSAGES or sum(len(row[2]) for row in rows) > MAX_TEXT:
-            self.rows.pop(key, None)
+            groups.pop()
+            if not groups:
+                del self.rows[key]
             raise ValueError('Send at most five messages and 4000 characters together, then give me a moment.')
 
+    def group(self, message):
+        return next((rows for rows in self.rows.get((message.channel.id, message.author.id), [])
+                     if any(row[1].id == message.id for row in rows)), None)
+
+    def latest(self, message):
+        """Whether this message ends its burst; otherwise a later one answers for both."""
+        rows = self.group(message)
+        return bool(rows) and rows[-1][1].id == message.id
+
     def take(self, message):
-        return self.rows.pop((message.channel.id, message.author.id), [])
+        key, rows = (message.channel.id, message.author.id), self.group(message)
+        if rows is None:
+            return []
+        self.rows[key].remove(rows)
+        if not self.rows[key]:
+            del self.rows[key]
+        return rows
 
     def forget(self, user):
         for key in list(self.rows):

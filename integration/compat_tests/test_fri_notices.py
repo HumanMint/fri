@@ -1,6 +1,7 @@
 """Temporary notices follow actual reply delivery, without changing member text."""
 
 import asyncio
+import itertools
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -12,9 +13,11 @@ from fri import feedback as commands
 from fri.fri_chat import ChatResult
 from fri.fri_notices import ReplyInProgress, WaitingNotices, notice_text
 
+IDS = itertools.count(100000000000000001)
+
 
 def event(user=10):
-    return SimpleNamespace(author=SimpleNamespace(id=user, display_name='Member'),
+    return SimpleNamespace(id=next(IDS), author=SimpleNamespace(id=user, display_name='Member'),
         guild=SimpleNamespace(id=123), channel=SimpleNamespace(id=456, typing=Mock(return_value=AsyncMock())),
         reply=AsyncMock(return_value=SimpleNamespace(delete=AsyncMock())))
 

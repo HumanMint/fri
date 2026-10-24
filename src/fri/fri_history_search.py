@@ -221,7 +221,7 @@ class HistorySearch:
             if (message.author.bot or message.webhook_id or str(message.author.id) != str(row['author']['id'])
                     or message.content != row['content'] or not message.content.strip()):
                 continue
-            a.revisions[(scope, message.author.id)] = profile['revision']
+            a.observe(scope, message.author.id, profile['revision'])
             self.evidence[(channel_id, message.id)] = (message.author.id, message.content)
             messages.append({'id': str(message.id), 'user_id': str(message.author.id),
                 'author': clean(message.author.display_name, 80), 'at': message.created_at.isoformat(),

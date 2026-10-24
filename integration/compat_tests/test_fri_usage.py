@@ -70,10 +70,12 @@ def conversation(monkeypatch, tmp_path):
             return {'receipts': []}
         if path == '/controls/catalog':
             return {'actions': []}
+        if path == '/chat/turn/check':
+            return store.check_chat(payload['user_id'], payload['revision'], payload.get('provenance', []))
         if path == '/chat/turn':
             return store.save_chat(payload['guild_id'], payload['conversation_id'], payload['user_id'],
                 payload['revision'], payload['input'], payload['reply'], payload['model'], payload['effort'],
-                notes=payload['notes'], source=payload['source'])
+                notes=payload['notes'], source=payload['source'], provenance=payload.get('provenance'))
         return {'ok': True}
 
     fri.api = api
@@ -89,6 +91,7 @@ def test_casual_usage_mention_remains_a_normal_conversation(monkeypatch, tmp_pat
         message.reply = AsyncMock()
         assert not await agent.owner_control(message, text)
         result = await fri.talk(123, 999, 10, text, 'private', event=message)
+        await fri.record_turn(result)
         assert result.reply == 'yeah we can leave it for later'
         assert not any(path == '/agent/usage' for path, _ in calls)
         fri.chat.respond.assert_awaited_once()
@@ -104,6 +107,7 @@ def test_report_is_attributed_retained_and_seen_by_followup_without_extra_model_
         message = event(channel=999, guild=None, name='owner nickname', content='show usage by model')
         assert not await agent.owner_control(message, message.content)
         report = await fri.talk(123, 999, 10, message.content, 'private', event=message)
+        await fri.record_turn(report)
         fri.chat.respond.assert_not_awaited()
         assert len([p for p, _ in calls if p == '/agent/usage']) == 1
         assert not any(path == '/chat/usage/report' for path, _ in calls)
