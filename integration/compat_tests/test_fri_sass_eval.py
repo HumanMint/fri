@@ -87,6 +87,14 @@ def test_the_grader_sees_tool_results_and_who_said_what(grader):
     assert situations[text('freaky_not_in_on_it')]['recent'][0]['name'] == 'Kev'
 
 
+def test_the_grader_sees_request_drafts(grader):
+    seen, _ = grader
+    draft = 'Add a remaining-time column to the Gene queue embed, owner review before merge.'
+    scored({text('project_help_mode'): ChatResult(reply='show time left per track. drafted it.', draft=draft,
+                                                   status='completed')})
+    assert seen[-1]['fri_request_draft'] == draft
+
+
 def test_a_failed_grader_call_fails_the_case(grader):
     assert scored({text('rib_clapback'): 'grader down'})['rib_clapback:grade'] is False
 

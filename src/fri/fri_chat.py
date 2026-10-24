@@ -1,7 +1,6 @@
 """Conversation with bounded harness actions over official ChatGPT plan OAuth."""
 
 import asyncio
-import contextlib
 import hashlib
 import json
 import re
@@ -342,6 +341,10 @@ class ChatResult:
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
 
 
+class CacheKeyRejected(Exception):
+    """The plan route refused the optional prompt_cache_key by name before producing any output."""
+
+
 def cache_key(source):
     """Keep one channel's calls on the same prompt cache. Only a hash of the channel id leaves Fri."""
     channel = (source or {}).get('channel_id')
@@ -378,22 +381,6 @@ class Chat:
     async def headers(self):
         token = await asyncio.to_thread(self.subscription.access_token)
         return {'Authorization': 'Bearer ' + token}
-
-    @contextlib.asynccontextmanager
-    async def stream(self, client, payload):
-        """Open a Responses stream. If the plan route rejects the optional prompt_cache_key by name,
-        retry once without it and stop sending it, so a cache hint can never take chat down."""
-        async with client.stream('POST', RESOURCE + '/responses', json=payload,
-                                 headers=await self.headers()) as response:
-            if not (response.status_code == 400 and 'prompt_cache_key' in payload and
-                    b'prompt_cache_key' in await response.aread()):
-                yield response
-                return
-        self.cache_keys = False
-        del payload['prompt_cache_key']
-        async with client.stream('POST', RESOURCE + '/responses', json=payload,
-                                 headers=await self.headers()) as response:
-            yield response
 
     async def models(self):
         async with httpx.AsyncClient(timeout=30, trust_env=False, transport=self.transport) as client:
@@ -462,8 +449,11 @@ class Chat:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30), trust_env=False,
                                          transport=self.transport) as client:
-                async with self.stream(client, payload) as response:
+                async with client.stream('POST', RESOURCE + '/responses', json=payload,
+                                         headers=await self.headers()) as response:
                     if response.status_code != 200:
+                        if 'prompt_cache_key' in payload and b'prompt_cache_key' in await response.aread():
+                            raise CacheKeyRejected
                         result.status = 'failed'
                         if response.status_code == 429:
                             result.error = 'mint’s ai wallet is tapped out for now, plan or rate limit. check usage or try me again later.'
@@ -472,6 +462,9 @@ class Chat:
                         return result
                     async for event in events(response.aiter_lines()):
                         kind = event.get('type')
+                        if (kind in ('error', 'response.failed') and not text_parts and
+                                'prompt_cache_key' in payload and 'prompt_cache_key' in json.dumps(event)):
+                            raise CacheKeyRejected
                         key = (event.get('output_index', 0), event.get('content_index', 0))
                         if kind == 'response.output_text.delta':
                             text_parts[key] = text_parts.get(key, '') + event.get('delta', '')
@@ -544,6 +537,10 @@ class Chat:
                             result.status = 'invalid_output'
                             result.error = 'Fri received an unreadable reply. Please try again.'
                         return result
+        except CacheKeyRejected:
+            # Nothing was generated yet, so retry once without the hint. cache_keys stays off, so no loop.
+            self.cache_keys = False
+            return await self.respond(text, context)
         except SubscriptionError as exc:
             result.error, result.status = str(exc), 'failed'
         except (httpx.HTTPError, ValueError, KeyError, TypeError):

@@ -57,26 +57,46 @@ def test_prompt_cache_key_is_a_stable_channel_hash():
     assert keys[0].startswith('fri-chat-') and '123456789012345678' not in keys[0]
 
 
-@pytest.mark.parametrize('names_the_key', [True, False])
-def test_a_rejected_cache_key_is_dropped_once_and_other_400s_are_not_retried(names_the_key):
+REJECTION = {'message': "Unknown parameter: 'prompt_cache_key'.", 'param': 'prompt_cache_key',
+             'code': 'unknown_parameter'}
+
+
+def sse(*events):
+    return httpx.Response(200, text=''.join('data: ' + json.dumps(event) + '\n\n' for event in events))
+
+
+@pytest.mark.parametrize('rejection', [
+    lambda: httpx.Response(400, json={'error': REJECTION}),
+    lambda: httpx.Response(422, json={'error': REJECTION}),
+    lambda: sse({'type': 'error', **REJECTION}),
+    lambda: sse({'type': 'response.created'}, {'type': 'response.failed', 'response': {'error': REJECTION}}),
+])
+def test_a_cache_key_rejected_by_name_is_dropped_and_retried_once(rejection):
     sent = []
 
     def handler(request):
-        payload = json.loads(request.content)
-        sent.append('prompt_cache_key' in payload)
-        if 'prompt_cache_key' in payload or not names_the_key:
-            param = 'prompt_cache_key' if names_the_key else 'input'
-            return httpx.Response(400, json={'error': {'message': f"Unknown parameter: '{param}'.",
-                                                       'param': param, 'code': 'unknown_parameter'}})
-        return httpx.Response(200, text='data: ' + json.dumps(response_event()) + '\n\n')
+        sent.append('prompt_cache_key' in json.loads(request.content))
+        return rejection() if sent[-1] else sse(response_event())
     chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
     context = {**CONTEXT, 'source': {'channel_id': '123456789012345678', 'user_id': '1'}}
-    first = asyncio.run(chat.respond('hi', context))
-    if names_the_key:
-        assert first.status == 'completed' and sent == [True, False]
-        assert asyncio.run(chat.respond('hi', context)).status == 'completed' and sent == [True, False, False]
-    else:
-        assert first.status == 'failed' and 'subscription connection' in first.error and sent == [True]
+    assert asyncio.run(chat.respond('hi', context)).status == 'completed' and sent == [True, False]
+    assert asyncio.run(chat.respond('hi', context)).status == 'completed' and sent == [True, False, False]
+
+
+@pytest.mark.parametrize('response', [
+    lambda: httpx.Response(400, json={'error': {**REJECTION, 'param': 'input', 'message': 'Bad input.'}}),
+    lambda: sse({'type': 'response.output_text.delta', 'delta': '{"reply": "par'},
+                {'type': 'response.failed', 'response': {'error': REJECTION}}),
+])
+def test_other_failures_and_failures_after_output_are_not_retried(response):
+    sent = []
+
+    def handler(request):
+        sent.append('prompt_cache_key' in json.loads(request.content))
+        return response()
+    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
+    context = {**CONTEXT, 'source': {'channel_id': '123456789012345678', 'user_id': '1'}}
+    assert asyncio.run(chat.respond('hi', context)).status == 'failed' and sent == [True] and chat.cache_keys
 
 
 def test_model_refresh_reads_subscription_visible_catalog():
