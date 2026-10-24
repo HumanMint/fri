@@ -209,13 +209,7 @@ class Fri(discord.Client):
                     report = json.loads(path.read_text())
                 except FileNotFoundError:
                     continue  # An isolated evaluation process may have delivered this receipt.
-                try:
-                    await self.api('POST', '/chat/usage/report', report)
-                except ControllerRejected:
-                    if report.get('role') != 'reply_check':
-                        raise
-                    # A controller rolled back past reply checks still accepts it as background attention.
-                    await self.api('POST', '/chat/usage/report', {**report, 'role': 'attention'})
+                await self.api('POST', '/chat/usage/report', report)
                 path.unlink(missing_ok=True)
 
     async def chat_once(self, text, context):

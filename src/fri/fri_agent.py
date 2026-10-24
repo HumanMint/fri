@@ -130,10 +130,11 @@ class Agent:
     def close(self):
         self.heartbeat.cancel()
 
-    async def record(self, role, model, effort, counters, status):
+    async def record(self, role, model, effort, counters, status, purpose=None):
         attempt = uuid.uuid4().hex
         private_json(self.fri.data/'usage'/(attempt+'.json'), {'attempt_id': attempt,
-            'role': role, 'model': model, 'effort': effort, 'status': status, 'counters': counters})
+            'role': role, 'model': model, 'effort': effort, 'status': status, 'counters': counters,
+            **({'purpose': purpose} if purpose else {})})
         try:
             await self.fri.flush_usage()
         except commands.UserFeedbackCheckFailure:

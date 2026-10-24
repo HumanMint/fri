@@ -53,7 +53,8 @@ async def check(agent):
             return None
         result, counters, status = await analyze(agent.fri.chat, INSTRUCTION, {'pairs': claim['pairs']},
                                                  claim['model'], claim['effort'], SCHEMA)
-    await agent.record('reply_check', claim['model'], claim['effort'], counters, status)
+    # An existing role, so a receipt still queued when Fri and the controller roll back is accepted.
+    await agent.record('attention', claim['model'], claim['effort'], counters, status, 'reply_check')
     findings = result.get('findings', [])[:20] if status == 'completed' else []
     try:
         return await agent.fri.api('POST', f"/agent/reply-checks/{claim['id']}/finish",

@@ -11,7 +11,7 @@ import discord
 import pytest
 from fastapi.testclient import TestClient
 from gene import fri_reply_checks as controller_checks
-from gene.api import create_app
+from gene.api import ChatUsage, create_app
 from gene.config import Settings
 from gene.fri_agent_store import AgentStore
 from gene.store import Store
@@ -82,7 +82,8 @@ def test_a_flagged_follow_up_becomes_a_labelled_finding(controller, monkeypatch)
     assert asyncio.run(check(agent)) == {'kept': 1, 'pairs': 1}
     name, effort, schema, data = seen[0]
     assert (name, effort, schema) == ('gpt-6-luna', 'low', SCHEMA)
-    agent.record.assert_awaited_once_with('reply_check', 'gpt-6-luna', 'low', {'input_tokens': 9}, 'completed')
+    agent.record.assert_awaited_once_with('attention', 'gpt-6-luna', 'low', {'input_tokens': 9}, 'completed',
+                                          'reply_check')
     assert data['pairs'][0]['earlier']['member'] == 'whats the best class for the new raid'
     assert '"20"' not in json.dumps(data) and 'public:1' not in json.dumps(data)
     overview = client.post('/agent/reply-checks/overview', headers=headers('fri'),
@@ -168,24 +169,25 @@ def test_an_older_controller_still_runs_fri_without_reply_checks(client, monkeyp
     assert 'reply-checks' not in agent.fri.capabilities and calls == ['/agent/reply-checks/claim']
 
 
-def test_a_reply_check_receipt_never_blocks_the_usage_queue_or_owner_notices(tmp_path, monkeypatch):
+def test_reply_check_usage_survives_a_paired_rollback(controller, tmp_path, monkeypatch):
+    store, client = controller
     (tmp_path/'usage').mkdir()
-    (tmp_path/'usage'/'a.json').write_text(json.dumps({'attempt_id': 'a'*32, 'role': 'reply_check'}))
-    posted = []
-
-    async def api(method, path, payload):
-        if payload['role'] == 'reply_check':
-            raise ControllerRejected('Input should be conversation, attention, ...')
-        posted.append(payload['role'])
-    runtime = SimpleNamespace(usage_lock=asyncio.Lock(), data=tmp_path, api=api)
-    asyncio.run(Fri.flush_usage(runtime))
-    assert posted == ['attention'] and not list((tmp_path/'usage').iterdir())
+    agent = Agent(SimpleNamespace(data=tmp_path, flush_usage=AsyncMock()))
+    asyncio.run(agent.record('attention', 'gpt-6-luna', 'low', {'input_tokens': 9}, 'completed', 'reply_check'))
+    receipt = json.loads(next((tmp_path/'usage').iterdir()).read_text())
+    # A role every paired controller knows, plus a field older ones ignore: a receipt still queued
+    # when both sides roll back is delivered instead of blocking the queue.
+    assert receipt['role'] == 'attention' and receipt['purpose'] == 'reply_check'
+    assert ChatUsage.model_config.get('extra', 'ignore') == 'ignore'
+    assert client.post('/chat/usage/report', headers=headers('fri'), json=receipt).status_code == 200
+    with store.connection() as db:
+        assert db.execute('SELECT role FROM agent_usage_roles').fetchone()[0] == 'reply_check'
 
     import fri.fri as fri_module
     notify = AsyncMock()
     monkeypatch.setattr(fri_module, 'notify_owner', notify)
     stuck = SimpleNamespace(flush_usage=AsyncMock(side_effect=commands.UserFeedbackCheckFailure('rejected')))
-    asyncio.run(Fri.owner_reviews.coro(stuck))
+    asyncio.run(Fri.owner_reviews.coro(stuck))  # Any stuck receipt still leaves owner notices running.
     notify.assert_awaited_once_with(stuck)
 
 

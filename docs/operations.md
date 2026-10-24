@@ -139,11 +139,13 @@ controller's operations guide describes the settings, retention, export and roll
 
 On the heartbeat, Fri waits for its background model slot, then claims at most one batch of up to 20
 pairs: Fri's verbatim reply, then the same member's next turn in that conversation within 15 minutes.
-Pairs carry no member, channel or message identifiers. Luna/low (configurable) flags only clear cases
+Pairs carry no member, channel or message identifiers, and Discord mentions, links and ids in the text
+arrive as neutral placeholders. Luna/low (configurable) flags only clear cases
 of a member being unhappy with the reply and returns four labels from fixed lists: category, severity,
 topic and suggested fix. There is no free-text field. Banter and roasting Fri back don't count. Usage
-is recorded as “reply checks”; an older controller that rejects that role gets the receipt as
-background attention, so it never blocks the usage queue. Usage delivery and owner notifications retry
+is recorded as attention with a `reply_check` purpose: this controller reports it as “reply checks”,
+and an older one ignores the purpose and counts attention, so a receipt still queued when both sides
+roll back is delivered rather than blocking the queue. Usage delivery and owner notifications retry
 independently. Nothing is posted to Discord and no chat text is stored by Fri; the controller decides
 what is kept and fences it by everyone's privacy revision.
 
