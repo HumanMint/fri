@@ -18,7 +18,9 @@ MODE=${1:-check}
 CACHE_ROOT=${FRI_OFFLINE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/fri-offline}
 GENE_REPO=${GENE_REPO:-$FRI/../gene}
 FRI_VENV=${FRI_VENV:-$FRI/.venv}
-PROFILE='(version 1)(allow default)(deny network-outbound (remote ip "*:*"))(allow network-outbound (remote ip "localhost:*"))'
+# Deny outbound IP, and the system resolver's socket: macOS resolves names through mDNSResponder,
+# which an IP-only rule does not cover.
+PROFILE='(version 1)(allow default)(deny network-outbound (remote ip "*:*"))(allow network-outbound (remote ip "localhost:*"))(deny network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))'
 
 die() { echo "offline-checks: $*" >&2; exit 1; }
 
@@ -27,7 +29,10 @@ if [ -z "${GENE_SHA:-}" ]; then
   GENE_SHA=$(sed -n 's/.*"verified_controller_commit"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
     "$FRI/docs/integration-pair.json" | head -n 1)
 fi
-echo "$GENE_SHA" | grep -Eq '^[0-9a-f]{40}$' || die "GENE_SHA must be a full 40-character commit, got: $GENE_SHA"
+case $GENE_SHA in
+  *[!0-9a-f]* | '') die "GENE_SHA must be a full 40-character lowercase hex commit, got: $GENE_SHA" ;;
+esac
+[ ${#GENE_SHA} -eq 40 ] || die "GENE_SHA must be a full 40-character lowercase hex commit, got: $GENE_SHA"
 GENE_DIR=$CACHE_ROOT/$GENE_SHA
 GENE_SRC=$GENE_DIR/src
 GENE_VENV=$GENE_DIR/venv
@@ -58,10 +63,12 @@ write_guard() {
 
 Best effort: native code and non-Python subprocesses are covered only by an OS-level sandbox.
 """
+import functools
+import ipaddress
 import socket
 import sys
 
-_LOCAL = {None, '', 'localhost', '127.0.0.1', '::1'}
+_LOCAL = {None, '', 'localhost', '127.0.0.1', '::1', '0.0.0.0', '::'}
 _SENDS = ('socket.connect', 'socket.sendto', 'socket.sendmsg')
 _LOOKUPS = ('socket.getaddrinfo', 'socket.gethostbyname', 'socket.gethostbyaddr', 'socket.getnameinfo')
 
@@ -83,6 +90,41 @@ def _hook(event, args):
 
 
 sys.addaudithook(_hook)
+
+
+def _numeric(host):
+    try:
+        ipaddress.ip_address(str(host).split('%', 1)[0])
+        return True
+    except ValueError:
+        return False
+
+
+def _address(name, args):
+    if name in ('connect', 'connect_ex', 'bind'):
+        return args[0] if args else None
+    if name == 'sendto':
+        return args[-1] if len(args) >= 2 else None
+    return args[3] if len(args) >= 4 else None  # sendmsg(buffers, ancdata, flags, address)
+
+
+def _checked(name):
+    """CPython resolves hostnames in C before the audit event; check them in Python first."""
+    real = getattr(socket.socket, name)
+
+    @functools.wraps(real)
+    def method(self, *args):
+        address = _address(name, args)
+        if self.family in (socket.AF_INET, socket.AF_INET6) and isinstance(address, tuple):
+            host = _host(address)
+            if host not in _LOCAL and (name != 'bind' or not _numeric(host)):
+                raise PermissionError(f'offline-checks: outbound network denied (socket.{name}, {host})')
+        return real(self, *args)
+    return method
+
+
+for _name in ('connect', 'connect_ex', 'sendto', 'sendmsg', 'bind'):
+    setattr(socket.socket, _name, _checked(_name))
 PY
 }
 
@@ -144,6 +186,12 @@ if layer == "guard":
         "gethostbyname_ex": lambda: socket.gethostbyname_ex(TEST_NAME),
         "gethostbyaddr": lambda: socket.gethostbyaddr(TEST_IP),
         "getnameinfo": lambda: socket.getnameinfo((TEST_IP, 443), 0),
+        # Hostnames passed to socket methods are resolved before any audit event fires.
+        "connect(name)": lambda: tcp().connect((TEST_NAME, 443)),
+        "connect_ex(name)": lambda: tcp().connect_ex((TEST_NAME, 443)),
+        "sendto(name)": lambda: udp().sendto(b"x", (TEST_NAME, 9)),
+        "sendmsg(name)": lambda: udp().sendmsg([b"x"], [], 0, (TEST_NAME, 9)),
+        "bind(name)": lambda: tcp().bind((TEST_NAME, 0)),
     })
 for name, probe in probes.items():
     try:

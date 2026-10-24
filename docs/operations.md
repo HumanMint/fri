@@ -179,10 +179,20 @@ and Red are **test-only** dependencies; the Fri wheel and runtime image contain 
 - `integration/compat_tests` and `integration/replay` against the pinned controller;
 - `ruff`.
 
-The guarantee comes from an OS layer: `sandbox-exec` on macOS or `unshare -rn` on Linux denies
-outbound IP. A Python audit-hook guard also denies non-loopback connect/sendto/sendmsg and every
-socket name lookup in each Python process. The guard covers only Python's socket layer;
-non-Python subprocesses and native code depend on an OS layer.
+The guarantee comes from an OS layer. On macOS, `sandbox-exec` denies outbound IP and the
+`mDNSResponder` resolver socket; an IP-only rule still let names resolve. On Linux, `unshare -rn`
+does the same.
+
+A Python guard adds a second layer in each Python process:
+
+- an audit hook denies non-loopback connect/sendto/sendmsg and the socket lookup functions;
+- wrappers on `socket.socket.connect`, `connect_ex`, `sendto`, `sendmsg` and `bind` reject
+  hostnames before CPython resolves them in C.
+
+The guard covers only Python's socket layer. Non-Python subprocesses and native code, such as
+uvloop's resolver, depend on an OS layer. OS-level DNS denial was verified manually: `example.com`
+resolved under the IP-only profile and failed with the resolver socket denied. It has no per-run
+canary, because proving it needs a real lookup.
 
 If no OS layer can be applied here (for example nested inside a Codex reviewer's sandbox), the
 script refuses to run unless `OFFLINE_ISOLATION=python` explicitly accepts the guard alone as best
