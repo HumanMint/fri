@@ -406,7 +406,8 @@ def test_a_cancelled_burst_wait_settles_every_ping_once(monkeypatch, tmp_path, c
     asyncio.run(scenario())
 
 
-def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize('forgotten', [False, True])
+def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog, forgotten):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
@@ -414,6 +415,8 @@ def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog):
         event = message('<@99> you there?')
         try:
             await agent.handle(event)
+            if forgotten:  # Even once the delivered record has let it go, by age or count.
+                agent.delivered.clear()
             await agent.handle(event)  # Discord can deliver an event again, e.g. after a resume.
             assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: fri disabled']
         finally:
@@ -421,8 +424,9 @@ def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('forgotten', [False, True])
 @pytest.mark.parametrize('when', ['profile', 'burst', 'reply', 'cancelled'])
-def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tmp_path, caplog, when):
+def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tmp_path, caplog, when, forgotten):
     # Discord can deliver the same event twice. The first copy, or the burst holding it, answers.
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
@@ -450,6 +454,8 @@ def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tm
             if when == 'reply':  # The burst's last message is replying for both.
                 tasks.append(asyncio.create_task(agent.handle(later)))
                 await asyncio.wait_for(held.wait(), 5)
+            if forgotten:  # Pushed out of the delivered record (by age or count) while still in flight.
+                agent.delivered.clear()
             await asyncio.wait_for(agent.handle(copy.copy(event)), 1)  # Ignored at once.
             if when == 'cancelled':
                 tasks[0].cancel()

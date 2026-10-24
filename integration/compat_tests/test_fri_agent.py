@@ -258,7 +258,7 @@ def test_delivered_ids_are_remembered_for_an_hour_and_a_bounded_count(monkeypatc
         clock = [0.0]
         monkeypatch.setattr('fri.fri_agent.time.monotonic', lambda: clock[0])
         monkeypatch.setattr('fri.fri_agent.MAX_DELIVERED', 3)
-        events = [SimpleNamespace(id=n) for n in range(4)]
+        events = [SimpleNamespace(id=n, channel=SimpleNamespace(id=1), author=SimpleNamespace(id=2)) for n in range(4)]
         for event in events[:3]:
             await agent.handle(event)
         await agent.handle(events[0])  # A redelivery is ignored.

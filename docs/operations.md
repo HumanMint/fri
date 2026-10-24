@@ -51,9 +51,11 @@ notice is deleted once that reply lands), `social cooldown` (after the cooldown'
 notice), `image share withdrawn`, `reply withheld: <recheck>` when a recheck failed after
 composing, and an exception type such as `Forbidden`. A burst's earlier messages are
 logged under the reason its last message got. A reply, a notice, a preview or a reaction
-counts as an answer. Bots, webhooks and DMs aren't logged. Fri remembers each event ID it
-receives for an hour (at most 10,000 IDs) and ignores a copy Discord delivers again, so the
-first delivery answers or explains for every copy, even after a burst that held it is answered.
+counts as an answer. Bots, webhooks and DMs aren't logged. Fri ignores a copy of an event
+that Discord delivers again while the first delivery, or the burst holding it, is still
+being handled, and for an hour after (at most 10,000 IDs), so the first delivery answers
+or explains for every copy. A ping is logged at most once while it is among the last
+10,000 pings watched.
 
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.

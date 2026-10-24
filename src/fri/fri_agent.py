@@ -9,7 +9,7 @@ import os
 import re
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import closing
 
 import discord
@@ -34,7 +34,7 @@ from .subscription import private_json
 LOG = logging.getLogger('fri.agent')
 NO_MENTIONS = discord.AllowedMentions.none()
 GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
-REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long a delivered event's ID is remembered.
+REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long, and how many, delivered IDs are remembered.
 DEFERRED = object()  # The burst holding this message answers, or explains, for it.
 
 
@@ -82,11 +82,13 @@ class Agent:
         self.recent = defaultdict(lambda: deque(maxlen=30))
         self.active = {}
         self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
+        self.handling = Counter()  # Discord message IDs being handled now, burst members included.
         self.delivered = {}  # Discord message ID -> when it first arrived, oldest first.
         self.recording = {}  # (channel, member): set once a delivered reply is recorded.
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
         self.pending = {}
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
+        self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
         self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
         self.seen = {}
         self.last_attention = {}
@@ -322,24 +324,34 @@ class Agent:
 
     async def handle(self, message):
         # Discord can deliver an event again, e.g. after a resume. Its first delivery answers, or
-        # explains, for every copy, even once a burst that held it is answered.
+        # explains, for every copy: while it or the burst holding it is still being handled, and
+        # for an hour after, in a bounded record the in-flight checks don't rely on.
         now = time.monotonic()
         while self.delivered and now-next(iter(self.delivered.values())) > REDELIVERY_SECONDS:
             del self.delivered[next(iter(self.delivered))]
-        if message.id in self.delivered:
+        if (message.id in self.handling or self.bursts.group(message) is not None or
+                message.id in self.delivered):
             return
         if len(self.delivered) >= MAX_DELIVERED:
             del self.delivered[next(iter(self.delivered))]
         self.delivered[message.id] = now
-        await self.watch(message)
+        self.handling[message.id] += 1
+        try:
+            await self.watch(message)
+        finally:
+            self.handling -= Counter([message.id])
 
     async def watch(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
+        # A copy that outlived the record of delivered events is left to the delivery watched first.
         if (message.guild is None or message.author.bot or getattr(message, 'webhook_id', None) or
+                message.id in self.watched or message.id in self.misses or message.id in self.replying or
                 not pinged(message, self.fri.user.id)):
             await self.receive(message)
             return
-        self.misses[message.id] = None
+        self.watched[message.id] = self.misses[message.id] = None
+        if len(self.watched) > MAX_DELIVERED:
+            del self.watched[next(iter(self.watched))]
         owned = False  # By a burst: its last message answers, or its drop explains, for this one.
         try:
             owned = await self.receive(message) is DEFERRED
@@ -466,6 +478,7 @@ class Agent:
             self.pending.pop(key, None)
         burst = self.bursts.take(message)
         earlier = [event for _, event, _ in burst if event is not message]
+        self.handling.update(event.id for event in earlier)  # Until this reply answers for them too.
         try:
             if len(burst) > 1:
                 await self.respond(message, directed or text, dm, burst=burst, **({'invitation': invitation} if invitation else {}))
@@ -476,6 +489,7 @@ class Agent:
                 self.miss(event, type(exc).__name__)
             raise
         finally:
+            self.handling -= Counter(event.id for event in earlier)
             for event in earlier:
                 self.settle(event)
 
