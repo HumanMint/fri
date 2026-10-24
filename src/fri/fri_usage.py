@@ -31,19 +31,15 @@ def usage_requested(text):
 def describe_usage(rows, *, by_model=False):
     if not rows:
         return 'nothing recorded for fri yet. this tracker covers fri activity, not the whole subscription.'
-    keys = ('tokens', 'calls', 'input', 'cached', 'output', 'reasoning')
-    groups = defaultdict(lambda: dict.fromkeys(keys, 0))
+    # Cached input and reasoning output are only summed over calls that reported them, so they show as
+    # counts with a coverage note, never as shares of totals that include calls without them.
+    groups = defaultdict(lambda: {'tokens': 0, 'calls': 0, 'cached': None, 'reasoning': None})
     missing = 0
     for row in rows:
         label = (f"{row['model']} / {row['effort'] or 'default'}" if by_model
                  else LABELS.get(row['role'], 'other activity'))
-        group = groups[label]
-        group['tokens'] += (row['input_tokens'] or 0) + (row['output_tokens'] or 0)
-        group['calls'] += row['attempts']
-        group['input'] += row['input_tokens'] or 0
-        group['cached'] += row.get('cached_tokens') or 0
-        group['output'] += row['output_tokens'] or 0
-        group['reasoning'] += row.get('reasoning_tokens') or 0
+        add(groups[label], tokens=(row['input_tokens'] or 0) + (row['output_tokens'] or 0),
+            calls=row['attempts'], cached=row.get('cached_tokens'), reasoning=row.get('reasoning_tokens'))
         missing += row.get('unknown_attempts', 0) or int(
             row['input_tokens'] is None or row['output_tokens'] is None)
     total = sum(value['tokens'] for value in groups.values())
@@ -52,17 +48,24 @@ def describe_usage(rows, *, by_model=False):
     lines = [f"fri has logged **{qualifier}{total:,} tokens** across **{attempts:,} calls** so far:"]
     ranked = sorted(groups.items(), key=lambda item: item[1]['tokens'], reverse=True)
     if len(ranked) > 6:
-        rest = {key: sum(value[key] for _, value in ranked[6:]) for key in keys}
+        rest = {'tokens': 0, 'calls': 0, 'cached': None, 'reasoning': None}
+        for _, value in ranked[6:]:
+            add(rest, **value)
         ranked = ranked[:6] + [('other models' if by_model else 'other tasks', rest)]
     for name, group in ranked:
-        # Cached input and reasoning output are reported shares, so they show what prompt caching and
-        # reasoning effort are doing to each task without claiming what the plan bills for them.
-        shares = [f"{group[part] / group[whole]:.0%} {label}" for part, whole, label in (
-            ('cached', 'input', 'of input cached'), ('reasoning', 'output', 'of output reasoning'))
-            if group[part] and group[whole]]
+        parts = [f'{group[key]:,} {label}' for key, label in (('cached', 'cached input'), ('reasoning', 'reasoning'))
+                 if group[key] is not None]
         lines.append(f"- {name}: {group['tokens']:,} tokens · {group['calls']:,} calls"
-                     + (f" ({', '.join(shares)})" if shares else ''))
+                     + (f" ({', '.join(parts)})" if parts else ''))
     if missing:
         lines.append('some calls have missing token counts, so these totals are incomplete.')
+    if any(group['cached'] is not None or group['reasoning'] is not None for _, group in ranked):
+        lines.append('cached input and reasoning are part of those totals and only count calls that reported them.')
     lines.append("cumulative fri activity, not your remaining plan allowance. gene's coding usage is separate.")
     return '\n'.join(lines)
+
+
+def add(group, **counts):
+    for key, value in counts.items():
+        if value is not None:
+            group[key] = (group[key] or 0) + value

@@ -47,20 +47,60 @@ def test_report_counts_input_and_output_once_and_labels_missing_counts(tmp_path)
     assert 'incomplete' in reply and 'cumulative' in reply and 'coding usage is separate' in reply
     assert '```' not in reply and 'input_tokens' not in reply and len(reply) < 1950
     assert 'nothing recorded' in describe_usage([])
-    assert '- chat: 120 tokens · 2 calls (70% of input cached, 75% of output reasoning)' in reply
+    assert '- chat: 120 tokens · 2 calls (70 cached input, 15 reasoning)' in reply
+    assert 'only count calls that reported them' in reply
     by_model = describe_usage(rows, by_model=True)
     assert 'model / high: 120 tokens' in by_model and '- chat:' not in by_model
-    assert '70% of input cached' in by_model
+    assert '(70 cached input, 15 reasoning)' in by_model
 
 
-def test_report_skips_shares_the_provider_did_not_report_and_folds_them_into_other_tasks():
-    rows = [{'role': role, 'model': 'model', 'effort': 'low', 'attempts': 1, 'input_tokens': 100 - index,
-             'output_tokens': 10, 'unknown_attempts': 0, 'cached_tokens': 50 if role == 'meme' else None,
-             'reasoning_tokens': None} for index, role in enumerate(
-                 ('conversation', 'web_search', 'attention', 'summary', 'status', 'history', 'meme'))]
-    reply = describe_usage(rows)
-    assert '- chat: 110 tokens · 1 calls\n' in reply and 'reasoning' not in reply
-    assert '- other tasks: 104 tokens · 1 calls (53% of input cached)' in reply
+def usage_store(tmp_path):
+    store = Store(tmp_path / 'usage.db')
+    agent = AgentStore(store, SimpleNamespace(agent_channels='', agent_history_channels='',
+        agent_role_id='', workshop_channel_id='', test_guild_id='', test_channel_id='',
+        web_search_enabled=False))
+    return store, agent
+
+
+def counters(input_tokens, output_tokens, cached, reasoning):
+    return {'input_tokens': input_tokens, 'output_tokens': output_tokens,
+            'cached_input_tokens': cached, 'reasoning_output_tokens': reasoning}
+
+
+def test_partial_and_zero_cache_reports_stay_counts_not_shares(tmp_path):
+    store, agent = usage_store(tmp_path)
+    store.add_chat_usage('a'*32, 'model', 'high', 'completed', counters(100, 20, 100, 20))
+    store.add_chat_usage('b'*32, 'model', 'high', 'completed', counters(900, 180, None, None))
+    store.add_chat_usage('c'*32, 'model', 'high', 'failed', counters(None, None, 100, 100), role='meme')
+    store.add_chat_usage('d'*32, 'model', 'high', 'completed', counters(10, 10, 0, 0), role='meme')
+    store.add_chat_usage('e'*32, 'model', 'high', 'completed', counters(50, 5, None, None), role='summary')
+    reply = describe_usage(agent.usage())
+    assert '- chat: 1,200 tokens · 2 calls (100 cached input, 20 reasoning)\n' in reply
+    assert '- meme checks: 20 tokens · 2 calls (100 cached input, 100 reasoning)\n' in reply
+    assert '- learning summaries: 55 tokens · 1 calls\n' in reply
+    assert '%' not in reply and 'incomplete' in reply and 'only count calls that reported them' in reply
+    store, agent = usage_store(tmp_path / 'zero')
+    store.add_chat_usage('f'*32, 'model', 'high', 'completed', counters(100, 20, 0, 0))
+    reply = describe_usage(agent.usage())
+    assert '(0 cached input, 0 reasoning)' in reply and 'incomplete' not in reply
+    store, agent = usage_store(tmp_path / 'none')
+    store.add_chat_usage('g'*32, 'model', 'high', 'completed', counters(100, 20, None, None))
+    reply = describe_usage(agent.usage())
+    assert '- chat: 120 tokens · 1 calls\n' in reply and 'reported them' not in reply
+
+
+@pytest.mark.parametrize('by_model', [False, True])
+def test_folded_bucket_adds_only_reported_counts(tmp_path, by_model):
+    store, agent = usage_store(tmp_path)
+    roles = ('conversation', 'web_search', 'attention', 'summary', 'status', 'history', 'meme', 'investigation')
+    for index, role in enumerate(roles):
+        cached = {6: 30, 7: 0}.get(index)
+        store.add_chat_usage(f'{index:032d}', f'model-{index}', 'high', 'completed',
+                             counters(200 - index, 10, cached, None), role=role)
+    reply = describe_usage(agent.usage(), by_model=by_model)
+    folded = 'other models' if by_model else 'other tasks'
+    assert f'- {folded}: 407 tokens · 2 calls (30 cached input)' in reply
+    assert len(reply.splitlines()) == 10 and len(reply) < 1950
 
 
 def conversation(monkeypatch, tmp_path):
