@@ -362,16 +362,13 @@ class ChatResult:
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
 
 
-class CacheKeyRejected(Exception):
-    """The plan route refused the optional prompt_cache_key by name before producing any output."""
-
-    def __init__(self, counters=None):
-        super().__init__('prompt_cache_key rejected')
-        self.counters = counters or {}
+CACHE_KEY_REJECTION = re.compile(r'(?:unknown|unsupported|unrecognized|invalid)\b[^.]*\bprompt_cache_key|'
+                                 r'\bprompt_cache_key\b[^.]*\b(?:not supported|not allowed|not permitted|unknown|'
+                                 r'unrecognized|invalid)')
 
 
 def rejects_cache_key(error):
-    """Only an explicit unknown, unsupported or invalid parameter error that names prompt_cache_key."""
+    """An explicit unknown or unsupported parameter error about prompt_cache_key, nothing broader."""
     if isinstance(error, bytes):
         try:
             error = json.loads(error).get('error')
@@ -379,9 +376,12 @@ def rejects_cache_key(error):
             return False
     if not isinstance(error, dict):
         return False
-    named = error.get('param') == 'prompt_cache_key' or 'prompt_cache_key' in str(error.get('message', ''))
     kind = f"{error.get('code') or ''} {error.get('type') or ''}".casefold()
-    return named and any(word in kind for word in ('unknown', 'unsupported', 'unrecognized', 'invalid'))
+    if not any(word in kind for word in ('unknown', 'unsupported', 'unrecognized', 'invalid')):
+        return False
+    if error.get('param'):
+        return error['param'] == 'prompt_cache_key'
+    return bool(CACHE_KEY_REJECTION.search(str(error.get('message', '')).casefold()))
 
 
 def cache_key(source):
@@ -494,22 +494,18 @@ class Chat:
                                          headers=await self.headers()) as response:
                     if response.status_code != 200:
                         if 'prompt_cache_key' in payload and rejects_cache_key(await response.aread()):
-                            raise CacheKeyRejected
+                            self.cache_keys = False  # Later calls skip the hint; this one fails as usual.
                         result.status = 'failed'
                         if response.status_code == 429:
                             result.error = 'mint’s ai wallet is tapped out for now, plan or rate limit. check usage or try me again later.'
                         else:
                             result.error = 'big ai didn’t take that request. the owner can check my subscription connection and model setting.'
                         return result
-                    generated = False
                     async for event in events(response.aiter_lines()):
                         kind = event.get('type')
-                        failed = event.get('response') or {}
-                        if (kind in ('error', 'response.failed') and not generated and 'prompt_cache_key' in payload
-                                and rejects_cache_key(failed.get('error') or event.get('error') or event)
-                                and not failed.get('output') and not usage(failed)['output_tokens']):
-                            raise CacheKeyRejected(usage(failed))
-                        generated = generated or kind not in ('response.created', 'response.in_progress', 'response.queued')
+                        if kind in ('error', 'response.failed') and 'prompt_cache_key' in payload and rejects_cache_key(
+                                (event.get('response') or {}).get('error') or event.get('error') or event):
+                            self.cache_keys = False
                         key = (event.get('output_index', 0), event.get('content_index', 0))
                         if kind == 'response.output_text.delta':
                             text_parts[key] = text_parts.get(key, '') + event.get('delta', '')
@@ -582,14 +578,6 @@ class Chat:
                             result.status = 'invalid_output'
                             result.error = 'Fri received an unreadable reply. Please try again.'
                         return result
-        except CacheKeyRejected as rejected:
-            # Nothing was generated yet, so retry once without the hint. cache_keys stays off, so no loop.
-            self.cache_keys = False
-            retry = await self.respond(text, context)
-            for name, value in rejected.counters.items():
-                if value:  # Keep any usage the rejected attempt reported.
-                    retry.counters[name] = (retry.counters.get(name) or 0) + value
-            return retry
         except SubscriptionError as exc:
             result.error, result.status = str(exc), 'failed'
         except (httpx.HTTPError, ValueError, KeyError, TypeError):

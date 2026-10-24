@@ -65,60 +65,43 @@ def sse(*events):
     return httpx.Response(200, text=''.join('data: ' + json.dumps(event) + '\n\n' for event in events))
 
 
-@pytest.mark.parametrize('rejection', [
-    lambda: httpx.Response(400, json={'error': REJECTION}),
-    lambda: httpx.Response(422, json={'error': REJECTION}),
-    lambda: sse({'type': 'error', **REJECTION}),
-    lambda: sse({'type': 'response.created'}, {'type': 'response.failed', 'response': {
-        'error': REJECTION, 'usage': {'input_tokens': 100, 'output_tokens': 0}}}),
-])
-def test_a_cache_key_rejected_by_name_is_dropped_and_retried_once(rejection):
+def cache_calls(response):
+    """Two chats on one Chat: records whether each request carried the cache hint."""
     sent = []
 
     def handler(request):
         sent.append('prompt_cache_key' in json.loads(request.content))
-        return rejection() if sent[-1] else sse(response_event())
+        return response() if len(sent) == 1 else sse(response_event())
     chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
     context = {**CONTEXT, 'source': {'channel_id': '123456789012345678', 'user_id': '1'}}
-    first = asyncio.run(chat.respond('hi', context))
-    assert first.status == 'completed' and sent == [True, False]
-    assert asyncio.run(chat.respond('hi', context)).status == 'completed' and sent == [True, False, False]
+    results = [asyncio.run(chat.respond('hi', context)) for _ in range(2)]
+    return results, sent
 
 
-def test_a_rejected_attempts_reported_usage_is_kept():
-    def handler(request):
-        if 'prompt_cache_key' in json.loads(request.content):
-            return sse({'type': 'response.failed', 'response': {
-                'error': REJECTION, 'usage': {'input_tokens': 100, 'output_tokens': 0}}})
-        return sse(response_event())
-    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
-    context = {**CONTEXT, 'source': {'channel_id': '123456789012345678', 'user_id': '1'}}
-    result = asyncio.run(chat.respond('hi', context))
-    assert result.status == 'completed' and result.counters['input_tokens'] == 200
+@pytest.mark.parametrize('rejection', [
+    lambda: httpx.Response(400, json={'error': {**REJECTION, 'type': 'invalid_request_error'}}),
+    lambda: httpx.Response(422, json={'error': {'type': 'invalid_request_error',
+                                                'message': 'prompt_cache_key is not supported on this route.'}}),
+    lambda: sse({'type': 'error', **REJECTION}),
+    lambda: sse({'type': 'response.created'}, {'type': 'response.failed', 'response': {'error': REJECTION}}),
+])
+def test_an_explicit_cache_key_rejection_turns_the_hint_off_for_later_calls(rejection):
+    (first, second), sent = cache_calls(rejection)
+    assert first.status != 'completed' and second.status == 'completed' and sent == [True, False]
 
 
 @pytest.mark.parametrize('response', [
-    lambda: httpx.Response(400, json={'error': {**REJECTION, 'param': 'input', 'message': 'Bad input.'}}),
-    lambda: sse({'type': 'response.output_text.delta', 'delta': '{"reply": "par'},
-                {'type': 'response.failed', 'response': {'error': REJECTION}}),
-    lambda: sse({'type': 'response.output_item.added', 'item': {'type': 'reasoning'}},
-                {'type': 'response.failed', 'response': {'error': REJECTION}}),
-    lambda: sse({'type': 'response.failed', 'response': {'error': REJECTION, 'output': [{'type': 'reasoning'}],
-                                                         'usage': {'input_tokens': 100, 'output_tokens': 30}}}),
-    lambda: sse({'type': 'response.failed', 'response': {'prompt_cache_key': 'fri-chat-echo',
-                                                         'error': {'code': 'server_error', 'message': 'Try again.'}}}),
+    lambda: httpx.Response(400, json={'error': {'type': 'invalid_request_error', 'param': 'input',
+        'message': 'Invalid input; the request also included prompt_cache_key.'}}),
     lambda: httpx.Response(500, json={'error': {'type': 'server_error', 'message': 'boom'},
                                       'prompt_cache_key': 'fri-chat-echo'}),
+    lambda: sse({'type': 'response.failed', 'response': {'prompt_cache_key': 'fri-chat-echo',
+                                                         'error': {'code': 'server_error', 'message': 'Try again.'}}}),
+    lambda: httpx.Response(429, json={'error': {'type': 'rate_limit_error', 'message': 'Slow down.'}}),
 ])
-def test_other_failures_and_failures_after_output_are_not_retried(response):
-    sent = []
-
-    def handler(request):
-        sent.append('prompt_cache_key' in json.loads(request.content))
-        return response()
-    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
-    context = {**CONTEXT, 'source': {'channel_id': '123456789012345678', 'user_id': '1'}}
-    assert asyncio.run(chat.respond('hi', context)).status == 'failed' and sent == [True] and chat.cache_keys
+def test_other_failures_keep_the_hint_and_are_not_retried(response):
+    (first, second), sent = cache_calls(response)
+    assert first.status == 'failed' and second.status == 'completed' and sent == [True, True]
 
 
 def test_model_refresh_reads_subscription_visible_catalog():
