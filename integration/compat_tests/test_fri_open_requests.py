@@ -13,8 +13,8 @@ import pytest
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_mentions import environment
 from fri.fri_chat import Chat, ChatResult
-from fri.fri_eval import evaluate
 from fri.fri_panel import InputModal
+from fri.fri_request_eval import evaluate as evaluate_requests
 from fri.fri_requests import DraftView
 
 
@@ -87,15 +87,40 @@ def test_the_model_sees_dates_and_withdrawals_not_raw_rows(store):
     assert 'withdrawn means' in sent[0]['instructions']
 
 
-def test_the_request_status_evaluation_supplies_states_and_checks_public_restraint():
-    seen = []
-    async def respond(text, context):
-        seen.append(context)
-        return ChatResult(status='completed', reply='your request got rejected lol' if 'raid' in text else 'not yet')
-    async def collect():
-        return [case async for case, _ in evaluate(SimpleNamespace(respond=respond), 'gpt-6.1-sol', 'high', suite='requests')]
-    cases = {case['name']: case for case in asyncio.run(collect())}
-    states = {name: [row['state'] for row in context['requests']] for name, context in zip(cases, seen)}
-    assert states['queued_has_not_started'] == ['queued'] and states['approved_is_not_live'] == ['approved']
-    assert seen[0]['source']['guild_id'] is None and seen[-1]['source']['guild_id'] == '444'
-    assert cases['public_banter_skips_requests']['passed'] is False  # Volunteering status in public fails.
+def test_the_request_status_evaluation_fails_wrong_answers():
+    judged = []
+    async def judge(data):  # Scripted stand-in for the model judge: it rejects the boastful reply.
+        judged.append(data)
+        return {'verdict': 'fail' if 'all done' in data['reply'] else 'pass', 'reason': ''}, {'input_tokens': 1}, 'completed'
+    def responder(reply, draft=None):
+        seen = []
+        async def respond(text, context):
+            seen.append(context)
+            return ChatResult(status='completed', reply=reply(text), draft=draft)
+        return SimpleNamespace(respond=respond, seen=seen)
+    async def run(chat):
+        return {case['name']: case async for case, _ in evaluate_requests(chat, 'gpt-6.1-sol', 'high', '', judge=judge)}
+    boastful = responder(lambda text: 'btw your fix is live now' if 'raid' in text else 'all done and live, daniel rejected it lol')
+    verdicts = asyncio.run(run(boastful))
+    graded = [name for name in verdicts if not name.endswith('_judge')]
+    assert graded and not any(verdicts[name]['passed'] for name in graded)
+    assert verdicts['public_banter_skips_requests']['evidence'] == {'guards_passed': False}  # No judge needed.
+    assert 'public_banter_skips_requests_judge' not in verdicts
+    assert not any(row['passed'] for row in asyncio.run(run(responder(lambda text: 'not yet', draft='Fix it again'))).values())
+    judged.clear()
+    careful = responder(lambda text: 'lmao that was a mess' if 'raid' in text else 'not yet, still waiting on its next step')
+    assert all(row['passed'] for row in asyncio.run(run(careful)).values())
+    assert len(judged) == len(careful.seen) == 7 and 'requests' not in careful.seen[5]  # The unavailable case.
+    assert judged[0]['requests'][0]['state'] == 'queued' and judged[0]['rubric'].startswith('Not started')
+    assert careful.seen[0]['source']['guild_id'] is None and careful.seen[2]['source']['guild_id'] == '444'
+
+
+def test_the_model_is_told_when_requests_are_unavailable():
+    sent = []
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, text='data: ' + json.dumps(response_event()) + '\n\n')
+    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
+    asyncio.run(chat.respond('fri did my fix go through', CONTEXT))  # E.g. an invitation or an older controller.
+    assert json.loads(sent[0]['input'][-1]['content'])['your_gene_requests'] is None
+    assert 'null means' in sent[0]['instructions']

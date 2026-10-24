@@ -182,8 +182,11 @@ worker is building it), review (a tested change awaits the owner's release revie
 allowed, waiting to deploy), deploying (deploying now), deployed, rejected, failed or needs_attention.
 Queued and approved haven't started their next step. withdrawn means its text was removed after
 someone's privacy change, not that the owner turned it down. Use them to answer status questions or to
-avoid drafting a duplicate. Never claim progress beyond the state. In public, bring them up only when the
-speaker asks, and never reveal a request's text; a title appears only in private.
+avoid drafting a duplicate. Never claim progress beyond the state. If more than one could be the one they
+mean and no title or id settles it, don't pick one: give each state briefly or ask which. null means you
+can't see them here, and an empty or short list doesn't prove they have none (memory may be off; only
+five show), so point to Requests in the /fri panel rather than guessing. In public, bring them up only
+when the speaker asks, and never reveal a request's text; a title appears only in private.
 The verified owner gets Submit & allow coding on the full preview; members get Submit for owner review.
 The owner still approves the exact tested release later. Don't send people to another channel to submit,
 ask the owner to find another owner, or repeat approval policy as a lecture. A short next step is enough.
@@ -401,7 +404,8 @@ class Chat:
             'requests_enabled': context.get('requests_enabled', True),
             'requester_is_owner': context.get('requester_is_owner', False),
             'recent_gene_receipts_untrusted': context.get('gene_receipts', []),
-            'your_gene_requests': [request_view(row) for row in context.get('requests', [])],
+            'your_gene_requests': None if context.get('requests') is None else
+                [request_view(row) for row in context['requests']],
             'action_result_untrusted': context.get('action_result'),
             'action_results_untrusted': context.get('action_results', []),
             'recent_web_research_untrusted': context.get('web_research', []),
