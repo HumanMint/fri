@@ -53,8 +53,9 @@ composing, and an exception type such as `Forbidden`. A burst's earlier messages
 logged under the reason its last message got. A reply, a notice, a preview or a reaction
 counts as an answer. Bots, webhooks and DMs aren't logged. Fri ignores a copy of an event
 that Discord delivers again while the first delivery, or the burst holding it, is still
-being handled, and for an hour after (at most 10,000 IDs), so the first delivery answers
-or explains for every copy. A ping is logged at most once while it is among the last
+being handled. Separately, it remembers each event ID for an hour from its first arrival
+(at most 10,000 IDs, oldest dropped first) and ignores copies in that time, so the first
+delivery answers or explains for every copy. A ping is logged at most once while it is among the last
 10,000 pings watched.
 
 Offline synthetic integration checks cover handler replies, image provenance,

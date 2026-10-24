@@ -266,8 +266,11 @@ def test_delivered_ids_are_remembered_for_an_hour_and_a_bounded_count(monkeypatc
         await agent.handle(events[3])  # The oldest ID makes room...
         await agent.handle(events[0])  # ...so a copy that late counts as new.
         assert agent.watch.await_count == 5 and len(agent.delivered) == 3
+        clock[0] = 3599
+        await agent.handle(events[3])  # Still within the hour from its first arrival...
+        assert agent.watch.await_count == 5
         clock[0] = 3601
-        await agent.handle(events[3])  # Remembered for an hour.
+        await agent.handle(events[3])  # ...and the ignored copy didn't restart that hour.
         assert agent.watch.await_count == 6 and list(agent.delivered) == [3]
     asyncio.run(scenario())
 
