@@ -179,12 +179,19 @@ and Red are **test-only** dependencies; the Fri wheel and runtime image contain 
 - `integration/compat_tests` and `integration/replay` against the pinned controller;
 - `ruff`.
 
-A Python audit-hook guard denies non-loopback connections and DNS in every Python process. On
-macOS, `sandbox-exec` also denies outbound IP; on Linux, `unshare -rn` does when available.
-Inside an existing sandbox where nesting fails, for example a Codex reviewer, the guard alone is
-used. The guard covers only Python's socket layer. Non-Python subprocesses and native code are
-covered only by an OS layer: the script's own, or the outer sandbox's. Every run first proves each active layer with a canary connection, prints the isolation it
-used, and exits non-zero on any failure.
+The guarantee comes from an OS layer: `sandbox-exec` on macOS or `unshare -rn` on Linux denies
+outbound IP. A Python audit-hook guard also denies non-loopback connect/sendto/sendmsg and every
+socket name lookup in each Python process. The guard covers only Python's socket layer;
+non-Python subprocesses and native code depend on an OS layer.
+
+If no OS layer can be applied here (for example nested inside a Codex reviewer's sandbox), the
+script refuses to run unless `OFFLINE_ISOLATION=python` explicitly accepts the guard alone as best
+effort, relying on the outer sandbox.
+
+Every run first proves each active layer with canaries. These target RFC 5737/6761 test
+addresses, and a backstop hook stops any probe the guard misses before it sends traffic. The run
+prints the isolation it used and exits non-zero on any failure. No Python starts with the
+caller's environment before `check` clears it.
 
 Overrides:
 
@@ -192,7 +199,7 @@ Overrides:
 - `GENE_REPO`: Gene repository path (default `../gene`);
 - `FRI_OFFLINE_CACHE`: cache location;
 - `FRI_VENV`: Fri venv, for a fresh review checkout without `.venv`;
-- `OFFLINE_ISOLATION=python`: guard only.
+- `OFFLINE_ISOLATION=python`: accept the Python guard alone (best effort) inside an outer network-denied sandbox.
 
 The equivalent manual command for the integration suites is
 `PYTHONPATH="$PWD/src:$PWD/integration:<gene>/src:<gene>" <gene venv>/bin/python -m pytest -q

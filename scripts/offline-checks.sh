@@ -8,8 +8,9 @@
 # The paired controller is the exact Gene commit in docs/integration-pair.json
 # (verified_controller_commit), extracted with `git archive` and given its own venv from that
 # commit's uv.lock. Environment overrides: GENE_SHA, GENE_REPO (default ../gene),
-# FRI_OFFLINE_CACHE, FRI_VENV (default .venv), OFFLINE_ISOLATION=python to skip the OS sandbox.
-# Bash 3.2 compatible (macOS /bin/bash).
+# FRI_OFFLINE_CACHE, FRI_VENV (default .venv), OFFLINE_ISOLATION=python to accept the Python-only
+# guard (best effort) inside an outer network-denied sandbox. Bash 3.2 compatible (macOS /bin/bash).
+# Nothing runs Python with the caller's environment before `check` clears it.
 set -euo pipefail
 
 FRI=$(cd "$(dirname "$0")/.." && pwd)
@@ -21,13 +22,10 @@ PROFILE='(version 1)(allow default)(deny network-outbound (remote ip "*:*"))(all
 
 die() { echo "offline-checks: $*" >&2; exit 1; }
 
-json_python() {
-  if [ -x "$FRI_VENV/bin/python" ]; then echo "$FRI_VENV/bin/python"; else command -v python3 || die 'python3 not found'; fi
-}
-
 if [ -z "${GENE_SHA:-}" ]; then
-  GENE_SHA=$("$(json_python)" -c 'import json, sys; print(json.load(open(sys.argv[1]))["verified_controller_commit"])' \
-    "$FRI/docs/integration-pair.json")
+  # Parsed without Python: no interpreter starts before the environment is cleared.
+  GENE_SHA=$(sed -n 's/.*"verified_controller_commit"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
+    "$FRI/docs/integration-pair.json" | head -n 1)
 fi
 echo "$GENE_SHA" | grep -Eq '^[0-9a-f]{40}$' || die "GENE_SHA must be a full 40-character commit, got: $GENE_SHA"
 GENE_DIR=$CACHE_ROOT/$GENE_SHA
@@ -56,25 +54,32 @@ setup() {
 write_guard() {
   # Loaded via PYTHONPATH by every Python process in the check phase, alongside any OS sandbox.
   cat > "$1/sitecustomize.py" <<'PY'
-"""offline-checks guard: deny non-loopback network and DNS from Python processes."""
+"""offline-checks guard: deny non-loopback network and name lookups from Python's socket layer.
+
+Best effort: native code and non-Python subprocesses are covered only by an OS-level sandbox.
+"""
 import socket
 import sys
 
 _LOCAL = {None, '', 'localhost', '127.0.0.1', '::1'}
+_SENDS = ('socket.connect', 'socket.sendto', 'socket.sendmsg')
+_LOOKUPS = ('socket.getaddrinfo', 'socket.gethostbyname', 'socket.gethostbyaddr', 'socket.getnameinfo')
 
 
 def _host(value):
+    if isinstance(value, tuple):
+        value = value[0] if value else None
     return value.decode() if isinstance(value, bytes) else value
 
 
 def _hook(event, args):
-    if event in ('socket.connect', 'socket.sendto'):
+    if event in _SENDS:
         sock, address = args[0], args[-1]
         if (getattr(sock, 'family', None) in (socket.AF_INET, socket.AF_INET6) and
-                isinstance(address, tuple) and _host(address[0]) not in _LOCAL):
-            raise PermissionError(f'offline-checks: outbound network denied ({address[0]})')
-    elif event == 'socket.getaddrinfo' and _host(args[0]) not in _LOCAL:
-        raise PermissionError(f'offline-checks: DNS lookup denied ({args[0]})')
+                isinstance(address, tuple) and _host(address) not in _LOCAL):
+            raise PermissionError(f'offline-checks: outbound network denied ({event}, {address[0]})')
+    elif event in _LOOKUPS and _host(args[0]) not in _LOCAL:
+        raise PermissionError(f'offline-checks: name lookup denied ({event}, {_host(args[0])})')
 
 
 sys.addaudithook(_hook)
@@ -82,9 +87,9 @@ PY
 }
 
 choose_isolation() {
-  ISOLATION=python-guard
   SANDBOX=()
   if [ "${OFFLINE_ISOLATION:-auto}" = python ]; then
+    ISOLATION='python-guard only (best effort; relies on an outer OS sandbox for full denial)'
     return
   fi
   if [ "$(uname)" = Darwin ] && /usr/bin/sandbox-exec -p "$PROFILE" /usr/bin/true 2>/dev/null; then
@@ -93,6 +98,9 @@ choose_isolation() {
   elif [ "$(uname)" = Linux ] && command -v unshare >/dev/null && unshare -rn true 2>/dev/null; then
     ISOLATION='unshare -rn + python-guard'
     SANDBOX=(unshare -rn)
+  else
+    die 'no OS-level network sandbox is available here (sandbox-exec / unshare -rn). Run inside an outer
+network-denied sandbox and set OFFLINE_ISOLATION=python to accept the Python-only guard as best effort.'
   fi
 }
 
@@ -109,13 +117,35 @@ run() {
     ${prefix[@]+"${prefix[@]}"} "$@"
 }
 
+# Targets are RFC 5737/6761 test addresses that never reach a real host.
 CANARY='
 import errno, socket, sys
 layer = sys.argv[1]
-probes = [("connect", lambda: socket.socket().connect(("1.1.1.1", 443)))]
+TEST_IP, TEST_NAME = "198.51.100.1", "offline-canary.invalid"
+def udp():
+    return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def tcp():
+    sock = socket.socket()
+    sock.settimeout(3)
+    return sock
+probes = {"connect": lambda: tcp().connect((TEST_IP, 443))}
 if layer == "guard":
-    probes.append(("dns", lambda: socket.getaddrinfo("example.com", 443)))
-for name, probe in probes:
+    class MissedByGuard(Exception):
+        pass
+    def backstop(event, args):  # Added after the guard: a miss stops here, before any traffic.
+        if event.startswith("socket.") and event not in ("socket.__new__", "socket.bind"):
+            raise MissedByGuard(event)
+    sys.addaudithook(backstop)
+    probes.update({
+        "sendto": lambda: udp().sendto(b"x", (TEST_IP, 9)),
+        "sendmsg": lambda: udp().sendmsg([b"x"], [], 0, (TEST_IP, 9)),
+        "getaddrinfo": lambda: socket.getaddrinfo(TEST_NAME, 443),
+        "gethostbyname": lambda: socket.gethostbyname(TEST_NAME),
+        "gethostbyname_ex": lambda: socket.gethostbyname_ex(TEST_NAME),
+        "gethostbyaddr": lambda: socket.gethostbyaddr(TEST_IP),
+        "getnameinfo": lambda: socket.getnameinfo((TEST_IP, 443), 0),
+    })
+for name, probe in probes.items():
     try:
         probe()
     except OSError as exc:
@@ -123,7 +153,9 @@ for name, probe in probes:
         denied = isinstance(exc, PermissionError) or exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH)
         if not (guard if layer == "guard" else denied):
             print(name, "inconclusive, not a denial by this layer:", exc); sys.exit(2)
-        print(name, "blocked:", exc)
+        print(name, "blocked")
+    except Exception as exc:
+        print(name, "NOT DENIED by this layer:", type(exc).__name__, exc); sys.exit(1)
     else:
         print(name, "SUCCEEDED: network is not blocked"); sys.exit(1)
 '
