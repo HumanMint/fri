@@ -463,10 +463,27 @@ def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tm
                 assert fri.chat_once.await_count == 1 and mention_lines(caplog) == []
                 if when == 'reply':
                     event.reply.assert_not_awaited()
-            assert agent.misses == {} and not agent.handling
+            assert agent.misses == {}
         finally:
             release.set()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_burst_message_redelivered_after_its_answer_is_ignored(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('<@99> hey', age=1), message('you around?')
+        try:
+            await asyncio.gather(agent.handle(first), agent.handle(second))
+            second.reply.assert_awaited_once()
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(copy.copy(first))  # Its own invitation is unspent, but it was answered.
+            first.reply.assert_not_awaited()
+            assert fri.chat_once.await_count == 1 and mention_lines(caplog) == []
+        finally:
             await fri.close()
     asyncio.run(scenario())
 

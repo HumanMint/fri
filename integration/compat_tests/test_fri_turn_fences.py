@@ -1,6 +1,7 @@
 """Save-after-delivery fences: what is checked before Discord, and what is recorded after."""
 
 import asyncio
+import copy
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -664,9 +665,9 @@ def test_a_redelivered_mention_waits_for_the_first_reply_to_be_delivered_and_rec
             await asyncio.wait_for(first, 5)
             assert len(sends) == 1 and fri.chat_once.await_count == 1
             assert sum(path == '/chat/turn' for path, _ in calls) == 1
-            await agent.handle(event)  # After it's recorded, the consumed grant refuses a repeat.
-            assert fri.chat_once.await_count == 1 and sends[0] not in sends[1:]
-            assert all('cannot renew its mention invitation' in text for text in sends[1:])
+            await agent.handle(event)  # After it's recorded, a copy is ignored too, without a notice.
+            await agent.handle(copy.copy(event))
+            assert fri.chat_once.await_count == 1 and len(sends) == 1
         finally:
             release.set()
             await first
