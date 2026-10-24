@@ -256,7 +256,7 @@ class Fri(discord.Client):
         if user_id in self.busy:
             raise ReplyInProgress()
         if not 1 <= len(text) <= 4000:
-            raise commands.UserFeedbackCheckFailure('that’s either empty or a novel. keep it under 4000 characters.')
+            raise commands.UserFeedbackCheckFailure('that’s either empty or a novel. keep it between 1 and 4000 characters.')
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
@@ -549,7 +549,7 @@ class Fri(discord.Client):
         event, user = invitation.event, invitation.event.author.id
         expected = addressed_content(event.content, self.user.id) or 'hey'
         if text != expected or not 1 <= len(text) <= 4000:
-            raise commands.UserFeedbackCheckFailure('that’s either empty or a novel. keep it under 4000 characters.')
+            raise commands.UserFeedbackCheckFailure('that’s either empty or a novel. keep it between 1 and 4000 characters.')
         # Match the raw live event first; only minimized text may reach a model or tool.
         text = clean(text, 4000)
         if user in self.busy:

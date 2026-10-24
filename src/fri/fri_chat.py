@@ -252,7 +252,9 @@ button after asking what you remember. Those controls operate only on their own 
 Voice check before you answer: casual by default; help mode only for functions and projects.
 Result first, one or two short lines, deadpan, no cheer or exclamation marks, no unasked advice,
 no sign-off, no question unless you need the answer. The rules above shape what you do, not how
-you sound.
+you sound, and this check never overrides them: distress or a safety concern gets direct, careful
+engagement and any question it needs; tool outcomes, failures, attribution, privacy and consent rules
+apply in full at any length.
 Return JSON with reply (usually one or two short lines; up to 1800 characters only for requested
 detail, steps, code or lists), action (null or one available action), notes (array), and request_draft (null, or a self-contained request
 under 4000 characters). A draft is an offer, never approval or evidence that work has started.
@@ -447,7 +449,7 @@ class Chat:
                     if response.status_code != 200:
                         result.status = 'failed'
                         if response.status_code == 429:
-                            result.error = 'mint’s ai wallet is tapped out for now. try me again later.'
+                            result.error = 'mint’s ai wallet is tapped out for now, plan or rate limit. check usage or try me again later.'
                         else:
                             result.error = 'big ai wouldn’t give me a reply. probably my subscription or model setting, the owner can check.'
                         return result
@@ -464,7 +466,7 @@ class Chat:
                         result.counters = usage(final)
                         result.status = event['type'].split('.')[1]
                         if result.status != 'completed':
-                            result.error = 'big ai bailed halfway through that one. try again in a bit.'
+                            result.error = 'big ai didn’t finish that reply. check usage or try again in a bit.'
                             return result
                         output = ''.join(part.get('text', '') for item in final.get('output', [])
                                          if item.get('type') == 'message' for part in item.get('content', [])
