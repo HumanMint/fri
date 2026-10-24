@@ -362,26 +362,21 @@ class ChatResult:
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
 
 
-# The field itself is named as the rejected parameter, e.g. "Unknown parameter: 'prompt_cache_key'"
-# or "prompt_cache_key is not supported". A message that merely mentions the field doesn't count.
-CACHE_KEY_REJECTION = re.compile(
-    r'(?:unknown|unsupported|unrecognized|invalid)\s+(?:request\s+)?(?:parameter|param|argument|field)s?'
-    r'(?:\s+supplied)?:?\s*[\'"`]?prompt_cache_key\b|'
-    r'\bprompt_cache_key[\'"`]?\s+(?:is\s+)?(?:not supported|not allowed|not permitted|unsupported|unknown|unrecognized)')
+def drops_cache_key(status, error):
+    """Whether a failed call that carried prompt_cache_key should stop later calls from sending it.
+
+    The hint only saves tokens and the failed reply is never replayed, so this errs toward dropping it:
+    any client error except auth and rate limits, or an error that names the field in any wording."""
+    return 400 <= status < 500 and status not in (401, 403, 429) or 'prompt_cache_key' in json.dumps(error)
 
 
-def rejects_cache_key(error):
-    """An error that names prompt_cache_key as the rejected parameter, nothing broader."""
-    if isinstance(error, bytes):
-        try:
-            error = json.loads(error).get('error')
-        except (ValueError, AttributeError):
-            return False
-    if not isinstance(error, dict):
-        return False
-    if error.get('param'):
-        return error['param'] == 'prompt_cache_key'
-    return bool(CACHE_KEY_REJECTION.search(str(error.get('message', '')).casefold()))
+def error_object(body):
+    """The error part of a failed HTTP body, so a request field echoed beside it isn't read as the cause."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    return data.get('error', data) if isinstance(data, dict) else data
 
 
 def cache_key(source):
@@ -493,7 +488,7 @@ class Chat:
                 async with client.stream('POST', RESOURCE + '/responses', json=payload,
                                          headers=await self.headers()) as response:
                     if response.status_code != 200:
-                        if 'prompt_cache_key' in payload and rejects_cache_key(await response.aread()):
+                        if 'prompt_cache_key' in payload and drops_cache_key(response.status_code, error_object(await response.aread())):
                             self.cache_keys = False  # Later calls skip the hint; this one fails as usual.
                         result.status = 'failed'
                         if response.status_code == 429:
@@ -503,8 +498,9 @@ class Chat:
                         return result
                     async for event in events(response.aiter_lines()):
                         kind = event.get('type')
-                        if kind in ('error', 'response.failed') and 'prompt_cache_key' in payload and rejects_cache_key(
-                                (event.get('response') or {}).get('error') or event.get('error') or event):
+                        if kind in ('error', 'response.failed') and 'prompt_cache_key' in payload and drops_cache_key(
+                                response.status_code,
+                                (event.get('response') or {}).get('error') if kind == 'response.failed' else event):
                             self.cache_keys = False
                         key = (event.get('output_index', 0), event.get('content_index', 0))
                         if kind == 'response.output_text.delta':
