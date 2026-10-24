@@ -1,6 +1,7 @@
 """Save-after-delivery fences: what is checked before Discord, and what is recorded after."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -890,10 +891,13 @@ def test_messages_queued_behind_a_delivery_still_get_answered(monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize('erase', ['spoken', 'clear_chats', 'erase_user', 'disable'])
-def test_a_message_waiting_behind_a_delivery_is_dropped_if_its_author_erases(monkeypatch, tmp_path, erase):
+@pytest.mark.parametrize('mention', [False, True])
+def test_a_message_waiting_behind_a_delivery_is_dropped_if_its_author_erases(monkeypatch, tmp_path, caplog, erase, mention):
+    caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
-        initial, queued, privacy = message('fri hello'), message('fri play old marker'), message('fri forget me')
+        initial, privacy = message('fri hello'), message('fri forget me')
+        queued = message('<@99> play old marker' if mention else 'fri play old marker')
         sending, release = asyncio.Event(), asyncio.Event()
 
         async def send(content, **kwargs):
@@ -926,6 +930,8 @@ def test_a_message_waiting_behind_a_delivery_is_dropped_if_its_author_erases(mon
             await asyncio.wait_for(asyncio.gather(*tasks), 5)
             assert store.chat_context('123', 'public:1', '20')['pending'] is None
             assert all('old marker' not in call.args[0] for call in fri.chat_once.await_args_list)
+            if mention:
+                assert f'Mention 1/{queued.id} ignored: author privacy changed' in caplog.messages
         finally:
             release.set()
             await asyncio.gather(*tasks, return_exceptions=True)

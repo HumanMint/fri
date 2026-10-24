@@ -214,6 +214,61 @@ def test_invalid_invitation_fails_before_model(monkeypatch, tmp_path, caplog, fa
     asyncio.run(scenario())
 
 
+def test_disabled_fri_logs_a_mention_in_its_own_channel(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        agent.config['enabled'] = False
+        event = message('<@99> you there?')
+        try:
+            await agent.handle(event)
+            assert not calls
+            event.reply.assert_not_awaited()
+            assert f'Mention 1/{event.id} ignored: fri disabled' in caplog.messages
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('configured_channel', [False, True])
+def test_a_discord_refusal_names_the_mention_it_dropped(monkeypatch, tmp_path, caplog, configured_channel):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, _, _ = environment(
+            monkeypatch, tmp_path, channel_id=1 if configured_channel else 8)
+        @asynccontextmanager
+        async def typing():
+            raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
+            yield
+        channel.typing = typing
+        event = message('<@99> you there?')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await fri.on_message(event)
+            event.reply.assert_not_awaited()
+            assert f'Mention {channel.id}/{event.id} not answered: Forbidden' in caplog.messages
+            assert not any('Missing Permissions' in line or 'you there' in line for line in caplog.messages)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_withdrawn_image_share_names_the_mention_it_dropped(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you there?')
+        monkeypatch.setattr('fri.fri_image_share.send_reply', AsyncMock(return_value=None))
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            assert f'Mention 1/{event.id} not answered: image share withdrawn' in caplog.messages
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('configured_channel', [False, True])
 def test_nicknamed_members_mention_matches_its_fetched_copy(monkeypatch, tmp_path, configured_channel):
     # The gateway event carries the author's server member, so it shows their nickname. A REST

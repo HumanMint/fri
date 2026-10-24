@@ -634,8 +634,12 @@ class Fri(discord.Client):
         if self.agent:
             try:
                 await self.agent.handle(message)
-            except (commands.UserFeedbackCheckFailure, discord.HTTPException):
-                LOG.warning('Fri interaction could not complete')
+            except (commands.UserFeedbackCheckFailure, discord.HTTPException) as exc:
+                from .fri_addressing import pinged
+                if message.guild and pinged(message, getattr(self.user, 'id', 0)):  # IDs and type only.
+                    LOG.warning('Mention %s/%s not answered: %s', message.channel.id, message.id, type(exc).__name__)
+                else:
+                    LOG.warning('Fri interaction could not complete')
             return
         if (message.author.bot or getattr(message, 'webhook_id', None) or not message.guild or
                 message.guild.id != self.guild_id):

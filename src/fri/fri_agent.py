@@ -345,6 +345,8 @@ class Agent:
         owner_report = (owner_addressed and message.author.id == self.fri.owner_id and
                         (dm or message.guild.id == self.fri.guild_id) and usage_requested(directed or text))
         if not self.config['enabled'] and not privacy and not owner_report:
+            if not dm and pinged(message, self.fri.user.id):
+                LOG.info('Mention %s/%s ignored: fri disabled', channel, message.id)
             return
         invitation = None
         if self.config['enabled'] and not dm and message.guild.id == self.fri.guild_id and explicit_mention(message, self.fri.user.id):
@@ -382,6 +384,8 @@ class Agent:
             # Erased meanwhile, here or through the panel, Gene or Red: drop it, as forget() drops a burst.
             if (self.forgotten.get(message.author.id, 0) != forgotten or
                     (await self.profile(scope, message.author.id))['revision'] != observed):
+                if invitation:
+                    LOG.info('Mention %s/%s ignored: author privacy changed', channel, message.id)
                 return
         active = (self.active.get((channel, message.author.id), 0) > time.time() or
                   self.bursts.has(channel, message.author.id))
@@ -505,6 +509,8 @@ class Agent:
             sent = await send_reply(message, result, view=view, mention_author=False,
                                     allowed_mentions=NO_MENTIONS, suppress_embeds=True)
             if sent is None:  # Nothing was delivered, so nothing is recorded as said.
+                if invitation:
+                    LOG.info('Mention %s/%s not answered: image share withdrawn', message.channel.id, message.id)
                 await self.fri.waiting_notices.clear(message.author.id)
                 return
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.

@@ -44,8 +44,10 @@ name, because Fri has no members intent or member cache.
 A mention Fri doesn't answer is logged at INFO with only its channel and message IDs:
 `Mention <channel>/<message> ignored: <reason>` when it never became an invitation (for
 example `not a visible user mention` for Fri's role pill, `message changed`, `stale event`,
-`missing permissions`), `reply withheld: <reason>` when a recheck failed after composing,
-and `not answered: social cooldown` once the cooldown notice has already shown.
+`missing permissions`, `fri disabled`, `author privacy changed`), `reply withheld: <reason>`
+when a recheck failed after composing, and `not answered: <reason>` for a cooldown whose
+notice already showed, a withdrawn image share, or a Discord or controller error (logged
+by error type only).
 
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.
