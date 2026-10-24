@@ -18,6 +18,7 @@ from .harness import (
     Scenario,
     Wait,
     act,
+    placeholder,
     quiet,
     react,
     reply,
@@ -42,7 +43,7 @@ def answered(replay, label):
 
 def placeholder_only(replay, label):
     """No retained turn for this event keeps a derived reply; only neutral placeholders remain."""
-    return all(turn['reply'].startswith(('Earlier ', '[')) for turn in replay.retained(label))
+    return all(placeholder(turn['reply']) for turn in replay.retained(label))
 
 
 CLOSING = Scenario(

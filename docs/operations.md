@@ -208,7 +208,8 @@ bookkeeping stays on real time.
 
 `known_gap` checks run as strict xfails. They count only when the final gap assertion raises
 `KnownGapPresent`, after every other precondition has passed. Gap checks inspect stored turns by
-source event, not by model wording. When a fix makes one pass, the suite
+source event, not by model wording. Only the exact neutral placeholders written by Fri and the
+controller count as non-derived storage. A gap check that errors fails the run. When a fix makes one pass, the suite
 fails until the marker is removed, so a documented gap can't silently disappear or come back.
 
 Print reports offline with `python -m replay` (run from `integration/` with the same

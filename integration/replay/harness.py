@@ -12,6 +12,7 @@ import importlib
 import json
 import os
 import pkgutil
+import re
 import sys
 import tempfile
 import threading
@@ -29,6 +30,7 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 from gene.config import Settings
 from gene.fri_agent_store import AgentStore
+from gene.fri_mentions import BREADCRUMB_REPLY
 
 from fri.fri_chat import Chat
 from fri.fri_protocol import compatible
@@ -39,6 +41,20 @@ TOKEN = 'fri-' + 'x' * 32
 BASE = 'http://controller.replay'
 ADMISSION = ('/agent/admit', '/chat/mentions/admit', '/chat/operations/admit')
 NAMES = {OWNER: 'owner', 20: 'bo', 30: 'ash', 40: 'kit'}
+# Exact neutral placeholders stored instead of a reply (fri.py:237, :342-346, :393; Gene's mention
+# breadcrumb). Full matches only: a changed wording fails loudly rather than passing as neutral.
+PLACEHOLDERS = (
+    re.compile(r'Earlier check: [a-z_]+(?: in channel \d+)?\. (?:Public research receipts are available '
+               r'separately for follow-ups\.|Fetch current evidence for follow-up details; no findings are '
+               r'retained here\.)'),
+    re.compile(re.escape('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
+                         'no quoted findings are retained here.')),
+    re.compile(re.escape(BREADCRUMB_REPLY)),
+)
+
+
+def placeholder(reply):
+    return any(pattern.fullmatch(reply or '') for pattern in PLACEHOLDERS)
 
 
 class BudgetExhausted(httpx.TransportError):
@@ -176,8 +192,8 @@ class Step:
                 stored.append('not-retained')
             elif kept.get('response_kind', 'reply') != 'reply':
                 stored.append(kept['response_kind'])
-            elif reply.startswith(('Earlier ', '[')):
-                stored.append('breadcrumb')  # Neutral placeholders, including the controller's own.
+            elif placeholder(reply):
+                stored.append('breadcrumb')
             elif any(reply and text.startswith(reply) for text in texts):
                 stored.append('reply-text')
             else:
@@ -658,7 +674,7 @@ class Replay:
 def failures(reports):
     """The single validity rule shared by pytest and the CLI; any entry makes a run unsuccessful."""
     return [item for report in reports if 'checks' in report for item in
-            [c['name'] for c in report['checks'] if not c['passed'] and not c['known_gap']] +
+            [c['name'] for c in report['checks'] if c['detail'] or (not c['passed'] and not c['known_gap'])] +
             [f'controller error for {path}' for path in report['controller_errors']] +
             [f'controller {status} for {path} in {label}' for label, path, status in report['unexpected_rejections']] +
             [f'rejected save in {label}' for label in report['rejected_saves']] +

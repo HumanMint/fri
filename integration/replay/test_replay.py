@@ -255,3 +255,24 @@ def test_subscription_expiry_stays_on_real_time(tmp_path):
     saved = json.loads(auth.read_text())
     assert saved['access_token'] == 'synthetic-new'
     assert abs(saved['expires_at'] - (time.time()+3600)) < 60
+
+
+@pytest.mark.parametrize('text', ['Earlier ash said denver, next month', '[ash said denver, next month]'])
+def test_placeholder_lookalikes_still_reproduce_the_privacy_gap(text, tmp_path):
+    """Round-4 finding: only exact neutral placeholders count, not reply prefixes."""
+    report = run(ERASURE, tmp_path, live=httpx.MockTransport(live_reply(text)), max_calls=1)
+    preconditions(report)
+    gap = next(c for c in report['checks'] if c['known_gap'])
+    assert not gap['passed'] and report['steps'][2]['route']['stored'] == ['reply-text']
+
+
+def test_erroring_known_gap_check_fails_the_run(tmp_path):
+    """Round-4 finding: a crashing gap check is a failure for the CLI too, not a documented gap."""
+    from dataclasses import replace
+
+    def broken(replay):
+        raise ValueError('synthetic gap evaluation error')
+
+    checks = [replace(c, test=broken) if c.known_gap else c for c in ERASURE.checks]
+    report = run(replace(ERASURE, checks=checks), tmp_path)
+    assert any(c['detail'] for c in report['checks']) and failures([report])
