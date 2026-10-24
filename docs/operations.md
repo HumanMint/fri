@@ -168,8 +168,60 @@ Run with both source trees available, credentials removed and network access den
 
 ```sh
 PYTHONPATH="$PWD/src:$PWD/integration:/path/to/gene/src:/path/to/gene" \
-  /path/to/gene/.venv/bin/python -m pytest -q -p no:cacheprovider integration/compat_tests
+  /path/to/gene/.venv/bin/python -m pytest -q -p no:cacheprovider integration/compat_tests integration/replay
 ```
+
+### Replay harness
+
+`integration/replay/` drives synthetic multi-message scenarios through the unmodified
+`Fri.on_message` pipeline and the real Gene controller in-process. It fakes Discord, the
+controller transport (an aiohttp-shaped adapter, so `Fri.api` runs unchanged) and the provider
+transport. A virtual wall clock controls message IDs, follow-up windows and controller TTLs:
+`time.time()` and every loaded `fri`/`gene` module's `dt.datetime.now()` follow it, while
+monotonic time stays real for asyncio. `Inspect` steps can record state mid-run.
+
+Each step records:
+
+- the observed route: local intercept, admission, model, tools, outcome, and how the turn was
+  stored;
+- a context manifest: field sizes, offered actions, prompt version, model and effort, with no raw
+  member text;
+- token usage.
+
+Production source is unchanged. Routes come from observable effects plus a pass-through spy on
+`Actions.execute`, so tools that return early (for example a clarification) or are cancelled by
+the turn deadline are traced too. All
+scenario members and messages are invented.
+
+Answer checks require completed inference, taken from Fri's own usage receipts. A provider
+error notice is never counted as an answer. A turn counts as stored only if it's read back from
+the synthetic store by its source event. A run is unsuccessful, and the CLI exits non-zero, if
+it has:
+
+- a controller 5xx;
+- a controller 4xx the scenario didn't declare in `expected_rejections`;
+- a rejected save;
+- a failed inference;
+- unused scripted responses;
+- a scenario skipped because the call budget ran out;
+- a failed ordinary check.
+
+pytest and the CLI share this single rule (`failures()`). Checks run before real time is restored.
+Live transports are created and closed per scenario from a factory, and subscription expiry
+bookkeeping stays on real time.
+
+`known_gap` checks run as strict xfails. They count only when the final gap assertion raises
+`KnownGapPresent`, after every other precondition has passed. Gap checks inspect stored turns by
+source event, not by model wording. Only the exact neutral placeholders written by Fri and the
+controller count as non-derived storage. A gap check that errors fails the run. When a fix makes one pass, the suite
+fails until the marker is removed, so a documented gap can't silently disappear or come back.
+
+Print reports offline with `python -m replay` (run from `integration/` with the same
+`PYTHONPATH`). `--live-model --auth SESSION --max-calls N` runs the same scenarios against the
+real provider with a hard call budget, and is never part of offline checks. It needs network access
+and a subscription session dedicated to evaluation, because refreshes rewrite the session. Never
+use the production session or a copy of its rotating refresh token. Nothing is posted to Discord,
+and live controller state is never touched.
 
 The maintainer runs this inside an OS network-denied environment or disposable
 container without credential mounts. Ordinary runtime tests need only Fri's own
