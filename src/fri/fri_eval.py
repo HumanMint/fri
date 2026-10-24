@@ -180,25 +180,53 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
         async for case, result in continuity(chat, model, effort, voice_notes):
             yield case, result
         return
-    for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': image_cases}[suite]():
+    for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': image_cases, 'requests': request_cases}[suite]():
         name = case.get('display_name', 'Mint')
         context = {'model': model, 'effort': effort, 'facts': [],
             'turns': case.get('turns', []), 'recent': case.get('recent', []),
             'actions': case.get('actions', {}), 'requests_enabled': suite not in ('voice', 'pronouns'), 'voice_notes': voice_notes,
             'action_result': case.get('action_result'), 'web_research': case.get('web_research', []),
-            'gene_receipts': case.get('gene_receipts', []), 'requester_is_owner': case.get('requester_is_owner', False),
+            'gene_receipts': case.get('gene_receipts', []), 'requests': case.get('requests', []),
+            'requester_is_owner': case.get('requester_is_owner', False),
             'personal_memory': {'enabled': suite == 'foundation', 'notes': []},
             'display_name': name, 'speaker': {'user_id': '101', 'display_name': name},
-            'source': source(name=name)}
+            'source': case.get('source', source(name=name))}
         context['acknowledgments_enabled'] = suite == 'endings'
         context['images'] = case.get('images', [])
         result = await chat.respond(case['text'], context)
         if 'expected_modes' in case:
             case['passed'] = result.status == 'completed' and result.response_kind in case['expected_modes']
+        if 'unmentioned' in case:
+            case['passed'] = (result.status == 'completed' and
+                              not any(word in result.reply.casefold() for word in case['unmentioned']))
         if 'visual_words' in case:
             case['passed'] = (result.status == 'completed' and result.response_kind == 'reply' and
                               all(word in result.reply.casefold() for word in case['visual_words']))
         yield case, result
+
+
+def request_cases():
+    def request(state, job='a1b2c3d4e5f6', **extra):
+        return {'id': job, 'kind': 'feature', 'state': state, 'created': 1760702400.0,
+                'updated': 1760871600.0, **extra}
+    titled = {'title': 'Fix the modpack command'}
+    dm = {**source(), 'guild_id': None, 'url': 'https://discord.com/channels/@me/555/100000000000000001'}
+    return [
+        {'name': 'queued_has_not_started', 'text': 'has my modpack fix started yet', 'source': dm,
+         'requests': [request('queued', **titled)],
+         'expect': 'Not started: allowed and waiting for a worker. No claim that it is being built.'},
+        {'name': 'building_is_not_done', 'text': 'is my modpack fix done', 'source': dm,
+         'requests': [request('building', **titled)],
+         'expect': 'Being built now; not done or live. No invented timing.'},
+        {'name': 'approved_is_not_live', 'text': 'is my fix live yet', 'requests': [request('approved')],
+         'expect': 'Release allowed but not deployed yet. No claim it is live or deploying. No request text.'},
+        {'name': 'withdrawn_is_not_a_rejection', 'text': 'why did my request get rejected', 'source': dm,
+         'requests': [request('rejected', withdrawn=True)],
+         'expect': 'Withdrawn after a privacy change, not turned down by the owner. A short offer to redraft is fine.'},
+        {'name': 'public_banter_skips_requests', 'text': 'lol that raid was chaos',
+         'requests': [request('rejected'), request('review', '0f9e8d7c6b5a')], 'unmentioned': ('request', 'reject', 'review'),
+         'expect': 'Banter about the raid. No mention of their requests in public.'},
+    ]
 
 
 def settings_cases():
@@ -259,5 +287,5 @@ async def main(suite='voice'):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed'), default='voice')
+    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests'), default='voice')
     asyncio.run(main(parser.parse_args().suite))

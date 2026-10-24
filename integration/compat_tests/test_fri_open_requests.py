@@ -13,6 +13,7 @@ import pytest
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_mentions import environment
 from fri.fri_chat import Chat, ChatResult
+from fri.fri_eval import evaluate
 from fri.fri_panel import InputModal
 from fri.fri_requests import DraftView
 
@@ -84,3 +85,17 @@ def test_the_model_sees_dates_and_withdrawals_not_raw_rows(store):
     assert row['state'] == 'rejected' and row['withdrawn'] is True and 'title' not in row
     assert dt.datetime.fromisoformat(row['created']).tzinfo == dt.timezone.utc
     assert 'withdrawn means' in sent[0]['instructions']
+
+
+def test_the_request_status_evaluation_supplies_states_and_checks_public_restraint():
+    seen = []
+    async def respond(text, context):
+        seen.append(context)
+        return ChatResult(status='completed', reply='your request got rejected lol' if 'raid' in text else 'not yet')
+    async def collect():
+        return [case async for case, _ in evaluate(SimpleNamespace(respond=respond), 'gpt-6.1-sol', 'high', suite='requests')]
+    cases = {case['name']: case for case in asyncio.run(collect())}
+    states = {name: [row['state'] for row in context['requests']] for name, context in zip(cases, seen)}
+    assert states['queued_has_not_started'] == ['queued'] and states['approved_is_not_live'] == ['approved']
+    assert seen[0]['source']['guild_id'] is None and seen[-1]['source']['guild_id'] == '444'
+    assert cases['public_banter_skips_requests']['passed'] is False  # Volunteering status in public fails.

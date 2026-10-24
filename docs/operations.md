@@ -118,6 +118,9 @@ appears only in the member's private conversation (DM or `/fri` panel), never fo
 other members' words, and not at all while their memory is off. Requests typed in the panel's form
 are sent with an empty source list, so they count as the member's own words. A request withdrawn
 after a privacy change is marked `withdrawn`, so Fri doesn't call it the owner's rejection.
+`python -m fri.fri_eval --suite requests` checks status answers with the real model: queued and
+approved haven't started their next step, building isn't done, withdrawn isn't a rejection, and
+public banter leaves requests alone.
 
 ## Deployment boundary
 
