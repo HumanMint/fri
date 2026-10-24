@@ -46,6 +46,11 @@ def own_words(argument, text):
     return words(argument) <= words(text)
 
 
+def grounded(receipts):
+    """A legacy companion's command argument may quote anyone; show only that a command ran."""
+    return [r if r.get('grounded') or not r.get('argument') else {**r, 'argument': '[not kept]'} for r in receipts]
+
+
 def words(text):
     # Case, accents and punctuation may differ ("Halo Beyonce" from "Halo by Beyoncé"); words may not.
     folded = unicodedata.normalize('NFKD', text.casefold())

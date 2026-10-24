@@ -75,7 +75,7 @@ def conversation(monkeypatch, tmp_path):
         if path == '/chat/turn':
             return store.save_chat(payload['guild_id'], payload['conversation_id'], payload['user_id'],
                 payload['revision'], payload['input'], payload['reply'], payload['model'], payload['effort'],
-                notes=payload['notes'], source=payload['source'])
+                notes=payload['notes'], source=payload['source'], provenance=payload.get('provenance'))
         return {'ok': True}
 
     fri.api = api

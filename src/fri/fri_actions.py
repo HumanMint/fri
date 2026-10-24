@@ -15,7 +15,7 @@ from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
-from .gene_controls import COMMANDS, arguments, music_control_intent, own_words, requested
+from .gene_controls import COMMANDS, arguments, grounded, music_control_intent, own_words, requested
 from .privacy import clean
 from .web_policy import public_query
 
@@ -59,6 +59,11 @@ class Actions:
             action.get('argument'), discord_source(self.event).model_dump(),
             str(self.guild), self.scope.get('conversation_id', ''), str(self.user), self.revision,
             str(getattr(getattr(self.fri, 'user', None), 'id', ''))))
+
+    def observe(self, scope, user, revision):
+        # Keep the first revision read this turn: a later read must not relabel earlier evidence,
+        # so valid() still notices the change before anything is delivered.
+        self.revisions.setdefault((scope, user), revision)
 
     def derived(self):
         """Other members' words are in this turn's context, so they could reach a write."""
@@ -341,7 +346,7 @@ class Actions:
             profile = profiles[user]
             if not profile['enabled']:
                 continue
-            self.revisions[(scope, user)] = profile['revision']
+            self.observe(scope, user, profile['revision'])
             records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
                             'at': message.created_at.isoformat(), 'text': clean(message.content, 500)})
         return {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
@@ -402,7 +407,7 @@ class Actions:
             'target_channel_id': target, 'request_text': clean(self.event.content, 4000),
             'action': verb, 'argument': argument, 'revision': self.revision,
             'continuation_id': (burst or self.pending)['source']['id'] if continued else '',
-            'burst_origin': self.conversation['message_burst'][-2] if burst else None,
+            'burst_origin': self.conversation['message_burst'][-2] if burst else None, 'grounded': True,
             'addressed_bot_id': str(getattr(getattr(self.fri, 'user', None), 'id', ''))})
         result = None
         try:
@@ -438,7 +443,7 @@ class Actions:
             recent = await self.fri.api('POST', '/controls/recent', self.scope)
         except commands.UserFeedbackCheckFailure:
             return {'uncertain': 'The independent health check is unavailable; no repair has started.'}
-        receipts = [r for r in recent.get('receipts', []) if r['channel_id'] in channels]
+        receipts = grounded([r for r in recent.get('receipts', []) if r['channel_id'] in channels])
         self.sources.update(r['channel_id'] for r in receipts)
         repairs = []
         auto_available = self.agent.state.get('auto_repairs_enabled', False)

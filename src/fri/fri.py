@@ -41,6 +41,7 @@ MAX_PROVENANCE = 200
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
 UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
+LEGACY = '[an earlier fri reply from before fri tracked its sources]'
 CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
@@ -50,6 +51,18 @@ def private_read(receipts):
     """Includes a diagnosis nested in an uncertain Gene command receipt."""
     return any(r.get('kind') in PRIVATE_READS or r.get('diagnostic') or (r.get('gene_result') or {}).get('diagnostic')
                for r in receipts)
+
+
+def attributed(context):
+    """Withhold what was saved without provenance (before this release, or by a legacy companion).
+
+    It may quote other members with no record of whom, so nothing may inherit it as complete.
+    """
+    context['turns'] = [turn if turn.get('attributed') or not turn.get('reply')
+                        else {**turn, 'reply': LEGACY, 'provenance': []} for turn in context.get('turns', [])]
+    if context.get('pending') and 'provenance' not in context['pending']:
+        context['pending'] = None
+    return context
 
 
 def turn_provenance(context, speaker, actions=None):
@@ -247,7 +260,7 @@ class Fri(discord.Client):
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
-                context = await self.api('POST', '/chat/context', scope)
+                context = attributed(await self.api('POST', '/chat/context', scope))
                 conversation = {}
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence
@@ -347,11 +360,11 @@ class Fri(discord.Client):
                 if actions:
                     actions.image_context = {key: context[key] for key in ('image_sources', 'image_event', 'image_invitation') if key in context}
                 if actions and guild_id == self.guild_id:
+                    from .gene_controls import current_music_context, grounded
                     recent = await self.api('POST', '/controls/recent', scope)
                     readable = await actions.channels(fresh=True)
-                    context['gene_receipts'] = [r for r in recent.get('receipts', []) if r['channel_id'] in readable]
+                    context['gene_receipts'] = grounded([r for r in recent.get('receipts', []) if r['channel_id'] in readable])
                     actions.sources.update(r['channel_id'] for r in context['gene_receipts'])
-                    from .gene_controls import current_music_context
                     actions.music_context = current_music_context(context['gene_receipts'])
                 text = clean(text, 4000)
                 result = await self.chat_once(text, context)
@@ -548,7 +561,7 @@ class Fri(discord.Client):
                 if not admission['allowed']:
                     return self.mention_cooldown(admission)
                 scope = invitation.granted_scope()
-                context = await self.api('POST', '/chat/context', scope)
+                context = attributed(await self.api('POST', '/chat/context', scope))
                 await invitation.collect()
                 context.update(invitation.context())
                 context.update(source=discord_source(event).evidence(), requests_enabled=False,

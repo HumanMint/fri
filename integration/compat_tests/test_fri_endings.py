@@ -172,9 +172,8 @@ def test_obvious_closing_avoids_model_and_records_typed_decision(monkeypatch):
                 return {'allowed': True}
             if path == '/chat/context':
                 return ctx
-            if path == '/chat/turn/check':
-                return {'ok': True}  # The closing reaction is fenced before delivery too.
-            assert path == '/chat/turn'
+            # The closing reaction is fenced before delivery, then recorded after it.
+            assert path in ('/chat/turn/check', '/chat/turn'), path
             assert body['response_kind'] == 'react' and body['reply'] == ''
             assert body['model'] == 'local-closing' and body['output_tokens'] == 0
             return {'ok': True}
@@ -184,6 +183,9 @@ def test_obvious_closing_avoids_model_and_records_typed_decision(monkeypatch):
         msg.id = int(ctx['source']['id'])
         result = await fri.talk(123, 456, 20, msg.content, 'public', event=msg)
         assert result.response_kind == 'react'
+        await fri.record_turn(result)
+        assert [call.args[1] for call in fri.api.await_args_list if call.args[1].startswith('/chat/turn')] == [
+            '/chat/turn/check', '/chat/turn']
         fri.chat.respond.assert_not_awaited()
         await fri.close()
     asyncio.run(scenario())

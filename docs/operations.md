@@ -65,7 +65,13 @@ advertises it, so the controller must be released first.
 
   More than 200 sources refuses the reply rather than dropping any. So does one member appearing with
   two revisions: their privacy changed while the turn was read, and Fri never relabels the older
-  read. A request draft carries its
+  read. Repeated reads in one turn (history pages, channel reads) keep the first revision they saw,
+  so a change between them fails the final access check.
+- **Unattributed history.** Replies saved before this release, or by a legacy companion during
+  rollout or after a Fri-only rollback, may quote other members with no record of whom. The
+  controller marks them, and Fri shows the model only that an earlier reply existed. Pending
+  questions saved without provenance are ignored. A legacy command receipt shows that a command ran,
+  not its argument. A request draft carries its
   turn's fence: preview, every page turn and submission re-run `/chat/turn/check` and refuse once
   any source changed. A submitted request carries those sources and the requester's revision. The
   controller checks them as it creates the job and withdraws the job, even mid-build, if any source

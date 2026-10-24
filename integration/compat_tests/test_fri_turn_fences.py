@@ -345,9 +345,9 @@ def test_draft_paging_rechecks_the_fence(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
-def history_source():
+def history_source(age=25):
     from compat_tests.test_fri_endings import source
-    return source(age=25, channel='1')
+    return source(age=age, channel='1')
 
 
 def queue_play(store, argument_seen):
@@ -394,7 +394,7 @@ def test_own_command_words_still_run_with_peers_in_context(monkeypatch, tmp_path
     async def scenario():
         fri, _, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         seen = []
-        _, deliver = queue_play(store, seen)
+        controls, deliver = queue_play(store, seen)
         store.save_chat('123', 'public:1', '20', 0, 'fri what did ash say?', MARKER, 'm', 'high',
                         source=history_source(), provenance=[{'user_id': '30', 'revision': 0}])
         event = message(text)
@@ -405,6 +405,7 @@ def test_own_command_words_still_run_with_peers_in_context(monkeypatch, tmp_path
             with patch('fri.fri_actions.asyncio.sleep', new=deliver):
                 result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
             assert seen == [argument] and result.turn['provenance'] == [{'user_id': '30', 'revision': 0}]
+            assert [row['grounded'] for row in controls.recent('20', '123', 'public:1')] == [True]
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -558,6 +559,76 @@ def test_own_erasure_after_the_draft_fence_refuses_the_request(monkeypatch, tmp_
                 await view.submit(click)
             with store.connection() as db:
                 assert not db.execute('SELECT 1 FROM jobs').fetchone()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+
+def test_history_saved_without_provenance_is_withheld(monkeypatch, tmp_path):
+    from fri.fri import LEGACY
+    async def scenario():
+        fri, _, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        # Saved before this release (or by a legacy companion): it may quote ash, with no record of it.
+        store.save_chat('123', 'public:1', '20', 0, 'fri where is ash moving', MARKER, 'm', 'high', source=history_source())
+        store.save_chat('123', 'public:1', '20', 0, 'fri thanks', 'anytime', 'm', 'high',
+                        source=history_source(24), provenance=[])
+        question = {'goal': 'web', 'question': 'before or after ash moves to denver?', 'topic': 'how are the lakers doing'}
+        store.save_chat('123', 'public:1', '20', 0, 'fri how are the lakers doing', question['question'], 'm', 'high',
+                        source=history_source(23), clarification=question)
+        event = message('fri what did you tell me earlier')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='something from before i tracked sources')
+        try:
+            result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
+            shown = fri.chat_once.await_args.args[1]
+            assert [turn['reply'] for turn in shown['turns']] == [LEGACY, 'anytime', LEGACY]
+            assert shown.get('pending') is None and MARKER not in str(shown)
+            assert result.turn['provenance'] == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_receipts_from_a_legacy_companion_hide_their_argument():
+    from fri.gene_controls import grounded
+    legacy = {'action': 'play', 'argument': MARKER, 'grounded': False}
+    assert grounded([legacy, {**legacy, 'argument': 'sandstorm', 'grounded': True}, {'action': 'skip', 'argument': ''}]) == [
+        {**legacy, 'argument': '[not kept]'}, {**legacy, 'argument': 'sandstorm', 'grounded': True},
+        {'action': 'skip', 'argument': ''}]
+
+
+def test_a_later_history_page_cannot_relabel_an_earlier_one(monkeypatch, tmp_path):
+    import discord
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        posts = [message(MARKER if i == 0 else f'played game {i}', user=30, age=60+i) for i in range(6)]
+        event = message('fri search history for what we played')
+        for post in posts+[event]:
+            post.created_at = discord.utils.snowflake_time(post.id)
+            post.jump_url = f'https://discord.com/channels/123/1/{post.id}'
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='done')
+        query = {'kind': 'history_search', 'channel_id': '1', 'query': '', 'author': '', 'after': '', 'before': '', 'cursor': ''}
+        async def http(route, *, params):
+            return {'messages': [[{'id': str(p.id), 'channel_id': '1', 'content': p.content,
+                'author': {'id': '30', 'bot': False}, 'hit': True}] for p in posts
+                if int(params['min_id']) <= p.id < int(params['max_id'])][:params['limit']]}
+        fri.http.request = AsyncMock(side_effect=http)
+        steps = []
+        async def respond(text, context):
+            steps.append(context.get('action_result'))
+            if len(steps) == 1:
+                return ChatResult(status='completed', action=query)
+            if len(steps) == 2:
+                store.clear_chats('30')  # Between pages: page two sees ash's new revision.
+                return ChatResult(status='completed', action={**query, 'cursor': context['action_result']['next_cursor']})
+            return ChatResult(reply=MARKER, status='completed')
+        fri.chat_once.side_effect = respond
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert MARKER in str(steps[1]['messages'])  # Page one was read at ash's old revision.
+            assert MARKER not in event.reply.await_args.args[0]
+            assert MARKER not in str(store.chat_context('123', 'public:1', '20')['turns'])
         finally:
             await fri.close()
     asyncio.run(scenario())

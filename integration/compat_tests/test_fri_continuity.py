@@ -35,7 +35,8 @@ def arm(store, body=None, topic=''):
     body = body or origin()
     question = {'goal': body['goal'], 'question': 'what song do you want?' if body['goal'] == 'play' else 'which one?', 'topic': topic}
     store.save_chat(body['guild_id'], body['conversation_id'], body['user_id'], body['revision'],
-        body['request_text'], question['question'], 'model', 'high', source=body['source'], clarification=question)
+        body['request_text'], question['question'], 'model', 'high', source=body['source'], clarification=question,
+        provenance=[])  # Armed by a companion that tracks sources.
     return store.chat_context(body['guild_id'], body['conversation_id'], body['user_id'])['pending']
 
 
