@@ -137,8 +137,10 @@ Fri runs (it was rolled back underneath), Fri stops asking until it restarts. Of
 applies `reply_check_enabled` through the usual settings preview (“enable reply checks”). The
 controller's operations guide describes the settings, retention, export and rollback purge.
 
-On the heartbeat, Fri waits for its background model slot, then claims at most one batch of up to 20
-pairs: Fri's verbatim reply, then the same member's next turn in that conversation within 15 minutes.
+On the heartbeat, Fri waits for its background model slot and signs in to the subscription, then
+claims at most one batch of up to 20 pairs and sends it straight away, so nothing erased before the
+claim is ever sent. Each pair is Fri's verbatim reply, then the same member's next turn in that
+conversation within 15 minutes.
 Pairs carry no member, channel or message identifiers, and Discord mentions, links and ids in the text
 arrive as neutral placeholders. Luna/low (configurable) flags only clear cases
 of a member being unhappy with the reply and returns four labels from fixed lists: category, severity,

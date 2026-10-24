@@ -25,6 +25,7 @@ from fri.fri_agent import Agent
 from fri.fri_errors import ControllerRejected
 from fri.fri_protocol import CAPABILITIES, compatible, contract
 from fri.fri_reply_checks import CATEGORIES, FIXES, SCHEMA, TOPICS, check, describe
+from fri.subscription import SubscriptionError
 
 FINDING = {'category': 'misunderstood', 'severity': 'medium', 'topic': 'games',
            'fix': 'answer_the_actual_question'}
@@ -60,7 +61,12 @@ def runtime(client, calls, monkeypatch, model=None):
         if response.status_code >= 400:
             raise ControllerRejected(response.json()['detail'])
         return response.json()
-    agent = Agent(SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, chat=None,
+
+    async def sign_in():
+        calls.append('sign-in')
+        return {'Authorization': 'Bearer test'}
+    agent = Agent(SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api,
+                                  chat=SimpleNamespace(headers=sign_in),
                                   capabilities=frozenset(contract()['capabilities'])))
     agent.record = AsyncMock()
     if model:
@@ -74,12 +80,14 @@ def test_a_flagged_follow_up_becomes_a_labelled_finding(controller, monkeypatch)
     save(store, 'i asked about the raid not pvp, read it again', 'fine. for the raid, healer.')
     seen, calls = [], []
 
-    async def model(chat, instruction, data, name, effort, schema):
+    async def model(chat, instruction, data, name, effort, schema, headers):
+        assert headers == {'Authorization': 'Bearer test'}  # Signed in before the claim, not after.
         seen.append((name, effort, schema, data))
         return {'findings': [{**FINDING, 'pair_id': data['pairs'][0]['id']}]}, {'input_tokens': 9}, 'completed'
 
     agent = runtime(client, calls, monkeypatch, model)
     assert asyncio.run(check(agent)) == {'kept': 1, 'pairs': 1}
+    assert calls[:2] == ['sign-in', '/agent/reply-checks/claim']
     name, effort, schema, data = seen[0]
     assert (name, effort, schema) == ('gpt-6-luna', 'low', SCHEMA)
     agent.record.assert_awaited_once_with('attention', 'gpt-6-luna', 'low', {'input_tokens': 9}, 'completed',
@@ -107,7 +115,7 @@ def test_the_claim_waits_for_the_model_slot(controller, monkeypatch):
     save(store, 'you never set it', 'ugh. setting it now.')
     calls = []
 
-    async def model(*_):
+    async def model(*_, **__):
         return {'findings': []}, {}, 'completed'
 
     agent = runtime(client, calls, monkeypatch, model)
@@ -123,13 +131,23 @@ def test_the_claim_waits_for_the_model_slot(controller, monkeypatch):
     assert asyncio.run(scenario()) == {'kept': 0, 'pairs': 1}
 
 
+def test_no_chat_is_claimed_while_the_subscription_sign_in_fails(controller, monkeypatch):
+    store, client = controller
+    save(store, 'remind me at 9', 'done.', ago=60)
+    save(store, 'you never set it', 'ugh. setting it now.')
+    calls = []
+    agent = runtime(client, calls, monkeypatch, AsyncMock(side_effect=AssertionError('no model call')))
+    agent.fri.chat = SimpleNamespace(headers=AsyncMock(side_effect=SubscriptionError('reconnect')))
+    assert asyncio.run(check(agent)) is None and calls == []
+
+
 def test_a_failed_model_call_is_reported_and_retried(controller, monkeypatch):
     store, client = controller
     save(store, 'remind me at 9', 'done.', ago=60)
     save(store, 'you never set it', 'ugh. setting it now.')
     statuses = iter(['failed', 'completed'])
 
-    async def model(*_):
+    async def model(*_, **__):
         return {}, {}, next(statuses)
 
     agent = runtime(client, [], monkeypatch, model)
@@ -164,7 +182,8 @@ def test_an_older_controller_still_runs_fri_without_reply_checks(client, monkeyp
     async def missing(method, path, payload=None):
         calls.append(path)
         raise ControllerRejected('Not Found')
-    agent = Agent(SimpleNamespace(api=missing, capabilities=frozenset(['reply-checks'])))
+    agent = Agent(SimpleNamespace(api=missing, chat=SimpleNamespace(headers=AsyncMock(return_value={})),
+                                  capabilities=frozenset(['reply-checks'])))
     assert asyncio.run(check(agent)) is None  # A controller rolled back under a running Fri.
     assert 'reply-checks' not in agent.fri.capabilities and calls == ['/agent/reply-checks/claim']
 

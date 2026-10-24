@@ -9,6 +9,7 @@ import logging
 from . import feedback as commands
 from .fri_agent_model import STRING, analyze, obj
 from .fri_errors import ControllerRejected
+from .subscription import SubscriptionError
 
 LOG = logging.getLogger('fri.reply_checks')
 CAPABILITY = 'reply-checks'
@@ -40,8 +41,14 @@ time). Pick the closest label; use other only when nothing fits.'''
 
 async def check(agent):
     """Run at most one claimed batch. Failures are reported so the controller can retry or skip."""
-    # Claim only once the model is free, so chat erased while other work runs never waits here.
+    # Claim only once the model is free and Fri is signed in, so nothing waits between fetching the
+    # chat and sending it: anything erased before the claim is never sent.
     async with agent.slots:
+        try:
+            headers = await agent.fri.chat.headers()
+        except SubscriptionError:
+            LOG.warning('Reply checks wait for the subscription sign-in')
+            return None
         try:
             claim = await agent.fri.api('POST', '/agent/reply-checks/claim')
         except ControllerRejected:
@@ -52,7 +59,7 @@ async def check(agent):
         if not claim:
             return None
         result, counters, status = await analyze(agent.fri.chat, INSTRUCTION, {'pairs': claim['pairs']},
-                                                 claim['model'], claim['effort'], SCHEMA)
+                                                 claim['model'], claim['effort'], SCHEMA, headers=headers)
     # An existing role, so a receipt still queued when Fri and the controller roll back is accepted.
     await agent.record('attention', claim['model'], claim['effort'], counters, status, 'reply_check')
     findings = result.get('findings', [])[:20] if status == 'completed' else []
