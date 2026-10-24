@@ -22,6 +22,7 @@ READ = 10  # A watch read that hangs this long counts as an unreachable controll
 PROBE = 4  # Each live read in the owner's health report.
 GENE = frozenset({'stale', 'offline', 'stopped'})
 NOT_TAKING = 'gene isn’t taking commands right now, so i didn’t send that.'
+NOT_OFFERED = 'gene isn’t offering that command right now, so i didn’t send it.'
 HEALTH = re.compile(r"(?:(?:show|check|run|give)\s+(?:me\s+)?)?(?:(?:your|fri'?s|system)\s+)?"
                     r"health(?:\s*check)?(?:\s+(?:report|status|rn|please|pls))*")
 
@@ -97,7 +98,9 @@ class Watch:
         alert = self.load()['alert']
         return bool(alert and alert.get('open') and alert.get('kind') in kinds)
 
-    def refusal(self):
+    def refusal(self, offered=()):
+        if offered:  # Gene is polling; this one command is disabled or unloaded in Red.
+            return NOT_OFFERED
         return NOT_TAKING + (' owner already knows.' if self.alerted() else '')
 
     async def read(self):

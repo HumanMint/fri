@@ -12,7 +12,7 @@ from compat_tests.test_fri_runtime import configured, event
 from compat_tests.test_gene_controls import control_body, controls_api  # noqa: F401
 from fri.fri_agent import Agent
 from fri.fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
-from fri.fri_watch import CHECKS, NOT_TAKING, Watch, health_requested
+from fri.fri_watch import CHECKS, NOT_OFFERED, NOT_TAKING, Watch, health_requested
 
 
 def beat(controls, age=0, **changes):
@@ -250,8 +250,12 @@ def test_quick_control_with_gene_down_answers_at_once_without_charging_or_queuei
             fri.watcher.state = {'alert': {'open': True, 'kind': 'stale'}}
             result = await fri.talk(123, 1, 20, actual.content, 'public', event=actual)
             assert result.reply == NOT_TAKING+' owner already knows.'
+            client.post('/runtime/controls/poll', headers=headers('runtime'), json={'actions': ['queue']})
+            result = await fri.talk(123, 1, 20, actual.content, 'public', event=actual)
+            assert result.reply == NOT_OFFERED  # Gene is up; Red just isn't offering this one.
             with controls.store.connection() as db:
                 assert db.execute('SELECT count(*) FROM gene_controls').fetchone()[0] == 0
+            assert '/chat/operations/admit' not in paths and '/controls' not in paths
             fri.chat.respond.assert_not_awaited()
         finally:
             await fri.close()

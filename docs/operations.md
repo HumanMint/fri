@@ -137,7 +137,8 @@ Fri can't restart anything. It only notices and says so.
 - **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
   command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
   there, the member gets a fixed "gene isn't taking commands right now" at once, plus "owner
-  already knows" while a Gene outage DM is open, and nothing is queued. A command Gene accepts and
+  already knows" while a Gene outage DM is open, and nothing is queued. When Gene is polling but
+  Red has that one command disabled, the notice says Gene isn't offering it. A command Gene accepts and
   then hangs on still waits out the controller's 115 s; that needs a controller change.
 - **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed
   to Fri in a configured channel) whose controller read fails gets one fixed notice per channel

@@ -63,8 +63,9 @@ async def admit(fri, event, source, scope, text, context):
     if selected and selected['action'] != 'menu':
         # Gene lists its commands every few seconds while it polls. Nothing for 20 s means it's down or
         # stuck on another command: say so now, without spending the allowance or queueing anything.
-        if selected['action'] not in (await fri.api('GET', '/controls/catalog')).get('actions', []):
-            return Admission(result=ChatResult(reply=fri.watcher.refusal(), status='completed'))
+        offered = (await fri.api('GET', '/controls/catalog')).get('actions', [])
+        if selected['action'] not in offered:
+            return Admission(result=ChatResult(reply=fri.watcher.refusal(offered), status='completed'))
     grant = await fri.api('POST', '/chat/operations/admit', {**scope, 'source': source.model_dump(),
         'revision': context['revision'], 'input': text, 'continuation': not bool(selected)})
     if not grant['allowed']:
