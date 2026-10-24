@@ -160,16 +160,42 @@ and visibility when ready. The bot's Discord permissions alone do not enable acc
 
 ## Integration checks
 
-Use the Gene checkout named in the integration pairing file and install its test
-requirements (`uv sync --frozen --extra red`). This is a **test-only** dependency;
-the Fri wheel and runtime image contain neither Gene nor Red.
-
-Run with both source trees available, credentials removed and network access denied:
+Maintainers and review agents run the same script:
 
 ```sh
-PYTHONPATH="$PWD/src:$PWD/integration:/path/to/gene/src:/path/to/gene" \
-  /path/to/gene/.venv/bin/python -m pytest -q -p no:cacheprovider integration/compat_tests integration/replay
+scripts/offline-checks.sh setup   # once per paired Gene commit; the only networked step
+scripts/offline-checks.sh         # credential-free, network-denied checks
 ```
+
+`setup` reads `verified_controller_commit` from the integration pairing file. It extracts that
+exact Gene commit from a local Gene repository with `git archive`, and builds a dedicated venv
+from that commit's `uv.lock` (`uv sync --frozen --extra red`). Both live under
+`~/.cache/fri-offline/<gene-sha>/`, so an unrelated Gene branch or venv is never borrowed. Gene
+and Red are **test-only** dependencies; the Fri wheel and runtime image contain neither.
+
+`check` runs with a cleared environment (no tokens, temporary home/config):
+
+- Fri's `tests`;
+- `integration/compat_tests` and `integration/replay` against the pinned controller;
+- `ruff`.
+
+A Python audit-hook guard denies non-loopback connections and DNS in every Python process. On
+macOS, `sandbox-exec` also denies outbound IP; on Linux, `unshare -rn` does when available.
+Inside an existing sandbox where nesting fails, for example a Codex reviewer, the guard alone is
+used. Every run first proves each active layer with a canary connection, prints the isolation it
+used, and exits non-zero on any failure.
+
+Overrides:
+
+- `GENE_SHA`: another controller commit, such as `minimum_controller_commit`;
+- `GENE_REPO`: Gene repository path (default `../gene`);
+- `FRI_OFFLINE_CACHE`: cache location;
+- `FRI_VENV`: Fri venv, for a fresh review checkout without `.venv`;
+- `OFFLINE_ISOLATION=python`: guard only.
+
+The equivalent manual command for the integration suites is
+`PYTHONPATH="$PWD/src:$PWD/integration:<gene>/src:<gene>" <gene venv>/bin/python -m pytest -q
+-p no:cacheprovider integration/compat_tests integration/replay`.
 
 ### Replay harness
 
