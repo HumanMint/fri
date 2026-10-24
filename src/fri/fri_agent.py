@@ -451,8 +451,9 @@ class Agent:
         echo = result.echo
         await self.fri.record_turn(result, sent)
         if echo and message.guild and self.allowed(message.channel):
+            text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']  # As shown.
             self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
-                'name': 'Fri', 'text': clean(echo['text'], 500), 'at': time.time(), 'gene_error': False,
+                'name': 'Fri', 'text': clean(text, 500), 'at': time.time(), 'gene_error': False,
                 'fri': True, 'provenance': echo['provenance']})
         if result.status == 'completed' and not (invitation and invitation.outside):
             self.active[(message.channel.id, message.author.id)] = time.time()+(300 if result.clarification else 120)

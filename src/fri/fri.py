@@ -40,8 +40,15 @@ FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you 
 MAX_PROVENANCE = 200
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
+UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
+
+
+def private_read(receipts):
+    """Includes a diagnosis nested in an uncertain Gene command receipt."""
+    return any(r.get('kind') in PRIVATE_READS or r.get('diagnostic') or (r.get('gene_result') or {}).get('diagnostic')
+               for r in receipts)
 
 
 def turn_provenance(context, speaker, actions=None):
@@ -391,8 +398,8 @@ class Fri(discord.Client):
                             include_sources=action_kind == 'web_sources' or (link_request and action_kind != 'image_search'))
                     if action_kind == 'image_search' and receipt.get('image_status') == 'prepared':
                         result.media = actions.image_share.prepared
-                    stored, private_read = result.reply, any(r.get('kind') in PRIVATE_READS for r in receipts)
-                    if private_read and not (result.clarification or result.settings_preview or result.post_preview):
+                    stored, private = result.reply, private_read(receipts)
+                    if private and not (result.clarification or result.settings_preview or result.post_preview):
                         # Other channels' messages, archives and reports never become saved chat text.
                         checked_channel = receipt.get('channel_id', '')
                         stored = f'Earlier check: {action_kind}' + (f' in channel {checked_channel}' if checked_channel else '')
@@ -413,7 +420,7 @@ class Fri(discord.Client):
                                                            'track safely.'), status='completed')
                     if context.get('unattributed_reference'):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
-                    elif not private_read:
+                    elif not private:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored)
                     try:  # The save's privacy fence, applied before anything is shown.
                         await self.api('POST', '/chat/turn/check', result.turn)
@@ -469,8 +476,13 @@ class Fri(discord.Client):
                                     {'guild_id': scope['guild_id'], 'message_ids': own}))['messages']
         except commands.UserFeedbackCheckFailure:
             found = {}
-        if any(mid not in found or not found[mid]['verbatim'] for mid in own):
-            context['unattributed_reference'] = True  # Fail closed: answer live, retain nothing derived.
+        unresolved = {mid for mid in own if mid not in found or not found[mid]['verbatim']}
+        if unresolved:
+            # Fail closed before inference: the model never sees text whose sources erased or were never
+            # attributable, and nothing derived is retained. A copy keeps the integrity checks intact.
+            context['unattributed_reference'] = True
+            context['reply_target'] = [{**row, 'text': UNAVAILABLE} if row['source']['id'] in unresolved else row
+                                       for row in context['reply_target']]
         context['reference_provenance'] = [item for mid in own for item in found.get(mid, {}).get('provenance', [])]
 
     @staticmethod
@@ -488,6 +500,9 @@ class Fri(discord.Client):
             return None
         if isinstance(getattr(sent, 'id', None), int) and payload.get('response_kind', 'reply') == 'reply':
             payload = {**payload, 'reply_message_id': str(sent.id)}  # Later references resolve to its sources.
+            delivered = getattr(sent, 'content', None)
+            if payload.get('verbatim') and isinstance(delivered, str) and delivered != payload['reply']:
+                payload['reply'] = clean(delivered, 3500)  # E.g. an attachment fallback replaced the answer.
         try:
             saved = await self.api('POST', '/chat/turn', payload)
         except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError):

@@ -59,8 +59,8 @@ advertises it, so the controller must be released first.
   - a pending clarification;
   - the channel summary's authors;
   - reply targets. A referenced Fri message is resolved through `/chat/messages/sources` to its
-    original sources and speaker. If that's unknown, or the message kept only a breadcrumb, the new
-    reply is still delivered but stored as a neutral breadcrumb.
+    original sources and speaker. If that's unknown, or the message kept only a breadcrumb, its text
+    is withheld from the model before inference and the new turn is stored as a neutral breadcrumb.
   - configured-channel nearby context and read evidence.
 
   More than 200 sources refuses the reply rather than dropping any. The controller rejects stale provenance, deletes dependent turns
@@ -70,7 +70,9 @@ advertises it, so the controller must be released first.
 - **Real replies.** With provenance, Fri keeps what they actually said instead of placeholder
   breadcrumbs. This covers plain chat, reply targets, public research, image shares, Gene
   command results and the member's own saved work or reminders. Reads of other channels,
-  archives, learning reports and diagnostics still keep neutral breadcrumbs. Outside invitations
+  archives, learning reports and diagnostics still keep neutral breadcrumbs, including a diagnosis
+  nested in an uncertain Gene command. The recorded and echoed text is what Discord actually
+  showed, for example an attachment fallback. Outside invitations
   keep the controller's mention placeholder.
 - **Group view.** Fri's delivered public replies join the in-memory channel view, tagged with the
   speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,

@@ -273,8 +273,9 @@ HISTORY_MIDTURN = Scenario(
 def seed_summary(replay):
     import time
     with replay.store.connection() as db:
-        db.execute('INSERT INTO agent_summaries VALUES (?,?,?,?)',
-                   (str(1), 'ash is moving to denver next month', json.dumps([str(ASH)]), time.time()))
+        db.execute('INSERT INTO agent_summaries(channel_id,body,authors,at,revisions) VALUES (?,?,?,?,?)',
+                   ('1', 'ash is moving to denver next month', json.dumps([str(ASH)]), time.time(),
+                    json.dumps({str(ASH): 0})))
     return True
 
 
@@ -310,6 +311,23 @@ PENDING = Scenario(
     [Check('the clarification was armed', lambda r: r.inspections['armed']),
      Check('the derived question is gone after the erasure', lambda r: r.stored(BO)['pending'] is None)])
 
+def answer_without_seeing_denver(replay):
+    shown = json.dumps(replay.transport.last_payload['input'][-1]).lower()
+    assert 'denver' not in shown, 'erased content reached the model through a Fri reference'
+    return reply('which one? i dont have that anymore')
+
+
+REFERENCE_AFTER_ERASURE = Scenario(
+    'reply_to_fri_after_source_erasure_hides_it',
+    'A reference to Fri\'s reply whose source erased is withheld from the model before inference.',
+    [SHARE, Wait(30), Say(BO, 'fri where is ash moving', label='ask'), Wait(30),
+     Say(ASH, 'fri forget me', label='erase'), Wait(30),
+     Say(KIT, 'fri wait where?', reply_to='@ask', label='peer')],
+    {'conversation': [reply('ash is moving to denver'), answer_without_seeing_denver]},
+    [Check('kit gets an answer without the erased content', lambda r: answered(r, 'peer')
+           and all('denver' not in d.text for d in r.step('peer').deliveries)),
+     Check('nothing derived is kept for kit', lambda r: placeholder_only(r, 'peer'))])
+
 SCENARIOS = [CLOSING, OPEN_QUESTION, WEB_CLARIFICATION, OUTSIDE_MENTION, KEYWORDS, ERASURE, REPLY_TARGET,
              DELIVERY_FAILURE, TOOL_CONTINUITY, GROUP_VIEW, MIDTURN_ERASURE, HISTORY, HISTORY_MIDTURN, SUMMARY,
-             FRI_REFERENCE, PENDING]
+             FRI_REFERENCE, PENDING, REFERENCE_AFTER_ERASURE]

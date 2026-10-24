@@ -56,7 +56,10 @@ def test_reply_target_cannot_offer_or_create_persistent_reminder_or_plan(api, mo
         try:
             with pytest.raises(commands.UserFeedbackCheckFailure, match='not available'):
                 await fri.talk(123, event.channel.id, 10, event.content, 'private' if private else 'public', event=event)
-            assert captured[0]['reply_target'][0]['text'].startswith('Paddington')
+            # In the DM case the target is an unrecorded Fri reply: withheld from the model, fail closed.
+            from fri.fri import UNAVAILABLE
+            target = captured[0]['reply_target'][0]['text']
+            assert target == UNAVAILABLE if private else target.startswith('Paddington')
             assert kind not in captured[0]['actions']
             with client.app.state.store.connection() as db:
                 assert not db.execute('SELECT 1 FROM fri_reminders').fetchone()

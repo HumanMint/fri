@@ -322,6 +322,7 @@ class ModelTransport(httpx.AsyncBaseTransport):
         if not rows:
             raise UnscriptedCall(f'unscripted {kind} model call in step {self.steps[-1].label!r}')
         row = rows.pop(0)
+        self.last_payload = payload  # Lets a scripted callable assert what the model was shown.
         if callable(row):  # A scripted response may change the world mid-turn, e.g. an erasure.
             row = row(self.replay)
         if kind == 'web':

@@ -8,7 +8,7 @@ import pytest
 
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_runtime import configured
-from fri.fri import MAX_PROVENANCE, UNATTRIBUTED
+from fri.fri import MAX_PROVENANCE, UNATTRIBUTED, UNAVAILABLE
 from fri.fri_chat import ChatResult
 from fri.fri_errors import ControllerRejected
 from fri.panels import PrivatePanels
@@ -124,3 +124,114 @@ def test_displayed_panel_answer_is_recorded(monkeypatch):
         await fri.close()
     asyncio.run(scenario())
 
+
+
+def test_unresolved_fri_reference_is_withheld_from_the_model(monkeypatch, tmp_path):
+    from compat_tests.test_fri_endings import source
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        old = message('ash is moving to denver next month', user=99, age=20)
+        old.author.bot = True
+        store.save_chat('123', 'public:1', '20', 0, 'where is ash moving', old.content, 'm', 'high',
+                        source=source(age=30, channel='1'), provenance=[{'user_id': '30', 'revision': 0}],
+                        reply_message_id=str(old.id), verbatim=True)
+        store.personal_control('30', 'disable')  # The Fri reply's source erases.
+        event = message('fri wait where?', user=40)
+        event.reference = SimpleNamespace(message_id=old.id, channel_id=channel.id)
+        fri.chat_once.return_value = ChatResult(status='completed', reply='which one? i dont have that anymore')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            context = fri.chat_once.await_args.args[1]
+            assert context['reply_target'][0]['text'] == UNAVAILABLE and context['unattributed_reference']
+            assert 'denver' not in str(context['reply_target'])
+            event.reply.assert_awaited_once()
+            saved = store.chat_context('123', 'public:1', '40')['turns']
+            assert saved and saved[-1]['reply'] == UNATTRIBUTED
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_nested_diagnosis_is_kept_only_as_a_breadcrumb(monkeypatch, tmp_path):
+    from gene.control_store import Controls
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('fri play a song')
+        Controls(store).poll(['play'])
+        controller = fri.api
+
+        async def api(method, path, payload=None):
+            if path.startswith('/controls/') and path.endswith('/result'):
+                return {'done': True, 'uncertain': 'Gene restarted before confirming the command'}
+            return await controller(method, path, payload)
+
+        fri.api = api
+        fri.chat_once.side_effect = [ChatResult(status='completed', action={
+            'kind': 'gene_command', 'action': 'play', 'argument': 'a song'}),
+            ChatResult(status='completed', reply='diagnostic evidence marker')]
+        agent.run = AsyncMock(side_effect=[
+            ({'action': 'investigate', 'source_id': str(event.id)}, {}, 'completed'),
+            ({'summary': 'diagnostic evidence marker', 'proposed_request': ''}, {}, 'completed')])
+        try:
+            with patch('fri.fri_actions.asyncio.sleep', new=AsyncMock()):
+                result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
+            assert fri.chat_once.await_args.args[1]['action_result']['diagnostic']
+            assert result.reply == 'diagnostic evidence marker'
+            assert result.turn['verbatim'] is False and 'diagnostic evidence' not in result.turn['reply']
+            assert result.echo is None
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_attachment_fallback_records_what_discord_showed(monkeypatch, tmp_path):
+    from fri.fri_image_share import send_reply
+    async def scenario():
+        fri, _, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('fri explain this')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='a lovely red panda in a tree')
+        shown = 'i checked this one, but can’t attach it here. credit'
+        event.reply.return_value = SimpleNamespace(id=123456, content=shown)
+        try:
+            result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
+            event.guild.filesize_limit = 0
+            result.media = SimpleNamespace(body=b'x', guard=SimpleNamespace(current=AsyncMock(return_value=True)),
+                                           attribution=lambda: 'credit')
+            sent = await send_reply(event, result)
+            await fri.record_turn(result, sent)
+            assert store.chat_context('123', 'public:1', '20')['turns'][-1]['reply'] == shown
+            assert store.message_sources('123', ['123456'])['123456']['verbatim'] is True
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_tool_answer_survives_a_post_delivery_save_failure_without_its_receipt(monkeypatch, tmp_path):
+    import datetime as dt
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        controller = fri.api
+
+        async def api(method, path, payload=None):
+            if path == '/chat/turn':
+                raise ControllerRejected('synthetic refusal after delivery')
+            return await controller(method, path, payload)
+
+        fri.api = api
+        question = 'what is the current Python release?'
+        receipt = {'kind': 'web_search', 'query': question, 'answer': 'public evidence',
+                   'sources': ['https://www.python.org/downloads/'], 'checked_at': dt.datetime.now(dt.timezone.utc).isoformat()}
+        fri.chat_once.side_effect = [ChatResult(status='completed', action={'kind': 'web_search', 'query': question}),
+                                     ChatResult(status='completed', reply='3.14 is current')]
+        event = message('fri '+question)
+        try:
+            with patch('fri.fri_actions.lookup', new=AsyncMock(return_value=(receipt, {}, 'completed'))), \
+                    patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert event.reply.await_args.args[0].startswith('3.14 is current')
+            context = store.chat_context('123', 'public:1', '20')
+            assert not context['turns'] and not context['web_research']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

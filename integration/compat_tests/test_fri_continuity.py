@@ -58,7 +58,9 @@ def test_pending_request_survives_restart_and_only_one_answer_can_enqueue(store)
     with pytest.raises(ValueError):
         controls.enqueue(next_answer)
     claim = controls.poll(['play'])
-    assert claim['continuation'] == pending and claim['argument'] == 'blind melon no rain'
+    # Only member-authored authorization fields travel with the command, never the question.
+    assert claim['continuation'] == {k: pending[k] for k in ('goal', 'source', 'request_text', 'revision')}
+    assert claim['argument'] == 'blind melon no rain'
     assert controls.poll(['play']) is None
     with pytest.raises(ValueError):
         arm(restarted, {**origin(), 'source': pending['source']})
