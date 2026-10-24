@@ -473,3 +473,91 @@ def test_gene_error_text_reaches_only_the_repair_investigation(monkeypatch, tmp_
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_conflicting_revisions_refuse_instead_of_relabelling():
+    from fri import feedback as commands
+    from fri.fri import CHANGED, turn_provenance
+    old, new = {'user_id': '30', 'revision': 0}, {'user_id': '30', 'revision': 1}
+    assert turn_provenance({'reference_provenance': [old], 'summary_provenance': [old]}, '20') == [old]
+    assert turn_provenance({'reference_provenance': [{'user_id': '20', 'revision': 0}],
+                            'summary_provenance': [{'user_id': '20', 'revision': 1}]}, '20') == []
+    for context in ({'reference_provenance': [old], 'summary_provenance': [new]},
+                    {'turns': [{'provenance': [old]}], 'recent': [{'user_id': '30', 'revision': 1}]}):
+        with pytest.raises(commands.UserFeedbackCheckFailure, match=CHANGED):
+            turn_provenance(context, '20')
+
+
+def relabel_ash_mid_turn(fri, store):
+    """Ash clears chats after Bo's history was read; a fresh summary then labels ash with the new revision."""
+    import time
+    controller, changed = fri.api, []
+
+    async def api(method, path, payload=None):
+        if path == '/agent/context' and not changed:
+            changed.append(True)
+            store.clear_chats('30')
+            with store.connection() as db:
+                db.execute('INSERT INTO agent_summaries(channel_id,body,authors,at,revisions) VALUES (?,?,?,?,?)',
+                           ('1', 'ash now likes chess', '["30"]', time.time(), '{"30": 1}'))
+        return await controller(method, path, payload)
+    fri.api = api
+
+
+@pytest.mark.parametrize('path', ['reply', 'tool'])
+def test_privacy_change_between_context_reads_keeps_nothing(monkeypatch, tmp_path, path):
+    import datetime as dt
+
+    from fri import feedback as commands
+    from fri.fri import CHANGED
+    async def scenario():
+        fri, _, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        store.save_chat('123', 'public:1', '20', 0, 'fri what did ash say?', MARKER, 'm', 'high',
+                        source=history_source(), provenance=[{'user_id': '30', 'revision': 0}])
+        relabel_ash_mid_turn(fri, store)
+        question = 'what is the current Python release?'
+        receipt = {'kind': 'web_search', 'query': question, 'answer': 'public evidence',
+                   'sources': ['https://www.python.org/downloads/'], 'checked_at': dt.datetime.now(dt.timezone.utc).isoformat()}
+        fri.chat_once.side_effect = ([ChatResult(status='completed', reply=MARKER)] if path == 'reply' else
+            [ChatResult(status='completed', action={'kind': 'web_search', 'query': question}),
+             ChatResult(status='completed', reply='3.14, and '+MARKER)])
+        event = message('fri '+question)
+        try:
+            with patch('fri.fri_actions.lookup', new=AsyncMock(return_value=(receipt, {}, 'completed'))):
+                if path == 'reply':
+                    with pytest.raises(commands.UserFeedbackCheckFailure, match=CHANGED):
+                        await fri.talk(123, 1, 20, event.content, 'public', event=event)
+                else:
+                    result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
+                    assert MARKER not in result.reply and result.turn is None
+            assert MARKER not in str(store.chat_context('123', 'public:1', '20')['turns'])
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_own_erasure_after_the_draft_fence_refuses_the_request(monkeypatch, tmp_path):
+    from fri.fri_requests import DraftView
+    async def scenario():
+        fri, _, store, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('fri draft a feature for me')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='draft ready', draft='Add a personal checklist')
+        try:
+            result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
+            view = DraftView(fri, 20, result.draft, reviewed=True, fence=result.turn)
+            click = SimpleNamespace(user=SimpleNamespace(id=20), guild_id=123, channel_id=1, channel=channel,
+                message=SimpleNamespace(author=fri.user), response=SimpleNamespace(defer=AsyncMock()),
+                edit_original_response=AsyncMock())
+            controller = fri.api
+            async def api(method, path, payload=None):
+                if path == '/requests':
+                    store.erase_user('20')
+                return await controller(method, path, payload)
+            fri.api = api
+            with pytest.raises(ControllerRejected):
+                await view.submit(click)
+            with store.connection() as db:
+                assert not db.execute('SELECT 1 FROM jobs').fetchone()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

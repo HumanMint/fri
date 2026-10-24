@@ -41,6 +41,7 @@ MAX_PROVENANCE = 200
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
 UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
+CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
 
@@ -59,26 +60,30 @@ def turn_provenance(context, speaker, actions=None):
     reply targets (Fri's resolved to their sources), nearby invited context and read evidence.
     """
     seen = {}
+    def add(user, revision):
+        # Two revisions for one member means their privacy changed while this turn was read.
+        # Never keep either label: the older read would be relabelled as current.
+        if str(user) != str(speaker) and seen.setdefault(str(user), int(revision)) != int(revision):
+            raise commands.UserFeedbackCheckFailure(CHANGED)
     inherited = [item for turn in context.get('turns', []) for item in turn.get('provenance', [])]
     inherited += (context.get('pending') or {}).get('provenance', [])
     inherited += context.get('summary_provenance', []) + context.get('reference_provenance', [])
     for item in inherited:
-        seen.setdefault(str(item['user_id']), item['revision'])
+        add(item['user_id'], item['revision'])
     for row in context.get('recent', []):
         if row.get('gene_error'):
             continue
         if row.get('fri'):  # Fri's own earlier reply carries the members it was built from.
             for item in row.get('provenance', []):
-                seen.setdefault(str(item['user_id']), item['revision'])
+                add(item['user_id'], item['revision'])
         else:
-            seen.setdefault(str(row['user_id']), row.get('revision', 0))
+            add(row['user_id'], row.get('revision', 0))
     for row in context.get('reply_target', []) + context.get('invited_context', []):
         if row.get('privacy_revision') is not None:
-            seen.setdefault(str(row['source']['user_id']), row['privacy_revision'])
+            add(row['source']['user_id'], row['privacy_revision'])
     for (_, user), revision in (getattr(actions, 'revisions', None) or {}).items():
-        seen.setdefault(str(user), revision)
-    seen.pop(str(speaker), None)
-    return [{'user_id': user, 'revision': int(revision)} for user, revision in sorted(seen.items())]
+        add(user, revision)
+    return [{'user_id': user, 'revision': revision} for user, revision in sorted(seen.items())]
 
 
 class FriTree(app_commands.CommandTree):
@@ -404,6 +409,11 @@ class Fri(discord.Client):
                         checked_channel = receipt.get('channel_id', '')
                         stored = f'Earlier check: {action_kind}' + (f' in channel {checked_channel}' if checked_channel else '')
                         stored += '. Fetch current evidence for follow-up details; no findings are retained here.'
+                    try:  # A fixed harness question over referenced evidence derives nothing from it.
+                        provenance = ([] if result.clarification and actions.private_evidence
+                                      else turn_provenance(context, user_id, actions))
+                    except commands.UserFeedbackCheckFailure:
+                        return ChatResult(reply=unrecorded(receipts), status='completed')
                     result.turn = {**scope, 'revision': context['revision'], 'source': source.model_dump(),
                         'input': clean(event.content, 4000) if result.clarification or context.get('message_burst') else text,
                         'reply': stored, 'model': context['model'], 'effort': context['effort'], 'notes': [],
@@ -411,10 +421,7 @@ class Fri(discord.Client):
                         'burst': context.get('message_burst', []),
                         'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
                                                                          result.post_preview or result.clarification),
-                        # A fixed harness question over referenced evidence derives nothing from it.
-                        'provenance': [] if result.clarification and actions.private_evidence
-                                      else turn_provenance(context, user_id, actions),
-                        'verbatim': stored == result.reply}
+                        'provenance': provenance, 'verbatim': stored == result.reply}
                     if len(result.turn['provenance']) > MAX_PROVENANCE:
                         return ChatResult(reply=unrecorded(receipts, reason='too many people were in that context to '
                                                            'track safely.'), status='completed')

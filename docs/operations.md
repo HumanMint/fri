@@ -63,10 +63,13 @@ advertises it, so the controller must be released first.
     is withheld from the model before inference and the new turn is stored as a neutral breadcrumb.
   - configured-channel nearby context and read evidence.
 
-  More than 200 sources refuses the reply rather than dropping any. A request draft carries its
+  More than 200 sources refuses the reply rather than dropping any. So does one member appearing with
+  two revisions: their privacy changed while the turn was read, and Fri never relabels the older
+  read. A request draft carries its
   turn's fence: preview, every page turn and submission re-run `/chat/turn/check` and refuse once
-  any source changed. A submitted request carries those sources: the controller checks them as it
-  creates the job and withdraws the job if any of them later erases. Preview cards are recorded as soon as Discord accepts them, even if binding fails. The controller rejects stale provenance, deletes dependent turns
+  any source changed. A submitted request carries those sources and the requester's revision. The
+  controller checks them as it creates the job and withdraws the job, even mid-build, if any source
+  later erases. Preview cards are recorded as soon as Discord accepts them, even if binding fails. The controller rejects stale provenance, deletes dependent turns
   when any listed member turns memory off, is erased or clears chats, and drops turns whose
   sources' revisions moved. Over-inclusion is deliberate: anyone in the context can erase the
   derived copy.
@@ -84,6 +87,9 @@ advertises it, so the controller must be released first.
 - **Gene's errors.** Gene's error text can quote whoever ran the command, and there's no way to
   attribute it. Conversations see only that Gene posted an error. The owner's repair investigation
   still reads the full text.
+- **Not yet covered.** Repair requests Fri files after noticing a Gene error quote Gene's raw error
+  text, and `gene_diagnose` reads them back. Replies built from that read keep only a breadcrumb,
+  but the stored repair text isn't attributed or erased yet. It's tracked for a follow-up.
 - **Group view.** Fri's delivered public replies join the in-memory channel view, tagged with the
   speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background

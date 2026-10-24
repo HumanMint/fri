@@ -63,7 +63,12 @@ class Actions:
     def derived(self):
         """Other members' words are in this turn's context, so they could reach a write."""
         from .fri import turn_provenance
-        return bool(self.turn_context is not None and turn_provenance(self.turn_context, self.user, self))
+        if self.turn_context is None:
+            return False
+        try:
+            return bool(turn_provenance(self.turn_context, self.user, self))
+        except commands.UserFeedbackCheckFailure:
+            return True  # Someone's privacy changed mid-turn; the reply itself will be refused.
 
     def burst_permission(self, action):
         rows = self.conversation.get('message_burst', [])

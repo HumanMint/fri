@@ -83,11 +83,11 @@ class DraftView(PagedPreview):
             await self.fenced()
             channel = (getattr(interaction.channel, 'parent_id', None) or interaction.channel_id) if interaction.guild_id else self.cog.workshop_id
             identity = {'guild_id': str(self.cog.guild_id), 'user_id': str(self.user_id)}
-            # The controller rechecks the draft's sources as it creates the job, and withdraws the
-            # job if any of them later erases.
+            # The controller rechecks the requester's revision and the draft's sources as it creates
+            # the job, and withdraws the job if any source later erases.
             job = await self.cog.api('POST', '/requests', {**identity,
                 'channel_id': str(channel), 'source_id': 'fri-draft:'+self.source_id, 'source_url': '', 'body': self.draft,
-                'provenance': (self.fence or {}).get('provenance', [])})
+                **({'provenance': self.fence['provenance'], 'revision': self.fence['revision']} if self.fence else {})})
             # Never approve content differing from the full preview, even if a duplicate ID is returned.
             from .privacy import clean
             if job['body'] != clean(self.draft) or job['user_id'] != str(self.user_id):
