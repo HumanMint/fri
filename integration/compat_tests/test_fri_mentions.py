@@ -83,6 +83,10 @@ def environment(monkeypatch, tmp_path, *, channel_id=8):
     return fri, agent, store, controller, channel, message, calls, rows
 
 
+def mention_lines(caplog):
+    return [line for line in caplog.messages if line.startswith('Mention ')]
+
+
 def attachment(channel):
     return SimpleNamespace(url=f'https://cdn.discordapp.com/attachments/{channel}/1/meme.png',
         content_type='image/png', size=100, width=100, height=100, is_spoiler=lambda: False)
@@ -104,7 +108,7 @@ def test_outside_noninvitations_do_nothing(monkeypatch, tmp_path, caplog, text):
             assert not calls and not agent.recent and not agent.active
             fri.chat_once.assert_not_awaited()
             event.reply.assert_not_awaited()
-            assert f'Mention 8/{event.id} ignored: not a visible user mention' in caplog.messages
+            assert f'Mention 8/{event.id} not answered: not a visible user mention' in caplog.messages
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -124,7 +128,7 @@ def test_fris_role_pill_is_not_an_invitation_but_says_why(monkeypatch, tmp_path,
             fri.chat_once.assert_not_awaited()
             event.reply.assert_not_awaited()
             assert not any(path == '/chat/mentions/admit' for path, _ in calls)
-            assert f'Mention {channel.id}/{event.id} ignored: not a visible user mention' in caplog.messages
+            assert f'Mention {channel.id}/{event.id} not answered: not a visible user mention' in caplog.messages
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -202,12 +206,12 @@ def test_invalid_invitation_fails_before_model(monkeypatch, tmp_path, caplog, fa
             assert not calls
             fri.chat_once.assert_not_awaited()
             event.reply.assert_not_awaited()
-            # A member's dropped mention says why in the log, by message ID only. Webhooks aren't members.
-            reason = {'old': 'stale event', 'bot': 'ineligible event', 'webhook': None,
+            # A member's dropped mention says why in the log, by message ID only. Bots and webhooks aren't members.
+            reason = {'old': 'stale event', 'bot': None, 'webhook': None,
                       'foreign_guild': 'outside the main server', 'foreign_source': 'message changed',
                       'permission': 'missing permissions', 'disabled': 'fri disabled'}[failure]
             logged = [line for line in caplog.messages if line.startswith('Mention ')]
-            assert logged == ([f'Mention {channel.id}/{event.id} ignored: {reason}'] if reason else [])
+            assert logged == ([f'Mention {channel.id}/{event.id} not answered: {reason}'] if reason else [])
             assert not any('what do you think' in line for line in caplog.messages)
         finally:
             await fri.close()
@@ -224,7 +228,7 @@ def test_disabled_fri_logs_a_mention_in_its_own_channel(monkeypatch, tmp_path, c
             await agent.handle(event)
             assert not calls
             event.reply.assert_not_awaited()
-            assert f'Mention 1/{event.id} ignored: fri disabled' in caplog.messages
+            assert f'Mention 1/{event.id} not answered: fri disabled' in caplog.messages
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -264,6 +268,129 @@ def test_a_withdrawn_image_share_names_the_mention_it_dropped(monkeypatch, tmp_p
                 await agent.handle(event)
             assert not any(path == '/chat/turn' for path, _ in calls)
             assert f'Mention 1/{event.id} not answered: image share withdrawn' in caplog.messages
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_erasure_during_the_burst_wait_names_the_mention(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you there?')
+        async def erased(_):
+            agent.forget(20)  # "Forget me", the panel, or Gene/Red erasure, during the debounce.
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=erased):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_cooldown_burst_names_the_mention_it_answers_for(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, controller, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        for _ in range(30):  # Spend the allowance; its one cooldown notice has already shown.
+            controller.admit('20', 'public')
+        first, second = message('<@99> how is it going?', age=1), message('you around?')
+        try:
+            task = asyncio.create_task(agent.handle(first))
+            while not agent.bursts.has(1, 20):
+                await asyncio.sleep(0.01)
+            await agent.handle(second)  # Answers for both, without the mention's invitation.
+            await task
+            first.reply.assert_not_awaited()
+            second.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: social cooldown']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_mention_behind_a_finishing_reply_says_why(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        fri.busy.add(20)  # An earlier reply to the same member is still running...
+        original, checks = Invitation.current, []
+        async def current(self, **kwargs):
+            checks.append(await original(self, **kwargs))
+            if len(checks) == 2:
+                fri.busy.discard(20)  # ...and finishes while this mention is rechecked.
+            return checks[-1]
+        monkeypatch.setattr(Invitation, 'current', current)
+        try:
+            await agent.handle(event)
+            event.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: earlier reply still running']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_mention_in_an_overlong_burst_says_why(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, rest = message('<@99> hey', age=1), [message(f'and {n}') for n in range(5)]
+        try:
+            tasks = []
+            for event in (first, *rest[:-1]):
+                tasks.append(asyncio.create_task(agent.handle(event)))
+                while not agent.bursts.group(event):
+                    await asyncio.sleep(0.01)
+            await agent.handle(rest[-1])  # The sixth: the burst is dropped, and this one says so.
+            await asyncio.gather(*tasks)
+            first.reply.assert_not_awaited()
+            assert 'at most five messages' in rest[-1].reply.await_args.args[0]
+            fri.chat_once.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: burst too long']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_burst_that_fails_names_its_earlier_mention(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        @asynccontextmanager
+        async def typing():
+            raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
+            yield
+        channel.typing = typing
+        first, second = message('<@99> hey', age=1), message('you around?')
+        try:
+            task = asyncio.create_task(agent.handle(first))
+            while not agent.bursts.has(1, 20):
+                await asyncio.sleep(0.01)
+            with pytest.raises(discord.Forbidden):
+                await agent.handle(second)
+            await task
+            assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: Forbidden']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_answered_mention_logs_nothing(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        alone, first, second = message('<@99> hey', age=2), message('<@99> also', age=1), message('you around?')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(alone)
+            alone.reply.assert_awaited_once()
+            await asyncio.gather(agent.handle(first), agent.handle(second))  # One reply answers both.
+            second.reply.assert_awaited_once()
+            assert mention_lines(caplog) == [] and agent.misses == {}
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -343,7 +470,7 @@ def test_revocation_during_answer_never_sends_or_saves_context(monkeypatch, tmp_
             reason = {'privacy': 'check failed: ControllerRejected', 'source_edit': 'nearby message changed',
                       'permission': 'missing permissions', 'settings': 'check failed: ControllerRejected'}[change]
             assert [line for line in caplog.messages if line.startswith('Mention ')] == [
-                f'Mention {channel.id}/{event.id} reply withheld: {reason}']
+                f'Mention {channel.id}/{event.id} not answered: reply withheld: {reason}']
         finally:
             await fri.close()
     asyncio.run(scenario())

@@ -41,13 +41,17 @@ Freshness checks compare author and event IDs, never display names. A gateway ev
 the member's server nickname, but a fetched copy of the same message shows their global
 name, because Fri has no members intent or member cache.
 
-A mention Fri doesn't answer is logged at INFO with only its channel and message IDs:
-`Mention <channel>/<message> ignored: <reason>` when it never became an invitation (for
-example `not a visible user mention` for Fri's role pill, `message changed`, `stale event`,
-`missing permissions`, `fri disabled`, `author privacy changed`), `reply withheld: <reason>`
-when a recheck failed after composing, and `not answered: <reason>` for a cooldown whose
-notice already showed, a withdrawn image share, or a Discord or controller error (logged
-by error type only).
+Every ping to Fri from a member (a mention, a reply ping or Fri's role pill) that gets no
+lasting reply is logged once at INFO, with only its channel and message IDs:
+`Mention <channel>/<message> not answered: <reason>`. A reason is a gate or an error type,
+never content or names. Examples: `not a visible user mention` (the role pill, or a mention
+in quotes or code), `message changed`, `stale event`, `missing permissions`, `fri disabled`,
+`author privacy changed`, `burst too long`, `earlier reply still running` (its waiting
+notice is deleted once that reply lands), `social cooldown` (after the cooldown's one
+notice), `image share withdrawn`, `reply withheld: <recheck>` when a recheck failed after
+composing, and an exception type such as `Forbidden`. A burst's earlier messages are
+logged under the reason its last message got. A reply, a notice, a preview or a reaction
+counts as an answer. Bots, webhooks and DMs aren't logged.
 
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.

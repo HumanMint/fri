@@ -2,7 +2,6 @@
 
 import copy
 import datetime as dt
-import logging
 import time
 
 import discord
@@ -17,11 +16,6 @@ NEARBY_SECONDS = 30 * 60
 REFERENCE_SECONDS = 7 * 86400
 MAX_MESSAGES = 12
 CHANGED = 'That mention or its context changed while I was replying. Ask again for a fresh reply.'
-LOG = logging.getLogger('fri.mentions')
-
-
-def where(message):
-    return f'{message.channel.id}/{message.id}'
 
 
 def fingerprint(message):
@@ -42,7 +36,7 @@ class Invitation:
         self.rows, self.events, self.profiles, self.snapshots = [], {}, {}, {}
         self.image = None
         self.ambiguous_images = False
-        self.refusal = None  # Why the last check failed, for the log: a gate name, never content.
+        self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
 
     @classmethod
     async def create(cls, agent, message):
@@ -57,15 +51,12 @@ class Invitation:
             if await invitation.current(check_evidence=False):
                 return invitation
             reason = invitation.refusal
-        LOG.info('Mention %s ignored: %s', where(message), reason)
+        agent.miss(message, reason)
         return None
 
     def refuse(self, reason):
         self.refusal = reason
         return False
-
-    def withheld(self):
-        LOG.info('Mention %s reply withheld: %s', where(self.event), self.refusal)
 
     async def access(self):
         """Fetch current overwrites and both members; cached channel access is insufficient."""

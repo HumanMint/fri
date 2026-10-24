@@ -931,7 +931,7 @@ def test_a_message_waiting_behind_a_delivery_is_dropped_if_its_author_erases(mon
             assert store.chat_context('123', 'public:1', '20')['pending'] is None
             assert all('old marker' not in call.args[0] for call in fri.chat_once.await_args_list)
             if mention:
-                assert f'Mention 1/{queued.id} ignored: author privacy changed' in caplog.messages
+                assert f'Mention 1/{queued.id} not answered: author privacy changed' in caplog.messages
         finally:
             release.set()
             await asyncio.gather(*tasks, return_exceptions=True)

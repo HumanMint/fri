@@ -81,8 +81,9 @@ class Bursts:
     messages wait while Fri's previous reply is delivered and recorded.
     """
 
-    def __init__(self):
+    def __init__(self, dropped=None):
         self.rows = {}  # (channel, member): bursts, oldest first, each [(arrived, message, text)].
+        self.dropped = dropped or (lambda events, reason: None)  # Told of events no reply will answer.
 
     def has(self, channel, user):
         groups = self.rows.get((channel, user), [])
@@ -91,7 +92,10 @@ class Bursts:
     def add(self, message, arrived=None):
         key, now = (message.channel.id, message.author.id), time.monotonic()
         arrived = now if arrived is None else arrived
-        groups = [rows for rows in self.rows.get(key, []) if now-rows[0][0] <= 60]  # Abandoned ones expire.
+        groups, abandoned = [], []
+        for rows in self.rows.get(key, []):  # Abandoned ones expire.
+            (groups if now-rows[0][0] <= 60 else abandoned).append(rows)
+        self.dropped([row[1] for rows in abandoned for row in rows], 'burst abandoned')
         if not groups or arrived-groups[-1][0][0] > BURST_SECONDS:
             groups.append([])
         groups[-1].append((arrived, message, message.content))
@@ -101,6 +105,7 @@ class Bursts:
             groups.pop()
             if not groups:
                 del self.rows[key]
+            self.dropped([row[1] for row in rows[:-1]], 'burst too long')  # The newest gets the notice.
             raise ValueError('Send at most five messages and 4000 characters together, then give me a moment.')
 
     def group(self, message):
@@ -122,9 +127,8 @@ class Bursts:
         return rows
 
     def forget(self, user):
-        for key in list(self.rows):
-            if key[1] == user:
-                del self.rows[key]
+        for key in [key for key in self.rows if key[1] == user]:
+            self.dropped([row[1] for rows in self.rows.pop(key) for row in rows], 'author privacy changed')
 
 
 async def live_rows(agent, message, burst):
