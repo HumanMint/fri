@@ -80,35 +80,46 @@ def cache_calls(response):
 
 @pytest.mark.parametrize('rejection', [
     lambda: httpx.Response(400, json={'error': REJECTION}),
-    lambda: httpx.Response(422, json={'error': {'message': 'prompt_cache_key is not supported on this route.'}}),
-    lambda: httpx.Response(400, json={'detail': 'Unsupported parameter: prompt_cache_key'}),
-    lambda: httpx.Response(400, text='Bad Request'),
-    lambda: httpx.Response(400, json={'error': {'type': 'invalid_request_error', 'param': 'input',
-                                                'message': 'Invalid input.'}}),
+    lambda: httpx.Response(422, json={'detail': 'Unsupported parameter: prompt_cache_key'}),
+    lambda: httpx.Response(502, text='upstream rejected PROMPT_CACHE_KEY: unsupported parameter'),
+    lambda: httpx.Response(500, json={'error': {'type': 'server_error', 'message': 'boom'}}),
     lambda: sse({'type': 'error', **REJECTION}),
-    lambda: sse({'type': 'error', 'code': 'unsupported_parameter',
-                 'message': "The 'prompt_cache_key' parameter is not supported on this route."}),
-    lambda: sse({'type': 'error', 'code': None, 'param': 'prompt_cache_key', 'message': 'Unsupported.'}),
-    lambda: sse({'type': 'response.created'}, {'type': 'response.failed', 'response': {'error': REJECTION}}),
+    lambda: sse({'type': 'response.created'}, {'type': 'response.failed', 'response': {
+        'error': {'code': 'invalid_request_error', 'message': 'Invalid request.'}}}),
+    lambda: sse({'type': 'response.created'}),
 ])
-def test_a_client_error_or_an_error_naming_the_hint_turns_it_off_without_replay(rejection):
+def test_a_failure_before_any_output_drops_the_hint_without_replay(rejection):
     (first, second), sent = cache_calls(rejection)
     assert first.status != 'completed' and second.status == 'completed' and sent == [True, False]
 
 
 @pytest.mark.parametrize('response', [
-    lambda: httpx.Response(500, json={'error': {'type': 'server_error', 'message': 'boom'},
-                                      'prompt_cache_key': 'fri-chat-echo'}),
-    lambda: httpx.Response(503, text='upstream unavailable'),
+    lambda: httpx.Response(401, json={'error': {'message': 'Invalid token.'}}),
+    lambda: httpx.Response(403, json={'error': {'message': 'Forbidden.'}}),
     lambda: httpx.Response(429, json={'error': {'type': 'rate_limit_error', 'message': 'Slow down.'}}),
-    lambda: httpx.Response(401, json={'error': {'type': 'invalid_request_error', 'message': 'Invalid token.'}}),
-    lambda: sse({'type': 'response.failed', 'response': {'prompt_cache_key': 'fri-chat-echo',
-                                                         'error': {'code': 'server_error', 'message': 'Try again.'}}}),
-    lambda: sse({'type': 'error', 'code': 'server_error', 'message': 'The model crashed.'}),
+    lambda: sse({'type': 'response.output_text.delta', 'delta': '{"reply": "par'},
+                {'type': 'response.failed', 'response': {'error': REJECTION}}),
+    lambda: sse({'type': 'response.output_item.added', 'item': {'type': 'reasoning'}},
+                {'type': 'response.incomplete', 'response': {}}),
+    lambda: sse(response_event(content='not-json')),
 ])
-def test_server_errors_limits_auth_and_echoes_keep_the_hint(response):
+def test_auth_rate_limits_and_failures_after_output_keep_the_hint(response):
     (first, second), sent = cache_calls(response)
     assert first.status != 'completed' and second.status == 'completed' and sent == [True, True]
+
+
+def test_a_connection_that_never_answers_keeps_the_hint():
+    sent = []
+
+    def handler(request):
+        sent.append('prompt_cache_key' in json.loads(request.content))
+        if len(sent) == 1:
+            raise httpx.ConnectError('down', request=request)
+        return sse(response_event())
+    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
+    context = {**CONTEXT, 'source': {'channel_id': '123456789012345678', 'user_id': '1'}}
+    assert [asyncio.run(chat.respond('hi', context)).status for _ in range(2)] == ['interrupted', 'completed']
+    assert sent == [True, True]
 
 
 def test_model_refresh_reads_subscription_visible_catalog():

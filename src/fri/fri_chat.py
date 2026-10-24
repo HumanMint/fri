@@ -362,23 +362,6 @@ class ChatResult:
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
 
 
-def drops_cache_key(status, error):
-    """Whether a failed call that carried prompt_cache_key should stop later calls from sending it.
-
-    The hint only saves tokens and the failed reply is never replayed, so this errs toward dropping it:
-    any client error except auth and rate limits, or an error that names the field in any wording."""
-    return 400 <= status < 500 and status not in (401, 403, 429) or 'prompt_cache_key' in json.dumps(error)
-
-
-def error_object(body):
-    """The error part of a failed HTTP body, so a request field echoed beside it isn't read as the cause."""
-    try:
-        data = json.loads(body)
-    except ValueError:
-        return None
-    return data.get('error', data) if isinstance(data, dict) else data
-
-
 def cache_key(source):
     """Keep one channel's calls on the same prompt cache. Only a hash of the channel id leaves Fri."""
     channel = (source or {}).get('channel_id')
@@ -482,14 +465,15 @@ class Chat:
         key = cache_key(context.get('source'))
         if key and self.cache_keys:
             payload['prompt_cache_key'] = key
+        answered, produced, exempt = False, False, False
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30), trust_env=False,
                                          transport=self.transport) as client:
                 async with client.stream('POST', RESOURCE + '/responses', json=payload,
                                          headers=await self.headers()) as response:
+                    answered = True
                     if response.status_code != 200:
-                        if 'prompt_cache_key' in payload and drops_cache_key(response.status_code, error_object(await response.aread())):
-                            self.cache_keys = False  # Later calls skip the hint; this one fails as usual.
+                        exempt = response.status_code in (401, 403, 429)
                         result.status = 'failed'
                         if response.status_code == 429:
                             result.error = 'mint’s ai wallet is tapped out for now, plan or rate limit. check usage or try me again later.'
@@ -498,10 +482,8 @@ class Chat:
                         return result
                     async for event in events(response.aiter_lines()):
                         kind = event.get('type')
-                        if kind in ('error', 'response.failed') and 'prompt_cache_key' in payload and drops_cache_key(
-                                response.status_code,
-                                (event.get('response') or {}).get('error') if kind == 'response.failed' else event):
-                            self.cache_keys = False
+                        produced = produced or kind not in (
+                            'response.created', 'response.in_progress', 'response.queued', 'error', 'response.failed')
                         key = (event.get('output_index', 0), event.get('content_index', 0))
                         if kind == 'response.output_text.delta':
                             text_parts[key] = text_parts.get(key, '') + event.get('delta', '')
@@ -575,8 +557,15 @@ class Chat:
                             result.error = 'Fri received an unreadable reply. Please try again.'
                         return result
         except SubscriptionError as exc:
-            result.error, result.status = str(exc), 'failed'
+            result.error, result.status, exempt = str(exc), 'failed', True
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             result.error = 'The connection ended before Fri completed their reply. Please try again.'
+        finally:
+            # The hint only saves tokens. If it breaks a request, the server answers and fails it before any
+            # output, in whatever error format, so any such failure except auth and rate limits drops it for
+            # later calls. The failed reply is never replayed; a needless drop costs tokens until restart.
+            if ('prompt_cache_key' in payload and answered and not produced and not exempt
+                    and result.status != 'completed'):
+                self.cache_keys = False
         result.error = result.error or 'The connection ended before Fri completed their reply. Please try again.'
         return result
