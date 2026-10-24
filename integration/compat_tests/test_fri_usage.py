@@ -48,7 +48,7 @@ def test_report_counts_input_and_output_once_and_labels_missing_counts(tmp_path)
     assert '```' not in reply and 'input_tokens' not in reply and len(reply) < 1950
     assert 'nothing recorded' in describe_usage([])
     assert '- chat: 120 tokens · 2 calls (70 cached input, 15 reasoning)' in reply
-    assert 'only count calls that reported them' in reply
+    assert 'only count calls that reported each one' in reply
     by_model = describe_usage(rows, by_model=True)
     assert 'model / high: 120 tokens' in by_model and '- chat:' not in by_model
     assert '(70 cached input, 15 reasoning)' in by_model
@@ -78,7 +78,8 @@ def test_partial_and_zero_cache_reports_stay_counts_not_shares(tmp_path):
     assert '- chat: 1,200 tokens · 2 calls (100 cached input, 20 reasoning)\n' in reply
     assert '- meme checks: 20 tokens · 2 calls (100 cached input, 100 reasoning)\n' in reply
     assert '- learning summaries: 55 tokens · 1 calls\n' in reply
-    assert '%' not in reply and 'incomplete' in reply and 'only count calls that reported them' in reply
+    assert '%' not in reply and 'incomplete' in reply and 'only count calls that reported each one' in reply
+    assert 'cover different calls than the totals' in reply and 'part of' not in reply
     store, agent = usage_store(tmp_path / 'zero')
     store.add_chat_usage('f'*32, 'model', 'high', 'completed', counters(100, 20, 0, 0))
     reply = describe_usage(agent.usage())
@@ -86,7 +87,7 @@ def test_partial_and_zero_cache_reports_stay_counts_not_shares(tmp_path):
     store, agent = usage_store(tmp_path / 'none')
     store.add_chat_usage('g'*32, 'model', 'high', 'completed', counters(100, 20, None, None))
     reply = describe_usage(agent.usage())
-    assert '- chat: 120 tokens · 1 calls\n' in reply and 'reported them' not in reply
+    assert '- chat: 120 tokens · 1 calls\n' in reply and 'reported each one' not in reply
 
 
 @pytest.mark.parametrize('by_model', [False, True])

@@ -60,7 +60,8 @@ def describe_usage(rows, *, by_model=False):
     if missing:
         lines.append('some calls have missing token counts, so these totals are incomplete.')
     if any(group['cached'] is not None or group['reasoning'] is not None for _, group in ranked):
-        lines.append('cached input and reasoning are part of those totals and only count calls that reported them.')
+        lines.append('cached input and reasoning only count calls that reported each one, '
+                     'so they can cover different calls than the totals.')
     lines.append("cumulative fri activity, not your remaining plan allowance. gene's coding usage is separate.")
     return '\n'.join(lines)
 
