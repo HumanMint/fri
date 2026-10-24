@@ -132,7 +132,8 @@ class InputModal(discord.ui.Modal):
             await reply(self.cog, interaction, 'Saved. Future development jobs can use this fact.')
         else:
             channel = getattr(interaction.channel, 'parent_id', None) or interaction.channel_id
-            payload.update(source_id=str(interaction.id), channel_id=str(channel))
+            # Typed by the member alone: no one else's words, so the controller may show its title to them.
+            payload.update(source_id=str(interaction.id), channel_id=str(channel), provenance=[])
             job = await self.cog.api('POST', '/requests', payload)
             await reply(self.cog, interaction, f"Request `{job['id']}` is awaiting owner review. "
                         'Coding starts only after the owner allows it. Use **Requests** to follow its progress.')
