@@ -80,6 +80,7 @@ class Agent:
         self.recent = defaultdict(lambda: deque(maxlen=30))
         self.active = {}
         self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
+        self.recording = {}  # (channel, member): set once a delivered reply is recorded.
         self.pending = {}
         self.bursts = Bursts()
         self.seen = {}
@@ -355,6 +356,14 @@ class Agent:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})
             return
+        recording = self.recording.get((channel, message.author.id))
+        if recording and not privacy:
+            # Fri's reply was delivered but isn't saved yet, so a question it asked isn't pending
+            # yet either. This message may be the answer: decide only after the save.
+            try:
+                await asyncio.wait_for(recording.wait(), 30)
+            except TimeoutError:
+                pass
         active = (self.active.get((channel, message.author.id), 0) > time.time() or
                   self.bursts.has(channel, message.author.id))
         if not active and directed is None and not dm and not message.author.bot:
@@ -468,15 +477,21 @@ class Agent:
         if sent is None:  # Nothing was delivered, so nothing is recorded as said.
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        echo = result.echo
-        await self.fri.record_turn(result, sent)
-        if echo and message.guild and self.allowed(message.channel):
-            text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']  # As shown.
-            self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
-                'name': 'Fri', 'text': clean(text, 500), 'at': time.time(), 'gene_error': False,
-                'fri': True, 'provenance': echo['provenance']})
-        if result.status == 'completed' and not (invitation and invitation.outside):
-            self.active[(message.channel.id, message.author.id)] = time.time()+(300 if result.clarification else 120)
+        echo, key = result.echo, (message.channel.id, message.author.id)
+        recorded = self.recording[key] = asyncio.Event()  # The member may already be answering.
+        try:
+            await self.fri.record_turn(result, sent)
+            if echo and message.guild and self.allowed(message.channel):
+                text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']  # As shown.
+                self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
+                    'name': 'Fri', 'text': clean(text, 500), 'at': time.time(), 'gene_error': False,
+                    'fri': True, 'provenance': echo['provenance']})
+            if result.status == 'completed' and not (invitation and invitation.outside):
+                self.active[key] = time.time()+(300 if result.clarification else 120)
+        finally:
+            recorded.set()
+            if self.recording.get(key) is recorded:
+                del self.recording[key]
         self.last_spoke[message.channel.id] = time.time()
         await self.fri.waiting_notices.clear(message.author.id)
 

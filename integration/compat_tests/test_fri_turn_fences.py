@@ -666,3 +666,42 @@ def test_a_redelivered_mention_waits_for_the_first_reply_to_be_delivered_and_rec
             await first
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_an_answer_sent_while_the_question_is_being_saved_is_not_lost(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, answer = message('fri play'), message('blind melon no rain')
+        saving, release = asyncio.Event(), asyncio.Event()
+        controller, talked = fri.api, []
+
+        async def api(method, path, body=None):
+            if path == '/chat/turn':
+                saving.set()
+                await release.wait()
+            return await controller(method, path, body)
+        fri.api = api
+        talk = fri.talk
+        async def spy(*args, **kwargs):
+            talked.append(args[3])
+            return await talk(*args, **kwargs)
+        fri.talk = spy
+        fri.chat_once.return_value = ChatResult(status='completed', action={
+            'kind': 'clarify', 'goal': 'play', 'topic': '', 'question': 'what song?'})
+        first.reply.return_value = SimpleNamespace(id=first.id+1, content='what song?')
+        task = asyncio.create_task(agent.handle(first))
+        try:
+            await asyncio.wait_for(saving.wait(), 5)  # The member has the question; it isn't saved yet.
+            pending = asyncio.create_task(agent.handle(answer))
+            await asyncio.sleep(0.05)
+            assert talked == ['fri play']  # The answer waits for the save instead of being dropped.
+            release.set()
+            await asyncio.wait_for(task, 5)
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await asyncio.wait_for(pending, 5)
+            assert talked == ['fri play', 'blind melon no rain']
+        finally:
+            release.set()
+            await task
+            await fri.close()
+    asyncio.run(scenario())
