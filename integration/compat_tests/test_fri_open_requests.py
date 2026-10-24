@@ -10,6 +10,7 @@ import discord
 import httpx
 import pytest
 
+from compat_tests.conftest import proposed
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_mentions import environment
 from fri.fri_chat import Chat, ChatResult
@@ -99,7 +100,7 @@ def careful_answer(text, rows):
     if rows[0].get('withdrawn'):
         return 'it got withdrawn after a privacy change, not turned down'
     return {'queued': 'not started, waiting for a worker', 'building': 'being built, not done',
-            'approved': 'allowed but not deployed yet', 'deployed': 'yep, deployed',
+            'approved': 'allowed but not deployed yet', 'deployed': "it shipped. can't promise nobody rolled it back",
             'awaiting_owner': 'you already have that one waiting on the owner'}[states[0]]
 
 
@@ -144,3 +145,23 @@ def test_the_model_is_told_when_requests_are_unavailable():
     asyncio.run(chat.respond('fri did my fix go through', CONTEXT))  # E.g. an invitation or an older controller.
     assert json.loads(sent[0]['input'][-1]['content'])['your_gene_requests'] is None
     assert 'null means' in sent[0]['instructions']
+
+
+def test_a_rolled_back_request_still_reads_deployed_so_the_model_is_told_not_to_promise_it(store):
+    job = proposed(store)
+    store.approve(job['id'], 'b' * 40, 'owner')
+    release = store.claim_deploy()
+    store.finish_deploy(release['id'], release['lease'], True, 'Healthy')
+    store.rollback('guild', 'owner')
+    rollback = store.claim_deploy()
+    store.finish_deploy(rollback['id'], rollback['lease'], True, 'Previous version healthy')
+    assert store.status()['active_sha'] == 'a' * 40
+    [row] = store.chat_context('guild', 'private:9', 'member')['requests']
+    assert row['id'] == job['id'] and row['state'] == 'deployed'  # The controller doesn't record the revert.
+    sent = []
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, text='data: ' + json.dumps(response_event()) + '\n\n')
+    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
+    asyncio.run(chat.respond('is my fix live', {**CONTEXT, 'requests': [row]}))
+    assert "a later rollback isn't shown, so don't promise it's still live" in ' '.join(sent[0]['instructions'].split())

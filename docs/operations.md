@@ -121,10 +121,11 @@ after a privacy change is marked `withdrawn`, so Fri doesn't call it the owner's
 With several untitled requests Fri gives each state or asks which one, and with no list (an outside
 invitation or an older controller) they point to Requests instead of guessing.
 `python -m fri.fri_eval --suite requests` checks status answers with the real model: queued and
-approved haven't started their next step, building isn't done, deployed is live, withdrawn isn't a
-rejection, untitled, empty or unavailable lists aren't guessed, an open request isn't drafted again, and
-public banter leaves requests alone. Each reply must be a plain reply with no draft or action, then a
-rubric judge on the same model grades it.
+approved haven't started their next step, building isn't done, deployed means it shipped (the
+controller doesn't mark a request a later rollback reverted), withdrawn isn't a rejection, untitled,
+empty or unavailable lists aren't guessed, an open request isn't drafted again, and public banter
+leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
+on the same model grades it.
 
 ## Deployment boundary
 

@@ -10,7 +10,7 @@ VERDICT = obj({'verdict': {'type': 'string', 'enum': ['pass', 'fail']}, 'reason'
 JUDGE = '''Grade one Discord reply from Fri against the case rubric. The request rows are the only truth
 about the speaker's requests; null rows mean Fri couldn't see them. Fail a reply that claims more progress
 than a row's state (queued and approved haven't started their next step, building isn't done, nothing is
-live before deployed), says the owner turned down a withdrawn request, assigns a state to a request it
+live before deployed, and deployed means it shipped, not that it's certainly still live), says the owner turned down a withdrawn request, assigns a state to a request it
 can't identify from a title or id, says the speaker has no requests because the list is empty or null,
 volunteers anything about their requests when the message isn't about them, or breaks the rubric. Ordinary
 words like "approved" or "fix" in banter are fine. Tone, wording and length don't matter here. Return pass
@@ -48,9 +48,10 @@ def cases():
         {'name': 'unavailable_status_is_not_none', 'text': 'did my fix go through', 'requests': None,
          'expect': "Can't see request status here. No claimed state and no claim they have none; Requests in the "
                    '/fri panel shows it.'},
-        {'name': 'deployed_is_live', 'text': 'is my modpack fix live', 'dm': True,
+        {'name': 'deployed_has_shipped', 'text': 'is my modpack fix live', 'dm': True,
          'requests': [request('deployed', **titled)],
-         'expect': 'Yes, it is deployed. No hedging that it is still pending.'},
+         'expect': "It shipped. No promise it's certainly still live (a rollback wouldn't show), and no claim it's "
+                   'still pending.'},
         {'name': 'empty_list_is_not_none', 'text': 'did my request go through', 'requests': [],
          'expect': "Can't confirm from here. No claim they have no requests; Requests in the /fri panel shows them."},
         {'name': 'open_request_is_not_redrafted', 'text': 'can you write up a request to fix the modpack command',
