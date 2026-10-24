@@ -4,6 +4,8 @@ Fri is the Discord companion. Gene's controller remains the only deployment auth
 The companion has no shell, SSH, Docker, GitHub or worker/deployer credentials.
 
 - Python 3.11; `uv sync --frozen`, `uv run pytest`, `uv run ruff check .`.
+- Full offline verification (unit, real-controller integration, replay, ruff): `scripts/offline-checks.sh setup`
+  once, then `scripts/offline-checks.sh`. Reviewers use the same script.
 - Runtime lives in `src/fri`; no Gene or Red imports or database persistence code.
 - Keep tokens, subscription auth, raw member context, state, and databases out of Git.
 - Existing `GENE_*` identity variables are intentional compatibility names. They do not change permissions.

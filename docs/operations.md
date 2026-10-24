@@ -160,16 +160,60 @@ and visibility when ready. The bot's Discord permissions alone do not enable acc
 
 ## Integration checks
 
-Use the Gene checkout named in the integration pairing file and install its test
-requirements (`uv sync --frozen --extra red`). This is a **test-only** dependency;
-the Fri wheel and runtime image contain neither Gene nor Red.
-
-Run with both source trees available, credentials removed and network access denied:
+Maintainers and review agents run the same script:
 
 ```sh
-PYTHONPATH="$PWD/src:$PWD/integration:/path/to/gene/src:/path/to/gene" \
-  /path/to/gene/.venv/bin/python -m pytest -q -p no:cacheprovider integration/compat_tests integration/replay
+scripts/offline-checks.sh setup   # once per paired Gene commit; the only networked step
+scripts/offline-checks.sh         # credential-free, network-denied checks
 ```
+
+`setup` reads `verified_controller_commit` from the integration pairing file. It extracts that
+exact Gene commit from a local Gene repository with `git archive`, and builds a dedicated venv
+from that commit's `uv.lock` (`uv sync --frozen --extra red`). Both live under
+`~/.cache/fri-offline/<gene-sha>/`, so an unrelated Gene branch or venv is never borrowed. Gene
+and Red are **test-only** dependencies; the Fri wheel and runtime image contain neither.
+
+`check` runs with a cleared environment (no tokens, temporary home/config):
+
+- Fri's `tests`;
+- `integration/compat_tests` and `integration/replay` against the pinned controller;
+- `ruff`.
+
+The guarantee comes from an OS layer. On macOS, `sandbox-exec` denies outbound IP and the
+`mDNSResponder` resolver socket; an IP-only rule still let names resolve. On Linux, `unshare -rn`
+does the same.
+
+A Python guard adds a second layer in each Python process:
+
+- an audit hook denies non-loopback connect/sendto/sendmsg and the socket lookup functions;
+- wrappers on `socket.socket.connect`, `connect_ex`, `sendto`, `sendmsg` and `bind` reject
+  hostnames before CPython resolves them in C.
+
+The guard covers only Python's socket layer. Non-Python subprocesses and native code, such as
+uvloop's resolver, depend on an OS layer. OS-level DNS denial was verified manually: `example.com`
+resolved under the IP-only profile and failed with the resolver socket denied. It has no per-run
+canary, because proving it needs a real lookup.
+
+If no OS layer can be applied here (for example nested inside a Codex reviewer's sandbox), the
+script refuses to run unless `OFFLINE_ISOLATION=python` explicitly accepts the guard alone as best
+effort, relying on the outer sandbox.
+
+Every run first proves each active layer with canaries. These target RFC 5737/6761 test
+addresses, and a backstop hook stops any probe the guard misses before it sends traffic. The run
+prints the isolation it used and exits non-zero on any failure. No Python starts with the
+caller's environment before `check` clears it.
+
+Overrides:
+
+- `GENE_SHA`: another controller commit, such as `minimum_controller_commit`;
+- `GENE_REPO`: Gene repository path (default `../gene`);
+- `FRI_OFFLINE_CACHE`: cache location;
+- `FRI_VENV`: Fri venv, for a fresh review checkout without `.venv`;
+- `OFFLINE_ISOLATION=python`: accept the Python guard alone (best effort) inside an outer network-denied sandbox.
+
+The equivalent manual command for the integration suites is
+`PYTHONPATH="$PWD/src:$PWD/integration:<gene>/src:<gene>" <gene venv>/bin/python -m pytest -q
+-p no:cacheprovider integration/compat_tests integration/replay`.
 
 ### Replay harness
 
