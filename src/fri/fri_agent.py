@@ -176,7 +176,7 @@ class Agent:
         rows = self.messages(channel)
         source = self.fri.get_channel(channel)
         parent = getattr(source, 'parent_id', None) or channel
-        profiles, accepted = {}, []
+        profiles, accepted, stale = {}, [], set()
         async def current(user, revision):
             if user not in profiles:
                 profiles[user] = await self.profile(parent, user)
@@ -189,6 +189,8 @@ class Agent:
             if row.get('fri'):  # Fri's reply stays only while everyone it drew on still allows it.
                 if all([await current(item['user_id'], item['revision']) for item in row['provenance']]):
                     accepted.append(row)
+                else:
+                    stale.add(row['id'])
                 continue
             user = row['user_id']
             if user not in profiles:
@@ -198,6 +200,8 @@ class Agent:
                 accepted.append(row)
             else:
                 self.forget(int(user))
+        if stale:  # Drop invalidated Fri replies from the raw cache too, not just from this context.
+            self.recent[channel] = deque((r for r in self.recent[channel] if r['id'] not in stale), maxlen=30)
         return accepted
 
     def forget(self, user):
@@ -418,14 +422,12 @@ class Agent:
             return
         if result.post_preview:
             from .fri_workspace import show_preview
-            await show_preview(self.fri, message, result.post_preview)
-            await self.fri.record_turn(result)
+            await show_preview(self.fri, message, result.post_preview, delivered=lambda: self.fri.record_turn(result))
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if result.social_preview:
             from .fri_social import show_preview
-            await show_preview(self.fri, message, result.social_preview)
-            await self.fri.record_turn(result)
+            await show_preview(self.fri, message, result.social_preview, delivered=lambda: self.fri.record_turn(result))
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if not result.reply:
@@ -439,7 +441,7 @@ class Agent:
             view = MemoryLauncher(self.fri, result.memory_scope)
         elif result.draft:
             if dm or message.guild.id == self.fri.guild_id:
-                view = DraftView(self.fri, message.author.id, result.draft, public=True)
+                view = DraftView(self.fri, message.author.id, result.draft, public=True, fence=result.turn)
         from .fri_image_share import send_reply
         if result.settings_preview:
             result.reply = view.content

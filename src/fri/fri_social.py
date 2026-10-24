@@ -284,7 +284,7 @@ class SocialButton(discord.ui.DynamicItem[discord.ui.Button], template=COMPONENT
             await interaction.followup.send('that action could not be confirmed. the card may have expired, access may have changed, or this action belongs to the organizer. check current status before trying again.', ephemeral=True, allowed_mentions=NO_MENTIONS)
 
 
-async def show_preview(fri, message, preview):
+async def show_preview(fri, message, preview, delivered=None):
     kind, row = preview['kind'], preview['item']
     if row['user_id'] != str(message.author.id) or row['guild_id'] != str(fri.guild_id):
         raise commands.UserFeedbackCheckFailure('That preview belongs to another member.')
@@ -293,8 +293,12 @@ async def show_preview(fri, message, preview):
         raise commands.UserFeedbackCheckFailure('Use the original reminder DM or game-night channel.')
     if row['preview_id']:
         await message.reply('that preview already exists. use the original card, or ask for current reminder status.', allowed_mentions=NO_MENTIONS)
+        if delivered:
+            await delivered()
         return
     posted = await message.reply(**presentation(kind, row), mention_author=False, suppress_embeds=kind != 'reminder')
+    if delivered:  # Discord accepted the card; record that even if binding fails next.
+        await delivered()
     scope = {'guild_id': str(fri.guild_id), 'user_id': str(message.author.id),
              'channel_id': str(fri.workshop_id if private else (getattr(message.channel, 'parent_id', None) or message.channel.id)),
              'conversation_id': ('private:' if private else 'public:')+str(message.channel.id)}

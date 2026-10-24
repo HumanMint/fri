@@ -155,11 +155,13 @@ def delivery_text(post):
     return ('post '+post['state']+'. '+ ('i will not resend automatically.' if post['state'] == 'uncertain' else ''))
 
 
-async def show_preview(fri, message, post):
+async def show_preview(fri, message, post, delivered=None):
     if message.guild is not None or message.author.id != fri.owner_id or not isinstance(message.channel, discord.DMChannel):
         raise commands.UserFeedbackCheckFailure('Open the post preview in your owner DM.')
     if post['state'] != 'pending' or post['preview_id']:
         await message.reply(delivery_text(post)+' ask for a fresh preview if needed.', allowed_mentions=NO_MENTIONS)
+        if delivered:
+            await delivered()
         return
     view = discord.ui.View(timeout=None)
     for decision in ('send', 'cancel'):
@@ -169,6 +171,8 @@ async def show_preview(fri, message, post):
     embed.set_footer(text=f"Draft v{post['version']} · expires in 15 minutes · pings disabled")
     preview = await message.reply(f"**send once to <#{post['target_id']}>**\nnothing posted yet. this does not enable ambient replies there.",
         embed=embed, view=view, mention_author=False, allowed_mentions=NO_MENTIONS)
+    if delivered:  # Discord accepted the card; record that even if binding fails next.
+        await delivered()
     await fri.api('POST', f"/workspace/posts/{post['id']}/bind", {'message_id': str(preview.id)})
 
 

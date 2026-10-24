@@ -235,3 +235,86 @@ def test_tool_answer_survives_a_post_delivery_save_failure_without_its_receipt(m
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+MARKER = 'ash is moving to denver next month'
+
+
+def test_history_derived_draft_is_refused_after_its_source_erases(monkeypatch, tmp_path):
+    from fri.fri_requests import DraftView
+    async def scenario():
+        fri, agent, store, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        original = message(MARKER, user=30, age=40)
+        first = message('fri explain that', age=20)
+        first.reference = SimpleNamespace(message_id=original.id, channel_id=channel.id)
+        first.reply.return_value = SimpleNamespace(id=first.id+1, content=MARKER)
+        follow = message('fri draft a feature request using that earlier discussion')
+        follow.reply.return_value = SimpleNamespace(id=follow.id+1, content='here is the draft')
+        fri.chat_once.side_effect = [ChatResult(status='completed', reply=MARKER),
+                                     ChatResult(status='completed', reply='here is the draft',
+                                                draft='Add a moving checklist because '+MARKER)]
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(first)
+                agent.recent.clear()  # The follow-up relies on saved history only.
+                await agent.handle(follow)
+            view = follow.reply.await_args.kwargs['view']
+            assert view.fence['provenance'] == [{'user_id': '30', 'revision': 0}]
+            await view.fenced()  # Still valid before the erasure.
+            store.erase_user('30')
+            with pytest.raises(ControllerRejected):
+                await view.fenced()  # Preview refuses.
+            reviewed = DraftView(fri, 20, view.draft, reviewed=True, source_id=view.source_id, fence=view.fence)
+            click = SimpleNamespace(user=SimpleNamespace(id=20), guild_id=123, channel_id=1, channel=channel,
+                message=SimpleNamespace(author=fri.user), response=SimpleNamespace(defer=AsyncMock()),
+                edit_original_response=AsyncMock())
+            with pytest.raises(ControllerRejected):
+                await reviewed.submit(click)
+            with store.connection() as db:
+                assert not db.execute('SELECT 1 FROM jobs WHERE user_id=?', ('20',)).fetchone()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_delivered_preview_is_recorded_even_if_binding_fails(monkeypatch, tmp_path):
+    import datetime as dt
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('fri plan minecraft tomorrow at 7 or 8 UTC')
+        event.reply.return_value = SimpleNamespace(id=event.id+1)
+        day = dt.datetime.now(dt.timezone.utc)+dt.timedelta(days=2)
+        times = '\n'.join(day.replace(hour=h, minute=0).strftime('%Y-%m-%dT%H:%M') for h in (19, 20))
+        fri.chat_once.return_value = ChatResult(status='completed', action={
+            'kind': 'plan_prepare', 'title': 'minecraft', 'timezone': 'UTC', 'local_times': times})
+        controller = fri.api
+
+        async def api(method, path, payload=None):
+            if path.startswith('/social/plans/') and path.endswith('/bind'):
+                raise ControllerRejected('synthetic bind failure after Discord accepted the preview')
+            return await controller(method, path, payload)
+
+        fri.api = api
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()), pytest.raises(ControllerRejected):
+                await agent.handle(event)
+            event.reply.assert_awaited_once()
+            assert store.chat_context('123', 'public:1', '20')['turns']  # The delivered card is recorded.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_invalidated_fri_reply_is_pruned_from_the_raw_channel_cache(monkeypatch, tmp_path):
+    import time
+    async def scenario():
+        fri, agent, store, _, _, _, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        agent.recent[1].append({'id': '555', 'user_id': '99', 'text': MARKER, 'name': 'Fri', 'at': time.time(),
+                                'gene_error': False, 'fri': True, 'provenance': [{'user_id': '30', 'revision': 0}]})
+        try:
+            store.erase_user('30')
+            assert await agent.context_messages(1) == []
+            assert MARKER not in str(agent.messages(1))
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

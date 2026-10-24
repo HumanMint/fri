@@ -63,7 +63,9 @@ advertises it, so the controller must be released first.
     is withheld from the model before inference and the new turn is stored as a neutral breadcrumb.
   - configured-channel nearby context and read evidence.
 
-  More than 200 sources refuses the reply rather than dropping any. The controller rejects stale provenance, deletes dependent turns
+  More than 200 sources refuses the reply rather than dropping any. A request draft carries its
+  turn's fence: preview and submission re-run `/chat/turn/check` and refuse once any source
+  changed. Preview cards are recorded as soon as Discord accepts them, even if binding fails. The controller rejects stale provenance, deletes dependent turns
   when any listed member turns memory off, is erased or clears chats, and drops turns whose
   sources' revisions moved. Over-inclusion is deliberate: anyone in the context can erase the
   derived copy.

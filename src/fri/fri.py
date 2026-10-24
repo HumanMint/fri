@@ -594,7 +594,8 @@ class Fri(discord.Client):
         try:
             result = await self.talk(interaction.guild_id, interaction.channel_id, interaction.user.id, text, 'private',
                                      interaction.user.display_name, event=interaction)
-            view = DraftView(self, interaction.user.id, result.draft) if result.draft else HomeView(self, interaction.user.id)
+            view = (DraftView(self, interaction.user.id, result.draft, fence=result.turn) if result.draft
+                    else HomeView(self, interaction.user.id))
             if result.settings_preview:
                 from .fri_agent import BehaviorPreview
                 view = BehaviorPreview(self.agent, **result.settings_preview)
@@ -628,7 +629,7 @@ class Fri(discord.Client):
             async with message.channel.typing():
                 result = await self.talk(message.guild.id, message.channel.id, message.author.id, text, 'public',
                                          message.author.display_name, event=message)
-            view = DraftView(self, message.author.id, result.draft, public=True) if result.draft else None
+            view = DraftView(self, message.author.id, result.draft, public=True, fence=result.turn) if result.draft else None
             sent = await message.reply(result.reply, view=view, mention_author=False, allowed_mentions=NO_MENTIONS,
                                        suppress_embeds=True)
             await self.record_turn(result, sent)
