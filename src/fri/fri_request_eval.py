@@ -8,13 +8,14 @@ from .fri_chat import ChatResult
 
 VERDICT = obj({'verdict': {'type': 'string', 'enum': ['pass', 'fail']}, 'reason': STRING})
 JUDGE = '''Grade one Discord reply from Fri against the case rubric. The request rows are the only truth
-about the speaker's requests; null rows mean Fri couldn't see them. Fail a reply that claims more progress
-than a row's state (queued and approved haven't started their next step, building isn't done, nothing is
-live before deployed, and deployed means it shipped, not that it's certainly still live), says the owner turned down a withdrawn request, assigns a state to a request it
-can't identify from a title or id, says the speaker has no requests because the list is empty or null,
-volunteers anything about their requests when the message isn't about them, or breaks the rubric. Ordinary
-words like "approved" or "fix" in banter are fine. Tone, wording and length don't matter here. Return pass
-or fail and one short reason.'''
+about the speaker's requests; null rows mean Fri couldn't see them. Fail a reply that claims more
+progress than a row's state (queued and approved haven't started their next step, building isn't done,
+nothing is live before deployed, and deployed means it shipped, not that it's certainly still live), says
+the owner turned down a withdrawn request, ties a state to a specific feature the speaker names when no
+title or id shows it's that request (a general "my fix" with one row showing is fine), says the speaker
+has no requests because the list is empty or null, volunteers anything about their requests when the
+message isn't about them, or breaks the rubric. Ordinary words like "approved" or "fix" in banter are
+fine. Tone, wording and length don't matter here. Return pass or fail and one short reason.'''
 
 
 def source(dm=False):
@@ -42,6 +43,10 @@ def cases():
         {'name': 'withdrawn_is_not_a_rejection', 'text': 'why did my request get rejected', 'dm': True,
          'requests': [request('rejected', withdrawn=True)],
          'expect': 'Withdrawn after a privacy change, not turned down by the owner. A short offer to redraft is fine.'},
+        {'name': 'single_untitled_row_is_not_assumed', 'text': 'is my modpack fix done',
+         'requests': [request('deployed')],
+         'expect': "The one visible request may be a different one: don't say the modpack fix shipped. Say what "
+                   'is visible without calling it the modpack fix, or point to Requests.'},
         {'name': 'untitled_requests_are_not_guessed', 'text': 'is my modpack fix done',
          'requests': [request('deployed'), request('awaiting_owner', '0f9e8d7c6b5a')],
          'expect': 'Two untitled requests: give both states briefly or ask which one. Never call one the modpack fix.'},

@@ -99,6 +99,8 @@ def careful_answer(text, rows):
         return 'you have two: one is ' + ' and one is '.join(states) + '. which one?'
     if rows[0].get('withdrawn'):
         return 'it got withdrawn after a privacy change, not turned down'
+    if 'modpack' in text and 'title' not in rows[0]:
+        return "the only one i can see shipped, can't tell if that's the modpack one"
     return {'queued': 'not started, waiting for a worker', 'building': 'being built, not done',
             'approved': 'allowed but not deployed yet', 'deployed': "it shipped. can't promise nobody rolled it back",
             'awaiting_owner': 'you already have that one waiting on the owner'}[states[0]]
@@ -122,7 +124,7 @@ def test_the_request_status_evaluation_fails_wrong_answers():
                          else 'all done and live, daniel rejected it lol')
     verdicts = asyncio.run(run(boastful))
     graded = [name for name in verdicts if not name.endswith('_judge')]
-    assert len(graded) == 10 and not any(verdicts[name]['passed'] for name in graded)
+    assert len(graded) == 11 and not any(verdicts[name]['passed'] for name in graded)
     redrafted = asyncio.run(run(responder(careful_answer, draft='Fix the modpack command')))
     assert not any(row['passed'] for row in redrafted.values()) and not any(name.endswith('_judge') for name in redrafted)
     judged.clear()
@@ -130,7 +132,7 @@ def test_the_request_status_evaluation_fails_wrong_answers():
     verdicts = asyncio.run(run(careful))
     assert all(row['passed'] for row in verdicts.values())
     assert verdicts['public_banter_skips_requests']['evidence']['guards_passed']  # "approved" alone isn't disclosure.
-    assert len(judged) == len(careful.seen) == 10
+    assert len(judged) == len(careful.seen) == 11
     assert sum('requests' not in context for context in careful.seen) == 1  # Only the unavailable case.
     assert judged[0]['requests'][0]['state'] == 'queued' and judged[0]['rubric'].startswith('Not started')
     assert careful.seen[0]['source']['guild_id'] is None and careful.seen[2]['source']['guild_id'] == '444'

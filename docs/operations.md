@@ -118,8 +118,10 @@ appears only in the member's private conversation (DM or `/fri` panel), never fo
 other members' words, and not at all while their memory is off. Requests typed in the panel's form
 are sent with an empty source list, so they count as the member's own words. A request withdrawn
 after a privacy change is marked `withdrawn`, so Fri doesn't call it the owner's rejection.
-With several untitled requests Fri gives each state or asks which one, and with no list (an outside
-invitation or an older controller) they point to Requests instead of guessing.
+Public rows have no titles, so Fri ties a state to a feature the member names only when a title or id
+shows it's that request (or the member asks generally and one shows); otherwise they say what they can
+see without calling it that feature, or ask. With no list (an outside invitation or an older
+controller) they point to Requests instead of guessing.
 `python -m fri.fri_eval --suite requests` checks status answers with the real model: queued and
 approved haven't started their next step, building isn't done, deployed means it shipped (the
 controller doesn't mark a request a later rollback reverted), withdrawn isn't a rejection, untitled,
