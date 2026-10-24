@@ -388,6 +388,7 @@ def test_history_derived_command_argument_is_refused(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(('text', 'action', 'argument'), [
     ('fri play never gonna give you up by rick astley', 'play', 'Never Gonna Give You Up - Rick Astley'),
+    ('fri play Halo by Beyoncé', 'play', 'Halo Beyonce'),
     ('fri turn it up', 'volume', '70')])
 def test_own_command_words_still_run_with_peers_in_context(monkeypatch, tmp_path, text, action, argument):
     async def scenario():
@@ -404,6 +405,71 @@ def test_own_command_words_still_run_with_peers_in_context(monkeypatch, tmp_path
             with patch('fri.fri_actions.asyncio.sleep', new=deliver):
                 result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
             assert seen == [argument] and result.turn['provenance'] == [{'user_id': '30', 'revision': 0}]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erasure', ['after_submission', 'between_fence_and_write'])
+def test_submitted_derived_draft_keeps_its_sources(monkeypatch, tmp_path, erasure):
+    from fri.fri_requests import DraftView
+    async def scenario():
+        fri, _, store, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        store.save_chat('123', 'public:1', '20', 0, 'fri what did ash say?', MARKER, 'm', 'high',
+                        source=history_source(), provenance=[{'user_id': '30', 'revision': 0}])
+        event = message('fri draft a feature request from that earlier discussion')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='here is the draft',
+                                                draft='Add a moving checklist because '+MARKER)
+        try:
+            result = await fri.talk(123, 1, 20, event.content, 'public', event=event)
+            view = DraftView(fri, 20, result.draft, reviewed=True, fence=result.turn)
+            click = SimpleNamespace(user=SimpleNamespace(id=20), guild_id=123, channel_id=1, channel=channel,
+                message=SimpleNamespace(author=fri.user), response=SimpleNamespace(defer=AsyncMock()),
+                edit_original_response=AsyncMock())
+            controller = fri.api
+            async def api(method, path, payload=None):
+                if path == '/requests' and erasure == 'between_fence_and_write':
+                    store.erase_user('30')  # After the fence passed, before the job exists.
+                return await controller(method, path, payload)
+            fri.api = api
+            if erasure == 'between_fence_and_write':
+                with pytest.raises(ControllerRejected):
+                    await view.submit(click)
+            else:
+                await view.submit(click)
+                store.erase_user('30')
+            with store.connection() as db:
+                bodies = [row[0] for row in db.execute('SELECT body FROM jobs')]
+            assert all(MARKER not in body for body in bodies)
+            assert bodies == ([] if erasure == 'between_fence_and_write' else
+                              ['[Request withdrawn: someone it drew on erased their data]'])
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_gene_error_text_reaches_only_the_repair_investigation(monkeypatch, tmp_path):
+    import discord
+
+    from fri.fri_agent import GENE_ERROR
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        agent.gene_id = 88
+        error = message('', user=88, age=20)
+        error.author.bot = True
+        # Red Audio's no-match embed echoes the member's query, so it can't be attributed.
+        error.embeds = [discord.Embed(title='Unable To Play Tracks', description='No tracks found for `failed '+MARKER+'`.')]
+        try:
+            await agent.handle(message('!play failed '+MARKER, user=30, age=30))
+            await agent.handle(error)
+            event = message('fri explain that gene error')
+            fri.chat_once.return_value = ChatResult(status='completed', reply='gene hit an error')
+            await fri.talk(123, 1, 20, event.content, 'public', event=event)
+            shown = fri.chat_once.await_args.args[1]['recent']
+            assert MARKER not in str([row for row in shown if row['gene_error']])
+            assert [row['text'] for row in shown if row['gene_error']] == [GENE_ERROR]
+            raw = await agent.context_messages(1, raw_errors=True)
+            assert MARKER in [row for row in raw if row['gene_error']][0]['text']
         finally:
             await fri.close()
     asyncio.run(scenario())

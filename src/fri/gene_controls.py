@@ -1,6 +1,7 @@
 """Small audited command catalog. Model output cannot select arbitrary Red commands."""
 
 import re
+import unicodedata
 from urllib.parse import urlsplit
 
 COMMANDS = {
@@ -42,7 +43,13 @@ def own_words(argument, text):
     """Every word of a command argument comes from the member's own message."""
     if argument.casefold() in text.casefold():
         return True
-    return set(re.findall(r'\w+', argument.casefold())) <= set(re.findall(r'\w+', text.casefold()))
+    return words(argument) <= words(text)
+
+
+def words(text):
+    # Case, accents and punctuation may differ ("Halo Beyonce" from "Halo by Beyoncé"); words may not.
+    folded = unicodedata.normalize('NFKD', text.casefold())
+    return set(re.findall(r'\w+', ''.join(c for c in folded if not unicodedata.combining(c))))
 
 
 VERBS = {'play': r'play|queue|put on|add', 'pause': r'pause', 'resume': r'resume|unpause',

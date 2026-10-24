@@ -33,6 +33,7 @@ from .subscription import private_json
 
 LOG = logging.getLogger('fri.agent')
 NO_MENTIONS = discord.AllowedMentions.none()
+GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
 
 
 class BehaviorPreview(PagedPreview):
@@ -172,7 +173,7 @@ class Agent:
         self.recent[channel] = deque((r for r in self.recent[channel] if r['at'] > now-900), maxlen=30)
         return list(self.recent[channel])
 
-    async def context_messages(self, channel):
+    async def context_messages(self, channel, raw_errors=False):
         rows = self.messages(channel)
         source = self.fri.get_channel(channel)
         parent = getattr(source, 'parent_id', None) or channel
@@ -184,7 +185,9 @@ class Agent:
 
         for row in rows:
             if row['gene_error']:
-                accepted.append(row)
+                # Gene's error text can quote whoever ran the command, with no way to attribute it.
+                # Conversations learn only that it happened; the owner's repair investigation reads it.
+                accepted.append(row if raw_errors else {**row, 'text': GENE_ERROR})
                 continue
             if row.get('fri'):  # Fri's reply stays only while everyone it drew on still allows it.
                 if all([await current(item['user_id'], item['revision']) for item in row['provenance']]):
@@ -578,7 +581,7 @@ class Agent:
     async def attend(self):
         now = time.time()
         for channel_id in list(self.recent):
-            records = await self.context_messages(channel_id)
+            records = await self.context_messages(channel_id, raw_errors=True)
             fresh = [r for r in records if not r.get('fri') and int(r['id']) > self.seen.get(channel_id, 0)]
             if not fresh or now-self.last_attention.get(channel_id, 0) < self.config['heartbeat_seconds']:
                 continue
