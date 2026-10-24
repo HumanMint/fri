@@ -931,3 +931,81 @@ def test_a_message_waiting_behind_a_delivery_is_dropped_if_its_author_erases(mon
             await asyncio.gather(*tasks, return_exceptions=True)
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_dm_follow_up_during_delivery_is_still_answered(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=999)
+        first, follow = message('fri hello'), message('my follow-up')
+        first.guild = follow.guild = None
+        sending, release = asyncio.Event(), asyncio.Event()
+        real_sleep = asyncio.sleep
+        async def no_debounce(*args, **kwargs):
+            await real_sleep(0)
+        monkeypatch.setattr('fri.fri_agent.asyncio.sleep', no_debounce)
+
+        async def send(content, **kwargs):
+            sending.set()
+            await release.wait()
+            return SimpleNamespace(id=first.id+100, content=content)
+        first.reply.side_effect = send
+        task = asyncio.create_task(agent.handle(first))
+        try:
+            await asyncio.wait_for(sending.wait(), 5)
+            pending = asyncio.create_task(agent.handle(follow))  # Its privacy check can't use the DM channel.
+            await real_sleep(0.03)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(task, pending), 5)
+            assert fri.chat_once.await_count == 2
+        finally:
+            release.set()
+            await task
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_erasure_right_after_the_first_privacy_read_still_drops_the_waiting_message(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        initial, queued = message('fri hello'), message('fri play old marker')
+        sending, release = asyncio.Event(), asyncio.Event()
+        real_sleep = asyncio.sleep
+        async def no_debounce(*args, **kwargs):
+            await real_sleep(0)
+        monkeypatch.setattr('fri.fri_agent.asyncio.sleep', no_debounce)
+
+        async def send(content, **kwargs):
+            sending.set()
+            await release.wait()
+            return SimpleNamespace(id=initial.id+100, content=content)
+        initial.reply.side_effect = send
+        async def answer(text, context):
+            if 'old marker' in text:
+                return ChatResult(status='completed', action={'kind': 'clarify', 'goal': 'play', 'topic': '',
+                                                             'question': 'which version of old marker?'})
+            return ChatResult(status='completed', reply='hello')
+        fri.chat_once.side_effect = answer
+        read, reads = agent.profile, []
+        async def profile(channel, user):
+            result = await read(channel, user)
+            if asyncio.current_task().get_name() == 'queued' and not reads:
+                reads.append(result['revision'])
+                store.clear_chats('20')  # Lands just after Fri first saw revision 0.
+            return result
+        agent.profile = profile
+        first = asyncio.create_task(agent.handle(initial))
+        second = None
+        try:
+            await asyncio.wait_for(sending.wait(), 5)
+            second = asyncio.create_task(agent.handle(queued), name='queued')
+            await real_sleep(0.05)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(first, second), 5)
+            assert reads == [0]
+            assert store.chat_context('123', 'public:1', '20')['pending'] is None
+            assert all('old marker' not in call.args[0] for call in fri.chat_once.await_args_list)
+        finally:
+            release.set()
+            await asyncio.gather(*([first, second] if second else [first]), return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())

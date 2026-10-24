@@ -350,8 +350,10 @@ class Agent:
                 return
         if privacy:
             self.forget(message.author.id)
+        observed = None  # The author's privacy revision as first read for this message.
         if not dm and not message.author.bot:
             profile = await self.profile(parent, message.author.id)
+            observed = profile.get('revision', 0)
             if profile['enabled'] and not privacy:
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                     'name': clean(message.author.display_name, 60), 'text': text[:500], 'at': time.time(),
@@ -366,14 +368,16 @@ class Agent:
         if recording and not privacy:
             # Fri's reply was delivered but isn't saved yet, so a question it asked isn't pending
             # yet either. This message may be the answer: decide only after the save.
-            revision = (await self.profile(parent, message.author.id))['revision']
+            scope = self.fri.workshop_id if dm else parent  # The controller doesn't scope a DM channel.
+            if observed is None:
+                observed = (await self.profile(scope, message.author.id))['revision']
             try:
                 await asyncio.wait_for(recording.wait(), 30)
             except TimeoutError:
                 pass
             # Erased meanwhile, here or through the panel, Gene or Red: drop it, as forget() drops a burst.
             if (self.forgotten.get(message.author.id, 0) != forgotten or
-                    (await self.profile(parent, message.author.id))['revision'] != revision):
+                    (await self.profile(scope, message.author.id))['revision'] != observed):
                 return
         active = (self.active.get((channel, message.author.id), 0) > time.time() or
                   self.bursts.has(channel, message.author.id))
