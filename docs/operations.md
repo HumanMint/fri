@@ -108,6 +108,27 @@ advertises it, so the controller must be released first.
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
 
+## Members' own requests
+
+Each turn's chat context includes up to five of the speaker's own requests that are still open or
+settled within the last week, with their controller state (`your_gene_requests` for the model).
+Fri uses them to answer "is my fix done?" and to avoid duplicate drafts, never claims progress
+beyond the recorded state, and in public mentions them only when the speaker asks. Request text
+appears only in the member's private conversation (DM or `/fri` panel), never for drafts built from
+other members' words, and not at all while their memory is off. Requests typed in the panel's form
+are sent with an empty source list, so they count as the member's own words. A request withdrawn
+after a privacy change is marked `withdrawn`, so Fri doesn't call it the owner's rejection.
+Public rows have no titles, so Fri ties a state to a feature the member names only when a title or id
+shows it's that request (or the member asks generally and one shows); otherwise they say what they can
+see without calling it that feature, or ask. With no list (an outside invitation or an older
+controller) they point to Requests instead of guessing.
+`python -m fri.fri_eval --suite requests` checks status answers with the real model: queued and
+approved haven't started their next step, building isn't done, deployed means it shipped (the
+controller doesn't mark a request a later rollback reverted), withdrawn isn't a rejection, untitled,
+empty or unavailable lists aren't guessed, an open request isn't drafted again, and public banter
+leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
+on the same model grades it.
+
 ## Reply checks
 
 Needs a controller that advertises the optional `reply-checks` capability at startup; against an
