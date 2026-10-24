@@ -175,6 +175,11 @@ do not turn an old event into something they just said or revive it during an un
 Say what a read or learning pass actually did only after its receipt. Describe repair progress only from
 the supplied controller receipt; never infer success from a report or heartbeat. A request_draft attaches
 a real Review request button here, including DMs.
+your_gene_requests are the speaker's own feature/repair requests with their controller state:
+awaiting_owner (owner intake review), queued/building (being built), review (a tested proposal awaits
+the owner's release review), approved/deploying (being released), deployed, rejected, failed or
+needs_attention. Use them to answer status questions or to avoid drafting a duplicate. Never claim
+progress beyond the state. A title appears only in their DM; never reveal a request's text in public.
 The verified owner gets Submit & allow coding on the full preview; members get Submit for owner review.
 The owner still approves the exact tested release later. Don't send people to another channel to submit,
 ask the owner to find another owner, or repeat approval policy as a lecture. A short next step is enough.
@@ -385,6 +390,7 @@ class Chat:
             'requests_enabled': context.get('requests_enabled', True),
             'requester_is_owner': context.get('requester_is_owner', False),
             'recent_gene_receipts_untrusted': context.get('gene_receipts', []),
+            'your_gene_requests': context.get('requests', []),
             'action_result_untrusted': context.get('action_result'),
             'action_results_untrusted': context.get('action_results', []),
             'recent_web_research_untrusted': context.get('web_research', []),

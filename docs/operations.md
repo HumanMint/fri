@@ -108,6 +108,14 @@ advertises it, so the controller must be released first.
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
 
+## Members' own requests
+
+Each turn's chat context includes up to five of the speaker's own requests that are still open or
+settled within the last week, with their controller state (`your_gene_requests` for the model).
+Fri uses them to answer "is my fix done?" and to avoid duplicate drafts, and never claims progress
+beyond the recorded state. Request text appears only in the member's DM, never for drafts built
+from other members' words, and not at all while their memory is off.
+
 ## Deployment boundary
 
 The companion runs in its own `fri` Compose project using `fri-runtime:<full Fri SHA>`.
