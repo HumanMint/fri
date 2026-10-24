@@ -120,7 +120,7 @@ def test_web_usage_delivery_is_accepted_and_idempotent(client, status):
     assert usage[0]['role'] == 'web_search' and usage[0]['attempts'] == 1
 
 
-def test_web_reply_preserves_sources_and_keeps_only_a_neutral_receipt(monkeypatch, tmp_path):
+def test_web_reply_preserves_sources_and_retains_the_delivered_answer(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, _, _ = harness(monkeypatch, tmp_path)
         agent.state['web_search_enabled'] = True
@@ -145,8 +145,10 @@ def test_web_reply_preserves_sources_and_keeps_only_a_neutral_receipt(monkeypatc
         context = fri.chat.respond.await_args.args[1]
         assert 'web_search' not in context['actions'] and 'web_refine' in context['actions']
         assert context['action_result'] == {**receipt, 'outcome': 'completed'}
+        await fri.record_turn(result)  # As after a successful Discord delivery.
         saved = next(body for path, body in calls if path == '/chat/turn')
-        assert saved['reply'].startswith('Earlier check: web_search') and 'public evidence' not in saved['reply']
+        # The delivered public answer is retained for follow-ups; the raw research stays in its receipt.
+        assert saved['reply'] == result.reply and 'public evidence' not in saved['reply']
         assert saved['web_receipt'] == {k: receipt[k] for k in ('query', 'answer', 'sources', 'checked_at')}
         roles = [body.get('role', 'conversation') for path, body in calls if path == '/chat/usage/report']
         assert roles == ['conversation', 'web_search', 'conversation']

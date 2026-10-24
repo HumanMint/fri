@@ -125,11 +125,12 @@ def test_provider_error_notice_never_counts_as_an_answer(tmp_path):
 
 def test_rejected_save_is_not_reported_as_stored(tmp_path):
     """Review finding: only controller-accepted saves count, and the gap check reads the real store."""
+    scenario = Scenario('rejected', 'Delivered, then the controller refuses the save.',
+                        [Say(20, 'fri yo', label='yo')], {'conversation': [reply('yo')]})
     with rejecting('/chat/turn'):
-        report = run(DELIVERY_FAILURE, tmp_path)
+        report = run(scenario, tmp_path)
     assert report['rejected_saves'] == ['yo'] and report['steps'][1]['route']['stored'] == []
-    gap = next(c for c in report['checks'] if c['known_gap'])
-    assert gap['passed']  # The real store is empty, so this run does not reproduce the gap.
+    assert report['steps'][1]['route']['outcome'] == 'reply'  # Delivery is not undone by the refusal.
     with pytest.raises(RuntimeError):
         preconditions(report)
 
@@ -193,25 +194,28 @@ def test_live_factory_transport_is_created_and_closed_per_scenario(tmp_path):
     assert len(made) == 2 and all(transport.closed for transport in made)
 
 
-def test_live_delivery_gap_does_not_depend_on_scripted_wording(tmp_path):
-    """Round-3 finding: any retained turn for the failed send reproduces the gap, whatever it says."""
+def test_live_delivery_check_does_not_depend_on_scripted_wording(tmp_path):
+    """Round-3 finding: the check inspects the failed send's source event, whatever the reply says."""
     report = run(DELIVERY_FAILURE, tmp_path, live=httpx.MockTransport(live_reply('hey there')), max_calls=1)
     preconditions(report)
-    gap = next(c for c in report['checks'] if c['known_gap'])
-    assert not gap['passed'] and not gap['detail']
+    check = next(c for c in report['checks'] if c['name'] == 'no stored turn claims an undelivered reply')
+    assert check['passed'] and not report['steps'][1]['route']['stored']
 
 
 def test_known_gap_xfail_cannot_be_satisfied_by_other_assertions(tmp_path):
     """Round-3 finding: an unrelated AssertionError surfaces instead of counting as the gap."""
+    from dataclasses import replace
+
     from replay.harness import ModelTransport
 
     async def broken(self, request):
         raise AssertionError('synthetic provider invariant failure')
 
-    name = next(c.name for c in ERASURE.checks if c.known_gap)
+    gap = Check('synthetic gap', lambda r: False, known_gap='synthetic')
+    scenario = replace(ERASURE, checks=ERASURE.checks+[gap])
     with patch.object(ModelTransport, 'handle_async_request', broken), \
             pytest.raises(AssertionError, match='synthetic provider invariant'):
-        test_known_gap_still_reproduces(ERASURE, name, tmp_path)
+        test_known_gap_still_reproduces(scenario, gap.name, tmp_path)
 
 
 def test_controller_errors_fail_cli_and_pytest_alike(tmp_path):
@@ -259,12 +263,13 @@ def test_subscription_expiry_stays_on_real_time(tmp_path):
 
 
 @pytest.mark.parametrize('text', ['Earlier ash said denver, next month', '[ash said denver, next month]'])
-def test_placeholder_lookalikes_still_reproduce_the_privacy_gap(text, tmp_path):
+def test_placeholder_lookalikes_are_classified_as_derived_text(text, tmp_path):
     """Round-4 finding: only exact neutral placeholders count, not reply prefixes."""
+    from replay.harness import placeholder
+    assert not placeholder(text)
     report = run(ERASURE, tmp_path, live=httpx.MockTransport(live_reply(text)), max_calls=1)
     preconditions(report)
-    gap = next(c for c in report['checks'] if c['known_gap'])
-    assert not gap['passed'] and report['steps'][2]['route']['stored'] == ['reply-text']
+    assert report['steps'][2]['route']['stored'] == ['reply-text']  # Not mistaken for a breadcrumb.
 
 
 def test_erroring_known_gap_check_fails_the_run(tmp_path):
@@ -274,7 +279,7 @@ def test_erroring_known_gap_check_fails_the_run(tmp_path):
     def broken(replay):
         raise ValueError('synthetic gap evaluation error')
 
-    checks = [replace(c, test=broken) if c.known_gap else c for c in ERASURE.checks]
+    checks = ERASURE.checks+[Check('synthetic gap', broken, known_gap='synthetic')]
     report = run(replace(ERASURE, checks=checks), tmp_path)
     assert any(c['detail'] for c in report['checks']) and failures([report])
 

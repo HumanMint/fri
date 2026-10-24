@@ -141,8 +141,8 @@ KEYWORDS = Scenario(
            and any(d.view for d in r.step('tone').deliveries))])
 
 ERASURE = Scenario(
-    'derived_content_survives_erasure',
-    'Another member\'s recent message shapes a saved reply; that copy should not outlive their erasure.',
+    'derived_content_removed_on_erasure',
+    'Another member\'s recent message shapes a saved reply; their erasure removes that derived copy.',
     [Say(ASH, 'heads up im moving to denver next month', label='share'), Wait(30),
      Say(BO, 'fri where did ash say they were moving', label='ask'), Wait(30),
      Say(ASH, 'fri forget me', label='erase')],
@@ -158,31 +158,81 @@ ERASURE = Scenario(
      Check('the derived answer is stored verbatim', lambda r: route(r, 'ask')['stored'] == ['reply-text'],
            scripted_only=True),
      Check('erased member\'s details do not survive in another member\'s saved chat',
-           lambda r: placeholder_only(r, 'ask'),
-           known_gap='Replies built from recent channel context are saved verbatim and survive the source '
-                     'author\'s erasure; only reply-target/invited context is fenced (fri.py:390).')])
+           lambda r: placeholder_only(r, 'ask'))])
 
 REPLY_TARGET = Scenario(
-    'reply_target_turn_is_fenced',
-    'Contrast case: the same answer to an explicit reply reference is stored as a breadcrumb.',
+    'reply_target_continuity_and_erasure',
+    'An answer to an explicit reply reference is kept verbatim for continuity until its source erases.',
     [Say(ASH, 'heads up im moving to denver next month', label='share'), Wait(30),
-     Say(BO, 'fri where is that', reply_to='share', label='ask')],
+     Say(BO, 'fri where is that', reply_to='share', label='ask'),
+     Inspect('kept', lambda r: [turn['reply'] for turn in r.retained('ask')]), Wait(30),
+     Say(ASH, 'fri forget me', label='erase')],
     {'conversation': [reply('ash said denver, next month')]},
     [Check('reply-target answer is generated and delivered', lambda r: answered(r, 'ask')),
-     Check('reply-target turn is stored as a breadcrumb', lambda r: route(r, 'ask')['stored'] == ['breadcrumb']),
-     Check('referenced answer is retained only as a placeholder', lambda r: placeholder_only(r, 'ask')),
-     Check('referenced details are not stored', lambda r: 'denver' not in json.dumps(r.stored(BO)).lower(),
-           scripted_only=True)])
+     Check('the real answer is kept for follow-ups', lambda r: route(r, 'ask')['stored'] == ['reply-text']
+           and r.inspections['kept'] == [r.step('ask').deliveries[0].text]),
+     Check('the source member\'s erasure removes the derived answer', lambda r: placeholder_only(r, 'ask')),
+     Check('referenced details are not stored after erasure',
+           lambda r: 'denver' not in json.dumps(r.stored(BO)).lower(), scripted_only=True)])
 
 DELIVERY_FAILURE = Scenario(
-    'delivery_failure_after_save',
-    'A Discord send failure after a model reply should not leave a stored turn claiming it was said.',
+    'failed_delivery_is_not_saved',
+    'A Discord send failure after a model reply leaves no stored turn claiming it was said.',
     [FailNextDelivery(), Say(BO, 'fri yo', label='yo')],
     {'conversation': [reply('yo')]},
     [Check('the reply was generated', lambda r: route(r, 'yo')['inference'] == ['completed']),
      Check('failed delivery is observed', lambda r: route(r, 'yo')['outcome'] == 'delivery-failed'),
-     Check('no stored turn claims an undelivered reply', lambda r: not r.retained('yo'),
-           known_gap='The turn is saved before Discord delivery (fri.py:378, fri_agent.py:432).')])
+     Check('no stored turn claims an undelivered reply', lambda r: not r.retained('yo'))])
+
+TOOL_CONTINUITY = Scenario(
+    'tool_answer_is_remembered',
+    'A public lookup answer is kept verbatim, so the next turn knows what Fri actually said.',
+    [Say(BO, 'fri who won the last world series', label='ask'), Wait(40),
+     Say(BO, 'fri and who did they beat', label='follow')],
+    {'conversation': [act('web_search', query='who won the last world series'), reply('the dodgers won it'),
+                      reply('the yankees, in five')],
+     'web': [web('The Dodgers won the most recent World Series.', 'https://www.mlb.com/postseason')]},
+    [Check('lookup answer is delivered', lambda r: answered(r, 'ask') and route(r, 'ask')['tools'] == ['web_search']),
+     Check('the delivered answer, not a breadcrumb, is stored', lambda r: route(r, 'ask')['stored'] == ['reply-text'],
+           scripted_only=True),
+     Check('the follow-up sees the earlier turn', lambda r: first_call(r, 'follow')['prior_turns'] >= 1),
+     Check('stored history holds what Fri said', lambda r: r.step('ask').deliveries[0].text in
+           [turn['reply'] for turn in r.stored(BO)['turns']], scripted_only=True)])
+
+GROUP_VIEW = Scenario(
+    'group_context_includes_fri',
+    'Fri\'s own delivered reply joins the shared channel view and leaves it when its source erases.',
+    [Say(BO, 'fri whats a good starter modpack', label='ask'), Wait(20),
+     Say(ASH, 'fri what did you tell bo', label='peer'),
+     Inspect('peer_kept', lambda r: bool(r.retained('peer'))), Wait(20),
+     Say(BO, 'fri forget me', label='erase'), Wait(20),
+     Say(ASH, 'fri and what did bo ask', label='after')],
+    {'conversation': [reply('all the mods 9 is a fine start'), reply('i said all the mods 9'),
+                      reply('not sure, i dont have that anymore')]},
+    [Check('the peer\'s turn sees Fri\'s reply to bo', lambda r: first_call(r, 'peer')['recent_authors'] == 3),
+     Check('after bo erases, neither bo nor Fri\'s reply to bo remains in view',
+           lambda r: first_call(r, 'after')['recent_authors'] == 1),
+     Check('the peer\'s answer drew on bo transitively, so bo\'s erasure removed it too',
+           lambda r: r.inspections['peer_kept'] and not r.retained('peer'))])
+
+
+
+def erase_ash_mid_reply(replay):
+    replay.store.personal_control(str(ASH), 'disable')
+    return reply('ash said denver, next month')
+
+
+MIDTURN_ERASURE = Scenario(
+    'erasure_during_reply_blocks_delivery',
+    'If a referenced member erases while Fri is composing, the pre-delivery check stops the reply.',
+    [Say(ASH, 'heads up im moving to denver next month', label='share'), Wait(30),
+     Say(BO, 'fri where is ash moving', label='ask')],
+    {'conversation': [erase_ash_mid_reply]},
+    [Check('the composed answer is never delivered',
+           lambda r: all('denver' not in d.text for d in r.step('ask').deliveries)
+           and route(r, 'ask')['outcome'] == 'reply', scripted_only=True),
+     Check('nothing derived is saved', lambda r: not r.retained('ask'))],
+    expected_rejections=['/chat/turn/check'])
 
 SCENARIOS = [CLOSING, OPEN_QUESTION, WEB_CLARIFICATION, OUTSIDE_MENTION, KEYWORDS, ERASURE, REPLY_TARGET,
-             DELIVERY_FAILURE]
+             DELIVERY_FAILURE, TOOL_CONTINUITY, GROUP_VIEW, MIDTURN_ERASURE]

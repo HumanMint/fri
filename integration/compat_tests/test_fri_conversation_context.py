@@ -71,6 +71,7 @@ def test_split_command_reaches_real_red_checks_once_and_fences_replay(monkeypatc
             with patch('fri.fri_actions.asyncio.sleep', new=deliver):
                 result = await fri.talk(123, message.channel.id, 20, message.content,
                     'private' if private else 'public', event=message, burst=burst)
+            await fri.record_turn(result)  # As after a successful Discord delivery.
             assert result.reply == 'queued it' and len(calls) == 1
             assert calls[0][0] is member and calls[0][1] == 'blind melon no rain'
             first_context = fri.chat.respond.await_args_list[0].args[1]
@@ -254,7 +255,7 @@ def test_new_reply_target_or_unanswered_burst_never_uses_old_exchange_closing_sh
     assert not quick_closure('gotcha', {**context, 'message_burst': [{'text': 'a new question?'}, {'text': 'gotcha'}]})
 
 
-def test_reply_derived_answer_does_not_persist_another_members_words(monkeypatch, tmp_path, controls_api):  # noqa: F811
+def test_reply_derived_answer_persists_only_until_the_other_member_erases(monkeypatch, tmp_path, controls_api):  # noqa: F811
     async def scenario():
         client, controls = controls_api
         fri, agent, _, _ = harness(monkeypatch, tmp_path)
@@ -280,9 +281,12 @@ def test_reply_derived_answer_does_not_persist_another_members_words(monkeypatch
         try:
             result = await fri.talk(123, 1, 20, message.content, 'public', event=message)
             assert original.content in result.reply
+            assert result.turn['provenance'] == [{'user_id': '30', 'revision': 0}]
+            await fri.record_turn(result)
+            # The real answer is kept for continuity, tagged with the referenced member...
             saved = controls.store.chat_context('123', 'public:1', '20')['turns'][-1]
-            assert 'Paddington' not in str(saved) and not saved['allow_closing']
-            assert 'reply-context check' in saved['reply']
+            assert saved['reply'] == 'they said '+original.content
+            # ...so their erasure removes this derived copy from someone else's chat.
             controls.store.personal_control('30', 'disable')
             assert 'Paddington' not in str(controls.store.chat_context('123', 'public:1', '20'))
         finally:

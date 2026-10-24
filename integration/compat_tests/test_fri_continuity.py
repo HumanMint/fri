@@ -330,6 +330,7 @@ def test_real_clarification_to_red_command_keeps_voice_checks_and_receipts(monke
             controls.finish(claim['id'], claim['lease'], outcome)
         try:
             result = await fri.talk(123, 1, 20, initial['request_text'], 'public', event=original)
+            await fri.record_turn(result)  # The delivered question arms the clarification.
             assert result.reply == 'what song?' and calls == []
             assert client.app.state.store.chat_context('123', 'public:1', '20')['pending']
             with patch('fri.fri_actions.asyncio.sleep', new=deliver):

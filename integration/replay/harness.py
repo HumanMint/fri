@@ -321,6 +321,8 @@ class ModelTransport(httpx.AsyncBaseTransport):
         if not rows:
             raise UnscriptedCall(f'unscripted {kind} model call in step {self.steps[-1].label!r}')
         row = rows.pop(0)
+        if callable(row):  # A scripted response may change the world mid-turn, e.g. an erasure.
+            row = row(self.replay)
         if kind == 'web':
             return _stream([{'id': 'ws_1', 'type': 'web_search_call', 'status': 'completed'},
                             {'id': 'msg_1', 'type': 'message', 'content': [{
@@ -550,6 +552,7 @@ class Replay:
         self.scenario, self.root, self.chat_model, self.live = scenario, Path(root), chat_model, live
         self.steps = [Step(0, 'setup', None, None)]
         self.transport = ModelTransport(self.steps, None if live else scenario.script, None, max_calls)
+        self.transport.replay = self
         self.subscription = subscription or SimpleNamespace(access_token=lambda: 'synthetic-plan-token')
         self.mode = 'live' if live else 'scripted'
         self.inspections = {}

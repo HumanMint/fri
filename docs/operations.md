@@ -41,6 +41,33 @@ Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.
 They do not prove Discord delivery or live model interpretation of a particular meme.
 
+## Conversation continuity and provenance
+
+Requires the controller's `turn-provenance` capability. Fri starts only against a controller that
+advertises it, so the controller must be released first.
+
+- **Saved only after delivery.** A turn is staged while Fri composes the reply. Just before
+  delivery, `/chat/turn/check` runs the save's privacy fence without writing: the speaker's
+  revision, plus every referenced member's revision and memory setting. Only after Discord
+  accepts the reply (or Fri records a reaction or quiet decision) is the turn saved. A failed send
+  leaves no record claiming Fri said it. A refused check stops the reply. A failed save is
+  logged; it never retracts a delivered message.
+- **Provenance.** Each saved turn lists the other members whose messages shaped it: recent
+  channel rows, reply targets, configured-channel nearby context and read evidence, each with the
+  privacy revision Fri observed. The controller rejects stale provenance, deletes dependent turns
+  when any listed member turns memory off, is erased or clears chats, and drops turns whose
+  sources' revisions moved. Over-inclusion is deliberate: anyone in the context can erase the
+  derived copy.
+- **Real replies.** With provenance, Fri keeps what they actually said instead of placeholder
+  breadcrumbs. This covers plain chat, reply targets, public research, image shares, Gene
+  command results and the member's own saved work or reminders. Reads of other channels,
+  archives, learning reports and diagnostics still keep neutral breadcrumbs. Outside invitations
+  keep the controller's mention placeholder.
+- **Group view.** Fri's delivered public replies join the in-memory channel view, tagged with the
+  speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
+  once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
+  attention.
+
 ## Deployment boundary
 
 The companion runs in its own `fri` Compose project using `fri-runtime:<full Fri SHA>`.

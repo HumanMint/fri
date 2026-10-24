@@ -177,9 +177,18 @@ class Agent:
         source = self.fri.get_channel(channel)
         parent = getattr(source, 'parent_id', None) or channel
         profiles, accepted = {}, []
+        async def current(user, revision):
+            if user not in profiles:
+                profiles[user] = await self.profile(parent, user)
+            return profiles[user]['enabled'] and profiles[user]['revision'] == revision
+
         for row in rows:
             if row['gene_error']:
                 accepted.append(row)
+                continue
+            if row.get('fri'):  # Fri's reply stays only while everyone it drew on still allows it.
+                if all([await current(item['user_id'], item['revision']) for item in row['provenance']]):
+                    accepted.append(row)
                 continue
             user = row['user_id']
             if user not in profiles:
@@ -197,7 +206,8 @@ class Agent:
             if key[1] == user:
                 del self.pending[key]
         for key, rows in self.recent.items():
-            self.recent[key] = deque((r for r in rows if r['user_id'] != str(user)), maxlen=30)
+            self.recent[key] = deque((r for r in rows if r['user_id'] != str(user) and str(user) not in
+                                      {p['user_id'] for p in r.get('provenance', [])}), maxlen=30)
         for key in list(self.active):
             if key[1] == user:
                 del self.active[key]
@@ -401,17 +411,20 @@ class Agent:
         if result.response_kind in ('react', 'quiet'):
             if result.status == 'completed' and result.response_kind == 'react':
                 await self.acknowledge(message, result.reaction)
+            await self.fri.record_turn(result)  # Records the decision, never claimed reaction delivery.
             # Neither outcome renews active attention or the ambient reply timer.
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if result.post_preview:
             from .fri_workspace import show_preview
             await show_preview(self.fri, message, result.post_preview)
+            await self.fri.record_turn(result)
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if result.social_preview:
             from .fri_social import show_preview
             await show_preview(self.fri, message, result.social_preview)
+            await self.fri.record_turn(result)
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if not result.reply:
@@ -429,8 +442,17 @@ class Agent:
         from .fri_image_share import send_reply
         if result.settings_preview:
             result.reply = view.content
-        await send_reply(message, result, view=view, mention_author=False,
-                         allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+        sent = await send_reply(message, result, view=view, mention_author=False,
+                                allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+        if sent is None:  # Nothing was delivered, so nothing is recorded as said.
+            await self.fri.waiting_notices.clear(message.author.id)
+            return
+        echo = result.echo
+        await self.fri.record_turn(result, sent)
+        if echo and message.guild and self.allowed(message.channel):
+            self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
+                'name': 'Fri', 'text': clean(echo['text'], 500), 'at': time.time(), 'gene_error': False,
+                'fri': True, 'provenance': echo['provenance']})
         if result.status == 'completed' and not (invitation and invitation.outside):
             self.active[(message.channel.id, message.author.id)] = time.time()+(300 if result.clarification else 120)
         self.last_spoke[message.channel.id] = time.time()
@@ -553,7 +575,7 @@ class Agent:
         now = time.time()
         for channel_id in list(self.recent):
             records = await self.context_messages(channel_id)
-            fresh = [r for r in records if int(r['id']) > self.seen.get(channel_id, 0)]
+            fresh = [r for r in records if not r.get('fri') and int(r['id']) > self.seen.get(channel_id, 0)]
             if not fresh or now-self.last_attention.get(channel_id, 0) < self.config['heartbeat_seconds']:
                 continue
             self.seen[channel_id] = max(int(r['id']) for r in fresh)

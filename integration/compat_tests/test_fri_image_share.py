@@ -315,7 +315,7 @@ def test_complete_chat_tool_selection_persistence_and_upload(api, monkeypatch, t
         async def controller(method, path, body=None):
             if path == '/agent/state':
                 return agent.state
-            if path == '/chat/turn' and fault == 'recording':
+            if path in ('/chat/turn', '/chat/turn/check') and fault == 'recording':
                 raise commands.UserFeedbackCheckFailure('recording unavailable')
             return await call(method, path, body)
         fri.api = controller
@@ -353,15 +353,19 @@ def test_complete_chat_tool_selection_persistence_and_upload(api, monkeypatch, t
                     changed = copy.copy(event)
                     changed.content = 'never mind'
                     event.channel.fetch_message.return_value = changed
-                await send_reply(event, result, allowed_mentions=discord.AllowedMentions.none())
+                sent = await send_reply(event, result, allowed_mentions=discord.AllowedMentions.none())
                 if fault == 'edit_before_send':
                     event.reply.assert_not_awaited()
+                    assert sent is None
                 else:
                     assert 'file' in event.reply.await_args.kwargs
+                    await fri.record_turn(result, sent)  # Saved only after Discord accepts it.
             saved = client.app.state.store.chat_context('123', 'public:456', '10')
             assert 'data:image' not in str(saved) and 'cdn.donmai.us' not in str(saved)
             assert 'teal-haired' not in str(saved['turns'])
-            if fault != 'recording':
+            if fault in ('recording', 'edit_before_send'):
+                assert not saved['web_research']  # Undelivered turns keep no research receipt either.
+            else:
                 assert saved['web_research'][0]['sources'] == [API+'/posts/1']
             assert len(seen) == 2
         finally:

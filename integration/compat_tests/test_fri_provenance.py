@@ -114,7 +114,7 @@ def test_runtime_uses_event_author_not_supplied_display_name_and_saves_source(mo
         fri.api = api
         fri.chat.respond = AsyncMock(return_value=ChatResult(reply='yo', status='completed'))
         source = event(user=20, channel=1, name='current nickname')
-        await fri.talk(123, 1, 20, 'yo', 'public', 'forged name', event=source)
+        await fri.record_turn(await fri.talk(123, 1, 20, 'yo', 'public', 'forged name', event=source))
         context = fri.chat.respond.await_args.args[1]
         assert context['speaker'] == {'user_id': '20', 'display_name': 'current nickname'}
         saved = next(body for path, body in calls if path == '/chat/turn')

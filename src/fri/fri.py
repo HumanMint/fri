@@ -35,6 +35,31 @@ from .subscription import Subscription, private_json
 
 LOG = logging.getLogger('fri')
 NO_MENTIONS = discord.AllowedMentions.none()
+FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
+                'or say “forget me” any time.')
+MAX_PROVENANCE = 40
+# Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
+PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
+
+
+def turn_provenance(context, speaker, actions=None):
+    """Other members whose messages shaped this turn, with the privacy revision observed."""
+    seen = {}
+    for row in context.get('recent', []):
+        if row.get('gene_error'):
+            continue
+        if row.get('fri'):  # Fri's own earlier reply carries the members it was built from.
+            for item in row.get('provenance', []):
+                seen.setdefault(str(item['user_id']), item['revision'])
+        else:
+            seen.setdefault(str(row['user_id']), row.get('revision', 0))
+    for row in context.get('reply_target', []) + context.get('invited_context', []):
+        if row.get('privacy_revision') is not None:
+            seen.setdefault(str(row['source']['user_id']), row['privacy_revision'])
+    for (_, user), revision in (getattr(actions, 'revisions', None) or {}).items():
+        seen.setdefault(str(user), revision)
+    seen.pop(str(speaker), None)
+    return [{'user_id': user, 'revision': int(revision)} for user, revision in sorted(seen.items())]
 
 
 class FriTree(app_commands.CommandTree):
@@ -220,29 +245,29 @@ class Fri(discord.Client):
                 if image_source is None and quick_closure(
                         text, {**context, 'recent': self.agent.messages(channel_id) if self.agent else []}):
                     result = ChatResult(status='completed', response_kind='react', reaction='👍')
-                    return await self.save_response(scope, source, text, context, result, model='local-closing')
+                    return self.stage_turn(scope, source, text, context, result, model='local-closing', derived=False)
                 if user_id == self.owner_id and guild_id == self.guild_id and usage_requested(text):
                     usage = await self.api('POST', '/agent/usage',
                                            {'guild_id': str(guild_id), 'user_id': str(user_id)})
                     report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()))
-                    await self.api('POST', '/chat/turn', {**scope, 'revision': context['revision'],
-                        'source': source.model_dump(), 'input': text, 'reply': report,
-                        'model': 'local-usage-report', 'effort': '', 'notes': [],
-                        'input_tokens': 0, 'output_tokens': 0})
-                    return ChatResult(reply=report, status='completed')
+                    result = self.stage_turn(scope, source, text, context, ChatResult(reply=report, status='completed'),
+                                             model='local-usage-report', derived=False)
+                    await self.api('POST', '/chat/turn/check', result.turn)  # An erasure mid-turn stops it.
+                    return result
                 from .fri_operational import admit as admit_operation
                 operation = await admit_operation(self, event, source, scope, text, context)
                 if operation.result:
                     if operation.result.status == 'completed':
                         saved_result = (ChatResult(reply='Earlier check: gene_command. Fetch current evidence for follow-up details; no findings are retained here.', status='completed')
                                         if operation.tool_receipt else operation.result)
+                        operation.result.turn = self.stage_turn(scope, source, text, context, saved_result,
+                                                                model='local-control', derived=False).turn
                         try:
-                            await self.save_response(scope, source, text, context, saved_result, model='local-control')
-                        except (commands.UserFeedbackCheckFailure, TimeoutError):
+                            await self.api('POST', '/chat/turn/check', operation.result.turn)
+                        except commands.UserFeedbackCheckFailure:
                             if not operation.tool_receipt:
                                 raise
                             from .fri_outcomes import unrecorded
-                            LOG.warning('Tool result preserved; chat recording unavailable')
                             return ChatResult(reply=unrecorded([operation.tool_receipt]), status='completed')
                     return operation.result
                 if self.agent and self.agent.config['enabled'] and not operation.continuation:
@@ -336,28 +361,6 @@ class Fri(discord.Client):
                         return ChatResult(reply=unrecorded(receipts, reason='I couldn’t recheck conversation access to show the details.'), status='completed')
                     if current['revision'] != context['revision'] or not await actions.valid():
                         return ChatResult(reply=unrecorded(receipts, reason='Access or memory changed before I could safely show the details.'), status='completed')
-                    # Keep only a neutral breadcrumb so follow-ups know which evidence to fetch again.
-                    # Retrieved messages/answers never outlive source erasure in someone else's chat.
-                    checked_channel = receipt.get('channel_id', '')
-                    breadcrumb = f'Earlier check: {action_kind}'
-                    if checked_channel:
-                        breadcrumb += f' in channel {checked_channel}'
-                    breadcrumb += ('. Public research receipts are available separately for follow-ups.' if research or action_kind == 'web_sources'
-                                   else '. Fetch current evidence for follow-up details; no findings are retained here.')
-                    if result.clarification or ((result.settings_preview or result.post_preview) and not actions.private_evidence):
-                        breadcrumb = result.reply
-                    try:
-                        await self.api('POST', '/chat/turn', {**scope, 'revision': context['revision'],
-                            'source': source.model_dump(),
-                            'input': clean(event.content, 4000) if result.clarification or context.get('message_burst') else text,
-                            'reply': breadcrumb, 'model': context['model'],
-                            'effort': context['effort'], 'notes': [], 'web_receipt': research, 'clarification': result.clarification,
-                            'burst': context.get('message_burst', []),
-                            'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
-                                                                             result.post_preview or result.clarification)})
-                    except (commands.UserFeedbackCheckFailure, TimeoutError):
-                        LOG.warning('Tool result preserved; chat recording unavailable')
-                        return ChatResult(reply=unrecorded(receipts), status='completed')
                     result.notes = []
                     diagnosis = (receipt if action_kind == 'gene_diagnose'
                                  else receipt.get('gene_result', receipt).get('diagnostic', {}))
@@ -372,38 +375,89 @@ class Fri(discord.Client):
                             include_sources=action_kind == 'web_sources' or (link_request and action_kind != 'image_search'))
                     if action_kind == 'image_search' and receipt.get('image_status') == 'prepared':
                         result.media = actions.image_share.prepared
+                    stored, private_read = result.reply, any(r.get('kind') in PRIVATE_READS for r in receipts)
+                    if private_read and not (result.clarification or result.settings_preview or result.post_preview):
+                        # Other channels' messages, archives and reports never become saved chat text.
+                        checked_channel = receipt.get('channel_id', '')
+                        stored = f'Earlier check: {action_kind}' + (f' in channel {checked_channel}' if checked_channel else '')
+                        stored += '. Fetch current evidence for follow-up details; no findings are retained here.'
+                    result.turn = {**scope, 'revision': context['revision'], 'source': source.model_dump(),
+                        'input': clean(event.content, 4000) if result.clarification or context.get('message_burst') else text,
+                        'reply': stored, 'model': context['model'], 'effort': context['effort'], 'notes': [],
+                        'web_receipt': research, 'clarification': result.clarification,
+                        'burst': context.get('message_burst', []),
+                        'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
+                                                                         result.post_preview or result.clarification),
+                        'provenance': turn_provenance(context, user_id, actions)}
+                    if len(result.turn['provenance']) > MAX_PROVENANCE:
+                        result.turn.update(reply='Earlier answer drew on too many members to retain. Fetch current evidence.',
+                                           provenance=[])
+                    if not private_read:
+                        result.echo = self.echo(scope, context, result.turn['provenance'], stored)
+                    try:  # The save's privacy fence, applied before anything is shown.
+                        await self.api('POST', '/chat/turn/check', result.turn)
+                    except commands.UserFeedbackCheckFailure:
+                        return ChatResult(reply=unrecorded(receipts), status='completed')
                     return result
                 if context.get('gene_receipts') and not await actions.valid():
                     raise commands.UserFeedbackCheckFailure('Access changed during that check. Ask again for a fresh reply.')
-                return await self.save_response(scope, source, text, context, result)
+                result = self.stage_turn(scope, source, text, context, result, actions=actions)
+                # The save's privacy fence runs before delivery; the save itself waits for delivery.
+                await self.api('POST', '/chat/turn/check', result.turn)
+                return result
         finally:
             self.busy.discard(user_id)
 
-    async def save_response(self, scope, source, text, context, result, *, model=None):
+    def stage_turn(self, scope, source, text, context, result, *, model=None, actions=None, derived=True):
+        """Prepare the turn record; record_turn saves it only after Discord accepts the delivery."""
         if context.get('force_text_reply'):
             from .fri_mentions import force_text
             result = force_text(result)
         if context.get('message_burst'):
             text = context['message_burst'][-1]['text']
-        # A reply to someone else can quote their words. Keep the live answer on
-        # Discord, but never preserve derived copies in this member's memory.
-        referenced = bool(context.get('reply_target') or context.get('invited_context'))
-        if referenced:
+        # Referenced members' words may shape the reply. It is kept with provenance so their
+        # erasure reaches it, but never becomes this member's personal notes or a request draft.
+        if context.get('reply_target') or context.get('invited_context'):
             result.draft, result.notes = None, []
-        stored_reply = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
-                        'no quoted findings are retained here.') if referenced else result.reply
-        saved = await self.api('POST', '/chat/turn', {**scope, 'revision': context['revision'],
-            'source': source.model_dump(), 'input': text, 'reply': stored_reply if result.response_kind == 'reply' else result.reply,
-            'response_kind': result.response_kind, 'reaction': result.reaction,
-            'allow_closing': result.allow_closing and not referenced,
-            'burst': context.get('message_burst', []),
+        provenance = turn_provenance(context, scope['user_id'], actions) if derived else []
+        reply = result.reply
+        if len(provenance) > MAX_PROVENANCE:
+            reply, provenance, result.notes = ('Earlier answer drew on too many members to retain. '
+                                               'Fetch current evidence.'), [], []
+        result.turn = {**scope, 'revision': context['revision'], 'source': source.model_dump(), 'input': text,
+            'reply': reply, 'response_kind': result.response_kind, 'reaction': result.reaction,
+            'allow_closing': result.allow_closing, 'burst': context.get('message_burst', []),
             'model': model or context['model'], 'effort': '' if model else context['effort'],
             'notes': result.notes, 'input_tokens': 0 if model else result.counters.get('input_tokens'),
-            'output_tokens': 0 if model else result.counters.get('output_tokens')})
-        if saved.get('first_memory') and result.response_kind == 'reply':
-            result.reply += ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
-                             'or say “forget me” any time.')
+            'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance}
+        if derived and result.response_kind == 'reply':
+            result.echo = self.echo(scope, context, provenance, reply)
         return result
+
+    @staticmethod
+    def echo(scope, context, provenance, reply):
+        """Fri's delivered public reply for the shared channel view, tagged with whose words shaped it."""
+        if not scope['conversation_id'].startswith('public:') or not context.get('personal_memory', {}).get('enabled', True):
+            return None
+        return {'text': reply, 'provenance': provenance + [{'user_id': str(scope['user_id']),
+                                                            'revision': context['revision']}]}
+
+    async def record_turn(self, result, sent=None):
+        """Save a staged turn once delivered. Delivery is the evidence Fri actually said it."""
+        payload, result.turn = result.turn, None
+        if not payload:
+            return None
+        try:
+            saved = await self.api('POST', '/chat/turn', payload)
+        except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError):
+            LOG.warning('Delivered turn was not recorded')  # Includes privacy changes mid-reply.
+            return None
+        if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
+            try:
+                await sent.edit(content=(sent.content or '')+FIRST_MEMORY)
+            except discord.HTTPException:
+                LOG.info('First-memory notice was not added')
+        return saved
 
     @staticmethod
     def mention_cooldown(admission):
@@ -462,13 +516,14 @@ class Fri(discord.Client):
                 result.draft, result.notes = None, []
                 await invitation.require_current()
                 await require_current(context, event)
-                await self.api('POST', '/chat/turn', {**scope, 'revision': context['revision'],
+                # The controller stores only a neutral placeholder for outside invitations.
+                result.turn = {**scope, 'revision': context['revision'],
                     'input': text, 'reply': result.reply, 'source': invitation.source,
                     'model': context['model'], 'effort': context['effort'], 'notes': [],
                     'burst': [], 'clarification': None,
                     'response_kind': 'reply', 'reaction': None, 'allow_closing': False,
                     'input_tokens': result.counters.get('input_tokens'), 'output_tokens': result.counters.get('output_tokens'),
-                    'web_receipt': research})
+                    'web_receipt': research}
                 return result
         finally:
             self.busy.discard(user)
@@ -490,6 +545,9 @@ class Fri(discord.Client):
                 await reply(self, interaction, view.content, attachments=[], view=view, verbatim=True)
             else:
                 await reply(self, interaction, embed=card('Fri', result.reply), view=view)
+            saved = await self.record_turn(result)
+            if saved and saved.get('first_memory') and not result.settings_preview:
+                await reply(self, interaction, embed=card('Fri', result.reply+FIRST_MEMORY), view=view)
         except commands.UserFeedbackCheckFailure as exc:
             await reply(self, interaction, str(exc), view=HomeView(self, interaction.user.id))
         await self.waiting_notices.clear(interaction.user.id)
@@ -514,8 +572,9 @@ class Fri(discord.Client):
                 result = await self.talk(message.guild.id, message.channel.id, message.author.id, text, 'public',
                                          message.author.display_name, event=message)
             view = DraftView(self, message.author.id, result.draft, public=True) if result.draft else None
-            await message.reply(result.reply, view=view, mention_author=False, allowed_mentions=NO_MENTIONS,
-                                suppress_embeds=True)
+            sent = await message.reply(result.reply, view=view, mention_author=False, allowed_mentions=NO_MENTIONS,
+                                       suppress_embeds=True)
+            await self.record_turn(result, sent)
             await self.waiting_notices.clear(message.author.id)
         except ReplyInProgress:
             await self.waiting_notices.send(message)
