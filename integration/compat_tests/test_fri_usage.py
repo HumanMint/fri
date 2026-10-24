@@ -92,16 +92,20 @@ def test_partial_and_zero_cache_reports_stay_counts_not_shares(tmp_path):
 
 @pytest.mark.parametrize('by_model', [False, True])
 def test_folded_bucket_adds_only_reported_counts(tmp_path, by_model):
-    store, agent = usage_store(tmp_path)
     roles = ('conversation', 'web_search', 'attention', 'summary', 'status', 'history', 'meme', 'investigation')
-    for index, role in enumerate(roles):
-        cached = {6: 30, 7: 0}.get(index)
-        store.add_chat_usage(f'{index:032d}', f'model-{index}', 'high', 'completed',
-                             counters(200 - index, 10, cached, None), role=role)
-    reply = describe_usage(agent.usage(), by_model=by_model)
     folded = 'other models' if by_model else 'other tasks'
-    assert f'- {folded}: 407 tokens · 2 calls (30 cached input)' in reply
-    assert len(reply.splitlines()) == 10 and len(reply) < 1950
+    for case, (details, suffix) in enumerate([({6: (30, None), 7: (0, None)}, ' (30 cached input)\n'),
+                                              ({6: (None, 13), 7: (None, 17)}, ' (30 reasoning)\n'),
+                                              ({6: (0, 0), 7: (None, None)}, ' (0 cached input, 0 reasoning)\n'),
+                                              ({}, '\n')]):
+        store, agent = usage_store(tmp_path / str(case))
+        for index, role in enumerate(roles):
+            cached, reasoning = details.get(index, (None, None))
+            store.add_chat_usage(f'{index:032d}', f'model-{index}', 'high', 'completed',
+                                 counters(200 - index, 10, cached, reasoning), role=role)
+        reply = describe_usage(agent.usage(), by_model=by_model)
+        assert f'- {folded}: 407 tokens · 2 calls{suffix}' in reply
+        assert len(reply) < 1950
 
 
 def conversation(monkeypatch, tmp_path):
