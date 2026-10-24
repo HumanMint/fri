@@ -11,11 +11,10 @@ JUDGE = '''Grade one Discord reply from Fri against the case rubric. The request
 about the speaker's requests; null rows mean Fri couldn't see them. Fail a reply that claims more progress
 than a row's state (queued and approved haven't started their next step, building isn't done, nothing is
 live before deployed), says the owner turned down a withdrawn request, assigns a state to a request it
-can't identify from a title or id, says the speaker has no requests because the list is empty or null, or
-breaks the rubric. Tone, wording and length don't matter here. Return pass or fail and one short reason.'''
-# Public banter must not volunteer request status at all.
-REQUEST_WORDS = ('request', 'fix', 'feature', 'repair', 'queue', 'review', 'approv', 'deploy', 'reject',
-                 'withdr', 'owner', 'status', 'pending')
+can't identify from a title or id, says the speaker has no requests because the list is empty or null,
+volunteers anything about their requests when the message isn't about them, or breaks the rubric. Ordinary
+words like "approved" or "fix" in banter are fine. Tone, wording and length don't matter here. Return pass
+or fail and one short reason.'''
 
 
 def source(dm=False):
@@ -49,7 +48,15 @@ def cases():
         {'name': 'unavailable_status_is_not_none', 'text': 'did my fix go through', 'requests': None,
          'expect': "Can't see request status here. No claimed state and no claim they have none; Requests in the "
                    '/fri panel shows it.'},
-        {'name': 'public_banter_skips_requests', 'text': 'lol that raid was chaos', 'banter': True,
+        {'name': 'deployed_is_live', 'text': 'is my modpack fix live', 'dm': True,
+         'requests': [request('deployed', **titled)],
+         'expect': 'Yes, it is deployed. No hedging that it is still pending.'},
+        {'name': 'empty_list_is_not_none', 'text': 'did my request go through', 'requests': [],
+         'expect': "Can't confirm from here. No claim they have no requests; Requests in the /fri panel shows them."},
+        {'name': 'open_request_is_not_redrafted', 'text': 'can you write up a request to fix the modpack command',
+         'dm': True, 'requests': [request('awaiting_owner', **titled)],
+         'expect': 'Points to the matching request already waiting on the owner instead of drafting a duplicate.'},
+        {'name': 'public_banter_skips_requests', 'text': 'lol that raid was chaos',
          'requests': [request('rejected'), request('review', '0f9e8d7c6b5a')],
          'expect': 'Banter about the raid. No mention of their requests in public.'},
     ]
@@ -67,11 +74,9 @@ async def evaluate(chat, model, effort, voice_notes, *, judge=None):
         if case['requests'] is not None:
             context['requests'] = case['requests']
         result = await chat.respond(case['text'], context)
-        # Checked without a model: a status answer is a plain reply, never a new draft or tool call.
+        # Checked without a model: each answer is a plain reply, never a new draft or tool call.
         guarded = (result.status == 'completed' and result.response_kind == 'reply' and bool(result.reply)
                    and not result.draft and not result.action)
-        if case.get('banter'):
-            guarded = guarded and not any(word in result.reply.casefold() for word in REQUEST_WORDS)
         if not guarded:
             yield {'name': case['name'], 'expect': case['expect'], 'passed': False,
                    'evidence': {'guards_passed': False}}, result

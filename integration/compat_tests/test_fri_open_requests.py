@@ -87,30 +87,50 @@ def test_the_model_sees_dates_and_withdrawals_not_raw_rows(store):
     assert 'withdrawn means' in sent[0]['instructions']
 
 
+def careful_answer(text, rows):
+    """An accurate reply for each request-status case, as a stand-in for a good model."""
+    if 'raid' in text:
+        return 'who approved that strategy lmao'  # Banter that merely uses request-ish words.
+    if not rows:
+        return "can't see it from here. check Requests in the /fri panel"
+    states = [row['state'] for row in rows]
+    if len(rows) > 1:
+        return 'you have two: one is ' + ' and one is '.join(states) + '. which one?'
+    if rows[0].get('withdrawn'):
+        return 'it got withdrawn after a privacy change, not turned down'
+    return {'queued': 'not started, waiting for a worker', 'building': 'being built, not done',
+            'approved': 'allowed but not deployed yet', 'deployed': 'yep, deployed',
+            'awaiting_owner': 'you already have that one waiting on the owner'}[states[0]]
+
+
 def test_the_request_status_evaluation_fails_wrong_answers():
     judged = []
-    async def judge(data):  # Scripted stand-in for the model judge: it rejects the boastful reply.
+    async def judge(data):  # Scripted stand-in for the model judge: only the accurate answer passes.
         judged.append(data)
-        return {'verdict': 'fail' if 'all done' in data['reply'] else 'pass', 'reason': ''}, {'input_tokens': 1}, 'completed'
+        verdict = 'pass' if data['reply'] == careful_answer(data['message'], data['requests']) else 'fail'
+        return {'verdict': verdict, 'reason': ''}, {'input_tokens': 1}, 'completed'
     def responder(reply, draft=None):
         seen = []
         async def respond(text, context):
             seen.append(context)
-            return ChatResult(status='completed', reply=reply(text), draft=draft)
+            return ChatResult(status='completed', reply=reply(text, context.get('requests')), draft=draft)
         return SimpleNamespace(respond=respond, seen=seen)
     async def run(chat):
         return {case['name']: case async for case, _ in evaluate_requests(chat, 'gpt-6.1-sol', 'high', '', judge=judge)}
-    boastful = responder(lambda text: 'btw your fix is live now' if 'raid' in text else 'all done and live, daniel rejected it lol')
+    boastful = responder(lambda text, rows: 'btw your fix is live now' if 'raid' in text
+                         else 'all done and live, daniel rejected it lol')
     verdicts = asyncio.run(run(boastful))
     graded = [name for name in verdicts if not name.endswith('_judge')]
-    assert graded and not any(verdicts[name]['passed'] for name in graded)
-    assert verdicts['public_banter_skips_requests']['evidence'] == {'guards_passed': False}  # No judge needed.
-    assert 'public_banter_skips_requests_judge' not in verdicts
-    assert not any(row['passed'] for row in asyncio.run(run(responder(lambda text: 'not yet', draft='Fix it again'))).values())
+    assert len(graded) == 10 and not any(verdicts[name]['passed'] for name in graded)
+    redrafted = asyncio.run(run(responder(careful_answer, draft='Fix the modpack command')))
+    assert not any(row['passed'] for row in redrafted.values()) and not any(name.endswith('_judge') for name in redrafted)
     judged.clear()
-    careful = responder(lambda text: 'lmao that was a mess' if 'raid' in text else 'not yet, still waiting on its next step')
-    assert all(row['passed'] for row in asyncio.run(run(careful)).values())
-    assert len(judged) == len(careful.seen) == 7 and 'requests' not in careful.seen[5]  # The unavailable case.
+    careful = responder(careful_answer)
+    verdicts = asyncio.run(run(careful))
+    assert all(row['passed'] for row in verdicts.values())
+    assert verdicts['public_banter_skips_requests']['evidence']['guards_passed']  # "approved" alone isn't disclosure.
+    assert len(judged) == len(careful.seen) == 10
+    assert sum('requests' not in context for context in careful.seen) == 1  # Only the unavailable case.
     assert judged[0]['requests'][0]['state'] == 'queued' and judged[0]['rubric'].startswith('Not started')
     assert careful.seen[0]['source']['guild_id'] is None and careful.seen[2]['source']['guild_id'] == '444'
 
