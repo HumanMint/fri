@@ -601,6 +601,26 @@ class Agent:
             for event in events:
                 self.miss(event, reason)
 
+        async def outage():
+            # The fixed notice carries no evidence, so only the Discord-side checks apply, not a controller read.
+            if invitation and not await invitation.current(check_evidence=False):
+                return missed(f'reply withheld: {invitation.refusal}')
+            if not ambient and await self.unreachable(message, answering=True):
+                self.answered(events)
+            else:
+                missed('controller unreachable')
+            await self.fri.waiting_notices.clear(message.author.id)
+
+        async def withheld():
+            """The invitation's recheck before Fri answers; a dead controller there is an outage, not a change."""
+            try:
+                if await invitation.current():
+                    return False
+                missed(f'reply withheld: {invitation.refusal}')
+            except ControllerUnavailable:
+                await outage()
+            return True
+
         try:
             async with message.channel.typing():
                 # Entering Discord's typing context itself awaits an HTTP request.
@@ -610,32 +630,24 @@ class Agent:
                     text, 'private' if dm else 'public', message.author.display_name, event=message,
                     burst=burst, inspect_images=not ambient, **({'invitation': invitation} if invitation else {}))
         except ReplyInProgress:
-            if invitation and not await invitation.current():
-                return missed(f'reply withheld: {invitation.refusal}')
+            if invitation and await withheld():
+                return
             missed('earlier reply still running')  # Its waiting notice is deleted once that reply lands.
             if not ambient:
                 await self.fri.waiting_notices.send(message)
             return
         except ControllerUnavailable:
-            # The fixed notice carries no evidence, so only the Discord-side checks apply, not a controller read.
-            if invitation and not await invitation.current(check_evidence=False):
-                return missed(f'reply withheld: {invitation.refusal}')
-            if not ambient and await self.unreachable(message, answering=True):
-                self.answered(events)
-            else:
-                missed('controller unreachable')
-            await self.fri.waiting_notices.clear(message.author.id)
-            return
+            return await outage()
         except commands.UserFeedbackCheckFailure as exc:
-            if invitation and not await invitation.current():
-                return missed(f'reply withheld: {invitation.refusal}')
+            if invitation and await withheld():
+                return
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if invitation:
-            if not await invitation.current():
-                return missed(f'reply withheld: {invitation.refusal}')
+            if await withheld():
+                return
             from .fri_mentions import force_text
             result = force_text(result)
         if result.response_kind in ('react', 'quiet'):

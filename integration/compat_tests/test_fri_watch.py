@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import itertools
 import json
+import sys
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -434,6 +435,55 @@ def test_reads_stay_an_interval_apart_from_startup_into_the_gateway_loop(monkeyp
                 clock[0] += 120
                 await fri.watch()
             assert reads == [10, 130, 260] and fri.watcher.state['bad'] == 0 and not dm.sends
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_startup_waits_out_every_controller_read_it_needs(monkeypatch, tmp_path):
+    from fri.fri_protocol import contract
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        dm = owner_dm(fri)
+        clock, reads = [time.time()], []
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        async def api(method, path, value=None):
+            reads.append(path)
+            if path == '/fri/contract':
+                return contract()  # Up, but its database isn't: the state read fails.
+            if path == '/agent/state':
+                clock[0] += 10
+                if reads.count(path) <= 40:
+                    raise ControllerUnavailable(UNREACHABLE)
+                return {'config': {}, 'channels': []}
+            raise ControllerUnavailable(UNREACHABLE)
+        fri.api = api
+        fri.tree.sync = AsyncMock()
+        for loop in (fri.health, fri.owner_reviews, fri.watch):
+            monkeypatch.setattr(loop, 'start', lambda *args: None)
+        try:
+            with patch('fri.fri.CONTRACT_RETRY', 0), patch('fri.fri_agent.Agent.heartbeat'):
+                await fri.setup_hook()
+            assert reads.count('/fri/contract') == 1 and fri.agent.state == {'config': {}, 'channels': []}
+            assert len(dm.sends) == 1 and 'haven’t reached gene’s controller' in dm.sends[0]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_clock_that_went_back_never_mutes_the_watch(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        owner_dm(fri)
+        fri.watcher.state = {'bad': 2, 'kind': 'unreachable', 'since': time.time()+900, 'checked': time.time()+1000,
+                             'alert': None}  # Saved before the host clock was corrected.
+        try:
+            assert fri.watcher.due(slack=15)
+            await fri.watch()
+            assert fri.api.await_count == 1 and fri.watcher.state['bad'] == 1  # A fresh streak.
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -940,6 +990,31 @@ def test_no_notice_for_a_message_edited_since_it_was_sent(monkeypatch, tmp_path,
     asyncio.run(scenario())
 
 
+def test_a_dead_controller_at_the_last_recheck_answers_the_whole_burst(monkeypatch, tmp_path, caplog):
+    import logging
+
+    from fri.fri_mentions import Invitation
+    async def scenario():
+        fri, agent, _, _, _, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = make_message('<@99> you there?'), make_message('<@99> hello?')
+        original = Invitation.current
+        async def current(self, *, check_evidence=True):
+            # Only reply_once's last check before it answers, after the burst has formed.
+            if check_evidence and self.grant and sys._getframe(1).f_code.co_name in ('reply_once', 'withheld'):
+                raise ControllerUnavailable(UNREACHABLE)
+            return await original(self, check_evidence=check_evidence)
+        try:
+            with patch.object(Invitation, 'current', current):  # Real waits, so the two pings form a burst.
+                await asyncio.gather(agent.handle(first), agent.handle(second), return_exceptions=True)
+            replies = first.reply.await_count+second.reply.await_count
+            assert replies == 1 and {first.id, second.id} <= set(agent.responded)
+        finally:
+            await fri.close()
+    with caplog.at_level(logging.INFO, logger='fri.agent'):
+        asyncio.run(scenario())
+    assert not [r for r in caplog.records if r.getMessage().startswith('Mention ')]
+
+
 def test_an_admitted_mention_gets_the_notice_if_the_controller_dies_after_inference(monkeypatch, tmp_path):
     from fri.fri_chat import ChatResult
     async def scenario():
@@ -1039,6 +1114,25 @@ def test_owner_health_report_works_in_dm_with_the_controller_down_and_records_no
             assert dm.reply.await_args.kwargs['suppress_embeds'] is True
             called = [call.args[1] for call in fri.api.await_args_list]
             assert sorted(called) == ['/controls/health', '/status']  # No turn, context or usage write.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_health_report_names_genes_deployed_release_not_the_controllers(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        async def api(method, path, value=None):
+            if path == '/status':
+                return {'active_sha': 'abc1234'+'0'*33, 'paused': True}
+            return {'heartbeat_age_seconds': 3, 'command_poll_age_seconds': 1, 'responsive': True,
+                    'runtime': {'sha': 'c0ffee1'+'0'*33}}
+        fri.api = api
+        fri.get_guild = lambda _: None
+        try:
+            report = await fri.watcher.report()
+            assert '- controller: up, gene deployed abc1234, deploys paused' in report
+            assert '- gene: heartbeat 3s ago, command poll 1s ago, responsive, release c0ffee1' in report
         finally:
             await fri.close()
     asyncio.run(scenario())

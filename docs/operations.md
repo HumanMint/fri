@@ -240,10 +240,11 @@ Fri can't restart anything. It only notices and says so.
   DM whose last edit hasn't landed still reads as down, so it carries the next outage too. Only Fri or Discord can delete Fri's message in a DM. If it's gone
   when Fri goes to edit it mid-outage, Fri sends it again. Once the outage is over, nothing is sent
   late.
-- **Startup with the controller down.** Fri waits for `/fri/contract` (every 10 s) before it joins
-  the gateway, instead of exiting. Discord's HTTP API already works then, so the same watch reads,
+- **Startup with the controller down.** Fri retries its startup controller reads (`/fri/contract`,
+  then `/agent/state`) every 10 s before it joins the gateway, instead of exiting. Discord's HTTP API already works then, so the same watch reads,
   once per 2 minutes, still DM the owner. Reads stay about 2 minutes apart across that wait, the
-  loop's first pass and restarts, so a restart never shortens the 3-read debounce. Members see Fri offline until the controller answers, and
+  loop's first pass and restarts, so a restart never shortens the 3-read debounce. A last read
+  dated in the future (the host clock went back) starts a fresh streak instead of muting the watch. Members see Fri offline until the controller answers, and
   `fri health` waits too. A rejected or incompatible contract still stops Fri at once.
 - **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
   command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
@@ -267,7 +268,8 @@ Fri can't restart anything. It only notices and says so.
   the log only.
 - **`fri health`.** Owner DM only; in a server channel Fri says to DM. It works while the
   controller is down and records no turn. It shows Fri's release, Discord connection, heartbeat
-  status and age, loop states, waiting usage receipts, live `/status` and `/controls/health`
+  status and age, loop states, waiting usage receipts, live `/status` (Gene's deployed release, and
+  whether deploys are paused) and `/controls/health`
   (4 s each, failures shown as "unreachable" or "rejected"), and the watch state.
 
 ## Existing installation migration

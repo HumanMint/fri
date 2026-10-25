@@ -106,7 +106,8 @@ class Watch:
 
     def due(self, slack=0):
         """Whether a read is due, an interval after the last one. `slack` covers a read's own latency."""
-        return time.time()-self.load()['checked'] >= INTERVAL-slack
+        since = time.time()-self.load()['checked']
+        return since >= INTERVAL-slack or since < 0  # A last read "in the future" means the clock went back.
 
     def refusal(self, offered=()):
         if offered:  # Gene is polling; this one command is disabled or unloaded in Red.
@@ -139,8 +140,8 @@ class Watch:
         state = self.load()
         kind, detail = await self.read()
         now = time.time()
-        if now-state['checked'] > 3*INTERVAL:
-            state['bad'] = 0  # Fri itself was away; reads from before don't make a streak.
+        if not 0 <= now-state['checked'] <= 3*INTERVAL:
+            state['bad'] = 0  # Fri itself was away, or the clock moved back: reads from before don't make a streak.
         state['checked'] = now
         alert = state['alert']
         if kind == 'ok':
@@ -262,9 +263,9 @@ class Watch:
                  'channel_id': str(fri.workshop_id), 'conversation_id': f'public:{fri.workshop_id}'}
         status, health = await asyncio.gather(self.probe('GET', '/status'),
                                               self.probe('POST', '/controls/health', scope))
-        if isinstance(status, dict):
-            lines.append(f"- controller: up, release {str(status.get('active_sha') or '?')[:7]}"
-                         + (', paused' if status.get('paused') else ''))
+        if isinstance(status, dict):  # `active_sha` is Gene's deployed release; the controller has none of its own here.
+            lines.append(f"- controller: up, gene deployed {str(status.get('active_sha') or '?')[:7]}"
+                         + (', deploys paused' if status.get('paused') else ''))
         else:
             lines.append(f'- controller: {status}')
         if isinstance(health, dict):

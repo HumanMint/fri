@@ -109,6 +109,21 @@ class FriTree(app_commands.CommandTree):
         await reply(self.client, interaction, 'That action did not complete. Please try again.')
 
 
+async def patiently(fri, read):
+    """A controller read Fri needs before joining the gateway, waited out while the controller is down.
+
+    Discord's HTTP API already works here, so the watch still tells the owner when the controller is
+    what's down. A rejected or incompatible controller still stops startup at once."""
+    while True:
+        try:
+            return await read()
+        except ControllerUnavailable:
+            if fri.watcher.due():
+                LOG.warning('Controller unreachable at startup; waiting for it')
+                await fri.watcher.check()
+            await asyncio.sleep(CONTRACT_RETRY)
+
+
 class Fri(discord.Client):
     def __init__(self):
         intents = discord.Intents.none()
@@ -138,23 +153,13 @@ class Fri(discord.Client):
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        while True:
-            try:
-                contract = await self.api('GET', '/fri/contract')
-                break
-            except ControllerUnavailable:
-                # Fri waits for its controller before joining the gateway. Discord's HTTP API already
-                # works here, so the watch still tells the owner when the controller is what's down.
-                if self.watcher.due():
-                    LOG.warning('Controller unreachable at startup; waiting for it')
-                    await self.watcher.check()
-                await asyncio.sleep(CONTRACT_RETRY)
+        contract = await patiently(self, lambda: self.api('GET', '/fri/contract'))
         if not compatible(contract):
             raise RuntimeError('unsupported gene controller contract; fri did not start')
         self.capabilities = frozenset(contract['capabilities'])
         from .fri_agent import Agent
         self.agent = Agent(self)
-        await self.agent.start()
+        await patiently(self, self.agent.start)
         self.add_view(HomeView(self))
         from .fri_social import SocialButton
         from .fri_workspace import PostButton
