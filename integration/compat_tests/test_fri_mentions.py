@@ -1944,6 +1944,42 @@ def test_a_privacy_control_ping_that_waited_still_runs_with_fri_paused(monkeypat
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('change', ['disabled', 'unconfigured'])
+def test_settings_changed_during_a_queued_messages_member_lookup_stop_it(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, controller, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        present = SimpleNamespace(id=20)
+        async def member(*_, fresh=False, **__):
+            if fresh and not fri.busy and not member.changed:  # The recheck's own lookup.
+                member.changed = True
+                if change == 'disabled':
+                    controller.update({'enabled': False}, controller.state()['version'], '10')
+                    agent.state = controller.state()
+                else:
+                    agent.state = {**agent.state, 'channels': []}
+            return present
+        member.changed = False
+        agent.member = member
+        event = message('fri what is ash working on?')
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='hold on', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        fri.busy.add(20)  # A reply to them that's still going, so this waits its turn.
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                while not event.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            assert member.changed
+            fri.chat_once.assert_not_awaited()
+            assert [item.args[0] for item in event.reply.await_args_list] == [str(ReplyInProgress())]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('member', [True, False])
 def test_a_dm_low_battery_needs_a_current_member(monkeypatch, tmp_path, member):
     async def scenario():

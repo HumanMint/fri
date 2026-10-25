@@ -595,12 +595,17 @@ class Agent:
     async def excluded(self, message, dm, invitation=None, privacy=None, text=''):
         """Why a message that waited (its turn, or another control) is no longer one Fri answers, by
         the gates it passed coming in; None if it still is."""
+        # Every read first, not the cache its arrival filled, then the settings, which a change during
+        # those reads would otherwise slip past. A ping's invitation checks its author's access itself.
+        member = None
         if dm:
-            member = await self.member(message.author.id, fresh=True)  # Not the cache its arrival filled.
-            if not self.config['support_dms']:  # After that read, which a change can overlap.
-                return 'dms off'
-            if not member:
-                return 'not a member'
+            member = await self.member(message.author.id, fresh=True)
+        elif not invitation:
+            member = await self.member(message.author.id, fresh=True, guild_id=message.guild.id)
+        if dm and not self.config['support_dms']:
+            return 'dms off'
+        if dm and not member:
+            return 'not a member'
         if (not self.config['enabled'] and not privacy and
                 not (message.author.id == self.fri.owner_id and usage_requested(text))):
             return 'fri disabled'
@@ -608,8 +613,7 @@ class Agent:
             return None
         if not self.allowed(message.channel):
             return 'channel no longer configured'
-        if not invitation:  # A ping's invitation checks its author's access itself before it's answered.
-            member = await self.member(message.author.id, fresh=True, guild_id=message.guild.id)
+        if not invitation:
             permissions = member and message.channel.permissions_for(member)
             if not (permissions and permissions.view_channel and permissions.read_message_history):
                 return 'member changed'
