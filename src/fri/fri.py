@@ -35,7 +35,7 @@ from .fri_reports import ReportButton, report_component
 from .fri_requests import request_dm_component
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
-from .fri_usage import describe_usage, usage_requested
+from .fri_usage import describe_usage, usage_query, usage_requested
 from .panels import defer_panel
 from .privacy import clean
 from .reviews import owner_dm_component
@@ -427,9 +427,11 @@ class Fri(discord.Client):
                     await self.api('POST', '/chat/turn/check', result.turn)  # Fence even a reaction.
                     return result
                 if user_id == self.owner_id and guild_id == self.guild_id and usage_requested(text):
+                    window, label, windowless = usage_query(text, self.capabilities, time.time())
                     usage = await self.api('POST', '/agent/usage',
-                                           {'guild_id': str(guild_id), 'user_id': str(user_id)})
-                    report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()))
+                                           {'guild_id': str(guild_id), 'user_id': str(user_id), **window})
+                    report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()),
+                                            window=label, windowless=windowless)
                     result = self.stage_turn(scope, source, text, context, ChatResult(reply=report, status='completed'),
                                              model='local-usage-report', derived=False)
                     await self.api('POST', '/chat/turn/check', result.turn)  # An erasure mid-turn stops it.

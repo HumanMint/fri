@@ -458,6 +458,14 @@ can't be parsed, moves to `usage/rejected/` and stops blocking later receipts.
 `rejected_usage` in the health file counts them. Credential or contract refusals
 keep every receipt queued.
 
+The owner's usage report ("fri token usage", "show usage by model") is cumulative unless
+the ask names a rolling window: "last 24h", "past 3 days", "last week", "this month" and the
+like, up to 999 of a unit. "today" means the last 24 hours and "this week" the last 7 days,
+not calendar periods, and the reply names the exact window. Fri sends the window as `since`
+only to a controller that offers `usage-window`. An older controller gets the plain request,
+and the reply says the totals are all-time. Attempts count by when the controller recorded
+them, so a receipt held through an outage lands in the window it arrives in.
+
 A failed subscription renewal logs its cause: exception class, HTTP status and OAuth
 error code, never the response or tokens. Only a refused grant (HTTP 400/401), a
 renewal without the plan scope, or a missing or incomplete saved sign-in is reported
