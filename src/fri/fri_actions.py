@@ -49,7 +49,7 @@ class Actions:
         self.media_allowed = False
         self.invitation = None
         self.turn_context = None
-        self.caught_up = None
+        self.reads = []  # What each read showed, and the history window that finds it again.
         from .fri_image_share import ImageShare
         self.image_share = ImageShare(self)
         self.history = HistorySearch(self)
@@ -389,9 +389,9 @@ class Actions:
         # A catch-up stops at the speaker's last message before anyone else spoke. Messages
         # they sent just before asking, or that only bots answered, are them coming back, not leaving.
         returned, others, left, full = asked-RETURN_SECONDS, False, None, False
-        records, scanned, profiles, shown, size, posts = [], 0, {}, {}, 0, []
+        records, scanned, profiles, shown, size, posts, newest = [], 0, {}, {}, 0, [], 0
         async for message in channel.history(**options):
-            scanned += 1
+            scanned, newest = scanned+1, max(newest, message.id)
             if message.author.bot or message.webhook_id:
                 continue
             user = message.author.id
@@ -423,6 +423,7 @@ class Actions:
                 records.append(row)
                 continue
             self.observe(scope, user, profile['revision'])
+            shown[message.id] = (user, message.content, message.edited_at)
             records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
                             'at': message.created_at.isoformat(), 'text': clean(message.content, 500), **details(message)})
             if carries:
@@ -434,22 +435,30 @@ class Actions:
         if posts and self.media_allowed and self.turn_context is not None:
             result.update(await look(self.turn_context, posts))
             self.image_context = image_context(self.turn_context)
+        if shown:
+            # The same window, ending at the newest post it scanned, so a later post can't push one out.
+            self.reads.append({'channel': channel, 'options': {'before': discord.Object(id=newest+1), **options},
+                               'shown': shown})
         if catch_up:
-            self.caught_up = {'channel': channel, 'options': options, 'shown': shown}
             result.update(window='since_my_last_message',
                 your_last_message_at=left.created_at.isoformat(timespec='minutes') if left else None,
                 stopped_at='your_last_message' if left else 'size_limit' if full else
                     'message_limit' if scanned >= CATCH_UP_MESSAGES else 'time_limit')
         return result
 
-    async def caught_up_unchanged(self):
-        """Every message a catch-up showed must still exist unedited, like an invitation's sources."""
-        if not self.caught_up:
-            return True
-        read, shown = self.caught_up, self.caught_up['shown']
-        latest = {message.id: (message.author.id, message.content, message.edited_at)
-                  async for message in read['channel'].history(**read['options']) if message.id in shown}
-        return latest == shown
+    async def reads_unchanged(self):
+        """Every post a read showed still exists unedited, like an invitation's sources: one history
+        refetch per read, before each model request and before delivery."""
+        try:
+            for read in self.reads:
+                shown = read['shown']
+                latest = {message.id: (message.author.id, message.content, message.edited_at)
+                          async for message in read['channel'].history(**read['options']) if message.id in shown}
+                if latest != shown:
+                    return False
+        except discord.HTTPException:
+            return False
+        return True
 
     async def invited_context(self, channel_id):
         """An explicit configured-channel read introduces ephemeral evidence only now."""
@@ -617,7 +626,7 @@ class Actions:
                 return False
             if not await self.history.valid(channels):
                 return False
-            if not await self.caught_up_unchanged():
+            if not await self.reads_unchanged():
                 return False
             for (scope, user), revision in self.revisions.items():
                 profile = await self.agent.profile(scope, user)

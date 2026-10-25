@@ -63,6 +63,7 @@ UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
 LEGACY = '[an earlier fri reply from before fri tracked its sources]'
 CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
 CONVERSATION_CHANGED = 'the conversation changed while i was typing. ask again and i’ll catch up.'
+READ_CHANGED = 'that chat changed while i was reading it. ask again.'
 CLOSED = 'a channel i was pulling from just went private while i was replying, so that stays unsaid. ask again.'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
@@ -339,6 +340,8 @@ class Fri(discord.Client):
                 # signed in never reaches the model. Discord reads first, like the access check.
                 if actions and not await images_unchanged(actions.image_context, actions.event):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+                if actions and not await actions.reads_unchanged():  # And every post a read showed.
+                    raise commands.UserFeedbackCheckFailure(READ_CHANGED)
                 # So is the post they replied to or linked, and the rest of their burst.
                 evidence = actions.conversation if actions else {}
                 if evidence and (evidence.get('message_burst') or evidence.get('reply_target')):
