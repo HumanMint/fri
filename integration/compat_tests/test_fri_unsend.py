@@ -63,6 +63,18 @@ def test_a_deletion_mark_stays_while_its_message_is_handled_however_many_deletes
     assert not {50, 60} & set(agent.unsent)  # Handled now: they go like any other.
 
 
+def test_a_shown_messages_deletion_mark_outlasts_a_flood_of_unrelated_deletes(monkeypatch):
+    # A nearby message the model saw isn't being handled, but the reply's last check still needs its mark.
+    monkeypatch.setattr('fri.fri_agent.MAX_DELIVERED', 3)
+    agent = bare_agent()
+    agent.recent[1].extend(row(i) for i in range(1, 6))
+    agent.unsend(1, [5])
+    for start in range(1000, 1500, 100):  # Bulk deletes of messages Fri never had in view.
+        agent.unsend(1, range(start, start+100))
+    assert 5 in agent.unsent
+    assert not any(i >= 1000 for i in agent.unsent)
+
+
 def test_edits_refresh_a_members_row_as_they_left_it():
     agent = bare_agent()
     agent.recent[1].extend([row(1), row(2, user='99', fri=True, provenance=[]), row(3, user='77', gene_error=True),
