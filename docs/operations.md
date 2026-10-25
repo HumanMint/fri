@@ -466,7 +466,7 @@ refused until someone checks the DM and fixes the record by hand.
 
 Exit codes: 0 sent (or already sent); 2 refused: the same version with
 different notes (send a correction as a new version), notes that don't fit, a damaged record, or
-missing settings; 1 failed: Discord refused or the connection dropped. Every confirmed part is on
+missing settings; 1 failed: Discord refused, answered badly or the connection dropped. Every confirmed part is on
 record, so rerunning the same command after a 1 is safe. Members see nothing.
 
 ## Background work and health

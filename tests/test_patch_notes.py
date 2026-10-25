@@ -290,6 +290,7 @@ def record(*parts, more=None):
     pytest.param('{"versions": {', id='truncated'),
     pytest.param(b'\xff', id='not-utf8'),
     pytest.param('[' * 100000 + ']' * 100000, id='nested'),
+    pytest.param('{"versions": {"0.3.0": {"sha256": "' + '0' * 64 + '", "parts": [{}]}}, "versions": {}}', id='duplicate-key'),
     pytest.param(record(), id='no-parts'),
     pytest.param(record({**SENT, 'message_id': 5}), id='number-id'),
     pytest.param(record({**SENT, 'message_id': '0'}), id='zero-id'),
@@ -345,13 +346,15 @@ def test_cli_reports_a_discord_or_network_failure_with_exit_1_and_closes_the_cli
                                 {'code': 50007, 'message': 'Cannot send messages to this user'})
     monkeypatch.setattr(dm, 'send', forbidden)
     assert cli() == 1
-    assert 'failed: 403 Forbidden (error code: 50007)' in capsys.readouterr().err
+    assert 'failed: Forbidden: 403 Forbidden (error code: 50007)' in capsys.readouterr().err
     FakeClient.login_error = discord.LoginFailure('Improper token has been passed.')
     assert cli() == 1
     FakeClient.login_error = aiohttp.ClientConnectionError('cannot connect')
     assert cli() == 1
-    assert 'failed: cannot connect' in capsys.readouterr().err
-    assert len(FakeClient.instances) == 3 and all(c.closed for c in FakeClient.instances)
+    assert 'failed: ClientConnectionError: cannot connect' in capsys.readouterr().err
+    FakeClient.login_error = json.JSONDecodeError('Expecting value', '{', 1)  # A malformed Discord reply.
+    assert cli() == 1
+    assert len(FakeClient.instances) == 4 and all(c.closed for c in FakeClient.instances)
 
 
 @pytest.mark.parametrize('token, owner', [(None, str(OWNER)), ('secret-token', None), ('secret-token', 'me')])

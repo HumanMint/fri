@@ -23,7 +23,6 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-import aiohttp
 import discord
 
 from .private_files import private_json
@@ -116,10 +115,17 @@ def sent_ids(state):
     return [part['message_id'] for entry in state['versions'].values() for part in entry['parts'] if 'message_id' in part]
 
 
+def unique(pairs):
+    """A JSON object, refusing a repeated key: the last one would silently drop the others' receipts."""
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError('a key appears twice')
+    return dict(pairs)
+
+
 def load(path):
     """The whole record, checked: a damaged one is refused, never guessed past, since a guess can resend."""
     try:
-        state = json.loads(path.read_text())
+        state = json.loads(path.read_text(), object_pairs_hook=unique)
     except FileNotFoundError:
         return {'versions': {}}
     except (OSError, ValueError, RecursionError):  # Unreadable, truncated, not UTF-8, or nested past Python's limit.
@@ -216,9 +222,9 @@ def main(argv=None):
     except NotesRefused as exc:
         print(f'refused: {exc}', file=sys.stderr)
         return 2
-    except (discord.DiscordException, aiohttp.ClientError, OSError) as exc:
-        # Discord said no or the connection failed. Every confirmed part is on record, so a rerun is safe.
-        print(f'failed: {str(exc) or type(exc).__name__}', file=sys.stderr)
+    except Exception as exc:  # Discord, the network or the host failed mid-send, in whatever form.
+        # The record is written before each send and after each confirmation, so a rerun is safe.
+        print(f'failed: {type(exc).__name__}: {exc}', file=sys.stderr)
         return 1
     return 0
 
