@@ -17,6 +17,8 @@ from compat_tests.test_fri_mentions import environment
 from fri import feedback as commands
 from fri.fri import Fri
 from fri.fri_chat import Chat
+from fri.fri_errors import GateClosed
+from fri.fri_images import MAX_LOADS, look
 from fri.fri_mentions import Invitation
 
 
@@ -166,4 +168,102 @@ def test_a_configured_mention_drops_a_meme_edited_during_sign_in(monkeypatch, tm
         finally:
             await fri.close()
 
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('posts', [1, 2])
+def test_an_outside_mention_poster_who_opts_out_during_the_last_refetch_never_reaches_the_model(monkeypatch, tmp_path, posts):
+    """The nearby authors' privacy is checked after every Discord refetch, not before them."""
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path)
+        fri.data = tmp_path
+        memes = [message('caption '+str(user), user=user, age=user, attachments=[picture(channel.id, str(user)+'.png')])
+                 for user in (30, 40)[:posts]]
+        event = message('<@99> pick the best meme above')
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(side_effect=lambda url, channel: 'data:image/png;base64,'+url[-6:]))
+        fri.chat_once = MethodType(Fri.chat_once, fri)
+        sent = []
+        def handler(request):
+            sent.append(json.loads(request.content))
+            answer = {'response_kind': 'reply', 'reaction': None, 'reply': 'member 30 wins', 'request_draft': None,
+                      'action': None, 'notes': [], 'allow_closing': False}
+            return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(answer)))+'\n\n')
+        fri.chat = Chat(SimpleNamespace(access_token=lambda: 'test'), httpx.MockTransport(handler))
+        signed_in = False
+
+        async def headers():
+            nonlocal signed_in
+            signed_in = True
+            return {'Authorization': 'Bearer synthetic'}
+
+        async def fetch(mid):
+            if signed_in and mid == memes[0].id:  # They opt out while Fri refetches their post.
+                store.personal_control('30', 'disable')
+            return rows[mid]
+        fri.chat.headers = headers
+        channel.fetch_message = AsyncMock(side_effect=fetch)
+        try:
+            invitation = await Invitation.create(agent, event)
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await fri.invited_talk(invitation, 'pick the best meme above')
+            assert sent == []  # Neither the caption nor the image went out.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_download_that_fails_leaves_its_slot_to_an_older_meme(monkeypatch, tmp_path):
+    async def scenario():
+        fri, _, _, _, channel, message, _, _ = environment(monkeypatch, tmp_path)
+        memes = [message('', user=30, age=age, attachments=[picture(channel.id, f'{age}.png')]) for age in range(10, 130, 10)]
+        tried = []
+
+        async def load(url, channel):
+            tried.append(url.rsplit('/', 1)[1])
+            if url.rsplit('/', 1)[1] not in ('50.png', '120.png'):
+                raise httpx.ConnectError('cdn down')
+            return 'data:image/png;base64,'+url.rsplit('/', 1)[1]
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(side_effect=load))
+        context = {}
+        try:
+            result = await look(context, memes)
+            # The newest four fail, the fifth works; the hunt stops at MAX_LOADS downloads.
+            assert context['images'] == ['data:image/png;base64,50.png']
+            assert len(tried) == MAX_LOADS and '120.png' not in tried
+            assert result == {'images_inspected': 1, 'images_not_inspected': len(memes)-1}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('when', ['access_recheck', 'controller_check'])
+def test_turning_dms_off_during_the_last_checks_stops_the_request(monkeypatch, tmp_path, when):
+    async def scenario():
+        w, _, _, sent = image_world(monkeypatch, tmp_path)
+        w.fri.agent.config['support_dms'] = True
+        general, api = w.channels[GENERAL], w.fri.api
+
+        def off():
+            w.fri.agent.config['support_dms'] = False
+        if when == 'access_recheck':  # Before the request that would carry the memes.
+            fetching = general.guild.fetch_channel
+
+            async def fetch(cid):
+                off()
+                return await fetching(cid)
+            general.guild.fetch_channel = fetch
+        else:  # Before the very first request, during Gene's privacy check.
+            async def check(method, path, payload=None):
+                result = await api(method, path, payload)
+                if path == '/chat/turn/check':
+                    off()
+                return result
+            w.fri.api = check
+        try:
+            text = 'fri pick the best meme in general'
+            with pytest.raises(GateClosed):
+                await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert len(sent) == (1 if when == 'access_recheck' else 0)
+        finally:
+            await w.fri.close()
     asyncio.run(scenario())
