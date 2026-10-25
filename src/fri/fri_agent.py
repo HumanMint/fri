@@ -88,6 +88,7 @@ class Agent:
         self.delivered = {}  # Discord message ID -> when it first arrived, oldest first.
         self.recording = {}  # (channel, member): set once a delivered reply is recorded.
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
+        self.erased = {}  # member: how many of those erased their chats ("forget me"), not just a cache reset.
         self.direct = {}  # Discord message ID: when the direct path took it, so attention never picks it too.
         self.pending = {}
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
@@ -238,8 +239,10 @@ class Agent:
             self.recent[channel] = deque((r for r in self.recent[channel] if r['id'] not in stale), maxlen=30)
         return accepted
 
-    def forget(self, user):
+    def forget(self, user, erased=False):
         self.forgotten[user] = self.forgotten.get(user, 0)+1
+        if erased:
+            self.erased[user] = self.erased.get(user, 0)+1
         self.bursts.forget(user)
         for key in list(self.pending):
             if key[1] == user:
@@ -292,7 +295,7 @@ class Agent:
         await self.record('owner_settings', model, effort, counters, status, deliver=False)
         return status != 'completed' or result.get('answer') == 'settings_change'
 
-    async def owner_control(self, message, text, forgotten=None):
+    async def owner_control(self, message, text, erasures=None):
         if message.author.id != self.fri.owner_id:
             return False
         if message.guild and message.guild.id != self.fri.guild_id:
@@ -342,19 +345,19 @@ class Agent:
             return True
         self.control_queue.append(message.id)  # Before any await: requests keep arrival order.
         try:
-            arrived = self.forgotten.get(message.author.id, 0) if forgotten is None else forgotten
+            arrived = self.erased.get(message.author.id, 0) if erasures is None else erasures
             return await self.settings_preview(message, text, arrived)
         finally:
             self.control_queue.remove(message.id)
 
-    async def settings_preview(self, message, text, forgotten):
+    async def settings_preview(self, message, text, erasures):
         user = message.author.id
         scope = self.fri.workshop_id if message.guild is None else getattr(message.channel, 'parent_id', None) or message.channel.id
         revision = (await self.profile(scope, user))['revision']
 
         async def erased():  # Checked after each wait: an erased message is dropped like any waiting one.
             current = (await self.profile(scope, user))['revision']  # Read first: erasing can't slip in after.
-            return self.forgotten.get(user, 0) != forgotten or current != revision
+            return self.erased.get(user, 0) != erasures or current != revision
 
         self.state = state = await self.fri.api('GET', '/agent/state')
         # Ordinary chat that happens to say "model" or "make" goes to the normal reply. While Fri is
@@ -456,6 +459,7 @@ class Agent:
     async def receive(self, message):
         arrived = time.monotonic()  # Bursts group by arrival, even if this waits for an earlier reply.
         forgotten = self.forgotten.get(message.author.id, 0)
+        erasures = self.erased.get(message.author.id, 0)  # The owner settings fence ignores cache resets.
         if getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:
             return
         dm = message.guild is None
@@ -487,7 +491,7 @@ class Agent:
         directed = text if dm else await addressed_text(message, self.fri.user.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
         control = (owner_addressed and message.author.id == self.fri.owner_id and
-                   await self.owner_control(message, directed or text, forgotten))
+                   await self.owner_control(message, directed or text, erasures))
         if control == ERASED:
             return self.miss(message, 'author privacy changed')
         if control:
@@ -504,7 +508,7 @@ class Agent:
             if invitation is None:
                 return
         if privacy:
-            self.forget(message.author.id)
+            self.forget(message.author.id, erased=privacy == 'disable')
         observed = None  # The author's privacy revision as first read for this message.
         if not dm and not message.author.bot:
             profile = await self.profile(parent, message.author.id)

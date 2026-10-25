@@ -160,7 +160,7 @@ def test_busy_settings_preview_no_longer_swallows_ordinary_owner_chat(monkeypatc
 
 def erase(agent, how):
     if how == 'forget me':
-        agent.forget(10)
+        agent.forget(10, erased=True)
     else:  # The panel, Gene or Red: only the privacy revision moves.
         agent.profile.return_value = {'enabled': True, 'revision': 1, 'summary': ''}
 
@@ -236,8 +236,8 @@ def test_a_forget_before_the_line_was_handled_counts_from_arrival(monkeypatch, t
         calls = gate(monkeypatch)
         agent.record = AsyncMock()
         agent.run = AsyncMock()
-        arrived = agent.forgotten.get(10, 0)
-        agent.forget(10)  # While the message waited to be handled.
+        arrived = agent.erased.get(10, 0)
+        agent.forget(10, erased=True)  # While the message waited to be handled.
         message = owner_message()
         assert await agent.owner_control(message, 'set heartbeat to 10 minutes', arrived) == ERASED
         assert calls == []
@@ -259,7 +259,7 @@ def test_forget_me_during_a_privacy_read_that_returns_the_old_revision_still_cou
         async def profile(channel, user):
             reads.append(user)
             if len(reads) == at:
-                agent.forget(10)  # Lands while the controller still answers with the old revision.
+                agent.forget(10, erased=True)  # Lands while the controller still answers with the old revision.
             return {'enabled': True, 'revision': 0, 'summary': ''}
         agent.profile = profile
         checks, sol = [], []

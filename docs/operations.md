@@ -224,10 +224,12 @@ Calls whose result can't change what members see are skipped before inference.
   runs the Sol/high settings call, with typing shown. Anything else takes the normal reply path,
   even while another settings preview is being prepared. Requests queue as they reach the settings
   handling, before its controller reads; a request gets the busy note only if an earlier one is
-  still being decided or prepared when it's ready. A line the owner erased after it arrived (during
-  the controller reads, the sign-in, the check, the model slot wait or the Sol call) gets no reply,
-  preview or busy note and never reaches a model after the erasure is seen, like any waiting
-  message. While Fri is disabled the check is skipped, since the normal path can't answer then.
+  still being decided or prepared when it's ready. A line the owner erased after it arrived ("forget
+  me", or a privacy change from the panel, Gene or Red, during the controller reads, the sign-in,
+  the check, the model slot wait or the Sol call) gets no reply, preview or busy note and never
+  reaches a model after the erasure is seen, like any waiting message. Asking what Fri remembers, or
+  Fri clearing cached rows from an earlier erasure, doesn't count. While Fri is disabled the check
+  is skipped, since the normal path can't answer then.
 - Meme checks are unchanged: an inspection still runs while the reaction budget is closed, because
   the budget can reopen (or the owner can raise it) before the model answers.
 
