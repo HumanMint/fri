@@ -330,6 +330,12 @@ class Fri(discord.Client):
             elif fence:
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
                     context, fence['turn']['user_id'], fence['actions'])})
+                # What they read earlier this turn, text or images, from a channel they can't see now
+                # never reaches the next request either. Delivery checks the same thing again.
+                actions = fence['actions']
+                if (actions and actions.private_evidence and actions.sources and
+                        not actions.sources <= set(await actions.channels(fresh=True))):
+                    raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]

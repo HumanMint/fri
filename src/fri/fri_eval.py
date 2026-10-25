@@ -123,6 +123,8 @@ def catch_up_cases():
          'expect': 'Short recap that says it only covers the latest stretch.'},
         {'name': 'memes_above_reads_first', 'text': 'whats ur favorite meme out of the memes above',
          'actions': nearby, 'recent': memes, 'expected_action': 'read_recent',
+         # Unset fields mean this channel and the recent read; a catch-up never looks at images.
+         'expected_arguments': {'channel_id': ('555', '', None), 'window': ('recent', '', None)}, 'banned': RESEND,
          'expect': 'read_recent to look at the memes, unasked. Never asks for a resend.'},
     ]
 
@@ -252,12 +254,17 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
                               not mentions(prose(reply), CHEER) and not mentions(reply, case.get('banned', ())) and
                               (not case.get('needs') or mentions(reply, case['needs'])))
         if 'expected_action' in case:
-            case['passed'] = result.status == 'completed' and (result.action or {}).get('kind') == case['expected_action']
+            action, reply = result.action or {}, (result.reply or '').casefold().replace('’', "'")
+            case['passed'] = (result.status == 'completed' and action.get('kind') == case['expected_action'] and
+                              all(action.get(key) in allowed for key, allowed in case.get('expected_arguments', {}).items()) and
+                              not mentions(reply, case.get('banned', ())))
         yield case, result
         if suite == 'sass' and result.status == 'completed':
             yield await grade(chat, model, effort, case, result)
 
 
+# Asking for a resend of something Fri could have read itself.
+RESEND = ('resend', 're-send', 'send them again', 'reupload', 're-upload', "can't see", 'cannot see', "don't see")
 # Assistant cheer and sign-offs the casual voice never uses.
 CHEER = ('!', 'let me know', 'lmk', 'hope this helps', 'hope that helps', 'great question',
          'happy to help', 'glad i could help')
@@ -379,8 +386,7 @@ def memes_above():
             'images': [shape(kind, color) for _, _, kind, color in posters], 'inspected_images': inspected,
             'recent': [{'user_id': user, 'name': name, 'text': '', 'attachments': ['image']}
                        for user, name, _, _ in reversed(posters)],
-            'banned': ('resend', 're-send', 'send them again', 'reupload', 're-upload', "can't see", 'cannot see',
-                       "don't see", '?'),
+            'banned': (*RESEND, '?'),
             'needs': ('kev', 'jo', 'sam', 'circle', 'square', 'triangle', 'red', 'blue', 'green'),
             'image_notes': 'Fri was shown three images: 1 a green triangle posted by Sam, 2 a blue square '
                            'posted by Jo, 3 a red circle posted by Kev.',

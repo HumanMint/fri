@@ -384,6 +384,59 @@ def test_the_controls_suite_expects_a_read_before_judging_memes():
     async def run(result):
         return {case['name']: case.get('passed') async for case, _ in evaluate(Scripted({
             'whats ur favorite meme out of the memes above': result}), 'gpt-6.1-sol', 'high', suite='controls')}
-    read = ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': '555', 'window': 'recent'})
-    assert asyncio.run(run(read))['memes_above_reads_first'] is True
+    def read(channel='555', window='recent', reply=''):
+        return ChatResult(status='completed', reply=reply, action={'kind': 'read_recent', 'channel_id': channel, 'window': window})
+    assert asyncio.run(run(read()))['memes_above_reads_first'] is True
+    assert asyncio.run(run(read(channel=None, window=None)))['memes_above_reads_first'] is True
+    # A catch-up never looks at images, another channel isn't where the memes are, and a read is no
+    # excuse to ask for a resend.
+    for wrong in (read(window='since_my_last_message'), read(channel='999'), read(reply='resend them and i’ll pick')):
+        assert asyncio.run(run(wrong))['memes_above_reads_first'] is False
     assert asyncio.run(run('resend them and i’ll pick'))['memes_above_reads_first'] is False
+
+
+@pytest.mark.parametrize('lost', ['access', 'membership'])
+def test_a_channel_they_lose_mid_read_never_reaches_the_next_model_request(monkeypatch, tmp_path, lost):
+    """Access is rechecked before each model request, not only before delivery: by then the images
+    and text a read turned up would already have gone to the provider."""
+    from compat_tests.test_fri_member_profiles import DM, GENERAL, model, world
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        general = w.channels[GENERAL]
+        mid = discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)-dt.timedelta(seconds=60))
+        meme = Mock(spec=discord.Message, id=mid, content='', channel=general, guild=general.guild,
+            author=SimpleNamespace(id=30, display_name='Kev', bot=False), webhook_id=None,
+            attachments=[picture(GENERAL, 'meme.png')], embeds=[], edited_at=None,
+            jump_url=f'https://discord.com/channels/123/{GENERAL}/{mid}', created_at=discord.utils.snowflake_time(mid))
+        async def history(**kwargs):
+            yield meme
+        general.history, general.fetch_message = history, AsyncMock(return_value=meme)
+        async def load(url, channel):  # They lose the channel while its images download.
+            if lost == 'access':
+                general.permissions_for = lambda who: (discord.Permissions.none() if getattr(who, 'id', None) == 20
+                                                       else discord.Permissions.all())
+            else:
+                general.guild.fetch_member.side_effect = discord.NotFound(SimpleNamespace(status=404, reason=''), 'left')
+            return 'data:image/png;base64,meme.png'
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(side_effect=load))
+        sent = []
+        async def respond(text, context):
+            sent.append(list(context.get('images', [])))  # What this request carries, as it's sent.
+            if len(sent) == 1:
+                assert 'read_recent' in context['actions']
+                return ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': str(GENERAL),
+                                                              'window': 'recent'})
+            return ChatResult(status='completed', reply='kev wins, the font alone')
+        model(w, respond)
+        text = 'fri whats the best meme in general rn'
+        try:
+            try:
+                result = await w.fri.talk(123, DM, 20, text, 'private', 'member 20', event=w.message(DM, text))
+                assert 'kev' not in result.reply.casefold()
+            except commands.UserFeedbackCheckFailure:
+                pass
+            assert sent == [[]]
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
