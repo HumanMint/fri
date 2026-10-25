@@ -2,7 +2,6 @@
 
 import json
 import re
-import unicodedata
 
 TOKEN_PATTERNS = [
     re.compile(r'(?i)\b(?:mfa\.[\w-]{20,}|[\w-]{23,28}\.[\w-]{6}\.[\w-]{25,})\b'),
@@ -42,49 +41,37 @@ def clean(text: str, limit: int = 6000) -> str:
     return redact(text.strip())[:limit]
 
 
-# Invisible (default-ignorable) letters and marks, blank or zero-width symbols, and every variation
-# selector: even an emoji's U+FE0E/U+FE0F often changes nothing visible, so their presence could carry
-# hidden bits. Non-ASCII spaces (category Zs) stay escaped too: their widths differ, so a gap could.
-INVISIBLE = re.compile('[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u2800\u303f\u3164\uffa0'
-                       '\ufe00-\ufe0f\ufffc\U00013441\U00013442\U00016fe4\U0001d159\U0001da7f\U0001da80'
-                       '\U000e0100-\U000e01ef]')
-TOKEN = re.compile(r'\\(?:u[0-9a-f]{4}|.)|[^\x20-\x7e]')  # An escape json.dumps wrote, or one non-ASCII character.
-CONJOINING = re.compile('[\u1160-\u11ff\ud7b0-\ud7ff]')  # Hangul vowel and final jamo join the syllable before.
-
-
-def visible(char):
-    return unicodedata.category(char)[0] in 'LMNPS' and not INVISIBLE.match(char)
-
-
-def joins(char):
-    return unicodedata.category(char)[0] == 'M' or bool(CONJOINING.match(char))
+# The only characters that reach the model raw: none looks like another, or like ASCII. Emoji are
+# Emoji_Presentation in Unicode 14.0 (Python 3.11's version; Discord draws each as its own image), plus
+# U+2764, then Hangul syllables, Hangul compatibility jamo (ㅋㅋ) without the blank filler, and curly
+# quotes. Other scripts and symbols have pixel-identical pairs (Latin A and Cyrillic А, the Kelvin sign
+# and K, combining marks), so a row of them could spell bits a person can't see; they stay escaped.
+RAW = re.compile(
+    '[\u2018\u2019\u201c\u201d\u3131-\u3163\u3165-\u318e\uac00-\ud7a3\u2764'
+    '\u231a\u231b\u23e9-\u23ec\u23f0\u23f3\u25fd\u25fe\u2614\u2615\u2648-\u2653\u267f\u2693\u26a1'
+    '\u26aa\u26ab\u26bd\u26be\u26c4\u26c5\u26ce\u26d4\u26ea\u26f2\u26f3\u26f5\u26fa\u26fd\u2705'
+    '\u270a\u270b\u2728\u274c\u274e\u2753-\u2755\u2757\u2795-\u2797\u27b0\u27bf\u2b1b\u2b1c\u2b50'
+    '\u2b55\U0001f004\U0001f0cf\U0001f18e\U0001f191-\U0001f19a\U0001f1e6-\U0001f1ff\U0001f201'
+    '\U0001f21a\U0001f22f\U0001f232-\U0001f236\U0001f238-\U0001f23a\U0001f250\U0001f251'
+    '\U0001f300-\U0001f320\U0001f32d-\U0001f335\U0001f337-\U0001f37c\U0001f37e-\U0001f393'
+    '\U0001f3a0-\U0001f3ca\U0001f3cf-\U0001f3d3\U0001f3e0-\U0001f3f0\U0001f3f4\U0001f3f8-\U0001f43e'
+    '\U0001f440\U0001f442-\U0001f4fc\U0001f4ff-\U0001f53d\U0001f54b-\U0001f54e\U0001f550-\U0001f567'
+    '\U0001f57a\U0001f595\U0001f596\U0001f5a4\U0001f5fb-\U0001f64f\U0001f680-\U0001f6c5\U0001f6cc'
+    '\U0001f6d0-\U0001f6d2\U0001f6d5-\U0001f6d7\U0001f6dd-\U0001f6df\U0001f6eb\U0001f6ec'
+    '\U0001f6f4-\U0001f6fc\U0001f7e0-\U0001f7eb\U0001f7f0\U0001f90c-\U0001f93a\U0001f93c-\U0001f945'
+    '\U0001f947-\U0001f9ff\U0001fa70-\U0001fa74\U0001fa78-\U0001fa7c\U0001fa80-\U0001fa86'
+    '\U0001fa90-\U0001faac\U0001fab0-\U0001faba\U0001fac0-\U0001fac5\U0001fad0-\U0001fad9'
+    '\U0001fae0-\U0001fae7\U0001faf0-\U0001faf6]')
+NOT_PRINTABLE_ASCII = re.compile(r'[^\x20-\x7e]')
 
 
 def model_json(value):
-    """JSON for model input with visible text as written: emoji, curly quotes and non-English letters
-    stay raw instead of becoming \\u escapes. Controls, format and invisible characters (bidi, zero-width,
-    tags, variation selectors), non-ASCII spaces, line separators, surrogates, private-use and unassigned
-    code points stay escaped, and so does anything that would look like something else: a character NFC
-    replaces (the Kelvin sign looks like K), and every combining mark (or Hangul vowel or final jamo) but
-    the first on a raw character, where it leaves the pair normalized. A second mark can repeat the first
-    or swap order with it, é can arrive composed or not, and a mark on an escape or a string's opening
-    quote would draw on JSON's own text. json.dumps does the traversal, key conversion and errors, and its
-    output keeps every non-ASCII character inside a string, so ASCII-only output is exactly json.dumps'."""
+    """JSON for model input with emoji, Korean and curly quotes as written, so an emoji is one character
+    instead of a 12-character \\u escape. Everything else outside printable ASCII stays the escape
+    json.dumps writes: other scripts and symbols (they have lookalikes), combining marks, variation
+    selectors, controls, format and invisible characters, spaces and separators. json.dumps does the
+    traversal, key conversion and errors, and its output keeps every non-ASCII character inside a string,
+    so ASCII-only output is exactly json.dumps'."""
     text = json.dumps(value, ensure_ascii=False)
-    ends = {'token': -1, 'base': -1}  # Where the last escape or non-ASCII character, and the last raw base, end.
-
-    def written(match):
-        char, start = match.group(), match.start()
-        if len(char) > 1:
-            keep = True  # json.dumps' own escape.
-        elif joins(char):
-            # Unless a token ends here, the character before is plain ASCII: content, or the opening quote.
-            base = start == ends['base'] if start == ends['token'] else text[start-1] != '"'
-            keep = base and visible(char) and unicodedata.is_normalized('NFC', text[start-1:start+1])
-        else:
-            keep = visible(char) and unicodedata.is_normalized('NFC', char)
-            if keep:
-                ends['base'] = match.end()
-        ends['token'] = match.end()
-        return char if keep else json.dumps(char)[1:-1]
-    return TOKEN.sub(written, text)
+    return NOT_PRINTABLE_ASCII.sub(lambda match: match.group() if RAW.match(match.group()) else
+                                   json.dumps(match.group())[1:-1], text)

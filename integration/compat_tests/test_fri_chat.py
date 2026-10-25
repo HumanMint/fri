@@ -212,7 +212,7 @@ def test_model_input_carries_visible_text_raw_and_invisible_text_escaped():
     conversation, internal, web = [[m['content'] for m in payload['input']] for payload in payloads]
     first, _, second, reaction, current = conversation
     assert said in first and escaped in second and '"reaction": "👀"' in reaction
-    assert said in current and escaped in current and '"Mïnt"' in current
+    assert said in current and escaped in current and '"M\\u00efnt"' in current  # Other scripts stay escaped.
     assert said in internal[0] and escaped in internal[0]
     assert said in web[0]
     for text in [*conversation, *internal, *web]:

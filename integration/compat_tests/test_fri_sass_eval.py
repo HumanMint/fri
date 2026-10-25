@@ -147,7 +147,7 @@ def test_a_baseline_run_escapes_fri_internal_tasks_but_not_the_grader(monkeypatc
     from fri import fri_agent_model, fri_chat, fri_web
     for module in (fri_agent_model, fri_chat, fri_web):
         monkeypatch.setattr(module, 'model_json', module.model_json)
-    subject = {'request': '猫の画像ちょうだい'}  # Image selection runs on analyze() too.
+    subject = {'request': '고양이 사진 줘 🐱'}  # Image selection runs on analyze() too.
     async def both():
         graded = await fri_eval.grade(chat, 'gpt-6.1-sol', 'high', case, reply)
         await fri_agent_model.analyze(chat, 'Pick the subject.', subject, 'gpt-6-luna', 'low', fri_eval.GRADE)
