@@ -66,8 +66,9 @@ def test_forgetting_without_any_meme_state_writes_nothing(tmp_path):
 
 def test_a_note_shows_only_while_the_author_and_the_post_are_as_they_were():
     edited = dt.datetime(2026, 10, 25, tzinfo=dt.timezone.utc)
-    notes = {5: {'author': '30', 'revision': 2, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None},
-             6: {'author': '30', 'revision': 2, 'emoji': '💀', 'note': 'a cat', 'edited': edited.isoformat()}}
+    now = __import__('time').time()
+    notes = {5: {'author': '30', 'revision': 2, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None, 'at': now},
+             6: {'author': '30', 'revision': 2, 'emoji': '💀', 'note': 'a cat', 'edited': edited.isoformat(), 'at': now}}
     post = SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=None)
     assert reacted(notes, post, {'revision': 2}) == {'fri_reacted': {'emoji': '🗿', 'saw': 'gigachad at a desk'}}
     assert reacted(notes, SimpleNamespace(id=6, author=SimpleNamespace(id=30), edited_at=edited), {'revision': 2})
@@ -83,7 +84,8 @@ def test_a_read_shows_fris_own_reaction_and_what_it_saw(monkeypatch, tmp_path):
         meme = post('', age=600, attachments=[picture(1, 'gigachad.png')])
         other = post('lol', user=40, age=300)
         agent.ensure_memes = lambda: SimpleNamespace(notes=lambda: {meme.id: {
-            'author': '30', 'revision': 0, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None}})
+            'author': '30', 'revision': 0, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None,
+            'at': __import__('time').time()}})
         actions = Actions(agent, 20, 999, False)
         actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
         try:
@@ -162,3 +164,59 @@ def test_a_note_missing_a_field_is_never_shown(tmp_path):
         state['entries']['100'] = {'at': __import__('time').time(), 'status': 'reacted', 'channel': '3',
                                    'author': '11', 'revision': 0, 'note': 'A joke', 'edited': None}
     assert memes.notes() == {}
+
+
+def test_a_note_missing_its_edit_time_is_never_shown_and_never_crashes_a_read(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channel, rows, post = read_harness(monkeypatch, tmp_path)
+        meme = post('', age=600, attachments=[picture(1, 'gigachad.png')])
+        memes = Memes(SimpleNamespace(fri=SimpleNamespace(data=tmp_path/'memes')))
+        with memes.state() as state:
+            state['entries'][str(meme.id)] = {'at': __import__('time').time(), 'status': 'reacted', 'channel': '1',
+                                              'author': '30', 'revision': 0, 'emoji': '🗿', 'note': 'a desk'}
+        agent.ensure_memes = lambda: memes
+        actions = Actions(agent, 20, 999, False)
+        actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
+        try:
+            rows = (await actions.execute({'kind': 'read_recent', 'channel_id': '1', 'window': 'recent'}))['messages']
+            assert rows and 'fri_reacted' not in rows[0]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_opt_out_through_gene_drops_the_note_at_the_next_meme_check(harness):  # noqa: F811
+    async def scenario():
+        h = harness
+        h.add(attachments=[attachment()])
+        await h.agent.memes.check()
+        assert h.agent.memes.notes()
+        h.store.personal_control('11', 'disable')  # Not through Fri, so no local forget().
+        h.clock[0] += 1801
+        await h.agent.memes.check()
+        assert h.agent.memes.notes() == {} and 'A joke' not in h.agent.memes.path.read_text()
+    asyncio.run(scenario())
+
+
+def test_an_invalid_limit_elsewhere_never_stops_an_erasure_or_an_expiry(harness):  # noqa: F811
+    async def scenario():
+        h = harness
+        h.add(attachments=[attachment()])
+        await h.agent.memes.check()
+        data = json.loads(h.agent.memes.path.read_text())
+        data['next_check'] = 'broken'
+        h.agent.memes.path.write_text(json.dumps(data))
+        h.agent.forget(11, erased=True)
+        assert 'A joke' not in h.agent.memes.path.read_text()
+        assert json.loads(h.agent.memes.path.read_text())['next_check'] == 'broken'  # Left for the owner.
+    asyncio.run(scenario())
+
+
+def test_a_note_that_expires_during_a_read_is_not_shown():
+    import time
+
+    post = SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=None)
+    note = {'author': '30', 'revision': 2, 'emoji': '🗿', 'note': 'a desk', 'edited': None,
+            'at': time.time()-3*86400-1}
+    stale = []
+    assert reacted({5: note}, post, {'revision': 2}, stale) == {} and stale == [5]

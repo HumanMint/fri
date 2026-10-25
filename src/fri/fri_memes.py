@@ -62,11 +62,16 @@ class Memes:
         self.path = self.fri.data / 'meme-attention.json'
 
     @contextmanager
-    def state(self, *, write=True):
+    def locked(self):
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self.path.with_suffix('.lock').open('a') as lock:
             os.chmod(lock.name, 0o600)
             fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    @contextmanager
+    def state(self, *, write=True):
+        with self.locked():
             state = json.loads(self.path.read_text()) if self.path.exists() else {
                 'version': 1, 'next_check': 0, 'entries': {}, 'reactions': [], 'channels': {}}
             if not isinstance(state, dict) or state.get('version') != 1 or not all(k in state for k in (
@@ -128,6 +133,7 @@ class Memes:
             state['next_check'] = now + config['meme_interval_minutes'] * 60
             state['entries'] = {k: v for k, v in state['entries'].items() if v['at'] > now-KEEP}
             state['reactions'] = [at for at in state['reactions'] if at > now-86400]
+        await self.verify()
         remaining = 2
         # One maintainer-scoped channel initially; bounded even if configured with more.
         for channel_id in self.agent.state.get('meme_channels', [])[:3]:
@@ -172,34 +178,38 @@ class Memes:
                     state['channels'][channel_id] = {**state['channels'].get(channel_id, {}),
                         'name': clean(channel.name, 60), 'last_check': now, 'status': 'check_failed'}
 
-    def expire(self, now=None):
-        """Drop notes past KEEP even while meme checks are off, so nothing outlives its three days."""
-        now = now or time.time()
+    def scrub(self, doomed):
+        """Remove the note fields from every entry doomed(key, entry) picks and touch nothing else, so
+        an invalid limit elsewhere in the file never stops an erasure or an expiry."""
         if not self.path.exists():
             return
         try:
-            with self.state(write=False) as state:
-                if not any(entry.get('note') and entry['at'] <= now-KEEP for entry in state['entries'].values()):
-                    return
-            with self.state() as state:
-                for entry in state['entries'].values():
-                    if entry['at'] <= now-KEEP:
-                        for key in NOTE_KEYS:
-                            entry.pop(key, None)
+            with self.locked():
+                data = json.loads(self.path.read_text())
+                entries = data.get('entries') if isinstance(data, dict) else None
+                if not isinstance(entries, dict):
+                    raise ValueError('Meme state has no entries to scrub')
+                hit = False
+                for key, entry in entries.items():
+                    if isinstance(entry, dict) and any(f in entry for f in NOTE_KEYS) and doomed(key, entry):
+                        for field in NOTE_KEYS:
+                            entry.pop(field, None)
+                        hit = True
+                if hit:
+                    private_json(self.path, data)
         except (ValueError, OSError) as exc:
-            LOG.warning('Meme notes could not be expired: %s', type(exc).__name__)
+            LOG.warning('Meme notes could not be scrubbed: %s', type(exc).__name__)
+
+    def expire(self, now=None):
+        """Drop notes past KEEP even while meme checks are off, so nothing outlives its three days."""
+        now = now or time.time()
+        self.scrub(lambda key, entry: not isinstance(entry.get('at'), (float, int)) or entry['at'] <= now-KEEP)
 
     def drop(self, message_ids):
         """Forget the notes on these posts: the post or its author's privacy changed since."""
-        if not message_ids or not self.path.exists():
-            return
-        try:
-            with self.state() as state:
-                for key in map(str, message_ids):
-                    for field in NOTE_KEYS:
-                        state['entries'].get(key, {}).pop(field, None)
-        except (ValueError, OSError) as exc:
-            LOG.warning('Meme notes could not be dropped: %s', type(exc).__name__)
+        if message_ids:
+            keys = set(map(str, message_ids))
+            self.scrub(lambda key, entry: key in keys)
 
     def remember(self, message, reaction, observation, revision):
         """What Fri reacted with and saw, so a later chat can own it. Only while the author's privacy
@@ -221,19 +231,17 @@ class Memes:
             return {}
 
     def forget(self, user):
-        if not self.path.exists():
-            return
-        try:
-            with self.state(write=False) as state:
-                if not any(entry.get('author') == str(user) for entry in state['entries'].values()):
-                    return
-            with self.state() as state:
-                for entry in state['entries'].values():
-                    if entry.get('author') == str(user):
-                        for key in NOTE_KEYS:
-                            entry.pop(key, None)
-        except (ValueError, OSError) as exc:
-            LOG.warning('Meme notes could not be forgotten: %s', type(exc).__name__)
+        self.scrub(lambda key, entry: entry.get('author') == str(user))
+
+    async def verify(self):
+        """Drop the notes whose author turned memory off or changed their privacy since, through Fri or
+        elsewhere: a meme check never looks at a post it already recorded again."""
+        doomed = set()
+        for message_id, note in self.notes().items():
+            profile = await self.agent.profile(int(note['channel']), int(note['author']))
+            if not profile['enabled'] or profile['revision'] != note['revision']:
+                doomed.add(message_id)
+        self.drop(doomed)
 
     def receipt(self, message, status, images=0):
         with self.state() as state:
@@ -293,10 +301,12 @@ class Memes:
 
 
 def kept(entry, now):
-    """A whole, current note: Fri reacted, within KEEP, with every field the right shape."""
-    return (entry.get('status') == 'reacted' and entry['at'] > now-KEEP and isinstance(entry.get('note'), str) and
-            bool(entry['note']) and entry.get('emoji') in EMOJIS and isinstance(entry.get('author'), str) and
-            type(entry.get('revision')) is int and (entry.get('edited') is None or isinstance(entry['edited'], str)))
+    """A whole, current note: Fri reacted, within KEEP, with every field there and the right shape."""
+    return (entry.get('status') == 'reacted' and all(key in entry for key in NOTE_KEYS) and
+            isinstance(entry.get('channel'), str) and entry['channel'].isdigit() and entry['at'] > now-KEEP and
+            isinstance(entry['note'], str) and bool(entry['note']) and entry['emoji'] in EMOJIS and
+            isinstance(entry['author'], str) and entry['author'].isdigit() and type(entry['revision']) is int and
+            (entry['edited'] is None or isinstance(entry['edited'], str)))
 
 
 def reacted(notes, message, profile, stale=None):
@@ -308,6 +318,7 @@ def reacted(notes, message, profile, stale=None):
         return {}
     edited = getattr(message, 'edited_at', None)
     if (note['author'] != str(message.author.id) or note['revision'] != profile['revision'] or
+            note['at'] <= time.time()-KEEP or
             note['edited'] != (edited.isoformat() if isinstance(edited, dt.datetime) else None)):
         if stale is not None:
             stale.append(message.id)
