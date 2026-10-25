@@ -1325,7 +1325,8 @@ def test_a_refusal_that_isnt_json_is_still_a_refusal(monkeypatch, tmp_path, stat
             if status < 500:
                 with pytest.raises(ControllerRejected) as caught:  # Startup stops at once, as on any rejection.
                     await asyncio.wait_for(patiently(fri, lambda: fri.api('GET', '/fri/contract')), 5)
-                assert caught.value.status == status and request.calls == 1
+                # A page that isn't the controller's has no status to act on, such as setting a usage receipt aside.
+                assert caught.value.status == (status if body == 'garbled' else None) and request.calls == 1
                 assert await fri.watcher.read() == ('rejected', {})
             else:
                 assert await fri.watcher.read() == ('unreachable', {})

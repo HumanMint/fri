@@ -369,8 +369,9 @@ as needing a reconnect. Each refusal sends the owner one DM; a token that works 
 between, even briefly, makes the next refusal a new one.
 Network, rate-limit, provider and disk failures, including a malformed renewal
 response, ask members to retry. A renewal that can't be saved still keeps a rotated
-refresh token. A controller 4xx whose JSON body can't be read keeps its status, including a
-proxy's HTML or text error page, so it's a refusal (startup stops), never an outage.
+refresh token. A controller 4xx whose JSON body can't be read keeps its status. A 4xx that
+isn't JSON at all, such as a proxy's HTML or text page, is still a refusal (startup stops, and
+the watch reports a rejection, not an outage), but with no status, so no receipt is set aside.
 
 ## New installations
 

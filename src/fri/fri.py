@@ -216,16 +216,18 @@ class Fri(discord.Client):
         try:
             async with self.session.request(method, self.url + path, json=payload,
                     headers={'Authorization': 'Bearer ' + self.token, 'X-Fri-Contract': PROTOCOL}) as response:
+                foreign = False  # A non-JSON reply isn't the controller's: a proxy's page, or a wrong URL.
                 try:
                     data = await response.json()
-                except (ValueError, RecursionError, aiohttp.ContentTypeError):  # A proxy's HTML or text page.
+                except (ValueError, RecursionError, aiohttp.ContentTypeError) as exc:
                     if response.status < 400:
                         raise
-                    data = None  # A refusal keeps its status when its JSON can't be read; a non-JSON reply isn't the controller's.
+                    data, foreign = None, isinstance(exc, aiohttp.ContentTypeError)  # A refusal keeps its status when its JSON can't be read.
                 detail = str(data.get('detail', 'Controller rejected this request')) if isinstance(data, dict) else (
                     'Controller rejected this request')
                 if 400 <= response.status < 500:
-                    raise ControllerRejected(detail, response.status)
+                    # Still a refusal, so startup stops; one that isn't the controller's has no status to act on.
+                    raise ControllerRejected(detail, None if foreign else response.status)
                 if response.status >= 400:  # Its detail is a controller fault, for the log, not for members.
                     LOG.warning('Controller %s %s failed: HTTP %s', method, path.split('?')[0], response.status)
                     raise ControllerUnavailable(UNREACHABLE)
