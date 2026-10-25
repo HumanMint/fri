@@ -32,15 +32,13 @@ async def run(fri, actions, text, context, result):
 
 
 async def recheck(actions, context):
-    """Before the model hears the turn again: a ping's own check, which covers its image, else the image's.
-    A tool checks before it acts (Actions.execute) and the reply before it goes out, so only model calls
-    need this. An outside ping's model calls check it themselves (see Fri.chat_once)."""
+    """Before the model hears the turn again. A tool checks before it acts (Actions.execute) and the reply
+    before it goes out, so only model calls need this."""
     invitation = getattr(actions, 'invitation', None)
-    if invitation and (context.get('fence') or {}).get('invitation') is invitation:
-        return
-    if invitation:
-        await invitation.require_current()
-    await require_current_images(context, getattr(actions, 'event', None), checked=bool(invitation))
+    if context.get('image_sources'):  # Starts with a ping's own check (see fri_images.unchanged).
+        await require_current_images(context, getattr(actions, 'event', None))
+    elif invitation and (context.get('fence') or {}).get('invitation') is not invitation:
+        await invitation.require_current()  # An outside ping's model calls check it themselves (Fri.chat_once).
 
 
 async def _run(fri, actions, text, context, result, progress):

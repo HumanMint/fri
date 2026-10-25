@@ -1,16 +1,20 @@
-"""What the checks #53 kept still cover: a ping's preceding photo, nearby messages deleted during the
-privacy read that follows the Discord reads, and images on turns that aren't pings (from #53's first review)."""
+"""What the checks #53 kept still cover, from its Codex reviews: a ping's preceding photo, nearby messages
+deleted during the privacy read that follows the Discord reads, images on turns that aren't pings, a ping
+edited while its access reads are out, and an image withdrawn before a follow-up model call."""
 import asyncio
 import copy
 import datetime as dt
+import inspect
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import discord
+import httpx
 import pytest
 
 from compat_tests.test_fri_mentions import attachment, burst, environment
-from fri.fri_chat import ChatResult
+from fri.fri_chat import Chat, ChatResult
 
 
 @pytest.mark.parametrize('change', ['delete', 'remove_attachment'])
@@ -214,4 +218,122 @@ def test_sending_without_invitation_still_checks_image_after_context_read(monkey
             assert 'medical diagnosis' not in str(saved)
         finally:
             await fri.close()
+    asyncio.run(scenario())
+
+
+REAL_SLEEP = asyncio.sleep
+
+
+
+@pytest.mark.parametrize('image', [False, True])
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_edit_during_final_member_fetch_is_withheld(monkeypatch, tmp_path, image, channel_id):
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message('<@99> what does my sensitive screenshot say?' if image else '<@99> sensitive member detail',
+                        attachments=[attachment(channel_id)] if image else [])
+        sensitive = 'the sensitive member detail is a medical diagnosis'
+        event.reply.return_value = SimpleNamespace(id=event.id + 1, content=sensitive)
+        fri.chat_once.return_value = ChatResult(status='completed', reply=sensitive)
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(return_value='data:image/png;base64,aGVsbG8='))
+        talked, edited = [], []
+        talk = fri.talk
+
+        async def talking(*args, **kwargs):
+            result = await talk(*args, **kwargs)
+            talked.append(True)
+            return result
+
+        fri.talk = talking
+
+        async def fetch_member(user):
+            if talked and user == 99 and not edited:
+                await REAL_SLEEP(0)
+                changed = copy.copy(event)
+                changed.content = '<@99> never mind'
+                changed.attachments = []
+                changed.edited_at = dt.datetime.now(dt.timezone.utc)
+                rows[event.id] = changed
+                edited.append(True)
+            return SimpleNamespace(id=user, bot=user == 99)
+
+        channel.guild.fetch_member.side_effect = fetch_member
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert edited
+            replies = [call.args[0] for call in event.reply.await_args_list]
+            saved = store.chat_context('123', f'public:{channel_id}', '20')
+            exposed = (any(sensitive in reply for reply in replies), sensitive in str(saved))
+            assert exposed == (False, False), exposed
+        finally:
+            await fri.close()
+
+    asyncio.run(scenario())
+
+
+
+@pytest.mark.parametrize('change', ['delete', 'remove_attachment'])
+def test_withdrawn_ping_image_does_not_reach_followup_model(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        question = 'what is the current Python release?'
+        event = message('<@99> what does my screenshot say? also ' + question, attachments=[attachment(1)])
+        lookup = AsyncMock(return_value=({'query': question, 'answer': 'Public release info',
+            'sources': ['https://www.python.org/'],
+            'checked_at': dt.datetime.now(dt.timezone.utc).isoformat()}, {}, 'completed'))
+        monkeypatch.setattr('fri.fri_actions.lookup', lookup)
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(return_value='data:image/png;base64,aGVsbG8='))
+        model_calls, changed, sent = [], [], []
+        fri.data = tmp_path
+
+        def provider(request):
+            sent.append(json.loads(request.content))
+            return httpx.Response(500)
+
+        fri.chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(provider))
+
+        async def respond(text, context):
+            model_calls.append(bool(context.get('images')))
+            if len(model_calls) == 1:
+                return ChatResult(status='completed', action={'kind': 'web_search', 'query': question})
+            return await type(fri).chat_once(fri, text, context)
+
+        fri.chat_once.side_effect = respond
+        api = fri.api
+
+        async def checked(method, path, payload=None):
+            result = await api(method, path, payload)
+            if (path == '/chat/mentions/profiles' and lookup.await_count and not changed and
+                    any(frame.function == '_run' for frame in inspect.stack())):
+                if change == 'delete':
+                    del rows[event.id]
+                else:
+                    edited = copy.copy(event)
+                    edited.attachments = []
+                    edited.edited_at = dt.datetime.now(dt.timezone.utc)
+                    rows[event.id] = edited
+                changed.append(True)
+            return result
+
+        fri.api = checked
+
+        async def fetch(mid):
+            if mid not in rows:
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'deleted')
+            return rows[mid]
+
+        channel.fetch_message.side_effect = fetch
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert changed
+            images_sent = [part for payload in sent for row in payload['input']
+                           if isinstance(row.get('content'), list) for part in row['content']
+                           if part.get('type') == 'input_image']
+            assert not images_sent, images_sent
+            assert model_calls == [True], model_calls
+        finally:
+            await fri.close()
+
     asyncio.run(scenario())

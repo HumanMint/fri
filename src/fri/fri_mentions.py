@@ -64,7 +64,6 @@ class Invitation:
         self.image = None  # The one image post it inspects, snapshotted as chosen (see current).
         self.ambiguous_images = False
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
-        self.fetched = {}  # Message ID: Discord's copy as the last passing check read it.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
         self.revision = None  # The author's privacy revision as Fri first read it for this ping.
 
@@ -97,32 +96,30 @@ class Invitation:
         self.refusal = reason
         return False
 
-    async def access(self, *, control=False, messages=()):
+    async def access(self, *, control=False):
         """Fetch current overwrites and both members; cached channel access is insufficient. A privacy
-        `control` works with Fri paused. Returns whether access holds, and the `messages` by ID as Discord
-        has them now, read alongside: each a message, or the exception its fetch raised."""
+        `control` works with Fri paused."""
         event, guild = self.event, self.event.guild
         if not control and not self.agent.config['enabled']:
-            return self.refuse('fri disabled'), {}
+            return self.refuse('fri disabled')
         if guild.id != self.fri.guild_id and not self.agent.allowed(event.channel):
-            return self.refuse('outside the main server'), {}
-        # None of these depends on another, so they go out together.
-        channel, roles, author, fri, *fetched = await together(
+            return self.refuse('outside the main server')
+        # None of these depends on another, so they go out together. The message reads come after.
+        channel, roles, author, fri = await together(
             guild.fetch_channel(event.channel.id), guild.fetch_roles(), guild.fetch_member(event.author.id),
-            guild.fetch_member(self.fri.user.id), *(event.channel.fetch_message(mid) for mid in messages))
-        fetched = dict(zip(messages, fetched))
+            guild.fetch_member(self.fri.user.id))
         channel = settled(channel)
         if channel.id != event.channel.id or channel.guild.id != guild.id:
-            return self.refuse('channel changed'), fetched
+            return self.refuse('channel changed')
         thread = isinstance(channel, discord.Thread)
         if thread:
             if channel.is_private() or channel.archived or channel.locked:
-                return self.refuse('private, archived or locked thread'), fetched
+                return self.refuse('private, archived or locked thread')
             parent = await guild.fetch_channel(channel.parent_id)
         else:
             parent = channel
         if getattr(parent, 'nsfw', False):
-            return self.refuse('nsfw channel'), fetched
+            return self.refuse('nsfw channel')
         # Current role permissions matter as well as fresh channel overwrites.
         fresh_guild = copy.copy(guild)
         fresh_guild._roles = {role.id: role for role in settled(roles)}
@@ -131,12 +128,12 @@ class Invitation:
         for user, member in ((event.author.id, author), (self.fri.user.id, fri)):
             member = settled(member)
             if member.id != user or (user == event.author.id and member.bot):
-                return self.refuse('member changed'), fetched
+                return self.refuse('member changed')
             permissions = parent.permissions_for(member)
             if not (permissions.view_channel and permissions.read_message_history and
                     (permissions.send_messages_in_threads if thread else permissions.send_messages)):
-                return self.refuse('missing permissions'), fetched
-        return True, fetched
+                return self.refuse('missing permissions')
+        return True
 
     async def current(self, *, check_evidence=True, control=False):
         try:
@@ -145,10 +142,9 @@ class Invitation:
                 return self.refuse('stale event')
             if age < -5:
                 return self.refuse('clock skew')
-            allowed, fetched = await self.access(control=control, messages=[self.event.id])
-            if not allowed:
+            if not await self.access(control=control):
                 return False
-            current = settled(fetched[self.event.id])
+            current = await self.event.channel.fetch_message(self.event.id)  # After access, as it stands now.
             if (current.id != self.event.id or current.author.bot or current.webhook_id or
                     fingerprint(current) != self.original or not explicit_mention(current, self.fri.user.id)):
                 return self.refuse('message changed')
@@ -162,14 +158,13 @@ class Invitation:
                 image = self.image if self.image is not None and self.image.id != self.event.id and (
                     self.image.id not in self.events) else None
                 later = [*self.events, *([image.id] if image else [])]
-                fetched.update(zip(later, await together(*(self.event.channel.fetch_message(mid) for mid in later))))
+                fetched = dict(zip(later, await together(*(self.event.channel.fetch_message(mid) for mid in later))))
                 for mid in self.events:
                     nearby = settled(fetched[mid])
                     if nearby.webhook_id or nearby.author.bot or fingerprint(nearby) != self.snapshots[mid]:
                         return self.refuse('nearby message changed')
                 if image and fingerprint(settled(fetched[image.id])) != self.image_snapshot:
                     return self.refuse('image changed')
-            self.fetched = {mid: settled(message) for mid, message in fetched.items()}
             return True
         except ControllerUnavailable:
             raise  # Nothing changed; the controller is down, and the caller's outage handling says so.
@@ -196,10 +191,9 @@ class Invitation:
                     revision = await self.agent.revision(self.event.author.id)
                 except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
                     return None
-            allowed, fetched = await self.access(messages=[self.event.id])
-            if not allowed:
+            if not await self.access():
                 return None
-            current = settled(fetched[self.event.id])
+            current = await self.event.channel.fetch_message(self.event.id)
             if (current.id != self.event.id or current.author.id != self.event.author.id or current.author.bot or
                     current.webhook_id or not explicit_mention(current, self.fri.user.id)):
                 return None

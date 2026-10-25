@@ -54,11 +54,12 @@ def counted_environment(monkeypatch, tmp_path):
     return fri, agent, store, channel, message, calls, rows, reads
 
 
-BEFORE = {'plain': (13, 5), 'image': (17, 5), 'image and tool': (17, 5)}
-# After the model: one round for the ping's last check, which covers its image. The tool adds its own
-# checks before acting (the ping's, then the image's after the conversation read), its read, and one
-# before the model hears the turn again.
-AFTER = {'plain': (5, 1), 'image': (5, 1), 'image and tool': (38, 10)}
+# Each ping check: the access reads together, then the ping, then (once admitted) the controller's privacy
+# read and the nearby messages and image post together, the same order as one by one.
+BEFORE = {'plain': (13, 7), 'image': (17, 8), 'image and tool': (17, 8)}
+# After the model: the ping's last check, which covers its image. The tool adds its own checks before
+# acting, its read, and one before the model hears the turn again.
+AFTER = {'plain': (5, 2), 'image': (5, 2), 'image and tool': (40, 19)}
 
 
 @pytest.mark.parametrize('case', ['plain', 'image', 'image and tool'])

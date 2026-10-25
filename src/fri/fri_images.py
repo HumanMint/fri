@@ -68,23 +68,19 @@ async def attach(context, event, text, *, source=None, invitation=None):
         context['image_invitation'] = invitation
 
 
-async def unchanged(context, event, *, checked=False):
-    """`checked`: a ping's own check just passed, so its copies of the ping and the image's message stand in
-    for fresh reads (its check covers both: see Invitation.current)."""
+async def unchanged(context, event):
     if not context.get('image_sources'):
         return True
     invitation = context.get('image_invitation')
-    if invitation and not checked and not await invitation.current():
+    if invitation and not await invitation.current():
         return False
-    fetched = invitation.fetched if invitation else {}
     try:
-        current = fetched.get(event.id) or await event.channel.fetch_message(event.id)
+        current = await event.channel.fetch_message(event.id)
         if (current.author.id != event.author.id or current.webhook_id or
                 current.content != event.content or current.edited_at != event.edited_at):
             return False
         source = context.get('image_event', event)
-        image = current if source.id == event.id else (
-            fetched.get(source.id) or await event.channel.fetch_message(source.id))
+        image = current if source.id == event.id else await event.channel.fetch_message(source.id)
         return ((image.author.id == event.author.id or
                  (invitation and image.author.id == source.author.id)) and not getattr(image.author, 'bot', False) and not image.webhook_id and
                 image.channel.id == event.channel.id and image.content == source.content and
@@ -93,6 +89,6 @@ async def unchanged(context, event, *, checked=False):
         return False
 
 
-async def require_current(context, event, *, checked=False):
-    if not await unchanged(context, event, checked=checked):
+async def require_current(context, event):
+    if not await unchanged(context, event):
         raise commands.UserFeedbackCheckFailure(CHANGED)
