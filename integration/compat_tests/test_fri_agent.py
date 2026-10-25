@@ -237,14 +237,41 @@ def test_followups_work_without_name_but_dont_follow_someone_elses_reply():
             await agent.handle(message)
             agent.respond.assert_not_awaited()
             agent.active[(456, 11)] = time.time()+120
+            message.id += 1  # Each step is a new message; Fri ignores a redelivered one.
             await agent.handle(message)
             assert agent.respond.await_count == 1
             message.reference = SimpleNamespace(message_id=20, resolved=SimpleNamespace(author=SimpleNamespace(id=12)))
+            message.id += 1
             await agent.handle(message)
             assert agent.respond.await_count == 1
             message.guild.id = 999
+            message.id += 1
             await agent.handle(message)
             assert agent.respond.await_count == 1
+    asyncio.run(scenario())
+
+
+def test_delivered_ids_are_remembered_for_an_hour_and_a_bounded_count(monkeypatch):
+    async def scenario():
+        agent = Agent(SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, user=SimpleNamespace(id=99)))
+        agent.watch = AsyncMock()
+        clock = [0.0]
+        monkeypatch.setattr('fri.fri_agent.time.monotonic', lambda: clock[0])
+        monkeypatch.setattr('fri.fri_agent.MAX_DELIVERED', 3)
+        events = [SimpleNamespace(id=n, channel=SimpleNamespace(id=1), author=SimpleNamespace(id=2)) for n in range(4)]
+        for event in events[:3]:
+            await agent.handle(event)
+        await agent.handle(events[0])  # A redelivery is ignored.
+        assert agent.watch.await_count == 3
+        await agent.handle(events[3])  # The oldest ID makes room...
+        await agent.handle(events[0])  # ...so a copy that late counts as new.
+        assert agent.watch.await_count == 5 and len(agent.delivered) == 3
+        clock[0] = 3599
+        await agent.handle(events[3])  # Still within the hour from its first arrival...
+        assert agent.watch.await_count == 5
+        clock[0] = 3601
+        await agent.handle(events[3])  # ...and the ignored copy didn't restart that hour.
+        assert agent.watch.await_count == 6 and list(agent.delivered) == [3]
     asyncio.run(scenario())
 
 
@@ -259,7 +286,8 @@ def test_private_context_never_receives_public_buffer_and_nonmembers_cannot_dm()
         agent.profile.assert_not_awaited()
         agent.member = AsyncMock(return_value=None)
         agent.respond = AsyncMock()
-        await agent.handle(SimpleNamespace(guild=None, author=SimpleNamespace(id=11, bot=False), webhook_id=None))
+        await agent.handle(SimpleNamespace(id=1, channel=SimpleNamespace(id=5), guild=None,
+                                           author=SimpleNamespace(id=11, bot=False), webhook_id=None))
         agent.respond.assert_not_awaited()
     asyncio.run(scenario())
 
