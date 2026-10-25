@@ -31,8 +31,11 @@ def requested(text):
         r'|\b(what|which|who|when|where|find|search|look up)\b.*\b(said|recommended|mentioned|posted|talked|discussed|linked)\b.*\b(earlier|before|yesterday|last week|last month|last year|ago|history|chat|messages?|logs?)\b'
         r'|\b(what|which|who|when|where|find|search|look up)\b.*\b(earlier|yesterday|last week|last month|last year|history|chat|messages?|logs?)\b.*\b(said|recommended|mentioned|posted|talked|discussed|linked)\b'
         r'|\b(search|find)\b.*\b(before|last month|last week|last year|ago)\b'
-        # "what was that song kev mentioned": a thing someone said, named before the verb.
-        r"|\b(?:what(?:'s|’s|s)?|which)\s+(?:(?:was|were|is)\s+)?(?:that|the|those)\s+\w+(?:\s+\w+){1,4}?\s+"
+        # "what was that song kev mentioned": a thing someone said, named before the verb. The word
+        # before the verb is who said it, so "the most commonly recommended laptop" or "the difference
+        # between shared and dedicated" stay general questions.
+        r"|\b(?:what(?:'s|’s|s)?|which)\s+(?:(?:was|were|is)\s+)?(?:that|the|those)\s+\w+(?:\s+\w+){0,3}?\s+"
+        r'(?!(?:\w+ly|most|more|least|between|and|or|of|for|with|in|on|to|by|than|as|being|been)\b)\w+\s+'
         r'(said|mentioned|recommended|posted|linked|shared|sent|dropped)\b', visible))
 
 
