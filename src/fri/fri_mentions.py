@@ -162,7 +162,9 @@ class Invitation:
             if (current.id != self.event.id or current.author.id != self.event.author.id or current.author.bot or
                     current.webhook_id or not explicit_mention(current, self.fri.user.id)):
                 return None
-            if reason == 'message changed' and current.edited_at is None:
+            if reason == 'message changed' and fingerprint(current) == self.original:
+                text = CONTEXT_CHANGED  # Another message in its burst changed, not this one.
+            elif reason == 'message changed' and current.edited_at is None:
                 text = GLITCH  # Not the member's edit, so don't say it was.
             # Last, so an erasure during the checks above still counts.
             if fenced and await self.agent.erasure(self.event.author.id, self.forgotten, revision):

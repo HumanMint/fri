@@ -1708,6 +1708,71 @@ def test_a_stale_ping_redelivered_after_its_record_expires_is_told_once(monkeypa
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('another', [False, True])
+def test_a_privacy_control_hears_a_refused_arrival_read_whatever_another_did(monkeypatch, tmp_path, caplog, another):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> forget me')
+        async def profile(*_):
+            if another:  # Another of their controls ran during this read.
+                agent.forget(20)
+            raise ControllerRejected('Controller rejected this request')
+        agent.profile = profile
+        try:
+            await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(CONTEXT_CHANGED,)]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: check failed: ControllerRejected']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('newest', ['unmentioned', 'unpinged ping'])
+def test_a_bursts_notice_goes_to_a_ping_that_still_stands(monkeypatch, tmp_path, caplog, newest):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        events = [message('<@99> first question'), message('<@99> more details')]
+        if newest == 'unmentioned':
+            events.append(message('fri final detail'))
+        removed = events[1]  # They take the ping out of this one while Fri types.
+        def unping():
+            edited = copy.copy(removed)
+            edited.content, edited.mentions = 'more details', []
+            rows[removed.id] = edited
+        if newest == 'unmentioned':  # And the controller refuses the reply's save.
+            api = fri.api
+            async def refused(method, path, payload=None):
+                if path == '/chat/turn/check':
+                    unping()
+                    raise ControllerRejected('This conversation changed while Fri was replying.')
+                return await api(method, path, payload)
+            fri.api = refused
+        else:  # The ping their reply answers is the one changed.
+            async def answer(*_):
+                unping()
+                return ChatResult(status='completed', reply='an answer')
+            fri.chat_once.side_effect = answer
+        released, debounce, grouped = gated_debounce()
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in events:
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_awaited_once()
+            assert all(not event.reply.await_count for event in events[1:])
+            assert [item.args[0] for item in events[0].reply.await_args_list] == [CONTEXT_CHANGED]
+            assert f'Mention 1/{events[0].id} not answered, told why: ' in '\n'.join(mention_lines(caplog))
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('stays', [True, False])
 def test_a_queued_dm_needs_a_current_member_when_its_turn_comes(monkeypatch, tmp_path, stays):
     async def scenario():
