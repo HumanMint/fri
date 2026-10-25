@@ -196,8 +196,9 @@ removes what was built on them here too.
 "What do you remember about me?" in public lists only what that channel can see. In a DM it lists
 every note with where it shows, and My memory there edits any of them; the panel shows the first 25.
 Editing a profile note clears the member's saved chats across the server, removes the same words
-wherever a single channel kept them (under any category), and stops background learning from
-bringing them back from older messages anywhere in the server. "Forget me" is unchanged and erases everything. At
+wherever a single channel kept them (under any category), and stops background learning from using
+anything the member said before the edit, anywhere in the server: no note, archive observation or
+channel summary comes from those messages, however it's phrased. "Forget me" is unchanged and erases everything. At
 startup Fri logs how many configured channels are readable by everyone. If that's none, profiles
 never fill, and the server's channel permissions are the thing to look at.
 
@@ -309,8 +310,9 @@ with the previously retained, compatible full Fri SHA/image.
 
 Before rolling the Gene controller back past member profiles, stop it and run
 `python -m gene.profile_downgrade <controller database>` in the controller's environment. That
-removes profile notes, copies their removals to every learning channel so an older controller can't
-learn them back, and keeps every conversation's own notes and chats. A Fri-only rollback needs nothing: an older Fri sends no audience
+removes profile notes, copies their removals to every configured channel so an older controller saves
+no note from the member's earlier messages, and keeps every conversation's own notes and chats. It
+refuses to run when it can't tell the channels. A Fri-only rollback needs nothing: an older Fri sends no audience
 and doesn't ask for profiles, so the controller gives it only each conversation's own notes, within the
 limits it was built for. Profile notes stay stored, unseen, until a newer Fri returns or they expire, and
 "forget me" still erases them.
