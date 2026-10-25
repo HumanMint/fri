@@ -240,7 +240,7 @@ def test_mentioned_owner_report_uses_conversation_path_even_while_chat_is_paused
         message.reference = None
         with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
             await agent.handle(message)
-        agent.respond.assert_awaited_once_with(message, 'show usage by model', False, revision=0)
+        agent.respond.assert_awaited_once_with(message, 'show usage by model', False, forgotten=0, revision=0)
         assert not any(path == '/agent/state' for path, _ in calls)
         await fri.close()
     asyncio.run(scenario())
