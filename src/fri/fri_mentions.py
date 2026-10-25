@@ -130,6 +130,12 @@ class Invitation:
                 return self.refuse('stale event')
             if age < -5:
                 return self.refuse('clock skew')
+            # First, the image post it inspects when that's neither the ping nor a nearby message (e.g. their
+            # photo just before the ping), so the reads below, the ping's among them, come after it.
+            image = self.image
+            if check_evidence and image is not None and image.id != self.event.id and image.id not in self.events:
+                if fingerprint(await self.event.channel.fetch_message(image.id)) != self.image_snapshot:
+                    return self.refuse('image changed')
             if not await self.access(control=control):
                 return False
             current = await self.event.channel.fetch_message(self.event.id)
@@ -146,12 +152,6 @@ class Invitation:
                 # The ping again, as an edit during the privacy read would otherwise go unseen.
                 if not self.unchanged(await self.event.channel.fetch_message(self.event.id)):
                     return self.refuse('message changed')
-            # The image post it inspects, when that's neither the ping nor a nearby message (e.g. their
-            # photo just before the ping), so the check before sending covers every image the model saw.
-            image = self.image
-            if check_evidence and image is not None and image.id != self.event.id and image.id not in self.events:
-                if fingerprint(await self.event.channel.fetch_message(image.id)) != self.image_snapshot:
-                    return self.refuse('image changed')
             return True
         except ControllerUnavailable:
             raise  # Nothing changed; the controller is down, and the caller's outage handling says so.
