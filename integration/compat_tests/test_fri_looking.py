@@ -468,7 +468,7 @@ def test_each_model_request_checks_access_first_and_privacy_last(monkeypatch, tm
         w.fri.api = api
         w.fri.flush_usage = AsyncMock()
         # A Gene receipt from #1 on an ordinary turn: no read, so no private evidence.
-        actions = SimpleNamespace(sources={'1'}, private_evidence=False, channels=channels)
+        actions = SimpleNamespace(sources={'1'}, private_evidence=False, channels=channels, image_context={}, event=None)
         context = {'model': 'm', 'effort': 'high', 'fence': {'turn': {'user_id': '20'}, 'actions': actions,
                                                               'shown': set()}}
         monkeypatch.setattr('fri.fri.turn_provenance', lambda *_: [])

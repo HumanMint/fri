@@ -1,6 +1,7 @@
 """Bounded conversational tools. Discord text never selects authority or scope."""
 
 import asyncio
+import copy
 import datetime as dt
 import json
 import time
@@ -125,7 +126,29 @@ class Actions:
             permissions = channel.permissions_for(member)
             if permissions.view_channel and permissions.read_message_history:
                 result[str(channel.id)] = channel
+        if fresh and self.sources & result.keys():
+            result = await self.recheck(result, member)
         return result
+
+    async def recheck(self, channels, member):
+        """Drop each channel this turn read from that `member` can't read now, judged from fetched
+        overwrites and roles: the cached channel can lag a revoke (see Invitation.access)."""
+        read = sorted(self.sources & channels.keys())
+        guild = channels[read[0]].guild  # channels() keeps only this server's channels
+        try:
+            fresh_guild = copy.copy(guild)
+            fresh_guild._roles = {role.id: role for role in await guild.fetch_roles()}
+            for channel_id in read:
+                channel = await guild.fetch_channel(int(channel_id))
+                parent = await guild.fetch_channel(channel.parent_id) if isinstance(channel, discord.Thread) else channel
+                parent = copy.copy(parent)
+                parent.guild = fresh_guild
+                permissions = parent.permissions_for(member)
+                if not (permissions.view_channel and permissions.read_message_history):
+                    del channels[channel_id]
+        except discord.HTTPException:
+            return {key: value for key, value in channels.items() if key not in self.sources}
+        return channels
 
     async def available(self):
         if self.invitation and self.invitation.outside:
