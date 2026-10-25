@@ -26,8 +26,8 @@ from fri.fri_actions import Actions
 from fri.fri_addressing import explicit_mention
 from fri.fri_agent import QUEUE_SECONDS, Agent
 from fri.fri_chat import Chat, ChatResult
-from fri.fri_errors import ControllerRejected, ControllerUnavailable
-from fri.fri_mentions import CONTEXT_CHANGED, GLITCH, NOTICES, Invitation
+from fri.fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
+from fri.fri_mentions import CONTEXT_CHANGED, NOTICES, Invitation
 from fri.fri_notices import ReplyInProgress
 
 
@@ -689,14 +689,15 @@ def test_a_ping_removed_before_its_waiting_notice_gets_none(monkeypatch, tmp_pat
 def test_a_controller_outage_entering_the_queue_still_says_so(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
-        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         event = message('<@99> you there?')
         fri.busy.add(20)
-        agent.profile = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
         try:
-            await agent.handle(event)
-            assert [item.args for item in event.reply.await_args_list] == [(GLITCH,)]
-            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: controller unavailable']
+            with pytest.raises(ControllerUnavailable):  # on_message still logs it.
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
+            assert mention_lines(caplog) == []  # Answered, by the outage notice.
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -817,12 +818,13 @@ def test_a_controller_outage_as_a_configured_ping_comes_in_says_so(monkeypatch, 
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         event = message('<@99> you there?')
-        agent.profile = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
         try:
-            await agent.handle(event)
-            assert [item.args for item in event.reply.await_args_list] == [(GLITCH,)]
+            with pytest.raises(ControllerUnavailable):
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
             fri.chat_once.assert_not_awaited()
-            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
+            assert mention_lines(caplog) == []
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -854,10 +856,10 @@ def test_a_slow_check_cannot_carry_a_waiting_message_past_its_deadline(monkeypat
 
 
 @pytest.mark.parametrize('down', ['admit', 'everything'])
-def test_a_controller_outage_at_admission_uses_the_glitch_line(monkeypatch, tmp_path, caplog, down):
+def test_a_controller_outage_at_admission_uses_the_outage_notice(monkeypatch, tmp_path, caplog, down):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
-        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         event = message('<@99> you there?')
         api = fri.api
         async def outage(method, path, payload=None):
@@ -869,9 +871,9 @@ def test_a_controller_outage_at_admission_uses_the_glitch_line(monkeypatch, tmp_
         fri.api = outage
         try:
             await agent.handle(event)
-            assert [item.args for item in event.reply.await_args_list] == [(GLITCH,)]
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
             fri.chat_once.assert_not_awaited()
-            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: controller unavailable']
+            assert mention_lines(caplog) == []
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -1010,7 +1012,7 @@ def test_a_rejected_revision_read_is_not_an_outage(monkeypatch, tmp_path, caplog
 def test_a_controller_that_goes_down_while_a_ping_waits_says_so(monkeypatch, tmp_path, caplog, when):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
-        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         event = message('<@99> you there?')
         event.reply.return_value = SimpleNamespace(delete=AsyncMock())
         fri.busy.add(20)
@@ -1025,11 +1027,12 @@ def test_a_controller_that_goes_down_while_a_ping_waits_says_so(monkeypatch, tmp
         down.calls = 0
         agent.revision = down
         try:
-            await agent.handle(event)
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):  # Its burst's debounce.
+                await agent.handle(event)
             fri.chat_once.assert_not_awaited()
             texts = [item.args[0] for item in event.reply.await_args_list]
-            assert texts == ([GLITCH] if when == 'before notice' else [str(ReplyInProgress()), GLITCH])
-            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: controller unavailable']
+            assert texts == ([UNREACHABLE] if when == 'before notice' else [str(ReplyInProgress()), UNREACHABLE])
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -1129,11 +1132,12 @@ def test_a_forget_me_ping_hears_about_an_outage(monkeypatch, tmp_path, caplog):
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         event = message('<@99> forget me')
-        agent.profile = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
         try:
-            await agent.handle(event)
-            assert [item.args for item in event.reply.await_args_list] == [(GLITCH,)]
-            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
+            with pytest.raises(ControllerUnavailable):
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
+            assert mention_lines(caplog) == []
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -1153,7 +1157,7 @@ def test_a_ping_that_waited_for_a_save_still_gets_its_checks(monkeypatch, tmp_pa
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
             fri.chat_once.assert_not_awaited()
-            expected = GLITCH if failure == 'outage' else NOTICES['stale event']
+            expected = UNREACHABLE if failure == 'outage' else NOTICES['stale event']
             assert [item.args for item in event.reply.await_args_list] == [(expected,)]
             assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: ' +
                                              ('controller unavailable' if failure == 'outage' else 'earlier reply still running')]
@@ -1162,16 +1166,18 @@ def test_a_ping_that_waited_for_a_save_still_gets_its_checks(monkeypatch, tmp_pa
     asyncio.run(scenario())
 
 
-def test_a_dm_outside_the_queue_keeps_its_controller_error(monkeypatch, tmp_path):
+def test_a_dm_that_comes_in_during_an_outage_gets_the_outage_notice(monkeypatch, tmp_path):
     async def scenario():
-        fri, agent, _, _, _, _, _, _ = environment(monkeypatch, tmp_path)
-        agent.profile = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
-        mid = discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc))
-        event = SimpleNamespace(id=mid, guild=None, author=SimpleNamespace(id=20, display_name='member', bot=False),
-                                channel=SimpleNamespace(id=5), reply=AsyncMock())
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        event = message('hey')
+        event.guild = None
         try:
-            await agent.take_turn(event, 'hey', True)
-            assert [item.args for item in event.reply.await_args_list] == [('the workshop controller is temporarily unavailable.',)]
+            with pytest.raises(ControllerUnavailable):
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
             fri.chat_once.assert_not_awaited()
         finally:
             await fri.close()
@@ -1443,11 +1449,8 @@ def test_a_reply_error_says_nothing_after_an_erasure_and_a_fixed_line_for_a_ping
             if failure == 'erased':  # Gene's fence rejected the save, and its notice stayed quiet.
                 assert texts == []
                 lines = [f'Mention 1/{events[0].id} not answered: check failed: ControllerRejected'] if burst else []
-            elif burst:
-                assert texts == [GLITCH]
-                lines = [f'Mention 1/{events[0].id} not answered, told why: controller unavailable']
-            else:  # Not a ping, so what it has always said.
-                assert texts == ['the workshop controller is temporarily unavailable.']
+            else:  # The outage notice, which answers for the whole burst.
+                assert texts == [UNREACHABLE]
                 lines = []
             assert mention_lines(caplog) == lines
         finally:
@@ -1553,7 +1556,8 @@ def test_a_burst_pings_fixed_line_needs_the_ping_to_still_stand(monkeypatch, tmp
             fri.chat_once.assert_awaited_once()
             ping.reply.assert_not_awaited()
             after.reply.assert_not_awaited()
-            assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: controller unavailable']
+            gate = 'missing permissions' if change == 'access' else 'message changed'
+            assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: reply withheld: {gate}']
         finally:
             released.set()
             await fri.close()
@@ -1562,7 +1566,7 @@ def test_a_burst_pings_fixed_line_needs_the_ping_to_still_stand(monkeypatch, tmp
 
 @pytest.mark.parametrize('text,path', [('<@99> forget me', '/chat/memory/control'),
                                        ('<@99> show my memory', '/chat/context')])
-def test_a_privacy_control_ping_hears_the_glitch_line_when_the_controller_is_down(monkeypatch, tmp_path, caplog, text, path):
+def test_a_privacy_control_ping_hears_the_outage_notice_when_the_controller_is_down(monkeypatch, tmp_path, caplog, text, path):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
@@ -1576,8 +1580,8 @@ def test_a_privacy_control_ping_hears_the_glitch_line_when_the_controller_is_dow
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
-            assert [item.args[0] for item in event.reply.await_args_list] == [GLITCH]
-            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
+            assert [item.args[0] for item in event.reply.await_args_list] == [UNREACHABLE]
+            assert mention_lines(caplog) == []
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -1646,7 +1650,7 @@ def test_a_queued_burst_pings_outage_line_needs_the_ping_to_still_stand(monkeypa
             ping.reply.assert_not_awaited()
             texts = [item.args[0] for item in after.reply.await_args_list]
             if change == 'none':
-                assert texts == [str(ReplyInProgress()), GLITCH]
+                assert texts == [str(ReplyInProgress()), UNREACHABLE]
                 assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered, told why: controller unavailable']
             else:
                 assert texts == [str(ReplyInProgress())]
@@ -1680,8 +1684,8 @@ def test_a_privacy_control_ping_hears_about_an_outage_whatever_changed(monkeypat
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
-            assert [item.args[0] for item in event.reply.await_args_list] == [GLITCH]
-            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
+            assert [item.args[0] for item in event.reply.await_args_list] == [UNREACHABLE]
+            assert mention_lines(caplog) == []
         finally:
             await fri.close()
     asyncio.run(scenario())

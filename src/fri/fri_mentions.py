@@ -9,7 +9,7 @@ import discord
 from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
-from .fri_errors import AuthorErased, ControllerUnavailable
+from .fri_errors import UNREACHABLE, AuthorErased, ControllerUnavailable
 from .fri_meme_media import sources
 from .privacy import clean
 
@@ -25,7 +25,7 @@ NOTICES = {'stale event': 'took me too long on that one. ping me again if you st
            'nearby message changed': CONTEXT_CHANGED, 'nearby privacy changed': CONTEXT_CHANGED,
            'check failed: ControllerRejected': CONTEXT_CHANGED}
 GLITCH = 'that one glitched on my end. ping me again.'
-NOTICES['controller unavailable'] = GLITCH
+NOTICES['controller unavailable'] = UNREACHABLE
 OUTAGES = ('controller unavailable', 'check failed: ControllerUnavailable')
 
 

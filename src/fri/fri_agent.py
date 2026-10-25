@@ -448,9 +448,11 @@ class Agent:
     async def withheld(self, message, events, reason, invitation=None, *, logged=None, fenced=True):
         """Say why a reply can't go out while the message still stands to be answered; else log why.
         `fenced`: a ping's notice also needs its author not to have erased since (see notice)."""
-        from .fri_mentions import notice_for
+        from .fri_mentions import OUTAGES, notice_for
         text = await invitation.notice(reason, fenced=fenced) if invitation else notice_for(reason)
-        if text:
+        if text and reason in OUTAGES:  # The outage notice, so once per channel per five minutes.
+            text = await self.unreachable(message, answering=True)
+        elif text:
             try:
                 await message.reply(text, mention_author=False, allowed_mentions=NO_MENTIONS)
             except discord.HTTPException:
@@ -524,6 +526,8 @@ class Agent:
         if revision is None and not privacy:  # Privacy controls don't depend on this read.
             try:
                 revision = await self.revision(user)
+            except ControllerUnavailable:
+                raise  # Its notice is the outage notice (see listen).
             except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
                 return await self.unreadable(message, events, exc, invitation, forgotten)
         since = None if privacy else (forgotten, revision)  # A privacy control always hears how it went.
@@ -542,10 +546,13 @@ class Agent:
                     noticed, refusal, erasure = True, None, None  # Why not, if the checks before the notice fail.
                     async def eligible():  # Run just before the notice posts.
                         nonlocal refusal, erasure
-                        if invitation and not await invitation.current():
-                            refusal = invitation.refusal
-                        else:
-                            erasure = await self.erasure(user, *since)
+                        try:
+                            if invitation and not await invitation.current():
+                                refusal = invitation.refusal
+                            else:
+                                erasure = await self.erasure(user, *since)
+                        except ControllerUnavailable:
+                            erasure = 'check failed: ControllerUnavailable'  # Said below, as an outage.
                         return not (refusal or erasure)
                     await self.fri.waiting_notices.send(message, eligible)  # Deleted once a reply to them lands.
                     if refusal:
@@ -580,16 +587,15 @@ class Agent:
             recheck = True  # E.g. they erased while a panel or ambient reply kept this one waiting.
 
     async def unreadable(self, message, events, exc, invitation, forgotten):
-        """A message whose author's privacy revision couldn't be read as it came in: say why, as its
-        reply would have, unless they erased meanwhile."""
+        """A message whose author's privacy revision couldn't be read as it came in, other than in an
+        outage (see listen): say why, as its reply would have, unless they erased meanwhile."""
         if self.forgotten.get(message.author.id, 0) != forgotten:
             return self.missed(events, 'author privacy changed')
         if not invitation and isinstance(exc, commands.UserFeedbackCheckFailure):
-            # Not a ping, so what its reply would have said, e.g. with the controller down.
+            # Not a ping, so what its reply would have said, e.g. the controller refusing.
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             return self.answered(events)
-        reason = 'controller unavailable' if isinstance(exc, ControllerUnavailable) else 'check failed: '+type(exc).__name__
-        return await self.withheld(message, events, reason, invitation)
+        return await self.withheld(message, events, 'check failed: '+type(exc).__name__, invitation)
 
     def missed(self, events, reason):
         for event in events:
@@ -775,6 +781,8 @@ class Agent:
         elif not privacy:  # A DM's too, as it comes in, so an erasure during any wait below counts.
             try:
                 observed = await self.revision(message.author.id)
+            except ControllerUnavailable:
+                raise  # Its notice is the outage notice (see listen).
             except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
                 return await self.unreadable(message, [message], exc, invitation, forgotten)
         if message.id in self.replying:
@@ -855,6 +863,8 @@ class Agent:
             invitation.forgotten = forgotten
         try:
             profile = await self.profile(channel, message.author.id)
+        except ControllerUnavailable:
+            raise  # Its notice is the outage notice (see listen).
         except commands.UserFeedbackCheckFailure as exc:
             if not invitation:
                 raise
