@@ -25,8 +25,8 @@ from fri.fri import FIRST_HERE, FIRST_MEMORY, FIRST_PROFILE, NO_MENTIONS, Fri
 from fri.fri_agent import Agent
 from fri.fri_chat import Chat, ChatResult
 from fri.fri_errors import ControllerRejected
-from fri.fri_memory import describe_profile, note_place, server_wide
-from fri.fri_memory_panel import SHOWN, MemoryView, show
+from fri.fri_memory import describe_profile, note_place, profiled, server_wide
+from fri.fri_memory_panel import SHOWN, EditMemory, MemoryView, show
 
 GENERAL, GAMING, STAFF, SPICY, DM, THREAD, SECRET = 1, 2, 5, 6, 900, 70, 71
 
@@ -516,6 +516,30 @@ def test_panel_labels_notes_and_stays_inside_discords_limits(monkeypatch, tmp_pa
             await show(w.fri, interaction, scope, state=state)
             body = shown.await_args.kwargs['embed'].description
             assert len(body) <= 4096 and 'games · across the server' in body and 'more. Remove some' in body
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_wording_edited_in_a_dm_stays_in_the_dm(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        shown = AsyncMock()
+        monkeypatch.setattr('fri.fri_panel.reply', shown)
+        monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+        try:
+            await w.say(GENERAL, 'fri I like chess', 'noted', note('I like chess'))
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            assert [row['scope'] for row in state['entries']] == ['server']
+            modal = EditMemory(MemoryView(w.fri, scope, state, selected=state['entries'][0]['id']))
+            modal.preference._value = 'I prefer quiet conversations'
+            await modal.on_submit(Mock(spec=discord.Interaction, id=int(dm_control()['id']), guild_id=None,
+                                       channel_id=DM, user=SimpleNamespace(id=20, display_name='friend')))
+            assert 'stays private, so it now lives only here' in shown.await_args.kwargs['embed'].description
+            await w.say(GAMING, 'fri recommend me something')
+            assert 'quiet conversations' not in json.dumps(model_context(w), default=str)
         finally:
             await w.fri.close()
     run(scenario)

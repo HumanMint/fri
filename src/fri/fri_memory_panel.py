@@ -165,6 +165,8 @@ class EditMemory(discord.ui.Modal):
                 **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
                 'action': 'replace', 'evidence': self.preference.value})
             view.cog.agent.forget(interaction.user.id)
-            await show(view.cog, interaction, view.scope, state=state, notice='Updated that preference.')
+            moved = view.selected.get('scope', view.scope['conversation_id']) != view.scope['conversation_id']
+            await show(view.cog, interaction, view.scope, state=state, notice='Updated that preference.'+(
+                ' What you type here stays private, so it now lives only here.' if moved else ''))
         except commands.UserFeedbackCheckFailure as exc:
             await show(view.cog, interaction, view.scope, notice=str(exc))
