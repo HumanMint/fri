@@ -132,19 +132,34 @@ def test_rejected_sign_in_sends_one_owner_dm_until_a_token_works_again():
     asyncio.run(scenario())
 
 
-def test_sign_in_notice_runs_beside_reviews_and_usage_and_retries(monkeypatch):
+def test_sign_in_dm_is_never_repeated_after_a_send_but_a_failed_lookup_retries():
     async def scenario():
         fri, owner = notice_runtime(rejected=True)
-        owner.send.side_effect = RuntimeError('DMs closed')
+        # Discord may have accepted it before the response was lost; a retry would carry a new nonce.
+        owner.send.side_effect = TimeoutError()
+        for _ in range(3):
+            await Fri.subscription_notice(fri)
+        owner.send.assert_awaited_once()
+        fri.chat.subscription.rejected = False
+        await Fri.subscription_notice(fri)
+        fri.chat.subscription.rejected = True
+        fri.get_user = lambda _: None
+        fri.fetch_user = AsyncMock(side_effect=[TimeoutError(), owner])
+        await Fri.subscription_notice(fri)
+        assert owner.send.await_count == 1 and not fri.subscription_noticed  # Nothing was sent yet.
+        owner.send.side_effect = None
+        await Fri.subscription_notice(fri)
+        assert owner.send.await_count == 2 and fri.subscription_noticed
+    asyncio.run(scenario())
+
+
+def test_sign_in_notice_runs_beside_reviews_and_usage(monkeypatch):
+    async def scenario():
+        fri, owner = notice_runtime(rejected=True)
         fri.subscription_notice = lambda: Fri.subscription_notice(fri)
         fri.flush_usage = AsyncMock()
         notify = AsyncMock()
         monkeypatch.setattr('fri.fri.notify_owner', notify)
-        await Fri.owner_reviews.coro(fri)
-        await fri.sign_in_notice
-        fri.flush_usage.assert_awaited_once()
-        notify.assert_awaited_once_with(fri)
-        assert not fri.subscription_noticed  # Logged; a later tick retries.
         # discord.py sleeps out a rate limit's retry_after inside send(); later ticks must not wait for it.
         release = asyncio.Event()
 
@@ -154,8 +169,8 @@ def test_sign_in_notice_runs_beside_reviews_and_usage_and_retries(monkeypatch):
         for _ in range(3):
             await Fri.owner_reviews.coro(fri)
             await asyncio.sleep(0)
-        assert fri.flush_usage.await_count == notify.await_count == 4
-        assert owner.send.await_count == 2 and not fri.sign_in_notice.done()  # One send in flight, not one per tick.
+        assert fri.flush_usage.await_count == notify.await_count == 3
+        assert owner.send.await_count == 1 and not fri.sign_in_notice.done()  # One send in flight, not one per tick.
         release.set()
         await fri.sign_in_notice
         assert fri.subscription_noticed

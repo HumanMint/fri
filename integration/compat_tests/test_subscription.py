@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -90,11 +91,14 @@ def test_refused_refresh_needs_the_owner_and_logs_only_its_cause(tmp_path, caplo
 
 MALFORMED = [{}, [], {'access_token': 'private-a', 'token_type': 'Bearer', 'expires_in': 0},
              {'access_token': 'private-a', 'token_type': 'Bearer', 'expires_in': None},
-             {'access_token': 'private-a', 'token_type': None, 'expires_in': 60}]
+             {'access_token': 'private-a', 'token_type': None, 'expires_in': 60},
+             {'access_token': 123, 'token_type': 'Bearer', 'expires_in': 60},
+             {'access_token': 'private-a', 'token_type': 'Bearer', 'expires_in': 60, 'scope': 7}]
 
 
 @pytest.mark.parametrize('outcome', [httpx.Response(503, text='private outage'), httpx.Response(429, json={'error': 'slow down'}),
                                      httpx.Response(200, text='not json'), httpx.ConnectError('private host'),
+                                     httpx.Response(200, text='{"access_token": "private-a", "token_type": "Bearer", "expires_in": 1e999}'),
                                      *(httpx.Response(200, json=body) for body in MALFORMED)])
 def test_transient_refresh_failure_does_not_tell_anyone_to_reconnect(tmp_path, caplog, outcome):
     path = tmp_path / 'session.json'
@@ -124,7 +128,7 @@ def test_renewal_without_the_plan_scope_is_a_refusal(tmp_path, caplog):
 
 
 @pytest.mark.parametrize('damage', ['expires_at', 'access_token', 'refresh_token', 'client_id', 'ext_agent_host_id',
-                                    'not json', 'not an object'])
+                                    'not json', 'not an object', 'null scopes', 'numeric access token', 'string expiry'])
 def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_path, caplog, damage):
     path = tmp_path / 'session.json'
     saved = expired(path, expires_at=0 if damage in ('refresh_token', 'client_id', 'ext_agent_host_id') else time.time() + 3600)
@@ -132,12 +136,74 @@ def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_
         path.write_text('{"access_token": "private')
     elif damage == 'not an object':
         path.write_text('["private"]')
+    elif damage in ('null scopes', 'numeric access token', 'string expiry'):
+        key, value = {'null scopes': ('scopes', None), 'numeric access token': ('access_token', 7),
+                      'string expiry': ('expires_at', 'soon')}[damage]
+        private_json(path, {**saved, key: value})
     else:
         private_json(path, {k: v for k, v in saved.items() if k != damage})
     session = Subscription(path, httpx.MockTransport(lambda _: pytest.fail('no refresh from an incomplete sign-in')))
     with pytest.raises(SubscriptionError, match='Reconnect') as exc:
         session.access_token()
     assert not isinstance(exc.value, SubscriptionUnavailable) and session.rejected
-    assert 'saved sign-in is unreadable or incomplete' in caplog.text and 'private' not in caplog.text
+    assert 'ChatGPT sign-in rejected: saved sign-in' in caplog.text and 'private' not in caplog.text
     private_json(path, {**saved, 'expires_at': time.time() + 3600})
     assert session.access_token() == 'old' and not session.rejected
+
+
+def test_rotated_refresh_token_is_kept_even_when_the_rest_of_the_renewal_is_unusable(tmp_path):
+    path = tmp_path / 'session.json'
+    saved = expired(path)
+    rotated = httpx.Response(200, json={'access_token': 'private-a', 'refresh_token': 'rotated',
+                                        'token_type': 'Bearer', 'expires_in': None})
+    with pytest.raises(SubscriptionUnavailable):
+        Subscription(path, httpx.MockTransport(lambda _: rotated)).access_token()
+    assert json.loads(path.read_text()) == {**saved, 'refresh_token': 'rotated'}  # Still expired, so the next call renews.
+
+
+def test_renewal_without_a_refresh_token_keeps_the_saved_one(tmp_path):
+    path = tmp_path / 'session.json'
+    expired(path)
+    renewed = httpx.Response(200, json={'access_token': 'new', 'refresh_token': None, 'token_type': 'Bearer',
+                                        'expires_in': 3600})
+    assert Subscription(path, httpx.MockTransport(lambda _: renewed)).access_token() == 'new'
+    record = json.loads(path.read_text())
+    assert record['refresh_token'] == 'private-refresh' and record['access_token'] == 'new'
+
+
+class Paused:
+    """The session path, except that one thread's existence check stalls and then sees no file."""
+
+    def __init__(self, path):
+        self.path, self.checking, self.release = path, threading.Event(), threading.Event()
+
+    def exists(self):
+        if threading.current_thread().name == 'stale':
+            self.checking.set()
+            self.release.wait(5)
+            return False
+        return self.path.exists()
+
+    def __getattr__(self, name):
+        return getattr(self.path, name)
+
+
+def test_an_older_missing_file_check_cannot_override_a_newer_success(tmp_path):
+    path = tmp_path / 'session.json'
+    expired(path, expires_at=time.time() + 3600)
+    session = Subscription(path)
+    session.path = Paused(path)
+    errors = []
+
+    def stale():
+        try:
+            session.access_token()
+        except SubscriptionError as exc:
+            errors.append(exc)
+    worker = threading.Thread(target=stale, name='stale')
+    worker.start()
+    assert session.path.checking.wait(5)
+    assert session.access_token() == 'old' and not session.rejected
+    session.path.release.set()
+    worker.join(5)
+    assert errors and not session.rejected  # The stale refusal finished last but observed first.

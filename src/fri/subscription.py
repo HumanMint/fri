@@ -3,8 +3,10 @@
 import fcntl
 import json
 import logging
+import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -69,14 +71,36 @@ def validate_identity(token, client_id, nonce, jwks, previous=None):
     return claims
 
 
+def usable(value):
+    return isinstance(value, str) and bool(value)
+
+
+def lifetime(value):
+    """Whole seconds from a token response, or None unless finite, positive and under a year."""
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(seconds) if math.isfinite(seconds) and 1 <= seconds <= 365 * 86400 else None
+
+
 def token_record(tokens, previous, *, client_id, host_id, identity=None):
-    scopes = tokens.get('scope', ' '.join(previous.get('scopes', []))).split()
-    if PLAN_SCOPE not in scopes or not tokens.get('access_token'):
-        raise SubscriptionError('ChatGPT plan access was not granted. Reconnect Fri with ChatGPT.')
-    if tokens.get('token_type', '').lower() != 'bearer' or int(tokens.get('expires_in', 0)) <= 0:
+    if not isinstance(tokens, dict):
         raise SubscriptionError('The subscription sign-in returned invalid credentials.')
-    return {**previous, **tokens, 'client_id': client_id, 'ext_agent_host_id': host_id,
-            'scopes': scopes, 'expires_at': time.time() + int(tokens['expires_in']),
+    saved_scopes = previous.get('scopes')
+    scope = tokens.get('scope', ' '.join(saved_scopes) if isinstance(saved_scopes, list) else '')
+    scopes = scope.split() if isinstance(scope, str) else []
+    if PLAN_SCOPE not in scopes or not usable(tokens.get('access_token')):
+        raise SubscriptionError('ChatGPT plan access was not granted. Reconnect Fri with ChatGPT.')
+    expires = lifetime(tokens.get('expires_in'))
+    if not isinstance(tokens.get('token_type'), str) or tokens['token_type'].lower() != 'bearer' or expires is None:
+        raise SubscriptionError('The subscription sign-in returned invalid credentials.')
+    # A response without a usable refresh token keeps the one already saved.
+    kept = {} if usable(tokens.get('refresh_token')) else {'refresh_token': previous.get('refresh_token')}
+    return {**previous, **tokens, **kept, 'client_id': client_id, 'ext_agent_host_id': host_id,
+            'scopes': scopes, 'expires_at': time.time() + expires,
             **({'subject': identity['sub'], 'email': identity.get('email'), 'issuer': ISSUER}
                if identity else {})}
 
@@ -91,23 +115,37 @@ class Subscription:
         self.path = Path(path)
         self.transport = transport
         self.rejected = False  # Set by a refusal that needs the owner, cleared by the next usable token.
+        self.guard = threading.Lock()
+        self.observed = self.settled = 0
+
+    def observation(self):
+        with self.guard:
+            self.observed += 1
+            return self.observed
+
+    def settle(self, observation, rejected):
+        """Calls finish out of order across threads; only a newer observation may change the flag."""
+        with self.guard:
+            if observation > self.settled:
+                self.settled, self.rejected = observation, rejected
 
     def access_token(self):
+        observation = self.observation()
         if not self.path.exists():
-            self.rejected = True
+            self.settle(observation, True)
             raise SubscriptionError('Fri needs a ChatGPT subscription sign-in. Ask the owner to connect them.')
         with self.path.with_suffix('.lock').open('a') as lock:
             os.chmod(lock.name, 0o600)
             fcntl.flock(lock, fcntl.LOCK_EX)
-            # Set under the lock, so an older refusal can't land after a newer success.
+            observation = self.observation()
             try:
                 token = self.locked_token()
             except SubscriptionUnavailable:
                 raise
             except SubscriptionError:
-                self.rejected = True
+                self.settle(observation, True)
                 raise
-            self.rejected = False
+            self.settle(observation, False)
             return token
 
     def locked_token(self):
@@ -115,14 +153,17 @@ class Subscription:
             saved = json.loads(self.path.read_text())
         except ValueError:
             saved = None
-        if (not isinstance(saved, dict) or not saved.get('access_token') or
-                not isinstance(saved.get('expires_at'), (int, float))):
+        expires_at = saved.get('expires_at') if isinstance(saved, dict) else None
+        if (not isinstance(saved, dict) or not usable(saved.get('access_token')) or isinstance(expires_at, bool) or
+                not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at)):
             raise incomplete()
-        if PLAN_SCOPE not in saved.get('scopes', []):
+        scopes = saved.get('scopes')
+        if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes) or PLAN_SCOPE not in scopes:
+            LOG.warning('ChatGPT sign-in rejected: saved sign-in has no plan scope')
             raise SubscriptionError('Fri has no ChatGPT plan permission. Reconnect their subscription.')
-        if saved['expires_at'] > time.time() + 90:
+        if expires_at > time.time() + 90:
             return saved['access_token']
-        if not all(saved.get(key) for key in ('refresh_token', 'client_id', 'ext_agent_host_id')):
+        if not all(usable(saved.get(key)) for key in ('refresh_token', 'client_id', 'ext_agent_host_id')):
             raise incomplete()
         tokens = None
         try:
@@ -135,6 +176,9 @@ class Subscription:
             renewed = token_record(tokens, saved, client_id=saved['client_id'],
                                    host_id=saved['ext_agent_host_id'])
         except (httpx.HTTPError, SubscriptionError, KeyError, ValueError, TypeError, AttributeError) as exc:
+            rotated = tokens.get('refresh_token') if isinstance(tokens, dict) else None
+            if usable(rotated) and rotated != saved['refresh_token']:
+                private_json(self.path, {**saved, 'refresh_token': rotated})  # The old one may be spent already.
             # A malformed success is the provider's fault, not the grant's; only a refusal needs the owner.
             withdrawn = plan_withdrawn(tokens)
             refused = withdrawn or refusal(exc)

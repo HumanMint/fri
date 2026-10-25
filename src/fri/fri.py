@@ -690,10 +690,10 @@ class Fri(discord.Client):
                 self.subscription_noticed = False
             elif not self.subscription_noticed:
                 owner = self.get_user(self.owner_id) or await self.fetch_user(self.owner_id)
+                self.subscription_noticed = True  # At most once: a send whose response was lost isn't repeated.
                 await owner.send(SIGN_IN_NOTICE, allowed_mentions=NO_MENTIONS)
-                self.subscription_noticed = True
-        except Exception as exc:  # A later tick retries.
-            LOG.warning('Owner sign-in notice pending: %s', type(exc).__name__)
+        except Exception as exc:  # A failed lookup retries next tick; a failed send waits until a token works again.
+            LOG.warning('Owner sign-in notice not sent: %s', type(exc).__name__)
 
     @tasks.loop(seconds=15)
     async def owner_reviews(self):
