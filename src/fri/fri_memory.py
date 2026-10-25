@@ -2,12 +2,43 @@
 
 import re
 
+import discord
+
 from .privacy import clean
 
 CATEGORIES = ('nickname', 'games', 'music', 'hobbies', 'conversation')
 MAX_NOTES = 10
 PER_CATEGORY = 3
 TTL = 90 * 86400
+PROFILES = 'member-profiles'  # The controller keeps one profile per member across readable channels.
+PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_thread)
+
+
+def server_wide(channel):
+    """Everyone in the server can read it, now. Only such a channel feeds a member's profile.
+
+    A private thread, an age-restricted channel, or one the default role can't view keeps what was
+    said in it to itself. Anything Fri can't resolve counts as restricted.
+    """
+    guild = getattr(channel, 'guild', None)
+    if guild is None:
+        return False
+    if isinstance(channel, discord.Thread):
+        if channel.type not in PUBLIC_THREADS:
+            return False
+        channel = channel.parent
+    is_nsfw = getattr(channel, 'is_nsfw', None)
+    if channel is None or not callable(is_nsfw) or is_nsfw():
+        return False
+    try:
+        return bool(channel.permissions_for(guild.default_role).view_channel)
+    except (AttributeError, TypeError):
+        return False
+
+
+def before_removal(message_id, profile):
+    """Sent before the member last edited their memory, so Fri keeps it nowhere (the controller's removed_at)."""
+    return discord.utils.snowflake_time(int(message_id)).timestamp() <= (profile.get('removed_at') or 0)
 
 
 def personal_note(candidate, text):
@@ -48,6 +79,71 @@ def memory_intent(text):
     if text in ('remember me again', 'start remembering me', 'turn memory on', 'enable memory'):
         return 'enable'
     return None
+
+
+def units(text):
+    """Discord counts message and embed lengths in UTF-16 code units, so an emoji counts twice."""
+    return len(text.encode('utf-16-le'))//2
+
+
+def clip(text, limit):
+    """At most limit UTF-16 code units, never splitting a character."""
+    kept, used = [], 0
+    for char in text:
+        used += 2 if ord(char) > 0xFFFF else 1
+        if used > limit:
+            break
+        kept.append(char)
+    return ''.join(kept)
+
+
+def profiled(fri, scope):
+    """Ask for the member's profile when the controller keeps them; otherwise the request is unchanged."""
+    return {**scope, 'profiles': True} if getattr(fri, 'profiles', False) else scope
+
+
+def note_place(get_channel, scope, conversation, *, public=False):
+    """Where a note shows, from the member's side. A public listing holds only the profile and here."""
+    if scope == 'server':
+        return 'across the server'
+    if scope in ('here', conversation):
+        return 'only in this channel' if public else 'only here'
+    kind, _, channel_id = scope.partition(':')
+    channel = get_channel(int(channel_id)) if kind == 'public' and channel_id.isdigit() else None
+    if channel is not None:
+        return 'only in #'+discord.utils.escape_markdown(channel.name)
+    return 'only in a channel i can’t see anymore' if kind == 'public' else 'only in another private chat'
+
+
+def describe_profile(enabled, groups, private):
+    """What the member's notes look like from here, grouped by where each one shows.
+
+    groups: [(heading, [evidence, ...])], already escaped. Public lists only what this channel can
+    see; a private conversation, seen only by the member, lists everything.
+    """
+    if not enabled:
+        return 'memory’s off, so i’m not keeping anything. say “remember me again” to turn it back on.'
+    footer = ('\n\nserver stuff follows you everywhere in the server, the rest stays where you said it. notes last '
+              '90 days, recent chats a week. My memory edits or removes one. “forget me” wipes all of it and turns '
+              'memory off.' if private else
+              '\n\nwhat you tell me in channels everyone here can read follows you around the server and into DMs. '
+              'DMs, the /fri panel and restricted channels stay where they were said. ask in DMs or /fri for the full list. '
+              '“forget me” wipes all of it and turns memory off.')
+    if not any(notes for _, notes in groups):
+        return ('memory’s on. nothing kept about you yet.' if private else
+                'memory’s on. nothing kept that this channel can see yet.') + footer
+    lines = ['memory’s on. everything i keep about you:' if private else 'memory’s on. what i keep that this channel can see:']
+    hidden = 0
+    for heading, notes in groups:
+        for index, note in enumerate(notes):
+            line = ('\n**'+heading+'**' if index == 0 else '')+'\n- '+note
+            if hidden or units(''.join(lines)+line+footer) > 1800:
+                hidden += 1  # Discord's limit. Once one is left out, the rest go too, headings intact.
+            else:
+                lines.append(line)
+    if hidden:
+        lines.append(f'\n…and {hidden} more in My memory.')
+    return ''.join(lines)+footer
 
 
 def describe_memory(profile):

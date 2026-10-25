@@ -39,7 +39,8 @@ def test_preferences_keep_several_per_category_dedupe_bound_and_survive_restart(
     remember(store, latest['evidence'], latest['category'])
     assert len(entries(store, '123', 'public:1', '20')['entries']) == 10
     assert latest['expires_at']-latest['at'] == 90*86400
-    assert not entries(store, '123', 'private:1', '20')['entries']
+    assert not entries(store, '123', 'public:2', '20')['entries']
+    assert len(entries(store, '123', 'private:1', '20')['entries']) == 10  # Only the member sees a DM.
     assert not entries(store, '123', 'public:1', '30')['entries']
 
 
@@ -101,7 +102,7 @@ def test_item_edits_fail_closed_at_scope_source_age_and_content_boundaries(store
     if change == 'user':
         user = event['user_id'] = '30'
     elif change == 'conversation':
-        scope, event['channel_id'] = 'private:1', '1'
+        scope, event['channel_id'] = 'public:2', '2'
     elif change.startswith('source_'):
         event[change[7:]+'_id'] = '999'
     elif change == 'stale':

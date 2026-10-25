@@ -93,7 +93,7 @@ def test_real_controller_privacy_scope_does_not_grant_chat_or_settings(harness):
             json={'guild_id': guild, 'channel_id': channel, 'user_id': '11'})
         assert r.status_code == expected
         if expected == 200:
-            assert r.json() == {'enabled': True, 'revision': 0}
+            assert r.json() == {'enabled': True, 'revision': 0, 'removed_at': 0}
     assert h.client.post('/agent/settings', headers=headers('fri'),
         json={'guild_id': '123', 'user_id': '11', 'version': 2, 'changes': {'meme_enabled': False}}).status_code == 403
     assert h.client.post('/agent/settings', headers=headers('fri'),
