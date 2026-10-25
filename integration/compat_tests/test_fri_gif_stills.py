@@ -8,7 +8,7 @@ import json
 import struct
 import zlib
 from functools import partial
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import discord
@@ -16,8 +16,11 @@ import httpx
 import pytest
 from PIL import Image
 
+from compat_tests.test_fri_chat import response_event
 from compat_tests.test_fri_looking import loads, picture, read_harness
 from compat_tests.test_fri_mentions import environment
+from fri import feedback as commands
+from fri.fri import Fri
 from fri.fri_actions import Actions
 from fri.fri_chat import Chat
 from fri.fri_images import attach, look, looked_unchanged
@@ -242,6 +245,48 @@ def test_a_nearby_animated_png_or_webp_is_labelled_too(monkeypatch, tmp_path):
         try:
             await look(context, [apng])
             assert context['inspected_images'][0]['still'] == 'gif first frame'
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['none', 'removed', 'swapped'])
+def test_an_outside_mentions_gif_preview_is_rechecked_before_the_model_sees_it(monkeypatch, tmp_path, change):
+    """Outside a configured channel the invitation's own check runs before the request; its
+    fingerprint doesn't cover embeds, so a gif link's preview is refetched too."""
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path)
+        fri.data = tmp_path
+        post = message('https://tenor.com/view/dance-123', user=30, age=60)
+        post.embeds = [tenor_embed()]
+        event = message('<@99> which gif is this?')
+        loads(monkeypatch)
+        fri.chat_once = MethodType(Fri.chat_once, fri)
+        sent = []
+
+        def handler(request):
+            sent.append(json.loads(request.content))
+            answer = {'response_kind': 'reply', 'reaction': None, 'reply': 'the dancing one',
+                      'request_draft': None, 'action': None, 'notes': [], 'allow_closing': False}
+            return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(answer)))+'\n\n')
+        fri.chat = Chat(SimpleNamespace(access_token=lambda: 'test'), httpx.MockTransport(handler))
+
+        async def headers():  # The poster swaps or removes the gif while Fri signs in.
+            if change != 'none':
+                changed = copy.copy(post)
+                changed.embeds = [] if change == 'removed' else [tenor_embed(PREVIEW.replace('dance', 'other'))]
+                rows[post.id] = changed
+            return {'Authorization': 'Bearer synthetic'}
+        fri.chat.headers = headers
+        try:
+            invitation = await Invitation.create(agent, event)
+            if change == 'none':
+                await fri.invited_talk(invitation, 'which gif is this?')
+                assert len(sent) == 1
+                return
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await fri.invited_talk(invitation, 'which gif is this?')
+            assert sent == []
         finally:
             await fri.close()
     asyncio.run(scenario())

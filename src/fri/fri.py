@@ -349,6 +349,10 @@ class Fri(discord.Client):
             # its invitation's own check instead, as before it replies.
             if fence and fence.get('invitation'):
                 await fence['invitation'].require_current()
+                # Its fingerprint doesn't cover embeds, so a gif link's preview it looked at is refetched.
+                from .fri_images import looked_unchanged
+                if not await looked_unchanged(context, [fence['invitation']]):
+                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
             elif fence:
                 # What came from a channel they can't see now (a read, an invited look around, Gene's
                 # receipts, a learning report) never reaches the request either. Delivery checks it again.
