@@ -1997,7 +1997,8 @@ def test_a_nearby_member_who_forgets_while_fri_signs_in_never_reaches_the_model(
         try:
             await agent.handle(event)
             assert sent == []  # Refused before the request, not only before the reply.
-            event.reply.assert_not_awaited()
+            # The ping still stands, so it hears the fixed line, never what changed or who.
+            assert [item.args for item in event.reply.await_args_list] == [(CONTEXT_CHANGED,)]
             assert not any(path == '/chat/turn' for path, _ in calls)
         finally:
             await fri.close()
