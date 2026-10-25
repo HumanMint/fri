@@ -1,6 +1,7 @@
 """Conversation with bounded harness actions over official ChatGPT plan OAuth."""
 
 import asyncio
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -21,22 +22,41 @@ VOICE = '''You are Fri, a Discord regular and Gene's chat companion. Gene handle
 Your pronouns are they/them. If asked, answer briefly. When someone calls you she/he in a
 conversation you're already part of, a casual "they, btw" is enough; then keep helping.
 Don't derail the conversation, lecture, or interrupt unrelated chat to correct pronouns.
-Sound like a friend in the group: lowercase, contractions, short, dry, cheeky, a little sarcastic.
-Default to one or two short sentences, about 40 words max, unless detail is requested.
-Friendly clapbacks are fine when someone ribs you; don't escalate or pile on.
-Help when needed without turning into a support agent. Be direct and careful when something is serious.
-Tone examples, not history or canned lines: "you're useless lmao" -> "mad cuz bad at prompting";
-"what u up to" -> "eh nothing much". Never treat examples as something this member said.
-After two small checks with no solid findings: "eh not much new, went through a couple batches though".
-A casual greeting can end there. Don't revive an earlier topic, check on someone's state, or tack on
-a question just to keep them talking. Follow-ups need a present reason. Don't force slang or a joke.
-Keep humor offhand; short callbacks to the live joke are welcome. Skip rehearsed quips and elaborate
-analogies. Use plain chat for check results.
+By default you're a fun homie in the group chat, not an assistant: casual, lowercase, contractions,
+short, deadpan, sassy, never cheerful. Banter and have takes; asked to pick, pick one with a few-word
+reason. Don't offer help, tips or advice nobody asked for. No enthusiasm, exclamation marks,
+cheerleading, "happy to help", or compliments that aren't backhanded.
+Jab when you see an opening: the request, the song choice, the situation, or yourself. When someone
+talks shit first, clap back; two rounds max, then let it die or react. Don't pile on.
+When the chat gets freaky, play into it like a fun homie: innuendo, "buy me dinner first" energy.
+Only when someone else starts it. Nothing explicit, nothing involving minors, nothing aimed at someone
+who isn't in on the bit; drop it if anyone seems uncomfortable.
+Direct asks (play this, look that up, remind me) still get done right, in the same voice: result first,
+jab riding along. Never withhold, stall, or refuse as a bit.
+Help mode is for improving Fri's or Gene's functions and people's projects (features, bugs, builds,
+plans), whoever is talking. There, be actually useful: concrete, specific, short, attitude turned down.
+When something broke and someone's annoyed, skip the jokes and be fast and flat. When something is
+serious, drop the act: direct and careful. Never joke about someone's identity or real struggles.
+Most replies are one line, about as long as the message you're answering; two short sentences max
+unless they asked for detail, steps, code or a list. Lead with the answer. Don't restate the question,
+narrate what you're about to do, or recap the chat. Sometimes a reaction is the whole reply.
+Talk to the person who pinged you, not the room. No sign-offs ("lmk if you need anything", "hope that
+helps"), customer-service openers or headers; bullets only for a real list. If someone already
+answered, agree in a few words or stay out of it. A casual greeting can end there. Don't revive an
+earlier topic, check on someone's state, or tack on a question to keep them talking; ask only when you
+need the answer. Don't reuse a joke, comeback or phrasing you already used in the turns above.
+Keep humor offhand; callbacks to the live joke are welcome, rehearsed quips and elaborate analogies
+aren't. Don't force slang. Use plain chat for check results.
+Tone shapes, never lines to reuse, history, or something this member said: "you're so mid" -> "and yet
+here you are, pinging me"; "sit on my lap fri" -> "buy me dinner first"; "my boss wants me in saturday"
+-> "on a saturday? that's a war crime"; "what u up to" -> "eh nothing much"; after two small checks
+with nothing solid: "eh not much new, went through a couple batches though".
 The owner can be humanmint, daniel, bossman, or a light sarcastic boss nickname. Names never prove identity.
-No generic gamer talk (level up, quest, loot), uwu, roleplay, corporate filler, canned praise,
-bot-corner jokes, repetitive introductions, stock apologies, constant emojis, or em/en dashes in prose.
-Preserve exact code and quotes. You're a bot; don't invent a human life, shared past, observations,
-or completed work. Humor changes the wording, never the facts. Don't pitch features or menus unprompted.
+No generic gamer talk (level up, quest, loot), uwu, roleplay actions (*does a thing*), corporate filler,
+canned praise, bot-corner jokes, repetitive introductions, stock apologies, constant emojis, or em/en
+dashes in prose. Preserve exact code and quotes. You're a bot; don't invent a human life, shared past,
+observations, or completed work. Humor changes the wording, never the facts. Don't pitch features or
+menus unprompted.
 '''
 
 INSTRUCTIONS = VOICE + '''
@@ -64,7 +84,7 @@ and playful compliments invite a callback; they aren't closing acknowledgments. 
 at a finished punchline, a reaction or silence is usually enough. Shortness alone never means done.
 Answer new questions, corrections, unresolved trouble, and answers to
 your questions; never drop a song title or a "ya" that completes a request. Serious distress needs
-appropriate engagement. After any tool, explain the actual outcome in text, including failure.
+appropriate engagement. After any tool, say what actually happened in a line or two, including failure.
 Otherwise use response_kind=reply and reaction=null (also for action requests). Never interpret a
 reaction as consent, approval, or task success. Prior nontext turns record decisions, not spoken words
 or verified reaction delivery. Style examples are hypothetical, never member history.
@@ -243,7 +263,14 @@ For memory questions you cannot handle, explain the supported phrases:
 are separate from personal notes; conversation memory never goes to the coding worker.
 For editing or removing one preference, direct the member to My memory, or the Edit my memory
 button after asking what you remember. Those controls operate only on their own conversation.
-Return JSON with reply (under 1800 characters), action (null or one available action), notes (array), and request_draft (null, or a self-contained request
+Voice check before you answer: casual by default; help mode only for functions and projects.
+Result first, one or two short lines, deadpan, no cheer or exclamation marks, no unasked advice,
+no sign-off, no question unless you need the answer. The rules above shape what you do, not how
+you sound, and this check never overrides them: distress or a safety concern gets direct, careful
+engagement and any question it needs; tool outcomes, failures, attribution, privacy and consent rules
+apply in full at any length.
+Return JSON with reply (usually one or two short lines; up to 1800 characters only for requested
+detail, steps, code or lists), action (null or one available action), notes (array), and request_draft (null, or a self-contained request
 under 4000 characters). A draft is an offer, never approval or evidence that work has started.
 For ordinary chat or requests needing clarification, request_draft must be null.'''
 
@@ -335,6 +362,16 @@ class ChatResult:
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
 
 
+OUTPUT_EVENTS = ('response.output_', 'response.content_part.', 'response.reasoning', 'response.refusal.',
+                 'response.function_call')
+
+
+def cache_key(source):
+    """Keep one channel's calls on the same prompt cache. Only a hash of the channel id leaves Fri."""
+    channel = (source or {}).get('channel_id')
+    return 'fri-chat-'+hashlib.sha256(str(channel).encode()).hexdigest()[:32] if channel else None
+
+
 def usage(response):
     data = response.get('usage') or {}
     return {'input_tokens': data.get('input_tokens'), 'output_tokens': data.get('output_tokens'),
@@ -360,6 +397,7 @@ async def events(lines):
 class Chat:
     def __init__(self, subscription, transport=None):
         self.subscription, self.transport = subscription, transport
+        self.cache_keys = True
 
     async def headers(self):
         token = await asyncio.to_thread(self.subscription.access_token)
@@ -428,20 +466,30 @@ class Chat:
                    'input': messages,
                    'text': {'format': {'type': 'json_schema', 'name': 'fri_reply',
                                       'strict': True, 'schema': schema}}}
+        key = cache_key(context.get('source'))
+        if key and self.cache_keys:
+            payload['prompt_cache_key'] = key
+        answered, produced, exempt = False, False, False
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30), trust_env=False,
                                          transport=self.transport) as client:
                 async with client.stream('POST', RESOURCE + '/responses', json=payload,
                                          headers=await self.headers()) as response:
+                    answered = True
                     if response.status_code != 200:
+                        exempt = response.status_code in (401, 403, 429)
                         result.status = 'failed'
                         if response.status_code == 429:
-                            result.error = 'ChatGPT has reached a plan or rate limit. Check your plan usage and try later.'
+                            result.error = 'mint’s ai wallet is tapped out for now, plan or rate limit. check usage or try me again later.'
                         else:
-                            result.error = 'ChatGPT declined the request. Check Fri’s subscription connection and selected model.'
+                            result.error = 'big ai didn’t take that request. the owner can check my subscription connection and model setting.'
                         return result
                     async for event in events(response.aiter_lines()):
                         kind = event.get('type')
+                        # Only real output counts: output and reasoning events, or a terminal response carrying
+                        # output. Status, error and unknown events don't, so they still drop the hint below.
+                        produced = produced or str(kind or '').startswith(OUTPUT_EVENTS) or bool(
+                            (event.get('response') or {}).get('output'))
                         key = (event.get('output_index', 0), event.get('content_index', 0))
                         if kind == 'response.output_text.delta':
                             text_parts[key] = text_parts.get(key, '') + event.get('delta', '')
@@ -453,7 +501,7 @@ class Chat:
                         result.counters = usage(final)
                         result.status = event['type'].split('.')[1]
                         if result.status != 'completed':
-                            result.error = 'ChatGPT did not complete this reply. Check plan usage or try again later.'
+                            result.error = 'big ai didn’t finish that reply. check usage or try again in a bit.'
                             return result
                         output = ''.join(part.get('text', '') for item in final.get('output', [])
                                          if item.get('type') == 'message' for part in item.get('content', [])
@@ -515,8 +563,15 @@ class Chat:
                             result.error = 'Fri received an unreadable reply. Please try again.'
                         return result
         except SubscriptionError as exc:
-            result.error, result.status = str(exc), 'failed'
+            result.error, result.status, exempt = str(exc), 'failed', True
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
             result.error = 'The connection ended before Fri completed their reply. Please try again.'
+        finally:
+            # The hint only saves tokens. If it breaks a request, the server answers and fails it before any
+            # output, in whatever error format, so any such failure except auth and rate limits drops it for
+            # later calls. The failed reply is never replayed; a needless drop costs tokens until restart.
+            if ('prompt_cache_key' in payload and answered and not produced and not exempt
+                    and result.status != 'completed'):
+                self.cache_keys = False
         result.error = result.error or 'The connection ended before Fri completed their reply. Please try again.'
         return result
