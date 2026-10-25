@@ -270,3 +270,92 @@ def test_a_thread_discord_archived_after_the_read_drops_it(monkeypatch, tmp_path
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_thread_whose_parent_discord_now_marks_age_restricted_is_dropped(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, _, post, thread = around(monkeypatch, tmp_path)
+        thread(channels[2], 2001)
+        actions = Actions(agent, 20, 999, False)  # A DM: no audience rule to lean on.
+        actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
+        try:
+            await actions.execute({'kind': 'read_recent', 'channel_id': '2001', 'window': 'recent'})
+            assert actions.sources == {'2001'} and await actions.valid()
+            fetched = copy.copy(channels[2])
+            fetched.nsfw, fetched.is_nsfw = True, lambda: True  # The cached parent still says it isn't.
+            channels[1].guild.fetch_channel = AsyncMock(side_effect=lambda cid: fetched if cid == 2 else channels[cid])
+            assert '2001' not in await actions.channels(fresh=True, around=True)
+            assert not await actions.valid()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_whose_only_reading_is_a_forums_threads_still_gets_the_read(monkeypatch, tmp_path):
+    import datetime as dt
+
+    from compat_tests.test_fri_links_fences import real_server
+    from compat_tests.test_fri_member_profiles import world
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        guild, _, channels = real_server(w, monkeypatch, [])
+        channels[2] = discord.ForumChannel(state=w.fri._connection, guild=guild, data={
+            'id': '2', 'name': 'forum', 'type': 15, 'position': 0, 'permission_overwrites': []})
+        guild._channels.update(channels)
+        guild._threads[2001] = discord.Thread(state=w.fri._connection, guild=guild, data={
+            'id': '2001', 'parent_id': '2', 'owner_id': '20', 'name': 'discussion', 'type': 11,
+            'last_message_id': None, 'message_count': 0, 'member_count': 1,
+            'thread_metadata': {'archived': False, 'auto_archive_duration': 1440, 'locked': False,
+                                'archive_timestamp': dt.datetime.now(dt.timezone.utc).isoformat()}})
+        w.fri.agent.state.update(channels=['2'], history_channels=[])
+        try:
+            listing = (await Actions(w.fri.agent, 20, 999, False).available())['read_recent']
+            assert listing['default_channel_id'] == '2001' and [row['channel_id'] for row in listing['channels']] == ['2001']
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_source_restricted_during_the_last_delivery_refetch_holds_the_answer(monkeypatch, tmp_path):
+    """valid() judges access after its Discord refetches, not before them."""
+    from compat_tests.test_fri_links_fences import everyone_reads, hosted
+    from compat_tests.test_fri_member_profiles import world
+    from fri.fri import Fri
+    from fri.fri_chat import ChatResult
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        everyone_reads(w, 1, 2)
+        target = w.message(2, 'whats going on in gaming', user=30, age=60)
+        target.created_at = discord.utils.snowflake_time(target.id)
+        target.jump_url = f'https://discord.com/channels/123/2/{target.id}'
+        event = w.message(1, 'fri whats going on in gaming')
+        hosted(w, 1, event)
+        event.reply = AsyncMock(return_value=SimpleNamespace(id=event.id+1, content='a reply'))
+        delivering = False
+
+        async def history(**_):
+            if delivering:  # One role loses #2 during delivery's refetch; speaker and Fri keep it.
+                w.channels[2].overwrites = {discord.Object(id=50): discord.PermissionOverwrite(view_channel=False)}
+            yield target
+        w.channels[2].history = history
+
+        async def respond(text, context, ready):
+            nonlocal delivering
+            await ready()
+            if not context.get('action_result'):
+                return ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': '2', 'window': 'recent'})
+            delivering = True
+            return ChatResult(status='completed', reply='they are planning movie night')
+
+        async def chat_once(text, context):
+            return await Fri.chat_once(w.fri, text, context)
+        w.fri.chat, w.fri.chat_once, w.fri.flush_usage = SimpleNamespace(respond=respond), chat_once, AsyncMock()
+        try:
+            await w.fri.agent.reply_once(event, event.content)
+            assert delivering
+            assert not any('movie night' in str(call.args) for call in event.reply.await_args_list)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())

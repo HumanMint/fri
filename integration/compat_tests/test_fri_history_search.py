@@ -76,6 +76,8 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'what is the most commonly recommended gaming laptop?',
                  'which is the most widely recommended Python tutorial?',
                  'what is the difference between shared and dedicated hosting?',
+                 'what is the best dermatologist recommended sunscreen?',
+                 'what is the average doctor recommended dose of vitamin D?',
                  'what was that'):
         assert not requested(text)
     assert valid_action(query())

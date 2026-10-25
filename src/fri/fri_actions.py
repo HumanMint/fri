@@ -173,6 +173,7 @@ class Actions:
         """Drop each channel this turn read from that `member` can't read now, judged from fetched
         overwrites and roles: the cached channel can lag a revoke (see Invitation.access). One read
         outside this channel's audience must also still keep nobody out."""
+        from .fri_conversation import age_restricted
         from .fri_memory import open_to_everyone
 
         read = sorted(self.sources & channels.keys())
@@ -189,7 +190,7 @@ class Actions:
                 parent = copy.copy(parent)
                 parent.guild = fresh_guild
                 permissions = parent.permissions_for(member)
-                if (not (permissions.view_channel and permissions.read_message_history) or
+                if (not (permissions.view_channel and permissions.read_message_history) or age_restricted(parent) or
                         (elsewhere(channels[channel_id]) and not open_to_everyone(parent))):
                     del channels[channel_id]
         except discord.HTTPException:
@@ -219,7 +220,8 @@ class Actions:
             return row
         # A forum holds threads, not posts: its threads are listed, the forum itself isn't read.
         readable = {k: v for k, v in (await self.channels(around=True)).items() if posts_in(v)}
-        default = next((k for k, v in channels.items() if posts_in(v)), None)
+        # A forum's threads can be all there is to read, so fall back to the first of those.
+        default = next((k for k, v in channels.items() if posts_in(v)), next(iter(readable), None))
         actions = {} if default is None else {'read_recent': {'channels': [listed(k, v) for k, v in readable.items()],
                     'default_channel_id': default, 'limit': 20, 'max_age_days': 7,
                     'description': 'Read one small recent batch when asked: text, what each post carries '
@@ -688,13 +690,14 @@ class Actions:
             from .fri_images import unchanged
             if not await unchanged(self.image_context, self.event):
                 return False
+            if not await self.reads_unchanged():
+                return False
+            if not await self.history.valid(await self.channels(around=True)):
+                return False
+            # Access after those Discord waits, so a channel restricted during the refetches still counts.
             channels = await self.channels(fresh=True)
             if not channels or not (self.sources <= set(channels) or
                                     self.sources <= set(await self.channels(fresh=True, around=True))):
-                return False
-            if not await self.history.valid(channels):
-                return False
-            if not await self.reads_unchanged():
                 return False
             for (scope, user), revision in self.revisions.items():
                 profile = await self.agent.profile(scope, user)
