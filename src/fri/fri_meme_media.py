@@ -113,9 +113,37 @@ async def load_image(url, channel, *, transport=None, gifs=False):
     return 'data:'+mime+';base64,'+base64.b64encode(body).decode()
 
 
+def gif_canvas(body):
+    """The canvas a GIF's first frame needs, read from its header: the logical screen, grown to the
+    first image descriptor's far corner. Pillow allocates that canvas while merely opening the file,
+    so it must be judged before. None when the header can't be read."""
+    if len(body) < 13 or body[:6] not in (b'GIF87a', b'GIF89a'):
+        return None
+    width, height, flags, pos = int.from_bytes(body[6:8], 'little'), int.from_bytes(body[8:10], 'little'), body[10], 13
+    if flags & 0x80:  # A global color table follows the screen descriptor.
+        pos += 3 * (2 << (flags & 7))
+    while pos < len(body):
+        if body[pos] == 0x2C:  # The first image descriptor: left, top, width, height.
+            if pos+9 > len(body):
+                return None
+            left, top, w, h = (int.from_bytes(body[pos+1+2*i:pos+3+2*i], 'little') for i in range(4))
+            return max(width, left+w), max(height, top+h)
+        if body[pos] != 0x21 or pos+2 > len(body):  # Only extensions may come before it.
+            return None
+        pos += 2
+        while pos < len(body) and body[pos]:
+            pos += body[pos]+1
+        pos += 1
+    return None
+
+
 def first_frame(body):
     """An animated image's first frame as a PNG, no wider or taller than STILL_SIDE."""
     from PIL import Image, UnidentifiedImageError
+    if body.startswith((b'GIF87a', b'GIF89a')):
+        canvas = gif_canvas(body)
+        if canvas is None or canvas[0]*canvas[1] > MAX_ANIMATED_PIXELS:
+            raise ValueError('Not a supported animated image')
     try:
         with Image.open(io.BytesIO(body)) as image:
             # The header's canvas size, before anything is decoded.

@@ -352,3 +352,24 @@ def test_an_animation_with_a_huge_canvas_is_refused_before_it_is_decoded():
                               embeds=[], content='')
         assert sources(big, gifs=True) is None  # An uploaded gif that big isn't even downloaded.
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('field', ['screen', 'frame'])
+def test_a_gif_whose_header_asks_for_a_huge_canvas_never_reaches_pillow(monkeypatch, field):
+    """Pillow allocates a GIF's canvas while opening it, so the header is judged first."""
+    async def scenario():
+        out = io.BytesIO()
+        Image.new('P', (2, 2)).save(out, 'GIF', disposal=2)
+        body = bytearray(out.getvalue())
+        if field == 'screen':
+            body[6:10] = (10000).to_bytes(2, 'little') * 2
+        else:  # A 2x2 screen whose first frame claims 10000x10000: Pillow grows the canvas to fit.
+            descriptor = body.index(b',')
+            body[descriptor+5:descriptor+9] = (10000).to_bytes(2, 'little') * 2
+
+        def never(*_, **__):
+            raise AssertionError('Pillow opened it')
+        monkeypatch.setattr('PIL.Image.open', never)
+        with pytest.raises(ValueError, match='Not a supported animated image'):
+            await load_image(ATTACHMENT, 1, transport=serve(bytes(body), 'image/gif'), gifs=True)
+    asyncio.run(scenario())
