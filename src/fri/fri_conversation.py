@@ -147,8 +147,12 @@ class Bursts:
         self.dropped([row[1] for row in rows], reason)
 
     def forget(self, user):
+        """Drop a member's bursts after a privacy control, except other privacy controls."""
         for key in [key for key in self.rows if key[1] == user]:
-            self.dropped([row[1] for rows in self.rows.pop(key) for row in rows], 'author privacy changed')
+            groups = self.rows.pop(key)
+            if kept := [rows for rows in groups if rows.alone]:
+                self.rows[key] = kept
+            self.dropped([row[1] for rows in groups if not rows.alone for row in rows], 'author privacy changed')
 
 
 async def live_rows(agent, message, burst):

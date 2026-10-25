@@ -10,7 +10,7 @@ import re
 import time
 import uuid
 from collections import Counter, defaultdict, deque
-from contextlib import closing
+from contextlib import closing, nullcontext
 
 import discord
 from discord.ext import tasks
@@ -94,6 +94,7 @@ class Agent:
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
         self.erased = {}  # member: how many of those erased their chats ("forget me"), not just a cache reset.
         self.turns = Turns(fri)  # Held by a direct reply through its delivery and save.
+        self.controls = defaultdict(asyncio.Lock)  # member: held while a privacy control of theirs is carried out.
         self.direct = {}  # Discord message ID: when the direct path took it, so attention never picks it too.
         self.pending = {}
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
@@ -503,7 +504,8 @@ class Agent:
         from .fri_pending import cancelled
         user = message.author.id
         events = [message, *(event for _, event, _ in burst if event is not message)]
-        privacy = memory_intent(text)
+        control = not (invitation and invitation.outside)  # Outside, all of it is chat (see Fri.talk).
+        privacy = memory_intent(text) if control else None
         if forgotten is None:
             forgotten = self.forgotten.get(user, 0)
         until = discord.utils.snowflake_time(message.id).timestamp()+QUEUE_SECONDS
@@ -514,11 +516,13 @@ class Agent:
                 return await self.unreadable(message, events, exc, invitation, forgotten)
         since = None if privacy else (forgotten, revision)  # A privacy control always hears how it went.
         recheck, noticed = waited, False  # Recheck erasure and the deadline before the next attempt.
-        if privacy or cancelled(text):
-            # Privacy controls and cancelling don't wait their turn (see Fri.talk). A cancel did wait in
-            # receive() for a delivered reply to be saved, so it cancels what that reply asked.
-            if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since) is not BUSY:
-                return
+        if privacy or (control and cancelled(text)):
+            # Privacy controls and cancelling don't wait their turn (see Fri.talk), though privacy
+            # controls go one at a time. A cancel did wait in receive() for a delivered reply to be
+            # saved, so it cancels what that reply asked.
+            async with self.controls[user] if privacy else nullcontext():
+                if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since) is not BUSY:
+                    return
             recheck = True
         while True:
             if not self.turns.ready(user, message.id):
@@ -838,12 +842,20 @@ class Agent:
         except commands.UserFeedbackCheckFailure as exc:
             if invitation and not await invitation.current():
                 return await withhold()
-            if invitation and since:
-                if isinstance(exc, (ControllerRejected, ControllerUnavailable)):  # A fixed line, not its text.
-                    reason = 'controller unavailable' if isinstance(exc, ControllerUnavailable) else 'check failed: ControllerRejected'
+            if since:  # Said only if they haven't erased since, checked last.
+                # A ping gets a fixed line, not the controller's text, even when a later message's reply answers it.
+                fixed = isinstance(exc, (ControllerRejected, ControllerUnavailable)) and bool(
+                    invitation or any(event.guild and explicit_mention(event, self.fri.user.id) for event in events))
+                reason = 'controller unavailable' if isinstance(exc, ControllerUnavailable) else 'check failed: ControllerRejected'
+                if fixed and invitation:  # Its notice checks erasure itself.
                     return await self.withheld(message, events, reason, invitation)
-                if reason := await self.erasure(message.author.id, *since):
-                    return await self.dropped(message, events, reason, invitation)
+                erased = await self.erasure(message.author.id, *since)
+                if erased == 'check failed: ControllerUnavailable' and isinstance(exc, ControllerUnavailable):
+                    erased = None  # The same outage, which is what this says.
+                if erased:
+                    return await self.dropped(message, events, erased, invitation)
+                if fixed:
+                    return await self.withheld(message, events, reason)
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)

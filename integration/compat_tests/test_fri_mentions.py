@@ -1341,6 +1341,142 @@ def test_showing_their_memory_keeps_what_they_sent_before_waiting(monkeypatch, t
     asyncio.run(scenario())
 
 
+def gated_debounce():
+    """Hold every burst's debounce until released, and wait for a message to join one."""
+    released, real_sleep = asyncio.Event(), asyncio.sleep
+    async def debounce(_):
+        await released.wait()
+    async def grouped(agent, event):
+        while agent.bursts.group(event) is None:
+            await real_sleep(0.01)
+    return released, debounce, grouped
+
+
+def test_two_privacy_controls_sent_together_are_both_carried_out_in_order(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('fri forget me'), message('fri remember me again')
+        for event in (first, second):
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='done')
+        released, debounce, grouped = gated_debounce()
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                await asyncio.wait_for(grouped(agent, first), 5)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                await asyncio.wait_for(grouped(agent, second), 5)
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert [payload['action'] for path, payload in calls if path == '/chat/memory/control'] == ['disable', 'enable']
+            assert first.reply.await_args.args[0].startswith('done. i erased our saved chats')
+            assert second.reply.await_args.args[0].startswith('memory’s back on')
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('case', ['busy', 'erased'])
+def test_an_outside_ping_worded_like_a_privacy_control_is_answered_as_chat(monkeypatch, tmp_path, caplog, case):
+    # Outside, Fri.talk answers it as chat, so it waits its turn and is fenced like any other.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> what do you remember about me?')
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='sent', delete=AsyncMock())
+        if case == 'busy':
+            fri.busy.add(20)
+            asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+        else:
+            async def answer(*_):
+                agent.forget(20)  # "Forget me" elsewhere, while this one is being answered.
+                return ChatResult(status='completed', reply='an answer from before the erasure')
+            fri.chat_once.side_effect = answer
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            if case == 'busy':
+                assert texts == [str(ReplyInProgress()), 'that meme is doing a lot of work']
+            else:
+                assert texts == []
+                assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('failure', ['erased', 'outage'])
+@pytest.mark.parametrize('burst', [True, False])
+def test_a_reply_error_says_nothing_after_an_erasure_and_a_fixed_line_for_a_ping(
+        monkeypatch, tmp_path, caplog, burst, failure):
+    # A ping answered by its follow-up's reply, or one message to Fri by name.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        events = [message('<@99> help'), message('fri more details')] if burst else [message('fri more details')]
+        last = events[-1]
+        if failure == 'erased':
+            async def answer(*_):
+                store.clear_chats('20')  # Through Gene, while Fri is typing.
+                return ChatResult(status='completed', reply='an answer from before the erasure')
+            fri.chat_once.side_effect = answer
+        else:
+            api = fri.api
+            async def down(method, path, payload=None):
+                if path == '/chat/turn/check':
+                    raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+                return await api(method, path, payload)
+            fri.api = down
+        released, debounce, grouped = gated_debounce()
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in events:
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_awaited_once()
+            assert all(not event.reply.await_count for event in events[:-1])
+            texts = [item.args[0] for item in last.reply.await_args_list]
+            if failure == 'erased':
+                assert texts == []
+                lines = [f'Mention 1/{events[0].id} not answered: author privacy changed'] if burst else []
+            elif burst:
+                assert texts == [GLITCH]
+                lines = [f'Mention 1/{events[0].id} not answered, told why: controller unavailable']
+            else:  # Not a ping, so what it has always said.
+                assert texts == ['the workshop controller is temporarily unavailable.']
+                lines = []
+            assert mention_lines(caplog) == lines
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_reply_error_says_nothing_after_an_erasure(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+        event = message('remember the private marker?')
+        event.guild = None
+        async def answer(*_):
+            store.clear_chats('20')  # Through Gene, while Fri is typing.
+            return ChatResult(status='completed', reply='an answer from before the erasure')
+        fri.chat_once.side_effect = answer
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_awaited_once()
+            event.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_stale_ping_redelivered_after_its_record_expires_is_told_once(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
