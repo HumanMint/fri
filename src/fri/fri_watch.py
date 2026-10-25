@@ -15,6 +15,7 @@ from .fri_errors import ControllerRejected, ControllerUnavailable
 from .private_files import private_json
 
 LOG = logging.getLogger('fri.watch')
+STARTED = time.time()  # A send from an earlier run of Fri can't have landed after this one started.
 NO_MENTIONS = discord.AllowedMentions.none()
 INTERVAL = 120  # Fri.watch runs every two minutes.
 CHECKS = 3  # Consecutive bad reads before the owner hears about it, so restarts and deploys stay quiet.
@@ -22,7 +23,7 @@ STALE = 60  # Gene's runtime reports every 10 s; a minute without one is several
 RELAPSE = 1800  # A new outage this soon after the last DM edits that DM instead of sending another.
 READ = 10  # A watch read that hangs this long counts as an unreachable controller.
 PROBE = 4  # Each live read in the owner's health report.
-DELIVERY = 30  # Owner lookup, send and edit: a stuck Discord call can't hold up the next read.
+DELIVERY = 30  # How long a pass waits on the owner DM's delivery before moving on. It never cancels it.
 GENE = frozenset({'stale', 'offline', 'stopped'})
 NOT_TAKING = 'gene isn’t taking commands right now, so i didn’t send that.'
 NOT_OFFERED = 'gene isn’t offering that command right now, so i didn’t send it.'
@@ -80,6 +81,7 @@ class Watch:
     def __init__(self, fri):
         self.fri = fri
         self.state = None
+        self.delivering = None
 
     @property
     def path(self):
@@ -179,20 +181,34 @@ class Watch:
         self.save()
 
     async def deliver(self):
-        alert = self.load()['alert']
-        if not alert or alert.get('shown') == alert['text']:
-            return
-        async with asyncio.timeout(DELIVERY):
+        """Has Discord show what `observe` decided, waiting up to DELIVERY before the pass moves on.
+
+        A Discord call is never cancelled: discord.py can't recover from a cancel inside its global
+        rate-limit wait, and every later Discord call would stall. A delivery still running is left to
+        finish, and the next pass waits on it again instead of starting another."""
+        if self.delivering is None or self.delivering.done():
+            alert = self.load()['alert']
+            if not alert or alert.get('shown') == alert['text']:
+                return
+            self.delivering = asyncio.create_task(self.push(alert))
+        done, _ = await asyncio.wait({self.delivering}, timeout=DELIVERY)
+        for task in done:
+            task.result()  # Re-raises only what ends Fri's process; `push` logs its own failures.
+
+    async def push(self, alert):
+        try:
             channel = self.fri.get_channel(int(alert['channel_id'])) if alert.get('channel_id') else None
             if channel is None:
                 owner = self.fri.get_user(self.fri.owner_id) or await self.fri.fetch_user(self.fri.owner_id)
                 channel = owner.dm_channel or await owner.create_dm()
             if not alert.get('message_id') and alert.get('attempted'):
-                # The last send may have landed after all, before a timeout or a restart. Discord can only
-                # have taken it between the attempt and its deadline, so every DM in that window is checked;
-                # a full pass with no match means it never landed. Clocks get a minute either side.
+                # The last send may have landed after all, before it failed or Fri restarted. Discord can only
+                # have taken it between the attempt and when that send settled, or this run of Fri started if
+                # it never did. Every DM in that window is checked; a full pass with no match means it never
+                # landed. Clocks get a minute either side.
                 at = alert['attempted_at']
-                after, until = (dt.datetime.fromtimestamp(t, dt.timezone.utc) for t in (at-60, at+DELIVERY+60))
+                end = max(at, alert.get('settled') or STARTED)
+                after, until = (dt.datetime.fromtimestamp(t, dt.timezone.utc) for t in (at-60, end+60))
                 async for sent in channel.history(limit=None, after=after, oldest_first=True):
                     if sent.created_at > until:
                         break
@@ -208,8 +224,14 @@ class Watch:
                     self.save()
                     return
                 alert.update(attempted=text, attempted_at=time.time())
+                alert.pop('settled', None)
                 self.save()
-                sent = await channel.send(text, nonce=alert['nonce'], allowed_mentions=NO_MENTIONS)
+                try:
+                    sent = await channel.send(text, nonce=alert['nonce'], allowed_mentions=NO_MENTIONS)
+                except (Exception, asyncio.CancelledError):
+                    alert['settled'] = time.time()  # Discord can't take this send any later.
+                    self.save()
+                    raise
                 # A nonce Discord already saw returns that first message, maybe with older text; the next pass edits it.
                 alert.update(message_id=str(sent.id), channel_id=str(channel.id), shown=getattr(sent, 'content', text),
                              sent=time.time())
@@ -222,7 +244,7 @@ class Watch:
             except discord.NotFound:
                 # Only Fri or Discord can delete Fri's message in a DM. If it's gone mid-outage, send it again.
                 if alert['open']:
-                    for key in ('message_id', 'channel_id', 'shown', 'attempted', 'attempted_at'):
+                    for key in ('message_id', 'channel_id', 'shown', 'attempted', 'attempted_at', 'settled'):
                         alert.pop(key, None)
                     alert.update(nonce=secrets.randbits(62), sent=None)
                 else:
@@ -232,6 +254,8 @@ class Watch:
                 return
             alert['shown'] = text
             self.save()
+        except Exception as exc:  # It runs on its own, so nobody else would hear; the next pass tries again.
+            LOG.warning('Gene watch deliver failed: %s', type(exc).__name__)
 
     def save(self):
         private_json(self.path, self.state)

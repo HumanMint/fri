@@ -231,10 +231,14 @@ Fri can't restart anything. It only notices and says so.
   with the outage length. A new outage within 30 minutes of the last DM edits that DM again instead
   of sending another. State lives in the private `fri-watch.json` in the data directory, so a
   restart mid-outage neither repeats nor forgets the DM. Fri saves what the DM should say before
-  it touches Discord, with 30 s for each pass, so a stuck send never delays the next read. A send
-  or edit that fails or times out is retried on the next pass, even after a restart. A send that
-  may have landed is looked up in the DM before it's sent again under the same nonce. Every DM from
-  a minute before the attempt to a minute after its deadline is checked, and a lookup that fails
+  it touches Discord. Each pass waits up to 30 s for the delivery, then moves on, so a slow send
+  never delays the next read. No Discord call is ever cancelled, because discord.py can't recover
+  from a cancel inside its global rate-limit wait and every later Discord call would stall. A
+  delivery still running is left to finish (aiohttp's 5-minute request timeout still ends a hung
+  call), and no second one starts beside it. A send or edit that fails is retried on the next
+  pass, even after a restart. A send that may have landed is looked up in the DM before it's sent
+  again under the same nonce. Every DM from a minute before the attempt to a minute after that
+  send settled (or after Fri restarted, if it died mid-send) is checked, and a lookup that fails
   proves nothing, so it's retried. A relapse keeps a DM whose delivery is still unknown rather than
   starting a second one. The 30-minute relapse window starts when a DM actually went out, and a
   DM whose last edit hasn't landed still reads as down, so it carries the next outage too. Only Fri or Discord can delete Fri's message in a DM. If it's gone

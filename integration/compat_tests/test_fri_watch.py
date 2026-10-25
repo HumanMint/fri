@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime
 import itertools
 import json
@@ -46,8 +47,9 @@ def routed(fri, client, paths=None):
 def owner_dm(fri):
     """The owner's DM channel. Like Discord's enforce_nonce, a repeated nonce returns the first message."""
     dm = SimpleNamespace(id=777, messages={}, nonces={}, sends=[], edits=[], hang=None, fail_send=None,
-                         landed=False, fail_edit=None)
+                         landed=False, fail_edit=None, tries=0)
     async def send(content, *, nonce=None, **options):
+        dm.tries += 1
         if dm.hang:
             await dm.hang.wait()
         if nonce is not None and nonce in dm.nonces:
@@ -268,15 +270,118 @@ def test_a_stuck_discord_call_never_holds_up_the_next_read(monkeypatch, tmp_path
         fri.data = tmp_path
         fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
         dm = owner_dm(fri)
-        dm.hang = asyncio.Event()  # Discord never answers the send.
+        dm.hang = asyncio.Event()  # Discord doesn't answer the send for a while.
         try:
             with patch('fri.fri_watch.DELIVERY', 0.05, create=True):
                 for _ in range(CHECKS+1):
                     await asyncio.wait_for(fri.watcher.check(), 1)
             assert fri.api.await_count == CHECKS+1 and not dm.sends
-            dm.hang = None
+            assert dm.tries == 1  # Left to finish, not abandoned for a second send.
+            dm.hang.set()
             await fri.watcher.check()
-            assert len(dm.sends) == 1
+            assert len(dm.sends) == 1 and dm.tries == 1 and fri.watcher.alerted({'unreachable'})
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_global_rate_limit_mid_send_is_waited_out_and_never_stalls_discord(monkeypatch, tmp_path):
+    """Through discord.py's own HTTP client: a global 429 shuts its gate, sleeps, then reopens it.
+    Cancelling that sleep would leave the gate shut and every later Discord call stuck."""
+    import discord
+    from discord.http import Route
+
+    def body(mid, content):
+        return {'id': str(mid), 'channel_id': '777', 'type': 0, 'content': content, 'tts': False,
+                'mention_everyone': False, 'mentions': [], 'mention_roles': [], 'attachments': [], 'embeds': [],
+                'pinned': False, 'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                'edited_timestamp': None, 'author': {'id': '99', 'username': 'fri', 'discriminator': '0',
+                                                     'avatar': None, 'bot': True}}
+
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        fri._connection.user = SimpleNamespace(id=99)
+        dm = discord.DMChannel(me=fri.user, state=fri._connection, data={'id': '777', 'type': 1, 'recipients': [
+            {'id': '10', 'username': 'owner', 'discriminator': '0', 'avatar': None}]})
+        owner = SimpleNamespace(id=10, dm_channel=None, create_dm=AsyncMock(return_value=dm))
+        fri.get_user = lambda uid: owner if uid == 10 else None
+        fri.get_channel = lambda cid: dm if cid == 777 else None
+        calls = []
+
+        class Response:
+            def __init__(self, status, data, **headers):
+                self.status, self.data, self.reason = status, data, 'x'
+                self.headers = {'content-type': 'application/json', **headers}
+
+            async def text(self, encoding=None):
+                return json.dumps(self.data)
+
+        @contextlib.asynccontextmanager
+        async def request(method, url, **options):  # Discord, behind its proxy, rate limiting the first send.
+            calls.append(method)
+            if method == 'POST' and calls.count('POST') == 1:
+                yield Response(429, {'message': 'x', 'retry_after': 0.3, 'global': True}, Via='1.1 discord')
+            elif method in ('POST', 'PATCH'):
+                yield Response(200, body(556, json.loads(options['data'])['content']))
+            else:
+                yield Response(200, {'id': '99', 'username': 'fri', 'discriminator': '0', 'avatar': None})
+        fri.http._HTTPClient__session = SimpleNamespace(request=request, closed=False, close=AsyncMock())
+        fri.http._global_over = asyncio.Event()
+        fri.http._global_over.set()
+        try:
+            with patch('fri.fri_watch.DELIVERY', 0.05):
+                for _ in range(CHECKS):
+                    await fri.watcher.check()  # The last pass moves on while discord.py waits out the 429.
+                assert calls == ['POST'] and not fri.watcher.alerted({'unreachable'})
+                await asyncio.sleep(0.5)
+                assert fri.http._global_over.is_set()
+                await asyncio.wait_for(fri.http.request(Route('GET', '/users/@me')), 1)
+                await fri.watcher.check()
+                assert calls == ['POST', 'POST', 'GET'] and fri.watcher.alerted({'unreachable'})
+                fri.api = AsyncMock(return_value={'heartbeat_age_seconds': 1, 'runtime': {
+                    'guild_connected': True, 'controls_running': True}})
+                await fri.watcher.check()
+            assert calls == ['POST', 'POST', 'GET', 'PATCH']  # One DM, then its recovery edit.
+            assert fri.watcher.state['alert']['shown'] == fri.watcher.state['alert']['text']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('way', ['failed', 'crashed'])
+def test_a_dm_discord_took_long_after_the_attempt_is_still_found(monkeypatch, tmp_path, way):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        clock = SimpleNamespace(now=time.time())
+        quick = dm.send
+        async def slow(content, **options):  # discord.py retried for minutes; Discord took the last try.
+            clock.now += 200
+            sent = await quick(content, **options)
+            sent.created_at = datetime.datetime.fromtimestamp(clock.now, datetime.timezone.utc)
+            raise http(500) if way == 'failed' else Crash()  # Fri never heard back.
+        try:
+            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now)):
+                for _ in range(CHECKS-1):
+                    await fri.watcher.check()
+                dm.send = slow
+                if way == 'failed':
+                    await fri.watcher.check()
+                else:
+                    with pytest.raises(Crash):
+                        await fri.watcher.check()
+                assert len(dm.sends) == 1 and not fri.watcher.alerted({'unreachable'})
+                dm.send = quick
+                dm.nonces.clear()  # Past Discord's nonce window, only Fri's own record can tell.
+                clock.now += 120
+                with patch('fri.fri_watch.STARTED', clock.now-60, create=True):
+                    fri.watcher = Watch(fri)
+                    await fri.watcher.check()
+            assert len(dm.sends) == 1 and fri.watcher.state['alert']['message_id'] == '556'
         finally:
             await fri.close()
     asyncio.run(scenario())
