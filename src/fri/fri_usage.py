@@ -5,8 +5,8 @@ from collections import defaultdict
 
 SUBJECT = r'(?:(?:my|our|your|the|current|fri\'s)\s+)?(?:token\s+usage|usage|tokens\s+used|token\s+counts?|token\s+totals?)'
 # Rolling windows only, each named exactly in the reply: "today" is the last 24 hours, not since midnight.
-SPAN = (r'(?:(?:for|over|in|from|during)\s+)?(?:the\s+)?(?:last|past)\s+(?:[1-9][0-9]{0,2}\s*'
-        r'(?:hours?|hrs?|h|days?|d|weeks?|wks?|w|months?)|hour|day|week|month)|today|this\s+(?:week|month)')
+SPAN = (r'(?:(?:for|over|in|from|during)\s+)?(?:(?:the\s+)?(?:last|past)\s+(?:[1-9][0-9]{0,2}\s*'
+        r'(?:hours?|hrs?|h|days?|d|weeks?|wks?|w|months?)|hour|day|week|month)|today|this\s+(?:week|month))')
 TAIL = rf'(?:\s+(?:so far|right now|rn|please|pls|by task|by model|breakdown|{SPAN}))*'
 REQUEST = re.compile(
     rf'(?:{SUBJECT}|'
@@ -61,6 +61,15 @@ def usage_query(text, capabilities, now):
         return {}, None, window is not None
     seconds, label = window
     return {'since': max(0.0, now-seconds)}, label, False
+
+
+def window_applied(rows, query):
+    """Whether the controller says every row covers the since Fri sent. One rolled back under a running Fri,
+    still listed as offering windows since startup, ignores since and marks nothing."""
+    since = query.get('since')
+    return since is not None and isinstance(rows, list) and all(
+        isinstance(row, dict) and type(row.get('since')) in (int, float) and abs(row['since']-since) < 0.001
+        for row in rows)
 
 
 def describe_usage(rows, *, by_model=False, window=None, windowless=False):

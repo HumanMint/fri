@@ -462,8 +462,9 @@ The owner's usage report ("fri token usage", "show usage by model") is cumulativ
 the ask names a rolling window: "last 24h", "past 3 days", "last week", "this month" and the
 like, up to 999 of a unit. "today" means the last 24 hours and "this week" the last 7 days,
 not calendar periods, and the reply names the exact window. Fri sends the window as `since`
-only to a controller that offers `usage-window`. An older controller gets the plain request,
-and the reply says the totals are all-time. Attempts count by when the controller recorded
+only to a controller that offers `usage-window`, and names it only when every row the
+controller returns carries that `since`. An older controller, including one rolled back
+while Fri kept running, gets or returns a plain report, and the reply says it's all-time. Attempts count by when the controller recorded
 them, so a receipt held through an outage lands in the window it arrives in.
 
 A failed subscription renewal logs its cause: exception class, HTTP status and OAuth

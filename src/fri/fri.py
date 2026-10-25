@@ -35,7 +35,7 @@ from .fri_reports import ReportButton, report_component
 from .fri_requests import request_dm_component
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
-from .fri_usage import describe_usage, usage_query, usage_requested
+from .fri_usage import describe_usage, usage_query, usage_requested, window_applied
 from .panels import defer_panel
 from .privacy import clean
 from .reviews import owner_dm_component
@@ -430,6 +430,8 @@ class Fri(discord.Client):
                     window, label, windowless = usage_query(text, self.capabilities, time.time())
                     usage = await self.api('POST', '/agent/usage',
                                            {'guild_id': str(guild_id), 'user_id': str(user_id), **window})
+                    if label and not window_applied(usage, window):
+                        label, windowless = None, True  # The controller didn't apply it, so these are all-time.
                     report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()),
                                             window=label, windowless=windowless)
                     result = self.stage_turn(scope, source, text, context, ChatResult(reply=report, status='completed'),
