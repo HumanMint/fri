@@ -438,10 +438,12 @@ class Chat:
                           'source': turn.get('source', {'kind': 'legacy_unverified'}),
                           'message_burst': turn.get('burst', [])})},
                          {'role': 'assistant', 'content': response}]
+        memory = context.get('personal_memory', {'enabled': False, 'notes': []})
         # Facts are data in a user message, never inserted into developer instructions.
         messages.append({'role': 'user', 'content': json.dumps({
             'approved_server_facts_for_reference': context['facts'],
-            'personal_memory': context.get('personal_memory', {'enabled': False, 'notes': []}),
+            'personal_memory': {**memory, 'notes': [{k: v for k, v in note.items() if k != 'provenance'}
+                                                    for note in memory.get('notes', [])]},
             'recent_channel_context': [{k: v for k, v in row.items() if k != 'provenance'}
                                        for row in context.get('recent', [])],
             'message_burst': context.get('message_burst', []),

@@ -25,6 +25,7 @@ from fri import feedback as commands
 from fri.fri import FIRST_HERE, FIRST_MEMORY, FIRST_PROFILE, NO_MENTIONS, Fri
 from fri.fri_agent import Agent
 from fri.fri_chat import Chat, ChatResult
+from fri.fri_context import discord_source
 from fri.fri_errors import ControllerRejected
 from fri.fri_memory import describe_profile, note_place, profiled, server_wide
 from fri.fri_memory_panel import SHOWN, EditMemory, MemoryView, show
@@ -151,7 +152,8 @@ def test_a_preference_said_in_general_follows_the_member_to_gaming_and_dms(monke
             for where in (GAMING, THREAD, DM):
                 await w.say(where, 'fri what should i play tonight')
                 notes = model_context(w)['personal_memory']['notes']
-                assert notes == [{'category': 'games', 'evidence': 'I like Minecraft', 'scope': 'server'}]
+                assert notes == [{'category': 'games', 'evidence': 'I like Minecraft', 'scope': 'server',
+                                  'provenance': []}]
             # What they said in #general shows up elsewhere, labelled and clipped for the model.
             elsewhere = model_context(w)['elsewhere']
             assert [row['channel'] for row in elsewhere][-2:] == ['#gaming', '#thread-70']
@@ -597,10 +599,71 @@ def test_an_edited_profile_note_keeps_following_the_member(monkeypatch, tmp_path
             assert 'Updated that preference.' in body and 'across the server' in body
             await w.say(GAMING, 'fri recommend me something')
             assert model_context(w)['personal_memory']['notes'] == [
-                {'category': 'games', 'evidence': 'I prefer quiet conversations', 'scope': 'server'}]
+                {'category': 'games', 'evidence': 'I prefer quiet conversations', 'scope': 'server', 'provenance': []}]
         finally:
             await w.fri.close()
     run(scenario)
+
+
+ASH = {'user_id': '30', 'revision': 0}
+
+
+def quoting_note(w):
+    """A preference saved from a message quoting ash, whose exchange has since expired."""
+    w.store.save_chat('123', 'public:1', '20', 0, 'ash said: I like Minecraft modpacks', 'noted', 'model', 'high',
+                      notes=note('I like Minecraft modpacks'), audience='server', provenance=[ASH],
+                      source=discord_source(w.message(GENERAL, 'ash said: I like Minecraft modpacks')).model_dump())
+    with w.store.connection() as db:
+        db.execute('DELETE FROM chat_turns')
+
+
+def test_a_reply_built_on_a_quoting_note_goes_when_they_forget(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            quoting_note(w)
+            _, saved, _ = await w.say(GAMING, 'fri what games do i like', 'minecraft modpacks, endless')
+            assert saved['ok'] and turns(w)[-1]['provenance'] == [ASH]
+            w.store.erase_user('30')
+            with w.store.connection() as db:
+                assert db.execute("SELECT count(*) FROM chat_turns WHERE user_id='20'").fetchone()[0] == 0
+            await w.say(THREAD, 'fri recommend me a game')
+            assert 'Minecraft' not in json.dumps(model_context(w), default=str)
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_reply_built_on_a_quoting_note_is_withheld_if_they_forget_meanwhile(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            quoting_note(w)
+
+            async def respond(text, context):
+                w.store.erase_user('30')  # Forgets while Fri writes the reply.
+                return ChatResult(status='completed', reply='minecraft modpacks, endless')
+            model(w, respond)
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await w.say(GAMING, 'fri what games do i like')
+            with w.store.connection() as db:
+                assert db.execute("SELECT count(*) FROM chat_turns WHERE user_id='20'").fetchone()[0] == 0
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_the_model_never_sees_whose_words_a_note_drew_on():
+    seen = []
+    def handler(request):
+        seen.append(json.loads(json.loads(request.content)['input'][-1]['content']))
+        return httpx.Response(200, text='data: '+json.dumps(response_event())+'\n\n')
+    chat = Chat(SimpleNamespace(access_token=lambda: 'test'), httpx.MockTransport(handler))
+    memory = {'enabled': True, 'notes': [{'category': 'games', 'evidence': 'I like chess', 'scope': 'server',
+                                          'provenance': [ASH]}]}
+    asyncio.run(chat.respond('hey', {**CONTEXT, 'personal_memory': memory}))
+    assert seen[0]['personal_memory'] == {'enabled': True, 'notes': [
+        {'category': 'games', 'evidence': 'I like chess', 'scope': 'server'}]}
 
 
 def test_the_model_sees_elsewhere_rows_clipped_without_ids():

@@ -117,7 +117,8 @@ def test_history_notes_require_attributed_self_disclosure_and_survive_restart(se
     assert finish(agent, claim, rows, notes)['saved'] == 1
     store = Store(settings.db)
     profile = store.chat_context('guild', 'public:1', 'person')['personal_memory']
-    assert profile['notes'] == [{'category': 'music', 'evidence': 'I love trance', 'scope': 'here'}]  # Not the profile.
+    assert profile['notes'] == [{'category': 'music', 'evidence': 'I love trance', 'scope': 'here',
+                                 'provenance': []}]  # Not the profile.
     assert not store.chat_context('guild', 'private:1', 'person')['personal_memory']['notes']
     assert not store.chat_context('guild', 'public:2', 'person')['personal_memory']['notes']
     assert not store.memories('guild')

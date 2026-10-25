@@ -84,7 +84,7 @@ def turn_provenance(context, speaker, actions=None):
     """Other members whose messages shaped this turn, with the privacy revision observed.
 
     Every context source carrying another member's words contributes: the live channel view
-    (including Fri's own replies), saved history, a pending clarification, the channel summary,
+    (including Fri's own replies), saved history, notes, a pending clarification, the channel summary,
     reply targets (Fri's resolved to their sources), nearby invited context and read evidence.
     """
     seen = {}
@@ -98,6 +98,9 @@ def turn_provenance(context, speaker, actions=None):
     inherited += context.get('summary_provenance', []) + context.get('reference_provenance', [])
     # A member's words from another channel can repeat someone else's: inherit what they drew on.
     inherited += [item for row in context.get('elsewhere', []) for item in row.get('provenance', [])]
+    # So can a note: it was learned while other members' words were in view.
+    inherited += [item for note in (context.get('personal_memory') or {}).get('notes', [])
+                  for item in note.get('provenance', [])]
     for item in inherited:
         add(item['user_id'], item['revision'])
     for row in context.get('recent', []):
