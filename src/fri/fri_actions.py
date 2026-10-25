@@ -491,7 +491,8 @@ class Actions:
             if carries:
                 posts.append(message)
         result = {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
-                  'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': floor if pins else after,
+                  'scanned': scanned, 'messages': records if pins else list(reversed(records)),  # Pins: newest pinned first.
+                  'lookback_floor': floor if pins else after,
                   'images_inspected': 0, 'personal_notes_saved': 0, **({'window': 'pins'} if pins else {})}
         # Asked to look around, Fri looks at the pictures too, as a member scrolling up would.
         if posts and self.media_allowed and self.turn_context is not None:
