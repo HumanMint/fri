@@ -146,8 +146,8 @@ class Agent:
             return  # The owner review loop delivers it.
         try:
             await self.fri.flush_usage()
-        except commands.UserFeedbackCheckFailure:
-            LOG.warning('Agent usage queued for delivery')
+        except Exception as exc:  # The receipt is on disk; the owner review loop retries delivery.
+            LOG.warning('Agent usage queued for delivery: %s', type(exc).__name__)
 
     async def run(self, role, instruction, data, schema, model=None, effort=None, *, images=()):
         model = model or self.config[role+'_model']

@@ -235,10 +235,13 @@ class Fri(discord.Client):
     def set_aside(self, path, cause):
         """A receipt the controller refuses can never succeed; keep it for inspection without blocking later ones."""
         rejected = path.parent / 'rejected'
-        rejected.mkdir(mode=0o700, exist_ok=True)
         try:
+            rejected.mkdir(mode=0o700, exist_ok=True)
             path.replace(rejected / path.name)
         except FileNotFoundError:
+            return
+        except OSError as exc:  # It stays queued and is offered again, after the receipts behind it.
+            LOG.warning('Usage receipt refused (%s) and could not be set aside: %s', cause, type(exc).__name__)
             return
         LOG.warning('Usage receipt set aside in usage/rejected: %s', cause)
 
@@ -250,8 +253,8 @@ class Fri(discord.Client):
             'status': result.status, 'counters': result.counters})
         try:
             await self.flush_usage()
-        except commands.UserFeedbackCheckFailure:
-            LOG.warning('Usage is saved locally; controller delivery will retry')
+        except Exception as exc:  # The receipt is on disk; a delivery problem must not discard a finished reply.
+            LOG.warning('Usage is saved locally; controller delivery will retry: %s', type(exc).__name__)
         if result.error or result.status != 'completed':
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         return result

@@ -204,6 +204,23 @@ def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_
     assert session.access_token() == 'old' and not session.rejected
 
 
+def test_a_withdrawn_plan_stays_withdrawn_after_its_refresh_token_rotates(tmp_path):
+    path = tmp_path / 'session.json'
+    saved = expired(path)
+    replies = [httpx.Response(200, json={'access_token': 'private-a', 'refresh_token': 'rotated', 'scope': 'openid',
+                                         'token_type': 'Bearer', 'expires_in': 60}),
+               # A later renewal that leaves out scope must not fall back to the plan scope saved before.
+               httpx.Response(200, json={'access_token': 'private-b', 'refresh_token': 'rotated-again',
+                                         'token_type': 'Bearer', 'expires_in': 3600})]
+    session = Subscription(path, httpx.MockTransport(lambda _: replies.pop(0)))
+    for _ in range(2):
+        with pytest.raises(SubscriptionError, match='Reconnect') as exc:
+            session.access_token()
+        assert not isinstance(exc.value, SubscriptionUnavailable) and session.rejected
+    assert len(replies) == 1 and session.refusals == 1
+    assert json.loads(path.read_text()) == {**saved, 'refresh_token': 'rotated', 'scopes': ['openid']}
+
+
 @pytest.mark.parametrize('expires_in', [None, 10**400], ids=['missing expiry', 'huge expiry'])
 def test_rotated_refresh_token_is_kept_even_when_the_rest_of_the_renewal_is_unusable(tmp_path, expires_in):
     path = tmp_path / 'session.json'
@@ -249,7 +266,7 @@ def test_a_failed_save_of_the_rotation_itself_is_still_not_raw(tmp_path, caplog,
     with pytest.raises(SubscriptionUnavailable):
         Subscription(path, httpx.MockTransport(lambda _: rotated)).access_token()
     assert json.loads(path.read_text()) == saved
-    assert 'rotated refresh token not saved: OSError' in caplog.text and 'private' not in caplog.text
+    assert 'refresh token or scopes not saved: OSError' in caplog.text and 'private' not in caplog.text
 
 
 def test_renewal_without_a_refresh_token_keeps_the_saved_one(tmp_path):

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import aiohttp
+import discord
 import pytest
 
 from compat_tests.test_api import actor, headers
@@ -16,6 +17,7 @@ from fri.fri import SIGN_IN_NOTICE, Fri
 from fri.fri_agent import Agent
 from fri.fri_agent_settings import DEFAULTS
 from fri.fri_errors import ControllerRejected
+from fri.fri_presence import Presence
 from fri.subscription import PLAN_SCOPE, Subscription, SubscriptionError, private_json
 
 STATE = {'config': {**DEFAULTS, 'enabled': True, 'meme_enabled': True}, 'version': 1,
@@ -331,6 +333,36 @@ def test_other_unreadable_refusals_keep_every_receipt_queued(tmp_path, status, e
     with pytest.raises(commands.UserFeedbackCheckFailure):
         asyncio.run(Fri.flush_usage(fri))
     assert fri.session.calls == 1 and len(list(usage.glob('*.json'))) == 2 and not (usage/'rejected').exists()
+
+
+def test_a_receipt_that_cannot_be_set_aside_waits_without_blocking_later_ones(client, tmp_path, caplog):
+    usage = tmp_path/'usage'
+    receipt(usage/('1'*32+'.json'), 'gpt-6-luna', role='not-a-role')
+    receipt(usage/('2'*32+'.json'), 'gpt-6.1-sol')
+    (usage/'rejected').write_text('')  # Not a folder, so moving a receipt into it fails like a read-only disk.
+    asyncio.run(Fri.flush_usage(usage_runtime(client, tmp_path)))
+    assert [p.name for p in usage.glob('*.json')] == ['1'*32+'.json']
+    assert 'could not be set aside: FileExistsError' in caplog.text
+    totals = client.post('/chat/usage', json=actor(), headers=headers('fri')).json()
+    assert {row['model']: row['attempts'] for row in totals} == {'gpt-6.1-sol': 1}
+
+
+def test_a_usage_delivery_failure_never_discards_a_finished_reply(tmp_path):
+    result = SimpleNamespace(status='completed', counters={'input_tokens': 1}, error=None)
+    fri = SimpleNamespace(chat=SimpleNamespace(respond=AsyncMock(return_value=result)), data=tmp_path,
+                          flush_usage=AsyncMock(side_effect=PermissionError(13, 'private')))
+    assert asyncio.run(Fri.chat_once(fri, 'hi', {'model': 'gpt-6-luna', 'effort': 'low'})) is result
+    agent = Agent(fri)
+    asyncio.run(agent.record('attention', 'gpt-6-luna', 'low', {'input_tokens': 1}, 'completed'))
+    assert len(list((tmp_path/'usage').glob('*.json'))) == 2  # Both stay queued for the next flush.
+
+
+def test_a_missing_presence_switch_clears_a_showing_status(tmp_path):
+    fri = SimpleNamespace(data=tmp_path, status=discord.Status.online, activity=object())
+    presence = Presence(SimpleNamespace(fri=fri, config={'enabled': True}))
+    presence.publish = AsyncMock()
+    asyncio.run(presence.check())
+    presence.publish.assert_awaited_once_with('')
 
 
 def test_client_level_refusals_keep_every_receipt_queued(client, tmp_path):
