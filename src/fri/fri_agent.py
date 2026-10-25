@@ -537,6 +537,8 @@ class Agent:
             # controls go one at a time. A cancel did wait in receive() for a delivered reply to be
             # saved, so it cancels what that reply asked.
             async with self.controls[user] if privacy else nullcontext():
+                if privacy and (reason := await self.excluded(message, dm, invitation, privacy)):
+                    return self.missed(events, reason)  # E.g. they left while another control ran.
                 if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since) is not BUSY:
                     return
             recheck = True
@@ -569,8 +571,8 @@ class Agent:
             if recheck:
                 if reason := await self.erasure(user, *since):
                     return await self.dropped(message, events, reason, invitation, since)
-                if dm and not (self.config['support_dms'] and await self.member(user, fresh=True)):
-                    return self.missed(events, 'not a member')  # They left while it waited, or DMs closed.
+                if reason := await self.excluded(message, dm, invitation, privacy, text):
+                    return self.missed(events, reason)
                 if time.time() >= until:
                     return await self.withheld(message, events, 'stale event', invitation or self.ping_among(events, since),
                                                logged='earlier reply still running')
@@ -585,6 +587,29 @@ class Agent:
             if outcome is not BUSY:
                 return
             recheck = True  # E.g. they erased while a panel or ambient reply kept this one waiting.
+
+    async def excluded(self, message, dm, invitation=None, privacy=None, text=''):
+        """Why a message that waited (its turn, or another control) is no longer one Fri answers, by
+        the gates it passed coming in; None if it still is."""
+        if dm:
+            member = await self.member(message.author.id, fresh=True)  # Not the cache its arrival filled.
+            if not self.config['support_dms']:  # After that read, which a change can overlap.
+                return 'dms off'
+            if not member:
+                return 'not a member'
+        if (not self.config['enabled'] and not privacy and
+                not (message.author.id == self.fri.owner_id and usage_requested(text))):
+            return 'fri disabled'
+        if dm or (invitation and invitation.outside):
+            return None
+        if not self.allowed(message.channel):
+            return 'channel no longer configured'
+        if not invitation:  # A ping's invitation checks its author's access itself before it's answered.
+            member = await self.member(message.author.id, fresh=True, guild_id=message.guild.id)
+            permissions = member and message.channel.permissions_for(member)
+            if not (permissions and permissions.view_channel and permissions.read_message_history):
+                return 'member changed'
+        return None
 
     async def unreadable(self, message, events, exc, invitation, forgotten):
         """A message whose author's privacy revision couldn't be read as it came in, other than in an

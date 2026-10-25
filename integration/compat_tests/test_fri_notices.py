@@ -19,7 +19,8 @@ IDS = itertools.count(100000000000000001)
 
 def event(user=10):
     return SimpleNamespace(id=next(IDS), author=SimpleNamespace(id=user, display_name='Member'),
-        guild=SimpleNamespace(id=123), channel=SimpleNamespace(id=456, typing=Mock(return_value=AsyncMock())),
+        guild=SimpleNamespace(id=123), channel=SimpleNamespace(id=456, typing=Mock(return_value=AsyncMock()),
+                                                               permissions_for=lambda _: discord.Permissions.all()),
         reply=AsyncMock(return_value=SimpleNamespace(delete=AsyncMock())))
 
 
@@ -27,6 +28,7 @@ def event(user=10):
 def test_wait_notice_is_deleted_only_after_completion(monkeypatch, tmp_path, outcome):
     async def scenario():
         fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=10))  # Still in the server when its turn comes.
         first, followup = event(), event()
         started, finish = asyncio.Event(), asyncio.Event()
         notice = followup.reply.return_value

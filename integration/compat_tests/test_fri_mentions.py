@@ -1743,6 +1743,116 @@ def test_a_queued_dm_needs_a_current_member_when_its_turn_comes(monkeypatch, tmp
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('change', ['stays', 'left', 'dms off'])
+def test_a_dm_privacy_control_that_waited_for_another_needs_a_current_member(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = {'member': SimpleNamespace(id=20)}
+        agent.member = AsyncMock(side_effect=lambda *_, **__: present['member'])
+        first, second = message('what do you remember about me?'), message('what do you remember about me?')
+        for event in (first, second):
+            event.guild = None
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='your memory', edit=AsyncMock())
+        talk, released, calls = fri.talk, asyncio.Event(), []
+        async def stalled(*args, **kwargs):
+            calls.append(kwargs.get('event'))
+            if len(calls) == 1:  # The first is still being answered when the second comes in.
+                await released.wait()
+            return await talk(*args, **kwargs)
+        fri.talk = stalled
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                while not calls:
+                    await real_sleep(0.01)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                while not agent.controls[20]._waiters:  # Waiting for the first to finish.
+                    await real_sleep(0.01)
+                if change == 'left':
+                    present['member'] = None
+                elif change == 'dms off':
+                    agent.config['support_dms'] = False
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert calls == ([first, second] if change == 'stays' else [first])
+            assert second.reply.await_count == (change == 'stays')
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['stays', 'disabled', 'unconfigured', 'left', 'access lost'])
+def test_a_queued_message_needs_fri_on_and_its_channel_still_configured(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, controller, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('fri what is ash working on?')
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='hold on', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        fri.busy.add(20)  # A reply to them that's still going, so this waits its turn.
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                while not event.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                if change == 'disabled':  # The owner pauses Fri meanwhile.
+                    controller.update({'enabled': False}, controller.state()['version'], '10')
+                    agent.state = controller.state()
+                elif change == 'unconfigured':
+                    agent.state = {**agent.state, 'channels': []}
+                elif change == 'left':
+                    channel.guild.fetch_member.side_effect = discord.NotFound(
+                        SimpleNamespace(status=404, reason='Not Found'), 'unknown member')
+                elif change == 'access lost':  # Fri still sees the channel; they no longer do.
+                    channel.permissions_for = lambda who: (discord.Permissions.all() if who.id == 99 else
+                                                           discord.Permissions.none())
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            if change == 'stays':
+                fri.chat_once.assert_awaited_once()
+                assert texts == [str(ReplyInProgress()), 'an answer']
+            else:
+                fri.chat_once.assert_not_awaited()
+                assert texts == [str(ReplyInProgress())]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_dms_turned_off_during_a_queued_dms_membership_lookup_stop_it(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = SimpleNamespace(id=20)
+        async def member(*_, fresh=False, **__):
+            if fresh and not fri.busy:  # The recheck's own lookup, while the owner turns DMs off.
+                agent.config['support_dms'] = False
+            return present
+        agent.member = member
+        event = message('what is ash working on?')
+        event.guild = None
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='hold on', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        fri.busy.add(20)
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                while not event.reply.await_count:
+                    await real_sleep(0.01)
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            fri.chat_once.assert_not_awaited()
+            assert [item.args[0] for item in event.reply.await_args_list] == [str(ReplyInProgress())]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('member', [True, False])
 def test_a_dm_low_battery_needs_a_current_member(monkeypatch, tmp_path, member):
     async def scenario():
