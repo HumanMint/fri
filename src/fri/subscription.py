@@ -48,7 +48,7 @@ def cause(exc):
         return type(exc).__name__
     try:
         code = exc.response.json().get('error')
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, RecursionError):  # Deeply nested JSON raises RecursionError.
         code = None
     code = code if isinstance(code, str) and re.fullmatch(r'[a-z_]{1,40}', code) else ''
     return f'HTTP {exc.response.status_code} {code}'.rstrip()
@@ -173,7 +173,7 @@ class Subscription:
     def locked_token(self):
         try:
             saved = json.loads(self.path.read_text())
-        except ValueError:
+        except (OSError, ValueError, RecursionError):  # Unreadable, gone since the check, or nested too deep.
             saved = None
         expires_at = saved.get('expires_at') if isinstance(saved, dict) else None
         if not isinstance(saved, dict) or not usable(saved.get('access_token')) or not moment(expires_at):
@@ -196,7 +196,8 @@ class Subscription:
             tokens = response.json()
             renewed = token_record(tokens, saved, client_id=saved['client_id'],
                                    host_id=saved['ext_agent_host_id'])
-        except (httpx.HTTPError, SubscriptionError, KeyError, ValueError, TypeError, AttributeError) as exc:
+        except (httpx.HTTPError, SubscriptionError, KeyError, ValueError, TypeError, AttributeError,
+                RecursionError) as exc:
             rotated = tokens.get('refresh_token') if isinstance(tokens, dict) else None
             if usable(rotated) and rotated != saved['refresh_token']:
                 private_json(self.path, {**saved, 'refresh_token': rotated})  # The old one may be spent already.

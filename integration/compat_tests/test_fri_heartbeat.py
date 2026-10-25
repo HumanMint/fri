@@ -266,14 +266,15 @@ def usage_runtime(client, tmp_path, token='fri-'+'x'*32):
 
 def test_refused_usage_receipts_are_set_aside_and_later_ones_still_deliver(client, tmp_path):
     usage = tmp_path/'usage'
-    receipt(usage/('1'*32+'.json'), 'gpt-6-luna')
+    receipt(usage/('1'*32+'.json'), 'gpt-6-luna', purpose='reply_check')
+    (usage/('0'*32+'.json')).write_text('['*1100 + '0' + ']'*1100)  # Parsing it raises RecursionError, not ValueError.
     receipt(usage/('2'*32+'.json'), 'gpt-6-luna', role='not-a-role')  # 422: a newer Fri role.
     receipt(usage/('3'*32+'.json'), 'gpt-6-luna', counters={'input_tokens': -1})  # 400: a bad counter.
     (usage/('4'*32+'.json')).write_text('{"truncated')
     receipt(usage/('5'*32+'.json'), 'gpt-6.1-sol')
     asyncio.run(Fri.flush_usage(usage_runtime(client, tmp_path)))
     assert not list(usage.glob('*.json'))
-    assert sorted(p.name for p in (usage/'rejected').glob('*.json')) == [c*32+'.json' for c in '234']
+    assert sorted(p.name for p in (usage/'rejected').glob('*.json')) == [c*32+'.json' for c in '0234']
     assert (usage/'rejected').stat().st_mode & 0o777 == 0o700
     totals = client.post('/chat/usage', json=actor(), headers=headers('fri')).json()
     assert {row['model']: row['attempts'] for row in totals} == {'gpt-6-luna': 1, 'gpt-6.1-sol': 1}

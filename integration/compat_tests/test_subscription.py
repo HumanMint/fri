@@ -89,6 +89,7 @@ def test_refused_refresh_needs_the_owner_and_logs_only_its_cause(tmp_path, caplo
     assert 'private' not in caplog.text and json.loads(path.read_text()) == saved
 
 
+NESTED = '[' * 1100 + '0' + ']' * 1100  # Valid JSON that Python's parser gives up on with RecursionError.
 MALFORMED = [{}, [], {'access_token': 'private-a', 'token_type': 'Bearer', 'expires_in': 0},
              {'access_token': 'private-a', 'token_type': 'Bearer', 'expires_in': None},
              {'access_token': 'private-a', 'token_type': None, 'expires_in': 60},
@@ -97,7 +98,8 @@ MALFORMED = [{}, [], {'access_token': 'private-a', 'token_type': 'Bearer', 'expi
 
 
 @pytest.mark.parametrize('outcome', [httpx.Response(503, text='private outage'), httpx.Response(429, json={'error': 'slow down'}),
-                                     httpx.Response(200, text='not json'), httpx.ConnectError('private host'),
+                                     httpx.Response(200, text='not json'), httpx.Response(200, text=NESTED),
+                                     httpx.ConnectError('private host'),
                                      httpx.Response(200, text='{"access_token": "private-a", "token_type": "Bearer", "expires_in": 1e999}'),
                                      httpx.Response(200, json={'access_token': 'private-a', 'token_type': 'Bearer', 'expires_in': 10**400}),
                                      *(httpx.Response(200, json=body) for body in MALFORMED)])
@@ -116,6 +118,18 @@ def test_transient_refresh_failure_does_not_tell_anyone_to_reconnect(tmp_path, c
     assert json.loads(path.read_text()) == saved
 
 
+@pytest.mark.parametrize('body', [NESTED, 'private, not json'], ids=['deeply nested', 'not json'])
+def test_a_refusal_with_an_unreadable_body_is_still_a_refusal(tmp_path, caplog, body):
+    path = tmp_path / 'session.json'
+    saved = expired(path)
+    session = Subscription(path, httpx.MockTransport(lambda _: httpx.Response(400, text=body)))
+    with pytest.raises(SubscriptionError, match='Reconnect') as exc:
+        session.access_token()
+    assert not isinstance(exc.value, SubscriptionUnavailable) and session.rejected
+    assert 'renewal rejected: HTTP 400\n' in caplog.text and 'private' not in caplog.text
+    assert json.loads(path.read_text()) == saved
+
+
 def test_renewal_without_the_plan_scope_is_a_refusal(tmp_path, caplog):
     path = tmp_path / 'session.json'
     expired(path)
@@ -130,7 +144,7 @@ def test_renewal_without_the_plan_scope_is_a_refusal(tmp_path, caplog):
 
 @pytest.mark.parametrize('damage', ['expires_at', 'access_token', 'refresh_token', 'client_id', 'ext_agent_host_id',
                                     'not json', 'not an object', 'null scopes', 'numeric access token', 'string expiry',
-                                    'huge expiry'])
+                                    'huge expiry', 'deeply nested'])
 def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_path, caplog, damage):
     path = tmp_path / 'session.json'
     saved = expired(path, expires_at=0 if damage in ('refresh_token', 'client_id', 'ext_agent_host_id') else time.time() + 3600)
@@ -138,6 +152,8 @@ def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_
         path.write_text('{"access_token": "private')
     elif damage == 'not an object':
         path.write_text('["private"]')
+    elif damage == 'deeply nested':
+        path.write_text(NESTED)
     elif damage in ('null scopes', 'numeric access token', 'string expiry', 'huge expiry'):
         key, value = {'null scopes': ('scopes', None), 'numeric access token': ('access_token', 7),
                       'string expiry': ('expires_at', 'soon'), 'huge expiry': ('expires_at', 10**400)}[damage]
@@ -172,6 +188,34 @@ def test_renewal_without_a_refresh_token_keeps_the_saved_one(tmp_path):
     assert Subscription(path, httpx.MockTransport(lambda _: renewed)).access_token() == 'new'
     record = json.loads(path.read_text())
     assert record['refresh_token'] == 'private-refresh' and record['access_token'] == 'new'
+
+
+class Unreadable:
+    """The session path, except that reading it fails after the existence check passed."""
+
+    def __init__(self, path, error):
+        self.path, self.error = path, error
+
+    def read_text(self):
+        raise self.error
+
+    def __getattr__(self, name):
+        return getattr(self.path, name)
+
+
+@pytest.mark.parametrize('error', [PermissionError(13, 'private'), FileNotFoundError(2, 'private')],
+                         ids=['permission denied', 'gone after the check'])
+def test_an_unreadable_saved_sign_in_is_a_refusal(tmp_path, caplog, error):
+    path = tmp_path / 'session.json'
+    expired(path, expires_at=time.time() + 3600)
+    session = Subscription(path)
+    session.path = Unreadable(path, error)
+    with pytest.raises(SubscriptionError, match='Reconnect') as exc:
+        session.access_token()
+    assert not isinstance(exc.value, SubscriptionUnavailable) and session.rejected
+    assert 'saved sign-in is unreadable' in caplog.text and 'private' not in caplog.text
+    session.path = path
+    assert session.access_token() == 'old' and not session.rejected
 
 
 class Paused:

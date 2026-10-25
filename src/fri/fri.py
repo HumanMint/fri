@@ -213,7 +213,7 @@ class Fri(discord.Client):
                     report = json.loads(path.read_text())
                 except FileNotFoundError:
                     continue  # An isolated evaluation process may have delivered this receipt.
-                except ValueError:
+                except (ValueError, RecursionError):  # Deeply nested JSON raises RecursionError.
                     self.set_aside(path, 'unreadable')
                     continue
                 try:
