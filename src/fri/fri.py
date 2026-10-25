@@ -496,12 +496,19 @@ class Fri(discord.Client):
                         notice = (f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
                                   f'back in about {minutes} mins') if admission.get('notice') else ''
                         return ChatResult(reply=notice, status='cooldown')
+                async def sources_unchanged():  # The reply target and burst, as Discord has them now.
+                    if conversation and (conversation.get('message_burst') or conversation.get('reply_target')):
+                        from .fri_conversation import unchanged
+                        if not await unchanged(self.agent, event, conversation):
+                            raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
+
+                async def looked(result):  # The caller's last look, then the sources again: it awaited.
+                    if last_look:
+                        await last_look(result)
+                        await sources_unchanged()
+
                 await typing('admitted')
-                if conversation and (conversation.get('message_burst') or conversation.get('reply_target')):
-                    # Read before typing could start: an edit or delete meanwhile mustn't reach the model.
-                    from .fri_conversation import unchanged
-                    if not await unchanged(self.agent, event, conversation):
-                        raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
+                await sources_unchanged()  # Read before typing could start: an edit or delete meanwhile mustn't reach the model.
                 if invitation:
                     if invitation.grant and event.reference and event.reference.message_id:
                         await invitation.collect(include_recent=False)
@@ -635,8 +642,7 @@ class Fri(discord.Client):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
                     elif not private:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored)
-                    if last_look:
-                        await last_look(result)
+                    await looked(result)
                     try:  # The save's privacy fence, applied before anything is shown.
                         await self.api('POST', '/chat/turn/check', result.turn)
                         self.still_open(context)
@@ -646,8 +652,7 @@ class Fri(discord.Client):
                 if context.get('gene_receipts') and not await actions.valid(outage=True):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 result = self.stage_turn(scope, source, text, context, result, actions=actions)
-                if last_look:
-                    await last_look(result)
+                await looked(result)
                 # The save's privacy fence runs before delivery; the save itself waits for delivery.
                 await self.api('POST', '/chat/turn/check', result.turn)
                 self.still_open(context)

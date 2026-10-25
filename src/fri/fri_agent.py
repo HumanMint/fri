@@ -1133,7 +1133,7 @@ class Agent:
                         later.author.id != message.author.id):
                     return True
             return False
-        except discord.HTTPException:
+        except (discord.HTTPException, TimeoutError):
             return True
 
     def answer_directly(self, message):
