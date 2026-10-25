@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -41,6 +42,25 @@ def test_deleted_messages_leave_the_live_view_but_gene_errors_stay():
     agent.unsend(8, [6])  # A channel Fri doesn't watch gains no key for attention to scan.
     assert 8 not in agent.recent
     assert set(agent.unsent) == {1, 2, 3, 4, 5}  # Only watched channels' and in-flight messages are kept.
+
+
+def test_a_deletion_mark_stays_while_its_message_is_handled_however_many_deletes_follow(monkeypatch):
+    # The record is bounded, but a fence still waiting on a deleted message must keep seeing it gone.
+    monkeypatch.setattr('fri.fri_agent.MAX_DELIVERED', 3)
+    monkeypatch.setattr('fri.fri_agent.REDELIVERY_SECONDS', 0)
+    agent = bare_agent()
+    agent.recent[1].extend(row(i) for i in range(1, 9))
+    agent.handling[50] += 1  # E.g. a turn paused before its model request.
+    agent.replying.add(60)
+    agent.unsend(1, [50, 60])
+    for batch in ([1, 2], [3, 4], [5, 6], [7, 8]):  # Bulk deletes, each older mark past capacity and age.
+        agent.unsend(1, batch)
+    assert {50, 60} <= set(agent.unsent)
+    assert len(agent.unsent) <= 3+2
+    agent.handling -= Counter([50])
+    agent.replying.discard(60)
+    agent.unsend(1, [9])
+    assert not {50, 60} & set(agent.unsent)  # Handled now: they go like any other.
 
 
 def test_edits_refresh_a_members_row_as_they_left_it():
