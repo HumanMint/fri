@@ -131,11 +131,14 @@ class Fri(discord.Client):
         self.chat_slots = asyncio.Semaphore(2)
         self.session = None
         self.agent = None
+        self.capabilities = frozenset()
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        if not compatible(await self.api('GET', '/fri/contract')):
+        contract = await self.api('GET', '/fri/contract')
+        if not compatible(contract):
             raise RuntimeError('unsupported gene controller contract; fri did not start')
+        self.capabilities = frozenset(contract['capabilities'])
         from .fri_agent import Agent
         self.agent = Agent(self)
         await self.agent.start()
@@ -662,11 +665,15 @@ class Fri(discord.Client):
 
     @tasks.loop(seconds=15)
     async def owner_reviews(self):
+        # Separate, so one undeliverable usage receipt can't hold back owner notifications.
         try:
             await self.flush_usage()
+        except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, TimeoutError):
+            LOG.warning('Usage delivery pending')
+        try:
             await notify_owner(self)
         except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, TimeoutError):
-            LOG.warning('Owner notification or usage delivery pending')
+            LOG.warning('Owner notification pending')
 
     @owner_reviews.before_loop
     async def before_reviews(self):

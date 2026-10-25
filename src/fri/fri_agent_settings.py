@@ -13,6 +13,8 @@ DEFAULTS = {
     'status_rotation_minutes': 360,
     'dm_turns': 8, 'public_turns': 20, 'cooldown_min_minutes': 10,
     'cooldown_max_minutes': 20, 'voice_notes': '', 'attention_notes': '', 'learning_notes': '',
+    'reply_check_enabled': False, 'reply_check_private': False, 'reply_check_model': 'gpt-6-luna',
+    'reply_check_effort': 'low', 'reply_check_minutes': 30, 'reply_check_daily_pairs': 120,
 }
 
 RANGES = {'heartbeat_seconds': (60, 1800), 'learning_first_minutes': (15, 360),
@@ -23,4 +25,5 @@ RANGES = {'heartbeat_seconds': (60, 1800), 'learning_first_minutes': (15, 360),
           'meme_daily_reactions': (0, 8),
           'status_rotation_minutes': (60, 720),
           'dm_turns': (3, 30), 'public_turns': (5, 60),
-          'cooldown_min_minutes': (10, 20), 'cooldown_max_minutes': (10, 20)}
+          'cooldown_min_minutes': (10, 20), 'cooldown_max_minutes': (10, 20),
+          'reply_check_minutes': (10, 720), 'reply_check_daily_pairs': (10, 400)}

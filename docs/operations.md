@@ -175,6 +175,36 @@ empty or unavailable lists aren't guessed, an open request isn't drafted again, 
 leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
 on the same model grades it.
 
+## Reply checks
+
+Needs a controller that advertises the optional `reply-checks` capability at startup; against an
+older one Fri still starts and simply never claims a batch. If the controller refuses a claim while
+Fri runs (it was rolled back underneath), Fri stops asking until it restarts. Off until the owner
+applies `reply_check_enabled` through the usual settings preview (“enable reply checks”). The
+controller's operations guide describes the settings, retention, export and rollback purge.
+
+On the heartbeat, Fri waits for its background model slot and signs in to the subscription, then
+claims at most one batch of up to 20 pairs and sends it straight away, so nothing erased before the
+claim is ever sent. Each pair is Fri's verbatim reply, then the same member's next turn in that
+conversation within 15 minutes.
+Pairs carry no member, channel or message identifiers, and Discord mentions, links and ids in the text
+arrive as neutral placeholders. Luna/low (configurable) flags only clear cases
+of a member being unhappy with the reply and returns four labels from fixed lists: category, severity,
+topic and suggested fix. There is no free-text field. Banter and roasting Fri back don't count. Usage
+is recorded as attention with a `reply_check` purpose: this controller reports it as “reply checks”,
+and an older one ignores the purpose and counts attention, so a receipt still queued when both sides
+roll back is delivered rather than blocking the queue. The receipt is saved and left to the usage loop,
+so a slow backlog never delays finishing the batch. Usage delivery and owner notifications retry
+independently. Nothing is posted to Discord and no chat text is stored by Fri; the controller decides
+what is kept and fences it by everyone's privacy revision.
+
+The owner can DM “show reply checks” for the last seven days: exact counts by category and the top
+recurring themes. In a server channel Fri only points the owner to DMs.
+
+Offline checks cover the controller wire contract, privacy fences and failure retries with a
+substituted model. They don't measure how well a live model separates banter from real complaints;
+`python -m fri.fri_eval` has no reply-check suite yet.
+
 ## Deployment boundary
 
 The companion runs in its own `fri` Compose project using `fri-runtime:<full Fri SHA>`.
