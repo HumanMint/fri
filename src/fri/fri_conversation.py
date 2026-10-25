@@ -77,9 +77,9 @@ def burst_continuation(origin, source, text, action, argument, revision, bot_id=
 class Burst(list):
     """One burst's rows, and its author's erasure baseline (see Agent.erasure) as they came in."""
 
-    def __init__(self, since=None):
+    def __init__(self, since=None, alone=False):
         super().__init__()
-        self.since = since
+        self.since, self.alone = since, alone
 
 
 class Bursts:
@@ -97,20 +97,22 @@ class Bursts:
         groups = self.rows.get((channel, user), [])
         return bool(groups and time.monotonic()-groups[-1][0][0] <= BURST_SECONDS)
 
-    def add(self, message, arrived=None, since=None):
+    def add(self, message, arrived=None, since=None, alone=False):
+        """`since`: the author's erasure baseline as it came in. `alone`: a privacy control, which
+        neither joins nor takes in other messages, so it's carried out and they're still answered."""
         key, now = (message.channel.id, message.author.id), time.monotonic()
         arrived = now if arrived is None else arrived
         groups, abandoned = [], []
         for rows in self.rows.get(key, []):  # Abandoned ones expire.
             (groups if now-rows[0][0] <= 60 else abandoned).append(rows)
         self.dropped([row[1] for rows in abandoned for row in rows], 'burst abandoned')
-        if (groups and arrived-groups[-1][0][0] <= BURST_SECONDS and
-                None not in (since, groups[-1].since) and since != groups[-1].since):
+        joins = groups and arrived-groups[-1][0][0] <= BURST_SECONDS and not (alone or groups[-1].alone)
+        if joins and since != groups[-1].since:
             # They erased in between, so nothing answers what came before, as forget() drops it.
             self.dropped([row[1] for row in groups.pop()], 'author privacy changed')
-        if not groups or arrived-groups[-1][0][0] > BURST_SECONDS:
-            groups.append(Burst())
-        groups[-1].since = groups[-1].since or since  # A privacy control has none, nor needs one.
+            joins = False
+        if not joins:
+            groups.append(Burst(since, alone))
         groups[-1].append((arrived, message, message.content))
         self.rows[key] = groups
         rows = groups[-1]

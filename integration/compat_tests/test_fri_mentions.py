@@ -355,7 +355,7 @@ def test_a_cache_reset_while_an_owner_settings_request_waits_keeps_its_preview(m
                 agent.recent[1].append({'id': '5', 'user_id': '10', 'name': 'owner', 'text': 'old', 'at': time.time(),
                                         'revision': -1, 'gene_error': False})
                 await agent.context_messages(1)
-            assert not agent.erased.get(10)  # Neither erased anything.
+            assert not agent.forgotten.get(10) and not agent.erased.get(10)  # Neither erased anything.
             resume.set()
             await task
             assert event.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
@@ -371,7 +371,7 @@ def test_only_forget_me_counts_as_an_erasure_for_waiting_settings_requests(monke
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(message('<@99> what do you remember about me?', user=20))
-                assert agent.forgotten.get(20) and not agent.erased.get(20)
+                assert not agent.forgotten.get(20) and not agent.erased.get(20)
                 await agent.handle(message('<@99> forget me', user=20))
             assert agent.erased.get(20)
         finally:
@@ -1280,6 +1280,63 @@ def test_a_burst_does_not_carry_messages_from_before_an_erasure(monkeypatch, tmp
             assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: author privacy changed']
         finally:
             debounced.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_privacy_control_in_a_burst_is_carried_out_and_the_rest_answered(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        control, after = message('fri forget me'), message('<@99> lol ok')
+        control.reply.return_value = SimpleNamespace(id=control.id+1, content='done')
+        after.reply.return_value = SimpleNamespace(id=after.id+1, content='ok')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='ok')
+        debounced, real_sleep = asyncio.Event(), asyncio.sleep
+        async def debounce(_):
+            await debounced.wait()
+        async def grouped(event):
+            while agent.bursts.group(event) is None:
+                await real_sleep(0.01)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = [asyncio.create_task(agent.handle(control))]
+                await asyncio.wait_for(grouped(control), 5)
+                tasks.append(asyncio.create_task(agent.handle(after)))
+                await asyncio.wait_for(grouped(after), 5)
+                debounced.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert control.reply.await_args.args[0].startswith('done. i erased our saved chats')
+            assert not (await agent.profile(1, 20))['enabled']
+            assert 'forget me' not in str(fri.chat_once.await_args_list)
+        finally:
+            debounced.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_showing_their_memory_keeps_what_they_sent_before_waiting(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        waiting = message('<@99> you there?')
+        waiting.reply.return_value = SimpleNamespace(id=waiting.id+1, content='here', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='here')
+        fri.busy.add(20)  # A reply to them that's still going.
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(waiting))
+                while not waiting.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                show = message('fri what do you remember about me?')
+                show.reply.return_value = SimpleNamespace(id=show.id+1, content='memory')
+                await agent.handle(show)
+                assert show.reply.await_args.args[0].startswith('Memory is on.')
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            assert [item.args[0] for item in waiting.reply.await_args_list] == [str(ReplyInProgress()), 'here']
+            assert not mention_lines(caplog)
+        finally:
             await fri.close()
     asyncio.run(scenario())
 

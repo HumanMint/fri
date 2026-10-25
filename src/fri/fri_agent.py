@@ -673,7 +673,7 @@ class Agent:
             invitation = await Invitation.create(self, message)
             if invitation is None:
                 return
-        if privacy:
+        if privacy in ('disable', 'enable'):  # Showing their memory changes nothing, so drops nothing.
             self.forget(message.author.id, erased=privacy == 'disable')
             forgotten = self.forgotten.get(message.author.id, 0)  # Their own request isn't an erasure since.
         observed = None  # The author's privacy revision as first read for this message.
@@ -727,7 +727,7 @@ class Agent:
         key = (channel, message.author.id)
         self.answer_directly(message)
         try:
-            self.bursts.add(message, arrived, None if privacy else (forgotten, observed))
+            self.bursts.add(message, arrived, None if privacy else (forgotten, observed), alone=bool(privacy))
         except ValueError as exc:
             self.pending.pop(key, None)
             await message.reply(notice_text(str(exc)), allowed_mentions=NO_MENTIONS, mention_author=False)
