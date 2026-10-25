@@ -156,6 +156,7 @@ class Agent:
         self.unreachable_notices = {}  # channel: when Discord took Fri's notice (monotonic), or None in flight.
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
+        self.saving = set()  # Fri's delivered replies whose turn is still being saved.
         self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
 
@@ -294,23 +295,24 @@ class Agent:
         investigation."""
         ids, now = {int(i) for i in ids}, time.monotonic()
         def handled(i):
-            return self.handling[i] or i in self.replying
-        # Raw events arrive from every channel Fri can see. Kept: what Fri is handling, and what attention
-        # may pick from a channel it watches.
-        marks = [i for i in ids if channel in self.recent or handled(i)]
-        # Bounded, oldest first, but never a message still being handled: its fences must keep seeing it gone.
-        spare, expired = len(self.unsent)+len(marks)-MAX_DELIVERED, []
+            return self.handling[i] or i in self.replying or i in self.saving
+        rows = self.recent.get(channel)  # Never index: that would add a channel for attention to scan.
+        # Raw events arrive from every channel Fri can see. Marked: what Fri is handling or saving, and what
+        # its live view holds, which a model call may have been shown and attention may pick. So every mark
+        # was a real message Fri had in hand, and an unrelated flood of deletes marks nothing.
+        viewed = {int(row['id']) for row in rows or ()}
+        marks = [i for i in ids if i in viewed or handled(i)]
+        # Marks last an hour, well past any reply still running (they give up within minutes), unless the
+        # message is still being handled. No count limit: one would drop marks a running reply needs.
+        expired = []
         for i, at in self.unsent.items():
-            if handled(i):
-                continue
-            if spare <= 0 and now-at <= REDELIVERY_SECONDS:
+            if now-at <= REDELIVERY_SECONDS:
                 break  # The rest are newer.
-            expired.append(i)
-            spare -= 1
+            if not handled(i):
+                expired.append(i)
         for i in expired:
             del self.unsent[i]
         self.unsent.update((i, now) for i in marks)
-        rows = self.recent.get(channel)  # Never index: that would add a channel for attention to scan.
         if rows:
             gone = {str(i) for i in ids}
             self.recent[channel] = deque((r for r in rows if r['gene_error'] or r['id'] not in gone), maxlen=30)
@@ -1295,6 +1297,7 @@ class Agent:
         # Discord can show the reply before its send call returns, so the member may answer from
         # then on. Their next message waits through delivery and recording.
         recorded = self.recording[key] = asyncio.Event()
+        sent = None
         try:
             sent = await send_reply(message, result, view=view, mention_author=False,
                                     allowed_mentions=NO_MENTIONS, suppress_embeds=True)
@@ -1302,6 +1305,7 @@ class Agent:
                 missed('image share withdrawn')
                 await self.fri.waiting_notices.clear(message.author.id)
                 return
+            self.saving.add(getattr(sent, 'id', None))  # So a delete while it saves is noticed (see unsend).
             self.answered(events)
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
             saved = await self.fri.record_turn(result, sent)
@@ -1319,6 +1323,8 @@ class Agent:
             recorded.set()
             if self.recording.get(key) is recorded:
                 del self.recording[key]
+            if sent is not None:
+                self.saving.discard(getattr(sent, 'id', None))
         await self.fri.waiting_notices.clear(message.author.id)
 
     async def acknowledge(self, message, emoji, erased=None):
