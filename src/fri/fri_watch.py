@@ -161,7 +161,9 @@ class Watch:
             if alert['kind'] != kind:  # Still down, differently; keep the one DM current.
                 alert.update(kind=kind, text=text+alert.get('again', ''))
         elif state['bad'] >= CHECKS:
-            if alert and alert.get('message_id') and now-(alert['sent'] or 0) < RELAPSE:
+            # A DM whose last edit hasn't landed still reads as down, so it carries the relapse too.
+            if alert and alert.get('message_id') and (now-(alert['sent'] or 0) < RELAPSE or
+                                                      alert.get('shown') != alert['text']):
                 again = f'\n-# again. it came back at <t:{int(alert["ended"])}:t>.'
                 alert.update(open=True, kind=kind, since=state['since'], text=text+again, again=again)
             elif alert and alert.get('attempted') and not alert.get('message_id') and alert.get('shown') != alert['text']:

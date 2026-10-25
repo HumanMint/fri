@@ -236,7 +236,8 @@ Fri can't restart anything. It only notices and says so.
   may have landed is looked up in the DM before it's sent again under the same nonce. Every DM from
   a minute before the attempt to a minute after its deadline is checked, and a lookup that fails
   proves nothing, so it's retried. A relapse keeps a DM whose delivery is still unknown rather than
-  starting a second one. The 30-minute relapse window starts when a DM actually went out. Only Fri or Discord can delete Fri's message in a DM. If it's gone
+  starting a second one. The 30-minute relapse window starts when a DM actually went out, and a
+  DM whose last edit hasn't landed still reads as down, so it carries the next outage too. Only Fri or Discord can delete Fri's message in a DM. If it's gone
   when Fri goes to edit it mid-outage, Fri sends it again. Once the outage is over, nothing is sent
   late.
 - **Startup with the controller down.** Fri waits for `/fri/contract` (every 10 s) before it joins
@@ -254,10 +255,11 @@ Fri can't restart anything. It only notices and says so.
   to Fri in a configured channel) whose controller read fails, before or while replying, gets one
   fixed notice per channel per 5 minutes instead of silence. A mention Fri already admitted only
   needs its Discord-side checks for this notice, since the notice carries no evidence; a privacy
-  recheck that can't reach the controller leads to the notice, not silence. Before a reply has
-  started, the notice rechecks the message as it is now. Any message, a DM included, must be
-  unedited. A channel message must still be addressed, and an @mention must pass its channel and
-  access checks with Fri enabled. A posted notice counts as Fri's answer to a ping. A notice that
+  recheck that can't reach the controller leads to the notice, not silence. Every notice first
+  fetches the message as Discord has it now: it must still exist and never have been edited, since
+  discord.py updates its cached copy in place. Before a reply has started, a channel message must
+  also still be addressed, and an @mention must pass its channel and access checks with Fri
+  enabled. A posted notice counts as Fri's answer to a ping. A notice that
   fails to post, for any reason, doesn't use up those 5 minutes. Ambient chimes stay quiet, and so
   does a message Fri already answered. Mentions outside configured channels keep their own gates
   and stay silent. The same text replaces the old "workshop controller is

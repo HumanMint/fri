@@ -377,7 +377,7 @@ class Agent:
             return False
         # A DM only reaches a controller read after its member check. Outside configured channels a
         # ping keeps its own gates and stays quiet.
-        if message.guild and not self.allowed(message.channel) or not answering and not await self.still_addressed(message):
+        if message.guild and not self.allowed(message.channel) or not await self.still_addressed(message, answering):
             return False
         now = time.time()
         self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if now-v < 300}
@@ -395,22 +395,26 @@ class Agent:
                 del self.unreachable_notices[message.channel.id]
         return posted
 
-    async def still_addressed(self, message):
-        """Fresh Discord-side gates for a notice outside the reply path: the message as it is now."""
-        if message.guild and explicit_mention(message, self.fri.user.id):
-            # The checks its invitation passed: edits, channel, access.
-            from .fri_mentions import Invitation
-            return (message.guild.id == self.fri.guild_id and
-                    await Invitation(self, message).current(check_evidence=False))
-        if message.guild and not self.config['enabled']:
-            return False
+    async def still_addressed(self, message, answering=False):
+        """The message as Discord has it now: still there, never edited, and, before a reply, still addressed.
+
+        discord.py updates its cached copy in place on an edit, so only a fresh fetch can show one."""
+        if message.guild and not answering:
+            if explicit_mention(message, self.fri.user.id):
+                # The checks its invitation passed: channel, access, Fri enabled, still a mention.
+                from .fri_mentions import Invitation
+                if (message.guild.id != self.fri.guild_id or
+                        not await Invitation(self, message).current(check_evidence=False)):
+                    return False
+            elif not self.config['enabled']:
+                return False
         try:
             current = await message.channel.fetch_message(message.id)
         except discord.HTTPException:
             return False
-        if current.content != message.content:  # Withdrawn or changed: nothing to answer as it was.
-            return False
-        return message.guild is None or await addressed_text(current, self.fri.user.id) is not None
+        if getattr(current, 'edited_at', None) is not None or current.content != message.content:
+            return False  # Edited since it was sent, maybe to take it back.
+        return answering or message.guild is None or await addressed_text(current, self.fri.user.id) is not None
 
     async def listen(self, message):
         """`receive`, plus the outage notice when a controller read fails before any reply has started."""

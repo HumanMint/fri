@@ -544,6 +544,35 @@ def test_the_relapse_window_starts_when_the_dm_actually_went_out(monkeypatch, tm
     asyncio.run(scenario())
 
 
+def test_a_dm_still_missing_its_recovery_note_carries_the_next_outage(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        clock = [time.time()]
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        async def checks(count):
+            for _ in range(count):
+                clock[0] += 120
+                await fri.watcher.check()
+        try:
+            await checks(CHECKS)
+            clock[0] += 1800  # A long outage: the next one is past the relapse window.
+            dm.fail_edit = http(500)
+            fri.api = AsyncMock(return_value=GOOD)
+            await checks(1)  # Recovered, but the note didn't land.
+            fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+            await checks(CHECKS-1)
+            dm.fail_edit = None
+            fri.watcher = Watch(fri)
+            await checks(1)
+            assert len(dm.sends) == 1 and '-# again. it came back at' in dm.messages[556].content
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_an_outage_over_before_its_dm_landed_sends_nothing_late(monkeypatch, tmp_path):
     async def scenario():
         fri = configured(monkeypatch)
@@ -870,6 +899,45 @@ def test_an_early_notice_counts_as_the_mention_answered(monkeypatch, tmp_path, c
     with caplog.at_level(logging.INFO, logger='fri.agent'):
         asyncio.run(scenario())
     assert not [r for r in caplog.records if r.getMessage().startswith('Mention ')]
+
+
+@pytest.mark.parametrize('dm', [False, True])
+@pytest.mark.parametrize('early', [False, True])
+def test_no_notice_for_a_message_edited_since_it_was_sent(monkeypatch, tmp_path, dm, early):
+    import copy
+    async def scenario():
+        fri, agent, _, _, _, make_message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        event = make_message('what time is it?' if dm else 'fri what time is it?')
+        if dm:
+            event.guild = None
+        def edit(content):
+            # discord.py updates its cached message in place, so only Discord's copy shows the edit.
+            edited = copy.copy(event)
+            edited.content, edited.edited_at = content, datetime.datetime.now(datetime.timezone.utc)
+            rows[event.id] = edited
+        api = fri.api
+        async def fail(method, path, value=None):
+            if path == '/chat/context':  # The reply has started; taken back meanwhile.
+                edit('never mind')
+                raise ControllerUnavailable(UNREACHABLE)
+            return await api(method, path, value)
+        if early:
+            edit(event.content)  # Edited, then reverted: same text, but no longer what Fri read.
+            agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+            fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        else:
+            fri.api = fail
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                try:
+                    await agent.handle(event)
+                except ControllerUnavailable:
+                    pass
+            event.reply.assert_not_awaited()
+            assert not agent.unreachable_notices
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
 
 
 def test_an_admitted_mention_gets_the_notice_if_the_controller_dies_after_inference(monkeypatch, tmp_path):
