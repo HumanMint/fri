@@ -1291,6 +1291,46 @@ def test_controller_dying_after_a_configured_mention_is_admitted_still_gets_the_
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('burst', [False, True])
+def test_controller_dying_at_the_gene_receipt_recheck_gets_the_notice_not_an_access_error(monkeypatch, tmp_path,
+                                                                                         burst):
+    async def scenario():
+        fri, agent, _, _, _, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first = make_message('<@99> can you explain that?')
+        second = make_message('<@99> and why did it stop?') if burst else None
+        paused = {'id': 'r1', 'channel_id': '1', 'action': 'pause', 'argument': '', 'state': 'finished',
+                  'at': time.time(), 'grounded': True, 'result': {'done': True, 'output': 'Paused'}}
+        api, failed = fri.api, []
+        async def recheck_down(method, path, value=None):
+            if path == '/controls/recent':
+                return {'receipts': [paused]}
+            frame = sys._getframe(1)
+            while frame and frame.f_code.co_qualname != 'Actions.valid':
+                frame = frame.f_back
+            if frame and not failed:  # Once, inside the recheck that guards a reply drawn from Gene receipts.
+                failed.append(path)
+                if burst:  # The burst's first mention changed while the controller was down.
+                    first.content, first.edited_at = '<@99> never mind', datetime.datetime.now(datetime.timezone.utc)
+                raise ControllerUnavailable(UNREACHABLE)
+            return await api(method, path, value)
+        fri.api = recheck_down
+        try:
+            if burst:  # Real waits, so the two pings form a burst.
+                await asyncio.gather(agent.handle(first), agent.handle(second))
+            else:
+                with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                    await agent.handle(first)
+            assert failed and fri.chat_once.await_count == 1
+            replies = [call.args for event in filter(None, (first, second)) for call in event.reply.await_args_list]
+            if burst:
+                assert not replies and not {first.id, second.id} & set(agent.responded)
+            else:
+                assert replies == [(UNREACHABLE,)] and first.id in agent.responded
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_controller_trouble_while_answering_an_outside_mention_stays_quiet(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, _, _, _, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=8)

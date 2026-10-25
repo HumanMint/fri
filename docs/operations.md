@@ -294,7 +294,9 @@ Fri can't restart anything. It only notices and says so.
   stands in for the whole burst, so every earlier message in it must also be as it arrived, and
   each @mention among them still gets those checks, even when the reply answers a later message.
   discord.py edits its cached copy in place, so only a fresh fetch shows an edit. A privacy
-  recheck that can't reach the controller leads to the notice, not silence. Every notice first
+  recheck that can't reach the controller leads to the notice, not silence, and so does the access
+  recheck before a reply drawn from recent Gene receipts (it used to say "my access changed
+  mid-check"). Rechecks after a tool ran keep their receipt reply. Every notice first
   fetches the message as Discord has it now: it must still exist and never have been edited, since
   discord.py updates its cached copy in place. Before a reply has started, a channel message must
   also still be addressed, and an @mention must pass its channel and access checks with Fri
