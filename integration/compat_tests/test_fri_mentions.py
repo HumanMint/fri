@@ -2142,24 +2142,34 @@ def test_a_dm_whose_author_leaves_before_the_model_runs_is_not_answered(monkeypa
         agent.member = AsyncMock(side_effect=lambda *_, **__: present['member'])
         event = message('what is ash working on?')
         event.guild = None
-        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        def meanwhile():  # After every arrival check passed.
+            if change == 'left':
+                present['member'] = None
+            elif change == 'dms off':
+                agent.config['support_dms'] = False
         api = fri.api
         async def reading(method, path, payload=None):
-            if path == '/chat/context':  # Inside the reply, after every arrival check passed.
-                if change == 'left':
-                    present['member'] = None
-                elif change == 'dms off':
-                    agent.config['support_dms'] = False
+            if path == '/chat/context' and when == 'context':
+                meanwhile()
             return await api(method, path, payload)
         fri.api = reading
+        del fri.chat_once  # The real one, with its last checks before the request.
+        reached = []
+        async def respond(text, context, *, ready=None):
+            if when == 'sign-in':  # While the subscription signs in, before the request.
+                meanwhile()
+            await ready()
+            reached.append(text)
+            return ChatResult(status='completed', reply='an answer')
+        fri.chat.respond = respond
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
             if change == 'stays':
-                fri.chat_once.assert_awaited_once()
+                assert reached == ['what is ash working on?']
                 assert [item.args[0] for item in event.reply.await_args_list] == ['an answer']
             else:
-                fri.chat_once.assert_not_awaited()
+                assert reached == []
                 event.reply.assert_not_awaited()
         finally:
             await fri.close()
