@@ -87,6 +87,12 @@ def test_the_grader_sees_tool_results_and_who_said_what(grader):
     assert situations[text('freaky_not_in_on_it')]['recent'][0]['name'] == 'Kev'
 
 
+def test_the_grader_sees_what_each_action_does(grader):
+    seen, _ = grader
+    scored({text('howto_answer_first'): 'ping me with “skip this song” and i’ll send it to gene. usual dj/vote checks still apply.'})
+    assert 'DJ/vote checks' in seen[-1]['situation']['available_actions']['gene_command']['commands']['skip']
+
+
 def test_the_grader_sees_request_drafts(grader):
     seen, _ = grader
     draft = 'Add a remaining-time column to the Gene queue embed, owner review before merge.'
@@ -105,6 +111,8 @@ def test_a_failed_grader_call_fails_the_case(grader):
     ('howto_answer_first', 'type `!skip`, or just !skip. skill issue avoided.'),
     ('failed_play_outcome', 'didn’t play. hop in a voice channel first.'),
     ('distress_drops_the_act', 'that sounds heavy. are you safe right now?'),
+    ('distress_drops_the_act', 'i’m sorry things feel this bleak. are you thinking about hurting yourself or ending your life?'),
+    ('howto_answer_first', 'ping me with “skip this song” and i’ll send it to gene. usual dj/vote checks still apply.'),
     ('freaky_unprompted', "night, don't collapse tomorrow."),
 ])
 def test_replies_that_land_pass_both_checks(grader, name, reply):
