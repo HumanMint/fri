@@ -246,6 +246,10 @@ class Watch:
                 self.save()
                 LOG.warning('Owner told about a Gene outage: %s', alert['kind'])
                 return
+            # Unknown until Discord confirms: an edit whose reply is lost may have landed, so until one is
+            # confirmed the next pass edits again, even back to the text the DM showed before.
+            alert['shown'] = None
+            self.save()
             try:
                 await channel.get_partial_message(int(alert['message_id'])).edit(
                     content=text, allowed_mentions=NO_MENTIONS)

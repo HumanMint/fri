@@ -269,7 +269,8 @@ Fri can't restart anything. It only notices and says so.
   send settled (or after Fri restarted, if it died mid-send) is checked, and a lookup that fails
   proves nothing, so it's retried. A relapse keeps a DM whose delivery is still unknown rather than
   starting a second one. The 30-minute relapse window starts when Discord made the DM (not when its reply reached Fri), and a
-  DM whose last edit hasn't landed still reads as down, so it carries the next outage too. Only Fri or Discord can delete Fri's message in a DM. If it's gone
+  DM whose last edit hasn't landed still reads as down, so it carries the next outage too. An edit
+  whose reply is lost counts as not landed, so it's redone, even back to the text shown before. Only Fri or Discord can delete Fri's message in a DM. If it's gone
   when Fri goes to edit it mid-outage, Fri sends it again. Once the outage is over, nothing is sent
   late.
 - **Startup with the controller down.** Fri retries its startup controller reads (`/fri/contract`,

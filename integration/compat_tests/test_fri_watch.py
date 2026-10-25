@@ -756,6 +756,42 @@ def test_the_relapse_window_counts_from_when_discord_made_the_dm_not_its_late_re
     asyncio.run(scenario())
 
 
+def test_an_edit_whose_reply_was_lost_is_redone_even_back_to_the_text_shown_before(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        clock = SimpleNamespace(now=time.time())
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now))
+        async def check():
+            clock.now += 120
+            await fri.watcher.check()
+        try:
+            for _ in range(CHECKS):
+                await check()
+            partial = dm.get_partial_message
+            def lost(mid):
+                async def edit(**options):
+                    await partial(mid).edit(**options)  # Discord applied it; its reply never came back.
+                    raise TimeoutError
+                return SimpleNamespace(edit=edit)
+            dm.get_partial_message = lost
+            fri.api = AsyncMock(return_value={'heartbeat_age_seconds': 0, 'runtime': {
+                'guild_connected': False, 'controls_running': True}})
+            await check()
+            assert 'cut off from discord' in dm.messages[556].content
+            dm.get_partial_message = partial
+            fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))  # Back to the first kind.
+            fri.watcher = Watch(fri)  # Across a restart too.
+            await check()
+            assert dm.messages[556].content == fri.watcher.state['alert']['text']
+            assert 'haven’t reached' in dm.messages[556].content and len(dm.sends) == 1
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_dm_still_missing_its_recovery_note_carries_the_next_outage(monkeypatch, tmp_path):
     async def scenario():
         fri = configured(monkeypatch)
