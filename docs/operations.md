@@ -190,9 +190,12 @@ Background learning still keeps per channel.
 Each turn also sees what the speaker last said to Fri in the server's other readable channels: up to
 two of their messages from the last 12 hours (`with_you_elsewhere_untrusted`). Only their own words
 travel, never Fri's replies, because a reply can draw on a note or exchange that stays in its own
-conversation. Fri re-checks that each channel is still readable by everyone before showing it, and
-the turn inherits their provenance, since a member's words can repeat someone else's: an erasure
-removes what was built on them here too.
+conversation. Fri re-checks that each channel is still readable by everyone right before each model
+request and again before posting the reply; if one closed meanwhile, the reply stays unsaid. The turn
+inherits their provenance, since a member's words can repeat someone else's: an erasure removes what
+was built on them here too. Every model request is signed in first and then runs the delivery privacy
+check, so the words of someone who erased or changed their privacy while Fri gathered context are
+never sent.
 "What do you remember about me?" in public lists only what that channel can see. In a DM it lists
 every note with where it shows, and My memory there edits any of them; the panel shows the first 25.
 An edited note keeps its place: the new wording shows wherever the note did, as its label says.

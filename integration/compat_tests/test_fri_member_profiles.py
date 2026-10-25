@@ -119,7 +119,9 @@ def model(w, respond):
     async def call(text, context):
         return await Fri.chat_once(w.fri, text, context)
 
-    async def signed_in(text, context, headers=None):
+    async def signed_in(text, context, ready=None):
+        if ready:  # Fri's last checks, as Chat.respond runs them once signed in.
+            await ready()
         return await respond(text, context)
     w.fri.chat = SimpleNamespace(respond=signed_in, headers=AsyncMock(return_value={'Authorization': 'Bearer test'}))
     w.fri.chat_once = AsyncMock(side_effect=call)
@@ -285,7 +287,7 @@ def test_a_message_from_before_a_removal_stays_out_of_channel_chatter(monkeypatc
             return await controller(method, path, payload)
         fri.api = api
         with store.connection() as db:
-            save(db, '123', 'server', '20', ('games', 'I like Minecraft'), time.time())
+            save(db, '123', 'server', '20', ('games', 'I like Minecraft'), time.time(), provenance=[])
         early = message('fri I like Minecraft modpacks', age=3)  # Waiting while the member edits their memory.
         removed = entries(store, '123', 'private:900', '20')['entries'][0]
         edit(store, '123', 'private:900', '20', removed['id'], 0, dm_control(), 'remove')
@@ -678,3 +680,59 @@ def test_the_model_sees_elsewhere_rows_clipped_without_ids():
     assert seen[0]['with_you_elsewhere_untrusted'] == [{'channel': '#gaming', 'minutes_ago': 40, 'message': 'a'*300}]
     asyncio.run(chat.respond('hey', CONTEXT))
     assert seen[1]['with_you_elsewhere_untrusted'] == []
+
+
+@pytest.mark.parametrize('kept', ['profile note', 'elsewhere'])
+def test_words_of_someone_who_forgets_while_fri_signs_in_never_reach_the_model(monkeypatch, tmp_path, kept):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            if kept == 'profile note':
+                quoting_note(w)
+            else:  # The member's own words in #general, said while ash's were in view.
+                text = 'ash and i are into minecraft modpacks'
+                w.store.save_chat('123', 'public:1', '20', 0, text, 'nice', 'model', 'high', audience='server',
+                                  provenance=[ASH], source=discord_source(w.message(GENERAL, text)).model_dump())
+            sent = []
+
+            def access_token():
+                w.store.erase_user('30')  # Forgets while Fri signs in, after it gathered context.
+                return 'test'
+            w.fri.chat = Chat(SimpleNamespace(access_token=access_token), httpx.MockTransport(
+                lambda request: sent.append(request) or httpx.Response(500)))
+
+            async def call(text, context):
+                return await Fri.chat_once(w.fri, text, context)
+            w.fri.chat_once = AsyncMock(side_effect=call)
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await w.say(GAMING, 'fri what games do i like')
+            assert sent == []  # Refused before the request, not only before delivery.
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_channel_closed_while_fri_thinks_keeps_the_reply_unsaid(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri my concert is friday at the blue room')
+            saved = len(turns(w))
+
+            closing = [True]
+
+            async def respond(text, context):
+                assert [row['channel'] for row in context['elsewhere']] == ['#general']
+                if closing.pop() if closing else False:
+                    w.readable[GENERAL] = False  # Restricted while the model writes the reply.
+                return ChatResult(status='completed', reply='your concert is friday at the blue room')
+            model(w, respond)
+            with pytest.raises(commands.UserFeedbackCheckFailure, match='went private'):
+                await w.say(GAMING, 'fri what are my plans')
+            assert len(turns(w)) == saved and not w.fri.agent.recent[GAMING]  # Not posted, saved or echoed.
+            w.readable[GENERAL] = True
+            await w.say(GAMING, 'fri what are my plans')  # Open again, so it's said.
+            assert len(turns(w)) == saved+1
+        finally:
+            await w.fri.close()
+    run(scenario)

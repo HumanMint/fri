@@ -424,8 +424,18 @@ class Chat:
                 raise SubscriptionError('The subscription model list could not be refreshed. Try reconnecting Fri.')
             return sorted({m['slug'] for m in response.json()['models'] if m.get('visibility') == 'list'})
 
-    async def respond(self, text, context, *, headers=None):
-        """headers: already signed in, so the request goes out as built, without waiting first."""
+    async def respond(self, text, context, *, ready=None):
+        """ready: the caller's last checks, run once signed in so nothing waits between them and the request.
+
+        The request is built after them, from the context they leave. A refusal there sends nothing.
+        """
+        headers = None
+        if ready:
+            try:
+                headers = await self.headers()
+            except SubscriptionError as exc:
+                return ChatResult(status='failed', error=str(exc))
+            await ready()
         text = clean(text, 4000)
         result = ChatResult()
         text_parts = {}
