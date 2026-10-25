@@ -381,19 +381,28 @@ def loops_view(loops, source=None):
 
     Each one already belongs to this conversation: the controller sends reminders only in their DM, saved
     work only where it was saved, and game-night cards only in their channel, with the card's counts. A /fri
-    panel is private too, so its empty reminder list becomes null: reminders never show there.
+    panel is private too, so its empty reminder list becomes null: reminders never show there. A kind or row
+    in an unexpected shape is dropped rather than breaking the reply.
     """
     def date(value):
-        return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds') if isinstance(
-            value, (int, float)) else value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds')
+        except (OverflowError, OSError, ValueError):
+            return None
+    def rows(kind):
+        value = loops.get(kind) if isinstance(loops, dict) else None
+        return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else None
     dm = (source or {}).get('kind') == 'discord_message' and (source or {}).get('guild_id') is None
-    return {'reminders': None if loops.get('reminders') is None or not dm else
-                [{**row, 'text': str(row.get('text', ''))[:300], 'due': date(row.get('due'))}
-                 for row in loops['reminders']],
-            'saved_work': [{**row, 'updated': date(row.get('updated'))} for row in loops.get('saved_work', [])],
-            'game_nights': None if loops.get('game_nights') is None else
-                [{**row, 'options': [date(value) for value in row.get('options', [])],
-                  'chosen': date(row.get('chosen'))} for row in loops['game_nights']]}
+    reminders, saved_work, game_nights = rows('reminders'), rows('saved_work'), rows('game_nights')
+    return {'reminders': None if reminders is None or not dm else
+                [{**row, 'text': str(row.get('text', ''))[:300], 'due': date(row.get('due'))} for row in reminders],
+            'saved_work': None if saved_work is None else
+                [{**row, 'updated': date(row.get('updated'))} for row in saved_work],
+            'game_nights': None if game_nights is None else
+                [{**row, 'options': [date(value) for value in row['options']] if isinstance(row.get('options'), list)
+                  else None, 'chosen': date(row.get('chosen'))} for row in game_nights]}
 
 
 @dataclass

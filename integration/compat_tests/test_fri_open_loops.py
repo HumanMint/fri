@@ -150,3 +150,19 @@ def test_the_open_loop_evaluation_fails_wrong_answers():
     assert all(row['passed'] for row in verdicts.values()) and len(judged) == len(careful.seen) == 8
     assert careful.seen[0]['source']['guild_id'] is None and careful.seen[5]['source']['guild_id'] == '444'
     assert judged[0]['open_loops']['reminders'][0]['state'] == 'scheduled'
+
+
+@pytest.mark.parametrize('loops', [
+    {'reminders': None, 'saved_work': None, 'game_nights': None},
+    {'reminders': 'x', 'saved_work': {'title': 'x'}, 'game_nights': 3},
+    {'reminders': [None, 'x', {'due': float('nan')}], 'saved_work': [{'updated': 1e300}],
+     'game_nights': [{'options': 'abc', 'chosen': float('inf')}]},
+    [], 'x', {},
+])
+def test_a_malformed_loops_payload_never_breaks_a_reply(loops):
+    dm = event().evidence()
+    shown = loops_view(loops, dm)
+    assert set(shown) == {'reminders', 'saved_work', 'game_nights'}
+    json.dumps(shown, allow_nan=False)  # Whatever arrives, the model input stays valid JSON.
+    sent, _ = respond({'loops': loops, 'source': dm})
+    assert sent == shown
