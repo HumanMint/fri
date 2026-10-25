@@ -47,6 +47,22 @@ class ChatSource(BaseModel):
         return data
 
 
+def source_identity(source):
+    """Which event and author a source names, without the author's display name.
+
+    A gateway event carries the author's server member, so its name is their nickname. A REST
+    fetch has no member data and Fri caches no members, so the same author shows their global
+    name. Freshness checks compare who, where and which event, never that name.
+    """
+    data = source.model_dump() if isinstance(source, ChatSource) else dict(source)
+    data.pop('display_name', None)
+    return data
+
+
+def same_source(first, second):
+    return source_identity(first) == source_identity(second)
+
+
 def discord_source(event, text=None, bot_id=0):
     # Imports stay local: the controller need not install the Discord runtime.
     import discord

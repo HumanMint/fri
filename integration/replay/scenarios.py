@@ -8,6 +8,7 @@ import json
 
 from .harness import (
     FRI,
+    GUILD,
     OUTSIDE,
     OWNER,
     Check,
@@ -350,7 +351,22 @@ REFERENCE_AFTER_ERASURE = Scenario(
            and all('denver' not in d.text for d in r.step('peer').deliveries)),
      Check('nothing derived is kept for kit', lambda r: placeholder_only(r, 'peer'))])
 
+def seed_request(replay):
+    job = replay.store.request(str(GUILD), str(BO), 'draft-seed', '', 'Fix the modpack command\nwith details', [])
+    with replay.store.connection() as db:
+        db.execute("UPDATE jobs SET state='review' WHERE id=?", (job['id'],))
+    return True
+
+
+REQUEST_STATUS = Scenario(
+    'own_request_status_is_known',
+    'Fri sees the speaker\'s own open request and its state, without its text in a public channel.',
+    [Inspect('seeded', seed_request), Say(BO, 'fri is my modpack fix done yet', label='ask')],
+    {'conversation': [reply('not yet, the tested change is waiting for the owner to review it')]},
+    [Check('the model sees the request and its state', lambda r: first_call(r, 'ask')['request_states'] == ['review']),
+     Check('no request text in a public channel', lambda r: first_call(r, 'ask')['request_titles'] == 0)])
+
 SCENARIOS = [CLOSING, OPEN_QUESTION, WEB_CLARIFICATION, OUTSIDE_MENTION, KEYWORDS, ERASURE, REPLY_TARGET,
              CATCH_UP,
              DELIVERY_FAILURE, TOOL_CONTINUITY, GROUP_VIEW, MIDTURN_ERASURE, HISTORY, HISTORY_MIDTURN, SUMMARY,
-             FRI_REFERENCE, PENDING, REFERENCE_AFTER_ERASURE]
+             FRI_REFERENCE, PENDING, REFERENCE_AFTER_ERASURE, REQUEST_STATUS]

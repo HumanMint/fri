@@ -9,14 +9,14 @@ import os
 import re
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import closing
 
 import discord
 from discord.ext import tasks
 
 from . import feedback as commands
-from .fri_addressing import addressed_text, explicit_mention
+from .fri_addressing import addressed_text, explicit_mention, pinged
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
@@ -34,6 +34,8 @@ from .subscription import private_json
 LOG = logging.getLogger('fri.agent')
 NO_MENTIONS = discord.AllowedMentions.none()
 GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
+REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long, and how many, delivered IDs are remembered.
+DEFERRED = object()  # The burst holding this message answers, or explains, for it.
 
 
 class BehaviorPreview(PagedPreview):
@@ -80,10 +82,14 @@ class Agent:
         self.recent = defaultdict(lambda: deque(maxlen=30))
         self.active = {}
         self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
+        self.handling = Counter()  # Discord message IDs being handled now, burst members included.
+        self.delivered = {}  # Discord message ID -> when it first arrived, oldest first.
         self.recording = {}  # (channel, member): set once a delivered reply is recorded.
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
         self.pending = {}
-        self.bursts = Bursts()
+        self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
+        self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
+        self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
         self.seen = {}
         self.last_attention = {}
         self.last_spoke = {}
@@ -303,7 +309,62 @@ class Agent:
             self.control_busy = False
         return True
 
+    def miss(self, event, reason):
+        if event.id in self.misses and self.misses[event.id] is None:
+            self.misses[event.id] = reason
+
+    def answered(self, events):
+        for event in events:
+            self.misses.pop(event.id, None)
+
+    def settle(self, event, reason=None):
+        if event.id in self.misses:  # IDs and a gate or exception name only, never content or names.
+            LOG.info('Mention %s/%s not answered: %s', event.channel.id, event.id,
+                     self.misses.pop(event.id) or reason or 'no reply')
+
     async def handle(self, message):
+        # Discord can deliver an event again, e.g. after a resume. Its first delivery answers, or
+        # explains, for every copy: while it or the burst holding it is still being handled, and
+        # for an hour after, in a bounded record the in-flight checks don't rely on.
+        now = time.monotonic()
+        while self.delivered and now-next(iter(self.delivered.values())) > REDELIVERY_SECONDS:
+            del self.delivered[next(iter(self.delivered))]
+        if (message.id in self.handling or self.bursts.group(message) is not None or
+                message.id in self.delivered):
+            return
+        if len(self.delivered) >= MAX_DELIVERED:
+            del self.delivered[next(iter(self.delivered))]
+        self.delivered[message.id] = now
+        self.handling[message.id] += 1
+        try:
+            await self.watch(message)
+        finally:
+            self.handling -= Counter([message.id])
+
+    async def watch(self, message):
+        # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
+        # A copy that outlived the record of delivered events is left to the delivery watched first.
+        if (message.guild is None or message.author.bot or getattr(message, 'webhook_id', None) or
+                message.id in self.watched or message.id in self.misses or message.id in self.replying or
+                not pinged(message, self.fri.user.id)):
+            await self.receive(message)
+            return
+        self.watched[message.id] = self.misses[message.id] = None
+        if len(self.watched) > MAX_DELIVERED:
+            del self.watched[next(iter(self.watched))]
+        owned = False  # By a burst: its last message answers, or its drop explains, for this one.
+        try:
+            owned = await self.receive(message) is DEFERRED
+        except BaseException as exc:
+            owned = self.bursts.group(message) is not None
+            if not owned:
+                self.miss(message, type(exc).__name__)
+            raise
+        finally:
+            if not owned:
+                self.settle(message)
+
+    async def receive(self, message):
         arrived = time.monotonic()  # Bursts group by arrival, even if this waits for an earlier reply.
         forgotten = self.forgotten.get(message.author.id, 0)
         if getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:
@@ -315,7 +376,8 @@ class Agent:
         elif not self.allowed(message.channel):
             # An outside ping is one event, never a new ambient/active channel.
             if message.guild.id != self.fri.guild_id or not explicit_mention(message, self.fri.user.id):
-                return
+                return self.miss(message, 'outside the main server' if message.guild.id != self.fri.guild_id
+                                 else 'not a visible user mention')
             from .fri_mentions import Invitation
             invitation = await Invitation.create(self, message)
             if invitation:
@@ -332,16 +394,16 @@ class Agent:
                 return
         text = clean(raw, 4000)
         if not text:
-            return
+            return self.miss(message, 'no text')
         directed = text if dm else await addressed_text(message, self.fri.user.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
         if owner_addressed and message.author.id == self.fri.owner_id and await self.owner_control(message, directed or text):
-            return
+            return self.answered([message])
         privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
         owner_report = (owner_addressed and message.author.id == self.fri.owner_id and
                         (dm or message.guild.id == self.fri.guild_id) and usage_requested(directed or text))
         if not self.config['enabled'] and not privacy and not owner_report:
-            return
+            return self.miss(message, 'fri disabled')
         invitation = None
         if self.config['enabled'] and not dm and message.guild.id == self.fri.guild_id and explicit_mention(message, self.fri.user.id):
             from .fri_mentions import Invitation
@@ -378,7 +440,7 @@ class Agent:
             # Erased meanwhile, here or through the panel, Gene or Red: drop it, as forget() drops a burst.
             if (self.forgotten.get(message.author.id, 0) != forgotten or
                     (await self.profile(scope, message.author.id))['revision'] != observed):
-                return
+                return self.miss(message, 'author privacy changed')
         active = (self.active.get((channel, message.author.id), 0) > time.time() or
                   self.bursts.has(channel, message.author.id))
         if not active and directed is None and not dm and not message.author.bot:
@@ -391,7 +453,7 @@ class Agent:
         if message.reference and directed is None:
             active = False
         if directed is None and not active and channel != self.dedicated:
-            return
+            return self.miss(message, 'not a visible user mention')
         # Short bursts share context and produce one response to the newest message.
         key = (channel, message.author.id)
         try:
@@ -399,18 +461,37 @@ class Agent:
         except ValueError as exc:
             self.pending.pop(key, None)
             await message.reply(notice_text(str(exc)), allowed_mentions=NO_MENTIONS, mention_author=False)
-            return
+            return self.answered([message])
         self.pending[key] = message.id
-        await asyncio.sleep(1.5)
+        try:
+            await asyncio.sleep(1.5)
+        except BaseException as exc:
+            if self.bursts.latest(message):  # No later message will answer this burst now.
+                if self.pending.get(key) == message.id:
+                    self.pending.pop(key, None)
+                self.bursts.drop(message, type(exc).__name__)
+            raise
         if not self.bursts.latest(message):
-            return  # A later message in the same burst answers for this one.
+            # A later message answers for this one, or the burst was dropped and said why.
+            return DEFERRED
         if self.pending.get(key) == message.id:
             self.pending.pop(key, None)
         burst = self.bursts.take(message)
-        if len(burst) > 1:
-            await self.respond(message, directed or text, dm, burst=burst, **({'invitation': invitation} if invitation else {}))
-        else:
-            await self.respond(message, directed or text, dm, **({'invitation': invitation} if invitation else {}))
+        earlier = [event for _, event, _ in burst if event is not message]
+        self.handling.update(event.id for event in earlier)  # Until this reply answers for them too.
+        try:
+            if len(burst) > 1:
+                await self.respond(message, directed or text, dm, burst=burst, **({'invitation': invitation} if invitation else {}))
+            else:
+                await self.respond(message, directed or text, dm, **({'invitation': invitation} if invitation else {}))
+        except BaseException as exc:
+            for event in earlier:
+                self.miss(event, type(exc).__name__)
+            raise
+        finally:
+            self.handling -= Counter(event.id for event in earlier)
+            for event in earlier:
+                self.settle(event)
 
     def ambient_ready(self, channel, user):
         return (user not in self.fri.busy and (channel, user) not in self.pending and
@@ -431,6 +512,11 @@ class Agent:
             self.replying.discard(message.id)
 
     async def reply_once(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None):
+        events = [message, *(event for _, event, _ in burst if event is not message)]  # This turn answers for all.
+        def missed(reason):
+            for event in events:
+                self.miss(event, reason)
+
         try:
             async with message.channel.typing():
                 # Entering Discord's typing context itself awaits an HTTP request.
@@ -441,39 +527,48 @@ class Agent:
                     burst=burst, inspect_images=not ambient, **({'invitation': invitation} if invitation else {}))
         except ReplyInProgress:
             if invitation and not await invitation.current():
-                return
+                return missed(f'reply withheld: {invitation.refusal}')
+            missed('earlier reply still running')  # Its waiting notice is deleted once that reply lands.
             if not ambient:
                 await self.fri.waiting_notices.send(message)
             return
         except commands.UserFeedbackCheckFailure as exc:
             if invitation and not await invitation.current():
-                return
+                return missed(f'reply withheld: {invitation.refusal}')
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
+            self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if invitation:
             if not await invitation.current():
-                return
+                return missed(f'reply withheld: {invitation.refusal}')
             from .fri_mentions import force_text
             result = force_text(result)
         if result.response_kind in ('react', 'quiet'):
-            if result.status == 'completed' and result.response_kind == 'react':
-                await self.acknowledge(message, result.reaction)
+            if result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(message, result.reaction):
+                self.answered(events)
+            else:
+                missed('reaction withheld' if result.response_kind == 'react' else 'chose quiet')
             await self.fri.record_turn(result)  # Records the decision, never claimed reaction delivery.
             # Neither outcome renews active attention or the ambient reply timer.
             await self.fri.waiting_notices.clear(message.author.id)
             return
+        async def delivered():  # A preview is answered once posted, even if binding it fails next.
+            self.answered(events)
+            await self.fri.record_turn(result)
+
         if result.post_preview:
             from .fri_workspace import show_preview
-            await show_preview(self.fri, message, result.post_preview, delivered=lambda: self.fri.record_turn(result))
+            await show_preview(self.fri, message, result.post_preview, delivered=delivered)
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if result.social_preview:
             from .fri_social import show_preview
-            await show_preview(self.fri, message, result.social_preview, delivered=lambda: self.fri.record_turn(result))
+            await show_preview(self.fri, message, result.social_preview, delivered=delivered)
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        if not result.reply:
+        if not result.reply:  # A cooldown's notice shows once; later messages in it stay quiet.
+            missed('social cooldown' if result.status == 'cooldown' else 'empty reply')
             await self.fri.waiting_notices.clear(message.author.id)
             return
         view = None
@@ -496,8 +591,10 @@ class Agent:
             sent = await send_reply(message, result, view=view, mention_author=False,
                                     allowed_mentions=NO_MENTIONS, suppress_embeds=True)
             if sent is None:  # Nothing was delivered, so nothing is recorded as said.
+                missed('image share withdrawn')
                 await self.fri.waiting_notices.clear(message.author.id)
                 return
+            self.answered(events)
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
             await self.fri.record_turn(result, sent)
             if echo and message.guild and self.allowed(message.channel):
@@ -514,7 +611,7 @@ class Agent:
         await self.fri.waiting_notices.clear(message.author.id)
 
     async def acknowledge(self, message, emoji):
-        """Only react to the triggering message, once, within the existing write scope."""
+        """Only react to the triggering message, once, within the existing write scope. True once added."""
         if emoji not in REACTIONS or not self.config['enabled']:
             return
         async with self.reaction_lock:
@@ -547,6 +644,7 @@ class Agent:
                 self.acknowledged[message.id] = now
                 self.last_reaction[key] = self.last_reaction[(channel.id, None)] = now
                 await current.add_reaction(emoji)
+                return True
             except discord.HTTPException:
                 LOG.info('Conversation reaction was not confirmed; leaving the turn quiet')
 

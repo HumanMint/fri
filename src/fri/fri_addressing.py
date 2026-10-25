@@ -23,6 +23,15 @@ def explicit_mention(message, bot_id):
                 re.search(r'(?<!\\)<@!?'+re.escape(str(bot_id))+r'>', visible_content(message.content or '')))
 
 
+def pinged(message, bot_id):
+    """Discord shows this as pinging Fri: a mention, a reply ping, or Fri's own integration role."""
+    users, roles = getattr(message, 'mentions', ()), getattr(message, 'role_mentions', ())
+    return bool(bot_id and (
+        (isinstance(users, (list, tuple)) and any(getattr(u, 'id', None) == bot_id for u in users)) or
+        (isinstance(roles, (list, tuple)) and
+         any(getattr(getattr(r, 'tags', None), 'bot_id', None) == bot_id for r in roles))))
+
+
 async def addressed_text(message, bot_id):
     content = message.content or ''
     explicit = explicit_mention(message, bot_id)

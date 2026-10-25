@@ -38,6 +38,27 @@ image selection removed for that turn. Explicit reply references load only their
 direct target initially, and keep their source and persistence guards. The current
 attachments and existing immediate own-photo pairing remain available directly.
 
+Freshness checks compare author and event IDs, never display names. A gateway event shows
+the member's server nickname, but a fetched copy of the same message shows their global
+name, because Fri has no members intent or member cache.
+
+Every ping to Fri from a member (a mention, a reply ping or Fri's role pill) that gets no
+lasting reply is logged once at INFO, with only its channel and message IDs:
+`Mention <channel>/<message> not answered: <reason>`. A reason is a gate or an error type,
+never content or names. Examples: `not a visible user mention` (the role pill, or a mention
+in quotes or code), `message changed`, `stale event`, `missing permissions`, `fri disabled`,
+`author privacy changed`, `burst too long`, `earlier reply still running` (its waiting
+notice is deleted once that reply lands), `social cooldown` (after the cooldown's one
+notice), `image share withdrawn`, `reply withheld: <recheck>` when a recheck failed after
+composing, and an exception type such as `Forbidden`. A burst's earlier messages are
+logged under the reason its last message got. A reply, a notice, a preview or a reaction
+counts as an answer. Bots, webhooks and DMs aren't logged. Fri ignores a copy of an event
+that Discord delivers again while the first delivery, or the burst holding it, is still
+being handled. Separately, it remembers each event ID for an hour from its first arrival
+(at most 10,000 IDs, oldest dropped first) and ignores copies in that time, so the first
+delivery answers or explains for every copy. A ping is logged at most once while it is among the last
+10,000 pings watched.
+
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.
 They do not prove Discord delivery or live model interpretation of a particular meme.
@@ -127,6 +148,27 @@ advertises it, so the controller must be released first.
   speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
+
+## Members' own requests
+
+Each turn's chat context includes up to five of the speaker's own requests that are still open or
+settled within the last week, with their controller state (`your_gene_requests` for the model).
+Fri uses them to answer "is my fix done?" and to avoid duplicate drafts, never claims progress
+beyond the recorded state, and in public mentions them only when the speaker asks. Request text
+appears only in the member's private conversation (DM or `/fri` panel), never for drafts built from
+other members' words, and not at all while their memory is off. Requests typed in the panel's form
+are sent with an empty source list, so they count as the member's own words. A request withdrawn
+after a privacy change is marked `withdrawn`, so Fri doesn't call it the owner's rejection.
+Public rows have no titles, so Fri ties a state to a feature the member names only when a title or id
+shows it's that request (or the member asks generally and one shows); otherwise they say what they can
+see without calling it that feature, or ask. With no list (an outside invitation or an older
+controller) they point to Requests instead of guessing.
+`python -m fri.fri_eval --suite requests` checks status answers with the real model: queued and
+approved haven't started their next step, building isn't done, deployed means it shipped (the
+controller doesn't mark a request a later rollback reverted), withdrawn isn't a rejection, untitled,
+empty or unavailable lists aren't guessed, an open request isn't drafted again, and public banter
+leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
+on the same model grades it.
 
 ## Deployment boundary
 
