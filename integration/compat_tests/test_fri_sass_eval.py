@@ -1,9 +1,14 @@
 import asyncio
+import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import httpx
 import pytest
 
-from fri import fri_eval
-from fri.fri_chat import ChatResult
+from compat_tests.test_fri_chat import response_event
+from fri import fri_eval, privacy
+from fri.fri_chat import Chat, ChatResult
 from fri.fri_eval import evaluate, model_text_cases, sass_cases
 
 
@@ -126,4 +131,57 @@ def test_every_model_text_case_is_graded_and_the_baseline_escapes_all_input(grad
     for module in (fri_agent_model, fri_chat, fri_web):
         monkeypatch.setattr(module, 'model_json', module.model_json)  # Restored after the test.
     fri_eval.ascii_baseline()
-    assert all(module.model_json is fri_eval.json.dumps for module in (fri_agent_model, fri_chat, fri_web))
+    assert all(module.model_json is fri_eval.json.dumps for module in (fri_chat, fri_web))
+    assert fri_agent_model.model_json is privacy.model_json  # The graders' analyze().
+
+
+def test_the_grader_reads_a_baseline_run_the_same_way(monkeypatch):
+    sent = []
+    def handler(request):
+        sent.append(json.loads(request.content)['input'][0]['content'])
+        event = response_event(content=json.dumps({'verdict': 'pass', 'reason': 'fine'}))
+        return httpx.Response(200, text='data: '+json.dumps(event)+'\n\n')
+    chat = Chat(SimpleNamespace(access_token=lambda: 'subscription'), httpx.MockTransport(handler))
+    case = next(case for case in model_text_cases() if case['name'] == 'korean_line')
+    reply = ChatResult(reply='ㅋㅋ 알았어', status='completed')
+    from fri import fri_agent_model, fri_chat, fri_web
+    for module in (fri_agent_model, fri_chat, fri_web):
+        monkeypatch.setattr(module, 'model_json', module.model_json)
+    graded = asyncio.run(fri_eval.grade(chat, 'gpt-6.1-sol', 'high', case, reply))
+    fri_eval.ascii_baseline()
+    assert asyncio.run(fri_eval.grade(chat, 'gpt-6.1-sol', 'high', case, reply))[0]['passed'] is graded[0]['passed'] is True
+    assert sent[0] == sent[1] and '알았어' in sent[0]
+
+
+UNSUCCESSFUL = ('failed', 'incomplete', 'interrupted', 'invalid_output')
+
+
+@pytest.mark.parametrize('status', UNSUCCESSFUL)
+def test_a_model_text_case_without_a_reply_fails(grader, status):
+    async def run():
+        replies = Scripted({case['text']: ChatResult(status=status) for case in model_text_cases()})
+        return [case async for case, _ in evaluate(replies, 'gpt-6.1-sol', 'high', suite='model-text')]
+    results = asyncio.run(run())
+    assert [case['name'] for case in results] == [case['name'] for case in model_text_cases()]
+    assert all(case['passed'] is False for case in results) and not grader[0]
+
+
+@pytest.mark.parametrize('suite', ['model-text', 'sass'])
+@pytest.mark.parametrize('status', UNSUCCESSFUL)
+def test_an_evaluation_run_with_failed_replies_exits_with_failure(grader, monkeypatch, tmp_path, suite, status):
+    async def respond(text, context):
+        return ChatResult(status=status)
+    def handle(request):
+        if request.url.path == '/status':
+            return httpx.Response(200, json={'chat_model': 'gpt-6.1-sol', 'chat_effort': 'high'})
+        if request.url.path == '/agent/state':
+            return httpx.Response(200, json={'config': {'voice_notes': 'brief'}})
+        return httpx.Response(200, json={'ok': True})
+    client_type = httpx.AsyncClient
+    monkeypatch.setenv('GENE_CONTROLLER_URL', 'http://controller.test')
+    monkeypatch.setenv('GENE_FRI_TOKEN', 'test-service-token')
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    with patch.object(fri_eval, 'Chat', return_value=SimpleNamespace(respond=respond)), patch.object(
+            fri_eval.httpx, 'AsyncClient', side_effect=lambda **kw: client_type(transport=httpx.MockTransport(handle), **kw)):
+        with pytest.raises(SystemExit, match='Evaluation failed'):
+            asyncio.run(fri_eval.main(suite))

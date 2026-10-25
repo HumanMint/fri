@@ -243,10 +243,14 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
                               (not case.get('needs') or mentions(reply, case['needs'])))
         if 'expected_action' in case:
             case['passed'] = result.status == 'completed' and (result.action or {}).get('kind') == case['expected_action']
+        if suite in GRADED and result.status != 'completed':
+            case['passed'] = False  # Nothing to grade, so it can't pass.
         yield case, result
-        if suite in ('sass', 'model-text') and result.status == 'completed':
+        if suite in GRADED and result.status == 'completed':
             yield await grade(chat, model, effort, case, result)
 
+
+GRADED = ('sass', 'model-text')  # Suites whose completed replies also get a model-graded verdict.
 
 # Assistant cheer and sign-offs the casual voice never uses.
 CHEER = ('!', 'let me know', 'lmk', 'hope this helps', 'hope that helps', 'great question',
@@ -416,9 +420,10 @@ def settings_cases():
 
 
 def ascii_baseline():
-    """Every model input ASCII-escaped, as before privacy.model_json, to compare the same cases."""
-    from . import fri_agent_model, fri_chat, fri_web
-    for module in (fri_agent_model, fri_chat, fri_web):
+    """Fri's model input ASCII-escaped, as before privacy.model_json, to compare the same cases. Here
+    analyze() serves only the graders, so it keeps one serialization and grades both runs alike."""
+    from . import fri_chat, fri_web
+    for module in (fri_chat, fri_web):
         module.model_json = json.dumps
 
 

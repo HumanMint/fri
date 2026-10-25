@@ -154,16 +154,18 @@ advertises it, so the controller must be released first.
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
 - **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
-  research) goes through `privacy.model_json`. Letters, marks, numbers, punctuation, symbols and
-  spaces arrive as written, so an emoji is one character instead of a 12-character `\u` escape.
+  research) goes through `privacy.model_json`. Letters, marks, numbers, punctuation and symbols
+  arrive as written, so an emoji is one character instead of a 12-character `\u` escape.
   Everything else stays escaped exactly as before: controls, format and invisible characters
-  (bidi overrides, zero-width characters, tag characters), line separators, surrogates,
-  private-use and unassigned code points, invisible letters and marks, blank symbols such as
-  U+2800, and every variation selector, even an emoji's own U+FE0F: 👍 and 👍️ look the same, so
-  selector presence could otherwise spell hidden bits. `json.dumps` still does the traversal, key
-  conversion and errors. To compare against the old escaping, run
-  `python -m fri.fri_eval --suite model-text` with and without `--baseline` (same cases and
-  settings, model-graded: boundaries, attribution, tone and non-English text).
+  (bidi overrides, zero-width characters, tag characters), non-ASCII spaces (their widths differ,
+  so a gap could carry bits), line separators, surrogates, private-use and unassigned code points,
+  invisible letters and marks, blank or zero-width symbols such as U+2800 and U+FFFC, and every
+  variation selector, even an emoji's own U+FE0F: 👍 and 👍️ look the same, so selector presence
+  could otherwise spell hidden bits. `json.dumps` still does the traversal, key conversion and
+  errors. To compare against the old escaping, run `python -m fri.fri_eval --suite model-text`
+  with and without `--baseline` (same cases and settings, model-graded: boundaries, attribution,
+  tone and non-English text). The baseline escapes only Fri's own input; the grader reads both runs
+  the same way. A case whose reply fails, or whose grade fails or is missing, fails the run.
 
 ## Members' own requests
 

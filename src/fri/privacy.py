@@ -42,23 +42,25 @@ def clean(text: str, limit: int = 6000) -> str:
     return redact(text.strip())[:limit]
 
 
-# Invisible (default-ignorable) letters and marks, blank symbols, and every variation selector: even
-# an emoji's U+FE0E/U+FE0F often changes nothing visible, so their presence could carry hidden bits.
-INVISIBLE = re.compile('[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u2800\u3164\uffa0'
-                       '\ufe00-\ufe0f\U0001d159\U000e0100-\U000e01ef]')
+# Invisible (default-ignorable) letters and marks, blank or zero-width symbols, and every variation
+# selector: even an emoji's U+FE0E/U+FE0F often changes nothing visible, so their presence could carry
+# hidden bits. Non-ASCII spaces (category Zs) stay escaped too: their widths differ, so a gap could.
+INVISIBLE = re.compile('[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u2800\u303f\u3164\uffa0'
+                       '\ufe00-\ufe0f\ufffc\U00013441\U00013442\U00016fe4\U0001d159\U0001da7f\U0001da80'
+                       '\U000e0100-\U000e01ef]')
 NOT_PRINTABLE_ASCII = re.compile(r'[^\x20-\x7e]')
 
 
 def visible(char):
-    category = unicodedata.category(char)
-    return (category[0] in 'LMNPS' or category == 'Zs') and not INVISIBLE.match(char)
+    return unicodedata.category(char)[0] in 'LMNPS' and not INVISIBLE.match(char)
 
 
 def model_json(value):
     """JSON for model input with visible text as written: emoji, curly quotes and non-English letters
     stay raw instead of becoming \\u escapes. Controls, format and invisible characters (bidi, zero-width,
-    tags, variation selectors), line separators, surrogates, private-use and unassigned code points stay
-    escaped. json.dumps does the traversal, key conversion and errors, and its output keeps every
-    non-ASCII character inside a string, so ASCII-only output is exactly json.dumps'."""
+    tags, variation selectors), non-ASCII spaces, line separators, surrogates, private-use and
+    unassigned code points stay escaped. json.dumps does the traversal, key conversion and errors, and
+    its output keeps every non-ASCII character inside a string, so ASCII-only output is exactly
+    json.dumps'."""
     return NOT_PRINTABLE_ASCII.sub(lambda match: match.group() if visible(match.group()) else
                                    json.dumps(match.group())[1:-1], json.dumps(value, ensure_ascii=False))

@@ -11,7 +11,9 @@ HIDDEN = {
     ' ': 'paragraph separator', '\x7f': 'delete', '\x85': 'next line', '\ud800': 'lone surrogate',
     '': 'private use', '\U0010ffff': 'noncharacter', '͏': 'combining grapheme joiner',
     'ㅤ': 'hangul filler', '︁': 'variation selector 2', '\U000e0100': 'variation selector 17',
-    '\u2800': 'braille blank', '\U0001d159': 'null notehead',
+    '\u2800': 'braille blank', '\U0001d159': 'null notehead', '\ufffc': 'object replacement',
+    '\u303f': 'half fill space', '\U00013441': 'hieroglyph blank', '\U00016fe4': 'khitan filler',
+    '\u00a0': 'no-break space', '\u2002': 'en space', '\u200a': 'hair space', '\u3000': 'ideographic space',
 }
 
 
@@ -23,7 +25,7 @@ def test_invisible_characters_stay_escaped(char):
 
 
 @pytest.mark.parametrize('value', ['it’s “fine”', '👍', '👍🏽', '❤', '한국어', 'café', 'naïve', '¯\\_(ツ)_/¯',
-                                   'x y', '日本語', 'Привет', '½ → ∞'])
+                                   '日本語', 'Привет', '½ → ∞'])
 def test_visible_text_reaches_the_model_as_written(value):
     text = model_json({'message': value})
     assert value.replace('\\', '\\\\') in text
