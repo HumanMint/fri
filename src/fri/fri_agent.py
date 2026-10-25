@@ -380,8 +380,7 @@ class Agent:
             return False
         # A DM only reaches a controller read after its member check. Outside configured channels a
         # ping keeps its own gates and stays quiet.
-        if message.guild and (not self.allowed(message.channel) or
-                              not answering and await addressed_text(message, self.fri.user.id) is None):
+        if message.guild and (not self.allowed(message.channel) or not answering and not await self.still_addressed(message)):
             return False
         now = time.time()
         self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if now-v < 300}
@@ -398,6 +397,21 @@ class Agent:
             if not posted and self.unreachable_notices.get(message.channel.id) == now:
                 del self.unreachable_notices[message.channel.id]
         return posted
+
+    async def still_addressed(self, message):
+        """Fresh Discord-side gates for a notice outside the reply path: the message as it is now."""
+        if explicit_mention(message, self.fri.user.id):
+            # The checks its invitation passed: edits, channel, access.
+            from .fri_mentions import Invitation
+            return (message.guild.id == self.fri.guild_id and
+                    await Invitation(self, message).current(check_evidence=False))
+        if not self.config['enabled']:
+            return False
+        try:
+            current = await message.channel.fetch_message(message.id)
+        except discord.HTTPException:
+            return False
+        return current.content == message.content and await addressed_text(current, self.fri.user.id) is not None
 
     async def watch(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.

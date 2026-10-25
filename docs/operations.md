@@ -233,8 +233,10 @@ Fri can't restart anything. It only notices and says so.
   restart mid-outage neither repeats nor forgets the DM. Fri saves what the DM should say before
   it touches Discord, with 30 s for each pass, so a stuck send never delays the next read. A send
   or edit that fails or times out is retried on the next pass, even after a restart. A send that
-  may have landed is looked up in the DM, among the first messages after that attempt, before it's
-  sent again under the same nonce. Only Fri or Discord can delete Fri's message in a DM. If it's gone
+  may have landed is looked up in the DM before it's sent again under the same nonce. Every DM from
+  a minute before the attempt to a minute after its deadline is checked, and a lookup that fails
+  proves nothing, so it's retried. A relapse keeps a DM whose delivery is still unknown rather than
+  starting a second one. The 30-minute relapse window starts when a DM actually went out. Only Fri or Discord can delete Fri's message in a DM. If it's gone
   when Fri goes to edit it mid-outage, Fri sends it again. Once the outage is over, nothing is sent
   late.
 - **Startup with the controller down.** Fri waits for `/fri/contract` (every 10 s) before it joins
@@ -250,7 +252,10 @@ Fri can't restart anything. It only notices and says so.
 - **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed
   to Fri in a configured channel) whose controller read fails, before or while replying, gets one
   fixed notice per channel per 5 minutes instead of silence. A mention Fri already admitted only
-  needs its Discord-side checks for this notice, since the notice carries no evidence. A notice that
+  needs its Discord-side checks for this notice, since the notice carries no evidence; a privacy
+  recheck that can't reach the controller leads to the notice, not silence. Before a reply has
+  started, the notice rechecks the message as it is now: still addressed and unedited, and for an
+  @mention its channel and access, with Fri enabled. A notice that
   fails to post, for any reason, doesn't use up those 5 minutes. Ambient chimes stay quiet, and so
   does a message Fri already answered. Mentions outside configured channels keep their own gates
   and stay silent. The same text replaces the old "workshop controller is

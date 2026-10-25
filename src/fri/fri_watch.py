@@ -161,12 +161,17 @@ class Watch:
             if alert['kind'] != kind:  # Still down, differently; keep the one DM current.
                 alert.update(kind=kind, text=text+alert.get('again', ''))
         elif state['bad'] >= CHECKS:
-            if alert and alert.get('message_id') and now-alert['sent'] < RELAPSE:
+            if alert and alert.get('message_id') and now-(alert['sent'] or 0) < RELAPSE:
                 again = f'\n-# again. it came back at <t:{int(alert["ended"])}:t>.'
                 alert.update(open=True, kind=kind, since=state['since'], text=text+again, again=again)
+            elif alert and alert.get('attempted') and not alert.get('message_id') and alert.get('shown') != alert['text']:
+                # Its DM may have landed without Fri hearing back. Keep the nonce and attempt so delivery
+                # can still find that DM and edit it to this outage, instead of sending a second one.
+                alert.update(open=True, kind=kind, since=state['since'], text=text, again='')
             else:
                 # The nonce is saved before the send, so a resend Discord already took returns that message.
-                state['alert'] = {'open': True, 'kind': kind, 'since': state['since'], 'sent': now, 'text': text,
+                # `sent` is when a DM actually went out, which starts the relapse window.
+                state['alert'] = {'open': True, 'kind': kind, 'since': state['since'], 'sent': None, 'text': text,
                                   'nonce': secrets.randbits(62)}
         self.save()
 
@@ -180,12 +185,17 @@ class Watch:
                 owner = self.fri.get_user(self.fri.owner_id) or await self.fri.fetch_user(self.fri.owner_id)
                 channel = owner.dm_channel or await owner.create_dm()
             if not alert.get('message_id') and alert.get('attempted'):
-                # The last send may have landed after all, before a timeout or a restart. It went out right
-                # after the attempt was saved, so it's among the first DMs since then, however many follow.
-                after = dt.datetime.fromtimestamp(alert['attempted_at']-60, dt.timezone.utc)
-                async for sent in channel.history(limit=50, after=after, oldest_first=True):
+                # The last send may have landed after all, before a timeout or a restart. Discord can only
+                # have taken it between the attempt and its deadline, so every DM in that window is checked;
+                # a full pass with no match means it never landed. Clocks get a minute either side.
+                at = alert['attempted_at']
+                after, until = (dt.datetime.fromtimestamp(t, dt.timezone.utc) for t in (at-60, at+DELIVERY+60))
+                async for sent in channel.history(limit=None, after=after, oldest_first=True):
+                    if sent.created_at > until:
+                        break
                     if sent.author.id == self.fri.user.id and sent.content == alert['attempted']:
-                        alert.update(message_id=str(sent.id), channel_id=str(channel.id), shown=sent.content)
+                        alert.update(message_id=str(sent.id), channel_id=str(channel.id), shown=sent.content,
+                                     sent=sent.created_at.timestamp())
                         self.save()
                         break
             text = alert['text']
@@ -198,7 +208,8 @@ class Watch:
                 self.save()
                 sent = await channel.send(text, nonce=alert['nonce'], allowed_mentions=NO_MENTIONS)
                 # A nonce Discord already saw returns that first message, maybe with older text; the next pass edits it.
-                alert.update(message_id=str(sent.id), channel_id=str(channel.id), shown=getattr(sent, 'content', text))
+                alert.update(message_id=str(sent.id), channel_id=str(channel.id), shown=getattr(sent, 'content', text),
+                             sent=time.time())
                 self.save()
                 LOG.warning('Owner told about a Gene outage: %s', alert['kind'])
                 return
@@ -210,7 +221,7 @@ class Watch:
                 if alert['open']:
                     for key in ('message_id', 'channel_id', 'shown', 'attempted', 'attempted_at'):
                         alert.pop(key, None)
-                    alert['nonce'] = secrets.randbits(62)
+                    alert.update(nonce=secrets.randbits(62), sent=None)
                 else:
                     alert['shown'] = text
                     LOG.info('Outage DM is gone; its recovery note was dropped')

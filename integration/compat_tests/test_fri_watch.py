@@ -415,6 +415,97 @@ def test_a_rejected_contract_still_stops_startup_at_once(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
+GOOD = {'heartbeat_age_seconds': 1, 'runtime': {'guild_connected': True, 'controls_running': True}}
+
+
+def test_a_landed_dm_is_found_even_behind_a_burst_just_before_it(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        try:
+            for _ in range(CHECKS-1):
+                await fri.watcher.check()
+            earlier = datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=10)
+            for mid in range(1000, 1151):  # More than a page, inside the minute before the attempt.
+                dm.messages[mid] = SimpleNamespace(id=mid, author=SimpleNamespace(id=10), content='hello?',
+                                                   created_at=earlier)
+            dm.fail_send, dm.landed = Crash(), True
+            with pytest.raises(Crash):
+                await fri.watcher.check()
+            dm.fail_send = None
+            dm.nonces.clear()
+            fri.watcher = Watch(fri)
+            await fri.watcher.check()
+            landed = next(sent.id for sent in dm.messages.values() if sent.author.id == 99)
+            assert len(dm.sends) == 1 and fri.watcher.state['alert']['message_id'] == str(landed)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_relapse_keeps_an_unresolved_dm_instead_of_sending_another(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        try:
+            for _ in range(CHECKS-1):
+                await fri.watcher.check()
+            dm.fail_send, dm.landed = Crash(), True
+            with pytest.raises(Crash):
+                await fri.watcher.check()
+            dm.fail_send = None
+            fri.watcher = Watch(fri)
+            history = dm.history
+            async def broken(**options):
+                raise http(500)
+                yield
+            dm.history = broken  # Fri can't tell whether its DM landed.
+            fri.api = AsyncMock(return_value=GOOD)
+            await fri.watcher.check()
+            assert not fri.watcher.state['alert']['open']
+            fri.api = AsyncMock(side_effect=ControllerRejected('Unsupported Fri contract'))
+            for _ in range(CHECKS-1):
+                await fri.watcher.check()
+            dm.history = history
+            await fri.watcher.check()
+            assert len(dm.sends) == 1 and 'rejecting my health checks' in dm.messages[556].content
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_relapse_window_starts_when_the_dm_actually_went_out(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        clock = [time.time()]
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        async def checks(count):
+            for _ in range(count):
+                clock[0] += 120
+                await fri.watcher.check()
+        dm.fail_send = http(500)
+        try:
+            await checks(CHECKS+16)  # Over half an hour of failed sends.
+            dm.fail_send = None
+            await checks(1)
+            assert len(dm.sends) == 1
+            fri.api = AsyncMock(return_value=GOOD)
+            await checks(1)
+            fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+            await checks(CHECKS)
+            assert len(dm.sends) == 1 and '-# again.' in dm.messages[556].content
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_an_outage_over_before_its_dm_landed_sends_nothing_late(monkeypatch, tmp_path):
     async def scenario():
         fri = configured(monkeypatch)
@@ -531,6 +622,7 @@ def message(content='fri you there?', channel=456, guild=123, user=11, **changes
         content=content, mentions=[], reference=None, webhook_id=None, reply=AsyncMock())
     for key, item in changes.items():
         setattr(value, key, item)
+    value.channel.fetch_message = AsyncMock(return_value=value)  # Unchanged since Fri read it.
     return value
 
 
@@ -667,6 +759,67 @@ def test_a_notice_lost_in_transport_leaves_the_channel_free(failure):
         with pytest.raises(ControllerUnavailable):
             await agent.handle(second)
         second.reply.assert_awaited_once()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('changed', ['edited', 'nsfw', 'disabled'])
+def test_an_early_notice_rechecks_the_mention_as_it_is_now(monkeypatch, tmp_path, changed):
+    import copy
+    async def scenario():
+        fri, agent, _, _, channel, make_message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        event = make_message()
+        async def fail_profile(*args):
+            if changed == 'edited':
+                edited = copy.copy(event)
+                edited.content, edited.mentions = 'talking to somebody else now', []
+                rows[event.id] = edited
+            elif changed == 'nsfw':
+                channel.nsfw = True
+            else:
+                agent.config['enabled'] = False
+            raise ControllerUnavailable(UNREACHABLE)
+        agent.profile = fail_profile
+        try:
+            with pytest.raises(ControllerUnavailable):
+                await agent.handle(event)
+            event.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_early_notice_skips_a_name_mention_edited_away():
+    async def scenario():
+        agent = down_agent()
+        edited = message()
+        edited.channel.fetch_message = AsyncMock(return_value=SimpleNamespace(**{**vars(edited), 'content': 'nvm'}))
+        with pytest.raises(ControllerUnavailable):
+            await agent.handle(edited)
+        edited.reply.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_an_admitted_mention_gets_the_notice_if_the_controller_dies_after_inference(monkeypatch, tmp_path):
+    from fri.fri_chat import ChatResult
+    async def scenario():
+        fri, agent, _, _, _, make_message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        api, down = fri.api, []
+        async def cut(method, path, value=None):
+            if down:
+                raise ControllerUnavailable(UNREACHABLE)
+            return await api(method, path, value)
+        async def inference(*args, **kwargs):
+            down.append(True)
+            return ChatResult(status='completed', reply='a safe synthetic response')
+        fri.api, fri.chat_once = cut, inference
+        event = make_message()
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert any(path == '/chat/mentions/admit' for path, _ in calls)
+            assert event.reply.await_count == 1 and event.reply.await_args.args == (UNREACHABLE,)
+        finally:
+            await fri.close()
     asyncio.run(scenario())
 
 
