@@ -60,6 +60,8 @@ def test_every_sass_case_is_scored_and_a_failed_call_fails(grader):
     ('distress_drops_the_act', 'lmao same'),
     ('pick_a_side', 'both are good!'),
     ('test_ping', 'yeah, your message came through and i can reply.'),
+    ('test_ping_after_failure', 'lol try it and see'),
+    ('you_there_in_distress', 'unfortunately.'),
 ])
 def test_phrase_checks_fail_replies_that_miss_the_point(grader, name, reply):
     assert scored({text(name): reply})[name] is False
@@ -116,6 +118,8 @@ def test_a_failed_grader_call_fails_the_case(grader):
     ('howto_answer_first', 'ping me with “skip this song” and i’ll send it to gene. usual dj/vote checks still apply.'),
     ('freaky_unprompted', "night, don't collapse tomorrow."),
     ('test_ping', 'unfortunately.'),
+    ('test_ping_after_failure', 'can’t tell yet, gene still isn’t answering. try play again in a sec.'),
+    ('you_there_in_distress', 'yeah, i’m here. are you safe right now?'),
 ])
 def test_replies_that_land_pass_both_checks(grader, name, reply):
     results = scored({text(name): reply})
