@@ -61,23 +61,18 @@ def joins(char):
 
 
 def redundant(text, index):
-    """A mark (or conjoining jamo) that repeats one already on its character, or leaves the character
-    unnormalized, draws nothing new: x with one shadda or two, é composed or not, and marks in either
-    order look alike, so the difference could carry hidden bits."""
-    char = text[index]
-    if not joins(char):
+    """Only a character's first mark (or conjoining jamo) arrives raw, and only when it leaves the
+    character normalized. A second mark can repeat the first or swap order with it, and é can arrive
+    composed or not, all looking alike, so those differences could carry hidden bits."""
+    if not joins(text[index]):
         return False
-    start = index
-    while start and joins(text[start-1]):
-        start -= 1
-    earlier = text[start:index]
-    return char in earlier or not unicodedata.is_normalized('NFC', text[max(start-1, 0):index+1])
+    return index == 0 or joins(text[index-1]) or not unicodedata.is_normalized('NFC', text[index-1:index+1])
 
 
 def model_json(value):
     """JSON for model input with visible text as written: emoji, curly quotes and non-English letters
     stay raw instead of becoming \\u escapes. Controls, format and invisible characters (bidi, zero-width,
-    tags, variation selectors), non-ASCII spaces, repeated or unnormalized combining marks, line
+    tags, variation selectors), non-ASCII spaces, a character's second and later combining marks, line
     separators, surrogates, private-use and unassigned code points stay escaped. json.dumps does the traversal, key conversion and errors, and
     its output keeps every non-ASCII character inside a string, so ASCII-only output is exactly
     json.dumps'."""

@@ -162,6 +162,12 @@ def test_a_baseline_run_escapes_fri_internal_tasks_but_not_the_grader(monkeypatc
 UNSUCCESSFUL = ('failed', 'incomplete', 'interrupted', 'invalid_output')
 
 
+def test_eval_turns_use_only_production_response_kinds():
+    from fri.fri_responses import KINDS
+    turns = [turn for case in model_text_cases()+sass_cases() for turn in case.get('turns', [])]
+    assert turns and all(turn.get('response_kind', 'reply') in KINDS for turn in turns)
+
+
 @pytest.mark.parametrize('status', UNSUCCESSFUL)
 def test_a_model_text_case_without_a_reply_fails(grader, status):
     async def run():

@@ -161,15 +161,15 @@ advertises it, so the controller must be released first.
   carry bits), line separators, surrogates, private-use and unassigned code points, invisible
   letters and marks, blank or zero-width symbols such as U+2800 and U+FFFC, and every variation
   selector, even an emoji's own U+FE0F: 👍 and 👍️ look the same, so selector presence could otherwise
-  spell hidden bits. For the same reason a combining mark (or Hangul vowel or final jamo) stays
-  escaped when it repeats one already on its character or leaves the character unnormalized: x with
-  one shadda or two, é composed or not, and marks in either order look alike. `json.dumps` still
-  does the traversal, key conversion and errors. To compare against the old escaping, run `python -m
+  spell hidden bits. For the same reason only a character's first combining mark (or Hangul vowel or
+  final jamo) arrives raw, and only when it leaves the character normalized: x with one shadda or
+  two, é composed or not, and two marks in either order look alike. `json.dumps` still does the
+  traversal, key conversion and errors. To compare against the old escaping, run `python -m
   fri.fri_eval --suite model-text` with and without `--baseline` (same cases and settings,
-  model-graded: boundaries, attribution, tone, non-English text and hidden carriers). The baseline
-  escapes all of Fri's own model input, internal tasks such as image selection included; the graders
-  pin `privacy.model_json`, so they read both runs the same way. A case whose reply fails, or whose
-  grade fails, fails the run.
+  model-graded: boundaries, attribution, tone, non-English text and hidden carriers (thumbs, doubled
+  shaddas, overlay order)). The baseline escapes all of Fri's own model input, internal tasks such
+  as image selection included; the graders pin `privacy.model_json`, so they read both runs the same
+  way. A case whose reply fails, or whose grade fails, fails the run.
 
 ## Members' own requests
 
