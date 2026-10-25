@@ -57,7 +57,8 @@ class ReviewButton(discord.ui.DynamicItem[discord.ui.Button], template=REVIEW_ID
                                                   allowed_mentions=NO_MENTIONS)
 
 
-def review_message(notice):
+def review_message(notice, tell=False):
+    """tell: a shipped repair a member reported, so the owner can let them know with one tap."""
     job, phase, reference = notice['job'], notice['phase'], notice['reference']
     if phase == 'status':
         state = job['state'].replace('_', ' ')
@@ -80,7 +81,11 @@ def review_message(notice):
                 model, effort = 'gpt-6.1-sol', 'xhigh'
             embed.set_footer(text=f"{model} · {effort}")
         attachment = discord.File(io.BytesIO(job['body'].encode()), filename=f"request-{job['id']}.txt")
-        return embed, attachment, discord.ui.View(timeout=None)
+        view = discord.ui.View(timeout=None)
+        if tell:
+            from .fri_fixes import TellReporter
+            view.add_item(TellReporter(job['id']))
+        return embed, attachment, view
     if phase == 'stale':
         embed = discord.Embed(title='Saved proposal needs a rebuild', description=
             f"Request `{job['id']}` finished, but a newer maintainer release is now live. "
@@ -135,7 +140,8 @@ async def deliver_review(cog, notice):
             previous = await channel.fetch_message(int(notice['message_id']))
         except discord.NotFound:
             pass
-    embed, attachment, view = review_message(notice)
+    from .fri_fixes import offers_tell
+    embed, attachment, view = review_message(notice, tell=offers_tell(cog, notice))
     try:
         if previous:
             if previous.author.id != cog.bot.user.id:
