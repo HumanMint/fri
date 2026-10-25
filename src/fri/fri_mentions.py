@@ -167,7 +167,7 @@ class Invitation:
                 text = GLITCH  # Not the member's edit, so don't say it was.
             # Last, so an erasure during the checks above still counts. An outage can't be checked
             # against itself, so only a known erasure silences the notice saying so.
-            erased = await self.agent.erased(self.event.author.id, self.forgotten, revision)
+            erased = await self.agent.erasure(self.event.author.id, self.forgotten, revision)
             if erased and not (reason in OUTAGES and erased == 'check failed: ControllerUnavailable'):
                 return None
             return text

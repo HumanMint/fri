@@ -302,6 +302,83 @@ def test_an_erasure_during_the_burst_wait_names_the_mention(monkeypatch, tmp_pat
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('when', ['state read', 'check'])
+def test_an_erasure_during_the_owner_settings_check_names_the_mention(monkeypatch, tmp_path, caplog, when):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you sound like an outdated model', user=10)
+        api = fri.api
+        async def erasing(method, path, payload=None):
+            if when == 'state read' and path == '/agent/state':
+                agent.forget(10, erased=True)
+            return await api(method, path, payload)
+        fri.api = erasing
+        async def analyze(*args, **kwargs):
+            if when == 'check':
+                agent.forget(10, erased=True)
+            return {'answer': 'other'}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        monkeypatch.setattr('fri.fri_chat.Chat.headers', AsyncMock(return_value={'Authorization': 'Bearer test'}))
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('reset', ['memory check', 'stale cleanup'])
+def test_a_cache_reset_while_an_owner_settings_request_waits_keeps_its_preview(monkeypatch, tmp_path, reset):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> set heartbeat to 10 minutes', user=10)
+        monkeypatch.setattr('fri.fri_chat.Chat.headers', AsyncMock(return_value={'Authorization': 'Bearer test'}))
+        checking, resume = asyncio.Event(), asyncio.Event()
+        async def analyze(chat, instruction, data, model, effort, schema, **kwargs):
+            if 'answer' in schema['properties']:
+                checking.set()
+                await resume.wait()
+                return {'answer': 'settings_change'}, {}, 'completed'
+            return {'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        task = asyncio.create_task(agent.handle(event))
+        try:
+            await asyncio.wait_for(checking.wait(), 1)
+            if reset == 'memory check':  # Read-only, but it clears Fri's cached context for the owner.
+                with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                    await agent.handle(message('<@99> what do you remember about me?', user=10))
+            else:  # Attention drops a row cached before an older erasure: nothing new was erased.
+                agent.recent[1].append({'id': '5', 'user_id': '10', 'name': 'owner', 'text': 'old', 'at': time.time(),
+                                        'revision': -1, 'gene_error': False})
+                await agent.context_messages(1)
+            assert not agent.erased.get(10)  # Neither erased anything.
+            resume.set()
+            await task
+            assert event.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
+        finally:
+            resume.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_only_forget_me_counts_as_an_erasure_for_waiting_settings_requests(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(message('<@99> what do you remember about me?', user=20))
+                assert agent.forgotten.get(20) and not agent.erased.get(20)
+                await agent.handle(message('<@99> forget me', user=20))
+            assert agent.erased.get(20)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('reactions', [True, False])
 def test_a_cooldown_burst_shows_a_low_battery_for_the_mention_it_answers_for(monkeypatch, tmp_path, caplog, reactions):
     caplog.set_level(logging.INFO, logger='fri')

@@ -75,7 +75,7 @@ def burst_continuation(origin, source, text, action, argument, revision, bot_id=
 
 
 class Burst(list):
-    """One burst's rows, and its author's erasure baseline (see Agent.erased) as they came in."""
+    """One burst's rows, and its author's erasure baseline (see Agent.erasure) as they came in."""
 
     def __init__(self, since=None):
         super().__init__()
