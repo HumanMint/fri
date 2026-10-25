@@ -1945,6 +1945,60 @@ def test_a_privacy_control_ping_that_waited_still_runs_with_fri_paused(monkeypat
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('change', ['stays', 'unpinged', 'deleted'])
+def test_a_privacy_control_ping_taken_back_while_fri_is_paused_changes_nothing(monkeypatch, tmp_path, caplog, change):
+    # Paused, a ping makes no invitation, so the message itself is checked as it stands.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, controller, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        controller.update({'enabled': False}, controller.state()['version'], '10')
+        agent.state = controller.state()
+        first, second = message('<@99> what do you remember about me?'), message('<@99> forget me')
+        for event in (first, second):
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='done', edit=AsyncMock())
+        talk, released, talked = fri.talk, asyncio.Event(), []
+        async def stalled(*args, **kwargs):
+            talked.append(kwargs.get('event'))
+            if len(talked) == 1:
+                await released.wait()
+            return await talk(*args, **kwargs)
+        fri.talk = stalled
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                while not talked:
+                    await real_sleep(0.01)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                while not agent.controls[20]._waiters:
+                    await real_sleep(0.01)
+                if change == 'unpinged':
+                    edited = copy.copy(second)
+                    edited.content, edited.mentions = 'keep my memory', []
+                    edited.edited_at = dt.datetime.now(dt.timezone.utc)
+                    rows[second.id] = edited
+                elif change == 'deleted':
+                    def gone(mid):
+                        if mid == second.id:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                        return rows[mid]
+                    channel.fetch_message.side_effect = gone
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            controls = [payload['action'] for path, payload in calls if path == '/chat/memory/control']
+            if change == 'stays':
+                assert controls == ['disable']
+                assert second.reply.await_args.args[0].startswith('done. i erased')
+            else:
+                assert controls == []
+                second.reply.assert_not_awaited()
+                assert mention_lines(caplog) == [f'Mention 1/{second.id} not answered: message changed']
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('change', ['disabled', 'unconfigured'])
 def test_settings_changed_during_a_queued_messages_member_lookup_stop_it(monkeypatch, tmp_path, change):
     async def scenario():
