@@ -696,7 +696,9 @@ class Fri(discord.Client):
 
     @tasks.loop(seconds=120)
     async def watch(self):
-        await self.watcher.check()  # Its own loop: a stuck heartbeat or owner DM can't hide an outage.
+        # Its own loop: a stuck heartbeat or owner DM can't hide an outage. Reads stay an interval apart
+        # across startup's wait, this loop's first pass and restarts; a pending DM still goes out.
+        await self.watcher.check(observe=self.watcher.due(slack=15))
 
     @watch.before_loop
     async def before_watch(self):

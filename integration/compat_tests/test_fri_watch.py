@@ -401,6 +401,44 @@ def test_fri_waits_out_a_controller_down_at_startup_and_still_tells_the_owner(mo
     asyncio.run(scenario())
 
 
+def test_reads_stay_an_interval_apart_from_startup_into_the_gateway_loop(monkeypatch, tmp_path):
+    from fri.fri_protocol import contract
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        dm = owner_dm(fri)
+        start = time.time()
+        clock, reads = [start], []
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        async def api(method, path, value=None):
+            if path == '/fri/contract':
+                clock[0] += 10
+                if clock[0] < start+140:
+                    raise ControllerUnavailable(UNREACHABLE)
+                return contract()  # Back ten seconds after startup's second read.
+            if path == '/agent/state':
+                return {'config': {}, 'channels': []}
+            reads.append(round(clock[0]-start))
+            if clock[0] < start+150:
+                raise ControllerUnavailable(UNREACHABLE)
+            return GOOD  # Gene came back between the reads.
+        fri.api = api
+        fri.tree.sync = AsyncMock()
+        for loop in (fri.health, fri.owner_reviews, fri.watch):
+            monkeypatch.setattr(loop, 'start', lambda *args: None)
+        try:
+            with patch('fri.fri.CONTRACT_RETRY', 0), patch('fri.fri_agent.Agent.start', AsyncMock()):
+                await fri.setup_hook()
+                await fri.watch()  # The loop's first pass, right after startup's last read.
+                assert reads == [10, 130] and fri.watcher.state['bad'] == 2
+                clock[0] += 120
+                await fri.watch()
+            assert reads == [10, 130, 260] and fri.watcher.state['bad'] == 0 and not dm.sends
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_rejected_contract_still_stops_startup_at_once(monkeypatch, tmp_path):
     async def scenario():
         fri = configured(monkeypatch)
@@ -797,6 +835,41 @@ def test_an_early_notice_skips_a_name_mention_edited_away():
             await agent.handle(edited)
         edited.reply.assert_not_awaited()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('user,recording', [(10, False), (11, True)])
+def test_an_early_dm_notice_skips_a_request_withdrawn_since(user, recording):
+    async def scenario():
+        agent = down_agent()
+        agent.member = AsyncMock(return_value=True)
+        agent.fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        event = message('fri show current settings' if user == 10 else 'one more thing', guild=None, user=user)
+        event.channel.fetch_message = AsyncMock(return_value=SimpleNamespace(**{**vars(event), 'content': 'never mind'}))
+        if recording:  # The member's previous reply is still being saved.
+            agent.recording[(event.channel.id, event.author.id)] = asyncio.Event()
+        with pytest.raises(ControllerUnavailable):
+            await agent.handle(event)
+        event.channel.fetch_message.assert_awaited()
+        event.reply.assert_not_awaited()
+        assert not agent.unreachable_notices
+    asyncio.run(scenario())
+
+
+def test_an_early_notice_counts_as_the_mention_answered(monkeypatch, tmp_path, caplog):
+    import logging
+    async def scenario():
+        fri, agent, _, _, _, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = make_message()
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        try:
+            with pytest.raises(ControllerUnavailable):
+                await agent.handle(event)
+            assert event.reply.await_count == 1 and event.id in agent.responded
+        finally:
+            await fri.close()
+    with caplog.at_level(logging.INFO, logger='fri.agent'):
+        asyncio.run(scenario())
+    assert not [r for r in caplog.records if r.getMessage().startswith('Mention ')]
 
 
 def test_an_admitted_mention_gets_the_notice_if_the_controller_dies_after_inference(monkeypatch, tmp_path):

@@ -364,9 +364,6 @@ class Agent:
         self.handling[message.id] += 1
         try:
             await self.watch(message)
-        except ControllerUnavailable:
-            await self.unreachable(message)
-            raise  # on_message still logs it.
         finally:
             self.handling -= Counter([message.id])
 
@@ -380,7 +377,7 @@ class Agent:
             return False
         # A DM only reaches a controller read after its member check. Outside configured channels a
         # ping keeps its own gates and stays quiet.
-        if message.guild and (not self.allowed(message.channel) or not answering and not await self.still_addressed(message)):
+        if message.guild and not self.allowed(message.channel) or not answering and not await self.still_addressed(message):
             return False
         now = time.time()
         self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if now-v < 300}
@@ -400,18 +397,29 @@ class Agent:
 
     async def still_addressed(self, message):
         """Fresh Discord-side gates for a notice outside the reply path: the message as it is now."""
-        if explicit_mention(message, self.fri.user.id):
+        if message.guild and explicit_mention(message, self.fri.user.id):
             # The checks its invitation passed: edits, channel, access.
             from .fri_mentions import Invitation
             return (message.guild.id == self.fri.guild_id and
                     await Invitation(self, message).current(check_evidence=False))
-        if not self.config['enabled']:
+        if message.guild and not self.config['enabled']:
             return False
         try:
             current = await message.channel.fetch_message(message.id)
         except discord.HTTPException:
             return False
-        return current.content == message.content and await addressed_text(current, self.fri.user.id) is not None
+        if current.content != message.content:  # Withdrawn or changed: nothing to answer as it was.
+            return False
+        return message.guild is None or await addressed_text(current, self.fri.user.id) is not None
+
+    async def listen(self, message):
+        """`receive`, plus the outage notice when a controller read fails before any reply has started."""
+        try:
+            return await self.receive(message)
+        except ControllerUnavailable:
+            if await self.unreachable(message):
+                self.answered([message])  # Before the ping's miss settles, so it isn't logged as unanswered.
+            raise  # on_message still logs it.
 
     async def watch(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
@@ -419,14 +427,14 @@ class Agent:
         if (message.guild is None or message.author.bot or getattr(message, 'webhook_id', None) or
                 message.id in self.watched or message.id in self.misses or message.id in self.replying or
                 not pinged(message, self.fri.user.id)):
-            await self.receive(message)
+            await self.listen(message)
             return
         self.watched[message.id] = self.misses[message.id] = None
         if len(self.watched) > MAX_DELIVERED:
             del self.watched[next(iter(self.watched))]
         owned = False  # By a burst: its last message answers, or its drop explains, for this one.
         try:
-            owned = await self.receive(message) is DEFERRED
+            owned = await self.listen(message) is DEFERRED
         except BaseException as exc:
             owned = self.bursts.group(message) is not None
             if not owned:

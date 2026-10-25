@@ -104,9 +104,9 @@ class Watch:
         alert = self.load()['alert']
         return bool(alert and alert.get('open') and alert.get('kind') in kinds and alert.get('message_id'))
 
-    def due(self):
-        """For Fri's startup wait, which has no loop of its own: a read per interval, as the loop would."""
-        return time.time()-self.load()['checked'] >= INTERVAL
+    def due(self, slack=0):
+        """Whether a read is due, an interval after the last one. `slack` covers a read's own latency."""
+        return time.time()-self.load()['checked'] >= INTERVAL-slack
 
     def refusal(self, offered=()):
         if offered:  # Gene is polling; this one command is disabled or unloaded in Red.
@@ -126,9 +126,9 @@ class Watch:
             return 'unreachable', {}
         return assess(health)
 
-    async def check(self):
+    async def check(self, observe=True):
         # A watchdog loop that stops on one odd error watches nothing, and a DM that fails waits for the next pass.
-        for step in (self.observe, self.deliver):
+        for step in (self.observe, self.deliver) if observe else (self.deliver,):
             try:
                 await step()
             except Exception as exc:

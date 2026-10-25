@@ -241,7 +241,8 @@ Fri can't restart anything. It only notices and says so.
   late.
 - **Startup with the controller down.** Fri waits for `/fri/contract` (every 10 s) before it joins
   the gateway, instead of exiting. Discord's HTTP API already works then, so the same watch reads,
-  once per 2 minutes, still DM the owner. Members see Fri offline until the controller answers, and
+  once per 2 minutes, still DM the owner. Reads stay about 2 minutes apart across that wait, the
+  loop's first pass and restarts, so a restart never shortens the 3-read debounce. Members see Fri offline until the controller answers, and
   `fri health` waits too. A rejected or incompatible contract still stops Fri at once.
 - **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
   command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
@@ -254,8 +255,9 @@ Fri can't restart anything. It only notices and says so.
   fixed notice per channel per 5 minutes instead of silence. A mention Fri already admitted only
   needs its Discord-side checks for this notice, since the notice carries no evidence; a privacy
   recheck that can't reach the controller leads to the notice, not silence. Before a reply has
-  started, the notice rechecks the message as it is now: still addressed and unedited, and for an
-  @mention its channel and access, with Fri enabled. A notice that
+  started, the notice rechecks the message as it is now. Any message, a DM included, must be
+  unedited. A channel message must still be addressed, and an @mention must pass its channel and
+  access checks with Fri enabled. A posted notice counts as Fri's answer to a ping. A notice that
   fails to post, for any reason, doesn't use up those 5 minutes. Ambient chimes stay quiet, and so
   does a message Fri already answered. Mentions outside configured channels keep their own gates
   and stay silent. The same text replaces the old "workshop controller is
