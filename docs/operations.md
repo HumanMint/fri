@@ -372,6 +372,33 @@ Fri can't restart anything. It only notices and says so.
   whether deploys are paused) and `/controls/health`
   (4 s each, failures shown as "unreachable" or "rejected"), and the watch state.
 
+## When Gene gets fixed
+
+- **Gene errors Fri files.** When attention files a Gene error (an automatic repair check, or an
+  owner-review request), Fri puts a 👀 on Gene's message and watches that job in the private
+  `gene-fixes.json` in the data directory. It holds only the job, channel and message ids. Each
+  error is watched once, for 3 days from when Gene posted it: filing the same error again through
+  the other path opens a second job, and that one isn't watched. The `fixes` heartbeat stage reads
+  each watched job. Once the job is deployed and its commit is still the live release, Fri replies
+  to Gene's message with one dry line, but only while proactive posts are on, the channel is still
+  configured and sendable (an archived thread isn't reopened), nobody spoke there in the last
+  60 s, and Gene's message still exists. The release and these gates are checked again after
+  Discord returns Gene's message, so a rollback or a config change meanwhile still stops it. A job
+  that's rejected, failed or needs attention, and one a rollback or newer release beat to it, just
+  stop being watched. A hand-off to the owner isn't announced, and neither are failures. The job is
+  marked done before the send, so a line Discord didn't confirm is never sent twice. It goes
+  through the same non-retrying send as one-off posts. A heartbeat waits up to 10 s on a pass and
+  never cancels one stuck in a Discord rate limit: the stage reports `TimeoutError`, and the next
+  heartbeat waits on that same pass.
+- **Tell reporter.** The owner's deployed DM for a repair a member reported (including one the owner
+  finished after its checks handed it over) gets a **Tell reporter** button, when the controller
+  offers `requester-notices` and the report is still on record. A tap claims the controller's mark,
+  checks the report again (still there, still the member's, in a configured channel Fri can post in
+  and not an archived thread, or their DM while they're still in the server), and replies to it once
+  with a fixed line, mentions off and no request text. A send Discord refused (a 4xx, rate limits
+  included) can be tapped again. One that may have posted is never retried. The owner sees the
+  outcome privately, and the button goes away once the reply is sent.
+
 ## Existing installation migration
 
 1. Deploy a reviewed Gene controller supporting `/fri/contract` and `gene-fri/1`.
@@ -457,7 +484,7 @@ explicitly reviewed retirement step.
 
 The 30-second heartbeat fetches controller state first, and defers the whole tick
 when that fails. Every later stage (presence, posts, reminders, owner reports,
-learning, attention, memes, reply checks) runs on its own: a failure is logged with
+learning, attention, gene fixes, memes, reply checks) runs on its own: a failure is logged with
 the stage and exception class only, and never skips the stages after it. `fri-health.json` keeps
 `agent_heartbeat.running/failed/status` for the release coordinator and adds
 `agent_heartbeat.stages`, one `{at, last_ok, error}` entry per enabled stage.
