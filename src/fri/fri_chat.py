@@ -18,6 +18,8 @@ from .fri_social import SOCIAL_ACTIONS
 from .privacy import clean
 from .subscription import RESOURCE, SubscriptionError
 
+WINDOWS = ('recent', 'since_my_last_message')  # read_recent: a small batch, or a catch-up.
+
 VOICE = '''You are Fri, a Discord regular and Gene's chat companion. Gene handles the utilities.
 Your pronouns are they/them. If asked, answer briefly. When someone calls you she/he in a
 conversation you're already part of, a casual "they, btw" is enough; then keep helping.
@@ -95,8 +97,12 @@ Help understand concrete needs and draft
 feature/fix requests when the requirements are clear. Ask a small clarifying question when needed.
 You have no shell, provisioning access, or deployment authority. The harness may offer limited actions.
 For a question about what you've learned, choose learning_overview if available. For a request to
-look around or read recent chat, choose read_recent with one listed channel_id. For an explicit
-request to do a learning pass now, choose run_learning. The owner-only actions are offered privately.
+look around or read recent chat, choose read_recent with one listed channel_id and window=recent.
+When they ask what they missed or to catch them up, use window=since_my_last_message on the channel they
+name, else default_channel_id. Then say the few things that actually happened and who did them in a
+couple of short lines, result first with a jab riding along. Skip filler; don't list every message.
+If nothing happened, say so. If stopped_at isn't your_last_message, it only covers what was read.
+For an explicit request to do a learning pass now, choose run_learning. The owner-only actions are offered privately.
 For an explicit question about older server chat, choose history_search when offered. Select a listed
 channel and a natural keyword someone might actually type, plus a member/date filter if relevant.
 Do not require a quoted phrase. Empty query is useful when the author/date is clearer than the words.
@@ -284,9 +290,13 @@ SCHEMA = {'type': 'object', 'properties': {
           'reply': {'type': 'string'},
           'request_draft': {'type': ['string', 'null']},
           'action': {'anyOf': [{'type': 'null'}, {'type': 'object', 'properties': {
-              'kind': {'type': 'string', 'enum': ['learning_overview', 'read_recent', 'run_learning', 'gene_diagnose']},
+              'kind': {'type': 'string', 'enum': ['learning_overview', 'run_learning', 'gene_diagnose']},
               'channel_id': {'type': 'string'}}, 'required': ['kind', 'channel_id'],
               'additionalProperties': False}, {'type': 'object', 'properties': {
+                  'kind': {'type': 'string', 'enum': ['read_recent']}, 'channel_id': {'type': 'string'},
+                  'window': {'type': 'string', 'enum': list(WINDOWS)}},
+                  'required': ['kind', 'channel_id', 'window'], 'additionalProperties': False},
+                  {'type': 'object', 'properties': {
                   'kind': {'type': 'string', 'enum': ['web_search', 'web_sources', 'web_refine']}, 'query': {'type': 'string'}},
                   'required': ['kind', 'query'], 'additionalProperties': False},
                   {'type': 'object', 'properties': {
@@ -526,9 +536,12 @@ class Chat:
                                 clarify = isinstance(action, dict) and action.get('kind') == 'clarify'
                                 voice = isinstance(action, dict) and action.get('kind') == 'preview_voice'
                                 image = isinstance(action, dict) and action.get('kind') == 'image_search'
+                                recent = isinstance(action, dict) and action.get('kind') == 'read_recent'
                                 parameter = 'voice_notes' if voice else ('query' if web else 'channel_id')
                                 work = isinstance(action, dict) and action.get('kind') in WORK_ACTIONS
                                 expected = {'kind', *WORK_ACTIONS[action['kind']]} if work else ({'kind', 'action', 'argument'} if control else {'kind', parameter})
+                                if recent:
+                                    expected = {'kind', 'channel_id', 'window'}
                                 if clarify:
                                     from .fri_pending import Clarification
                                     Clarification.model_validate({k: v for k, v in action.items() if k != 'kind'})
@@ -541,6 +554,7 @@ class Chat:
                                 if (not isinstance(action, dict) or set(action) != expected or
                                         action['kind'] not in context.get('actions', {}) or
                                         (work and not valid_work_action(action)) or
+                                        (recent and action['window'] not in WINDOWS) or
                                         (not clarify and not control and not work and (not isinstance(action[parameter], str) or len(action[parameter]) > (1500 if voice else MAX_REQUEST if image else 240 if web else 25))) or
                                         reply or draft is not None or parsed.get('notes', [])):
                                     raise ValueError('Invalid or unavailable action')

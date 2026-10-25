@@ -20,7 +20,8 @@ New conversation and on-demand surrounding context still need normal chat admiss
 an outside mention always keeps its separate one-event social admission.
 
 Each invitation can use at most twelve preceding messages from the same channel in
-the last thirty minutes and a direct reference up to seven days old. At most one
+the last thirty minutes and a direct reference up to seven days old. A catch-up in a
+configured channel uses its own read instead (see "Catching up"). At most one
 image post is inspected, preferring the current attachments, then the reference,
 then a single nearby candidate. Multiple candidates need clarification. Existing
 limits remain two non-spoiler PNG/JPEG/WebP attachments, 4 MB each, twenty million
@@ -61,6 +62,30 @@ delivery answers or explains for every copy. A ping is logged at most once while
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.
 They do not prove Discord delivery or live model interpretation of a particular meme.
+
+## Catching up
+
+"fri what did i miss", or any ask to be caught up, has the model call `read_recent` with
+`window=since_my_last_message`. Fri reads that channel back from the request (the message, or the
+panel interaction), up to 100 messages or 12 hours before it, and stops at the speaker's last
+message there. Their own messages from the five minutes before they asked ("back", "yo") and ones
+only bots answered count as them coming back, not where they left. Both windows are measured from
+the request, so a slow model call doesn't change what the read covers. Rows carry the author, minute and text cut to 300
+characters, without jump links, and stop once the serialized rows would pass 20,000 characters, so
+emoji-heavy chat keeps the newest stretch instead of growing the prompt. The receipt says where the
+read stopped (`your_last_message`, `size_limit`, `message_limit` or `time_limit`) and when the
+speaker last spoke, so Fri can say a recap only covers the latest stretch.
+
+It is the same tool, scope and fences as any `read_recent`: one channel the member can read (the
+current one in public, an approved one from a DM), no bots, webhooks, empty messages or members with
+memory off, each author's privacy revision rechecked before delivery, the history-days and
+dedicated-channel start floors, no images, no extra model call, only the conversation allowance,
+and a neutral breadcrumb in saved history. Before the reply goes out Fri reads the same window
+again, and withholds the reply if any message it showed was edited or deleted meanwhile. A
+configured-channel mention that asks to catch up gets this read, and that recheck, rather than the
+twelve-message nearby context. Outside invitations don't offer it.
+`python -m fri.fri_eval --suite controls` includes catch-up cases: choosing the window, a short
+attributed recap, an empty read and a partial one.
 
 ## Conversation continuity and provenance
 
@@ -172,6 +197,36 @@ controller doesn't mark a request a later rollback reverted), withdrawn isn't a 
 empty or unavailable lists aren't guessed, an open request isn't drafted again, and public banter
 leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
 on the same model grades it.
+
+## Reply checks
+
+Needs a controller that advertises the optional `reply-checks` capability at startup; against an
+older one Fri still starts and simply never claims a batch. If the controller refuses a claim while
+Fri runs (it was rolled back underneath), Fri stops asking until it restarts. Off until the owner
+applies `reply_check_enabled` through the usual settings preview (“enable reply checks”). The
+controller's operations guide describes the settings, retention, export and rollback purge.
+
+On the heartbeat, Fri waits for its background model slot and signs in to the subscription, then
+claims at most one batch of up to 20 pairs and sends it straight away, so nothing erased before the
+claim is ever sent. Each pair is Fri's verbatim reply, then the same member's next turn in that
+conversation within 15 minutes.
+Pairs carry no member, channel or message identifiers, and Discord mentions, links and ids in the text
+arrive as neutral placeholders. Luna/low (configurable) flags only clear cases
+of a member being unhappy with the reply and returns four labels from fixed lists: category, severity,
+topic and suggested fix. There is no free-text field. Banter and roasting Fri back don't count. Usage
+is recorded as attention with a `reply_check` purpose: this controller reports it as “reply checks”,
+and an older one ignores the purpose and counts attention, so a receipt still queued when both sides
+roll back is delivered rather than blocking the queue. The receipt is saved and left to the usage loop,
+so a slow backlog never delays finishing the batch. Usage delivery and owner notifications retry
+independently. Nothing is posted to Discord and no chat text is stored by Fri; the controller decides
+what is kept and fences it by everyone's privacy revision.
+
+The owner can DM “show reply checks” for the last seven days: exact counts by category and the top
+recurring themes. In a server channel Fri only points the owner to DMs.
+
+Offline checks cover the controller wire contract, privacy fences and failure retries with a
+substituted model. They don't measure how well a live model separates banter from real complaints;
+`python -m fri.fri_eval` has no reply-check suite yet.
 
 ## Deployment boundary
 

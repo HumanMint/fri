@@ -733,11 +733,15 @@ class Fri(discord.Client):
 
     @tasks.loop(seconds=15)
     async def owner_reviews(self):
+        # Separate, so one undeliverable usage receipt can't hold back owner notifications.
         try:
             await self.flush_usage()
+        except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, TimeoutError):
+            LOG.warning('Usage delivery pending')
+        try:
             await notify_owner(self)
         except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, TimeoutError):
-            LOG.warning('Owner notification or usage delivery pending')
+            LOG.warning('Owner notification pending')
 
     @owner_reviews.before_loop
     async def before_reviews(self):

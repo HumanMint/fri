@@ -18,7 +18,7 @@ LABELS = {'conversation': 'chat', 'web_search': 'web lookups', 'attention': 'att
           'status': 'daily statuses',
           'investigation': 'investigations',
           'owner_settings': 'settings previews', 'history': 'history lookups',
-          'evaluation': 'isolated tests'}
+          'evaluation': 'isolated tests', 'reply_check': 'reply checks'}
 
 
 def usage_requested(text):
