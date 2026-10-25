@@ -138,10 +138,13 @@ class Agent:
     def close(self):
         self.heartbeat.cancel()
 
-    async def record(self, role, model, effort, counters, status):
+    async def record(self, role, model, effort, counters, status, purpose=None, deliver=True):
         attempt = uuid.uuid4().hex
         private_json(self.fri.data/'usage'/(attempt+'.json'), {'attempt_id': attempt,
-            'role': role, 'model': model, 'effort': effort, 'status': status, 'counters': counters})
+            'role': role, 'model': model, 'effort': effort, 'status': status, 'counters': counters,
+            **({'purpose': purpose} if purpose else {})})
+        if not deliver:
+            return  # The owner review loop delivers it.
         try:
             await self.fri.flush_usage()
         except commands.UserFeedbackCheckFailure:
@@ -257,12 +260,25 @@ class Agent:
         if usage_requested(text):
             return False  # Keep reports in the normal attributed conversation and privacy flow.
         lower = text.lower()
+        if (re.search(r'\breply checks?\b', lower) and re.search(r'\b(show|list|how|what|any|summary|summari[sz]e)\b', lower)
+                and not re.search(r'\b(enable|disable|turn|pause|resume|set|change|stop|start|adjust)\b', lower)):
+            if message.guild:  # Findings are abstract, but they're still about members.
+                await message.reply('dm me for that one.', allowed_mentions=NO_MENTIONS)
+                return True
+            from .fri_reply_checks import describe
+            try:
+                overview = await self.fri.api('POST', '/agent/reply-checks/overview', self.identity(message.author.id))
+            except commands.UserFeedbackCheckFailure:
+                await message.reply('i couldn’t load reply checks right now.', allowed_mentions=NO_MENTIONS)
+                return True
+            await message.reply(describe(overview), allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+            return True
         if re.search(r'\b(refresh|update)\b.*\bmodels?\b', lower):
             catalog = await self.fri.chat.models()
             await self.fri.api('POST', '/chat/models/update', {**self.identity(message.author.id), 'models': catalog})
             await message.reply('available subscription models: '+', '.join(catalog)+'. selected models were kept.', allowed_mentions=NO_MENTIONS)
             return True
-        subject = re.search(r'\b(settings?|heartbeat|personality|system prompt|learning|learn|tone|voice|sarcasm|playful|cooldown|summary|summaries|model|memes?|reactions?|status|presence)\b', lower)
+        subject = re.search(r'\b(settings?|heartbeat|personality|system prompt|learning|learn|tone|voice|sarcasm|playful|cooldown|summary|summaries|model|memes?|reactions?|status|presence|reply checks?)\b', lower)
         inspect = re.search(r'\b(show|list|current)\b.*\b(settings?|configuration|models?|\w+ notes|system prompt)\b|\bhow (often|far)\b', lower)
         change = re.search(r'\b(change|set|adjust|tune|tweak|pause|stop|resume|enable|disable|make|use|be|sound|speak|respond)\b', lower)
         if not subject or not (inspect or change):
@@ -884,6 +900,9 @@ class Agent:
                     if self.memes is None:
                         self.memes = Memes(self)
                     await self.memes.check()
+                from .fri_reply_checks import CAPABILITY, check
+                if self.config.get('reply_check_enabled') and CAPABILITY in self.fri.capabilities:
+                    await check(self)
             self.heartbeat_status = 'ok'
         except (commands.UserFeedbackCheckFailure, discord.HTTPException, TimeoutError, ValueError, KeyError):
             self.heartbeat_status = 'deferred'

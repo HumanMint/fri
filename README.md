@@ -18,6 +18,8 @@ membership and have bounded conversation allowances. The `/fri` panel provides
 private settings, memory controls and request reviews.
 
 - Ask to play music through Gene; normal member, voice and DJ checks still apply.
+- Ask what you missed. Fri reads what others said in that channel since your last
+  message there (up to 100 messages or 12 hours) and gives you the short version.
 - Ask for current information. Relevant requested links are included; research
   receipts support later requests for sources without exposing internal reasoning.
 - Explicit Danbooru/Safebooru image requests can return an attached still image.
