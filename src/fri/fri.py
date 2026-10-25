@@ -19,6 +19,8 @@ from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
 from .fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
+from .fri_images import CHANGED as IMAGES_CHANGED
+from .fri_images import unchanged as images_unchanged
 from .fri_memory import (
     PROFILES,
     describe_memory,
@@ -332,6 +334,10 @@ class Fri(discord.Client):
                 # receipts, a learning report) never reaches the request either. Delivery checks it again.
                 # First, so nothing waits between the privacy check below and the request.
                 actions = fence['actions']
+                # Every post Fri looked at is still there as it was read: an edit or delete while Fri
+                # signed in never reaches the model. Discord reads first, like the access check.
+                if actions and not await images_unchanged(actions.image_context, actions.event):
+                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
                 if actions and actions.sources and not actions.sources <= set(await actions.channels(fresh=True)):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
@@ -964,11 +970,12 @@ class Fri(discord.Client):
 
 
 def main():
-    from .logging import install_secret_filter
+    from .logging import configure, install_secret_filter
     install_secret_filter()
+    configure()
     from .fri_instance import instance_lock
     with instance_lock(os.getenv('FRI_DATA', '/data')):
-        Fri().run(os.environ['DISCORD_TOKEN'], log_level=logging.INFO)
+        Fri().run(os.environ['DISCORD_TOKEN'], log_handler=None)  # configure() already set up logging.
 
 
 if __name__ == '__main__':
