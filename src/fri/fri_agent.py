@@ -448,11 +448,9 @@ class Agent:
     async def withheld(self, message, events, reason, invitation=None, *, logged=None, fenced=True):
         """Say why a reply can't go out while the message still stands to be answered; else log why.
         `fenced`: a ping's notice also needs its author not to have erased since (see notice)."""
-        from .fri_mentions import OUTAGES, notice_for
+        from .fri_mentions import notice_for
         text = await invitation.notice(reason, fenced=fenced) if invitation else notice_for(reason)
-        if text and reason in OUTAGES:  # The outage notice, so once per channel per five minutes.
-            text = await self.unreachable(message, answering=True)
-        elif text:
+        if text:
             try:
                 await message.reply(text, mention_author=False, allowed_mentions=NO_MENTIONS)
             except discord.HTTPException:
@@ -482,13 +480,45 @@ class Agent:
             return 'author privacy changed'
         return failed
 
-    async def dropped(self, message, events, reason, invitation=None, since=None):
+    async def dropped(self, message, events, reason, invitation=None, since=None, burst=()):
         """Drop a message whose author may have erased: quietly, unless all that's known is that the
-        controller can't be reached to check, which is worth saying (to a ping only while it stands)."""
+        controller can't be reached to check, which gets the outage notice."""
         if reason == 'check failed: ControllerUnavailable':
-            ping = invitation or (since and self.ping_among(events, since))
-            return await self.withheld(message, events, 'controller unavailable', ping)
+            return await self.outage(message, events, burst, invitation, since)
         return self.missed(events, reason)
+
+    async def outage(self, message, events, burst=(), invitation=None, since=None, *, ambient=False):
+        """The outage notice for a reply, or a waiting message, that can't go out with the controller down.
+
+        The fixed notice carries no evidence, so only the Discord-side checks apply, not a controller read.
+        It stands in for the whole burst: every earlier message must still be as it arrived (only a fetch
+        shows an edit, since discord.py edits its cached copy in place), and each mention keeps its gates.
+        Only a known erasure since it came in silences it (a privacy control's isn't fenced)."""
+        if since and self.forgotten.get(message.author.id, 0) != since[0]:
+            return self.missed(events, 'author privacy changed')
+        from .fri_mentions import Invitation
+        token = re.compile(r'(?<!\\)<@!?'+str(self.fri.user.id)+'>')
+        gates = [invitation] if invitation else []
+        for _, event, arrived in burst:
+            if event is message:
+                continue
+            try:
+                current = await event.channel.fetch_message(event.id)
+            except discord.HTTPException:
+                return self.missed(events, 'reply withheld: message changed')
+            if getattr(current, 'edited_at', None) is not None or current.content != arrived:
+                return self.missed(events, 'reply withheld: message changed')
+            if (getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
+                    token.search(visible_content(arrived or ''))):
+                gates.append(Invitation(self, event))
+        for gate in gates:
+            if not await gate.current(check_evidence=False):
+                return self.missed(events, f'reply withheld: {gate.refusal}')
+        if not ambient and await self.unreachable(message, answering=True):
+            self.answered(events)
+        else:
+            self.missed(events, 'controller unreachable')
+        await self.fri.waiting_notices.clear(message.author.id)
 
     async def recharging(self, message, dm, since=None):
         """A cooldown's notice shows once. A later message to Fri in it gets a low battery, not silence,
@@ -564,7 +594,7 @@ class Agent:
                     if refusal:
                         return await self.withheld(message, events, refusal, invitation, logged=f'reply withheld: {refusal}')
                     if erasure:
-                        return await self.dropped(message, events, erasure, invitation, since)
+                        return await self.dropped(message, events, erasure, invitation, since, burst)
                 try:
                     async with asyncio.timeout(until-time.time()):
                         while not self.turns.ready(user, message.id):
@@ -574,7 +604,7 @@ class Agent:
                 recheck = True
             if recheck:
                 if reason := await self.erasure(user, *since):
-                    return await self.dropped(message, events, reason, invitation, since)
+                    return await self.dropped(message, events, reason, invitation, since, burst)
                 if reason := await self.excluded(message, dm, invitation, privacy, text):
                     return self.missed(events, reason)
                 if time.time() >= until:
@@ -954,36 +984,8 @@ class Agent:
             for event in events:
                 self.miss(event, reason)
 
-        async def outage():
-            # The fixed notice carries no evidence, so only the Discord-side checks apply, not a controller read.
-            # It stands in for the whole burst: every earlier message must still be as it arrived (only a fetch
-            # shows an edit, since discord.py edits its cached copy in place), and each mention keeps its gates.
-            # Only a known erasure since it came in silences it (a privacy control's isn't fenced).
-            if since and self.forgotten.get(message.author.id, 0) != since[0]:
-                return missed('author privacy changed')
-            from .fri_mentions import Invitation
-            token = re.compile(r'(?<!\\)<@!?'+str(self.fri.user.id)+'>')
-            gates = [invitation] if invitation else []
-            for _, event, arrived in burst:
-                if event is message:
-                    continue
-                try:
-                    current = await event.channel.fetch_message(event.id)
-                except discord.HTTPException:
-                    return missed('reply withheld: message changed')
-                if getattr(current, 'edited_at', None) is not None or current.content != arrived:
-                    return missed('reply withheld: message changed')
-                if (getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
-                        token.search(visible_content(arrived or ''))):
-                    gates.append(Invitation(self, event))
-            for gate in gates:
-                if not await gate.current(check_evidence=False):
-                    return missed(f'reply withheld: {gate.refusal}')
-            if not ambient and await self.unreachable(message, answering=True):
-                self.answered(events)
-            else:
-                missed('controller unreachable')
-            await self.fri.waiting_notices.clear(message.author.id)
+        def outage():
+            return self.outage(message, events, burst, invitation, since, ambient=ambient)
 
         async def refused():
             """The invitation's recheck before Fri answers, True once it failed and that was handled. A dead
@@ -1029,7 +1031,7 @@ class Agent:
                                            fenced=since is not None)
             if since:  # Said only if they haven't erased since, checked last.
                 if erased := await self.erasure(message.author.id, *since):
-                    return await self.dropped(message, events, erased, invitation, since)
+                    return await self.dropped(message, events, erased, invitation, since, burst)
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
@@ -1043,7 +1045,7 @@ class Agent:
             reason = (await self.erasure(message.author.id, *since) if invitation else
                       'author privacy changed' if self.forgotten.get(message.author.id, 0) != since[0] else None)
             if reason:
-                return await self.dropped(message, events, reason, invitation, since)
+                return await self.dropped(message, events, reason, invitation, since, burst)
         if result.response_kind in ('react', 'quiet'):
             if (result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(
                     message, result.reaction, (lambda: self.erasure(message.author.id, *since)) if since else None)):

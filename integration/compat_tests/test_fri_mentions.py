@@ -1032,7 +1032,7 @@ def test_a_controller_that_goes_down_while_a_ping_waits_says_so(monkeypatch, tmp
             fri.chat_once.assert_not_awaited()
             texts = [item.args[0] for item in event.reply.await_args_list]
             assert texts == ([UNREACHABLE] if when == 'before notice' else [str(ReplyInProgress()), UNREACHABLE])
-            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
+            assert mention_lines(caplog) == []  # The outage notice answered it.
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -1159,8 +1159,8 @@ def test_a_ping_that_waited_for_a_save_still_gets_its_checks(monkeypatch, tmp_pa
             fri.chat_once.assert_not_awaited()
             expected = UNREACHABLE if failure == 'outage' else NOTICES['stale event']
             assert [item.args for item in event.reply.await_args_list] == [(expected,)]
-            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: ' +
-                                             ('controller unavailable' if failure == 'outage' else 'earlier reply still running')]
+            assert mention_lines(caplog) == ([] if failure == 'outage' else  # The outage notice answered it.
+                                             [f'Mention 1/{event.id} not answered, told why: earlier reply still running'])
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -1651,10 +1651,11 @@ def test_a_queued_burst_pings_outage_line_needs_the_ping_to_still_stand(monkeypa
             texts = [item.args[0] for item in after.reply.await_args_list]
             if change == 'none':
                 assert texts == [str(ReplyInProgress()), UNREACHABLE]
-                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered, told why: controller unavailable']
+                assert mention_lines(caplog) == []  # The outage notice answered the burst.
             else:
                 assert texts == [str(ReplyInProgress())]
-                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: controller unavailable']
+                reason = 'missing permissions' if change == 'access' else 'message changed'
+                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: reply withheld: {reason}']
         finally:
             released.set()
             await fri.close()
@@ -2014,6 +2015,53 @@ def test_no_outage_notice_for_a_message_whose_author_erased_during_its_arrival_r
                 assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
         finally:
             failed.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['none', 'edited', 'deleted'])
+def test_a_queued_bursts_outage_line_needs_its_earlier_message_unchanged(monkeypatch, tmp_path, caplog, change):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        before, ping = message('fri so about earlier'), message('<@99> help')
+        ping.reply.return_value = SimpleNamespace(id=ping.id+1, content='hold on', delete=AsyncMock())
+        fri.busy.add(20)  # A reply to them that's still going, so the burst waits its turn.
+        released, debounce, grouped = gated_debounce()
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in (before, ping):
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                while not ping.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                if change == 'edited':  # Maybe to take it back.
+                    edited = copy.copy(before)
+                    edited.content, edited.edited_at = 'fri never mind', dt.datetime.now(dt.timezone.utc)
+                    rows[before.id] = edited
+                elif change == 'deleted':
+                    def gone(mid):
+                        if mid == before.id:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                        return rows[mid]
+                    channel.fetch_message.side_effect = gone
+                agent.revision = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+                fri.busy.discard(20)
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_not_awaited()
+            before.reply.assert_not_awaited()
+            texts = [item.args[0] for item in ping.reply.await_args_list]
+            if change == 'none':
+                assert texts == [str(ReplyInProgress()), UNREACHABLE]
+                assert mention_lines(caplog) == []
+            else:
+                assert texts == [str(ReplyInProgress())]
+                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: reply withheld: message changed']
+        finally:
+            released.set()
             await fri.close()
     asyncio.run(scenario())
 

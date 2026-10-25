@@ -9,7 +9,7 @@ import discord
 from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
-from .fri_errors import UNREACHABLE, AuthorErased, ControllerUnavailable
+from .fri_errors import AuthorErased, ControllerUnavailable
 from .fri_meme_media import sources
 from .privacy import clean
 
@@ -25,8 +25,6 @@ NOTICES = {'stale event': 'took me too long on that one. ping me again if you st
            'nearby message changed': CONTEXT_CHANGED, 'nearby privacy changed': CONTEXT_CHANGED,
            'check failed: ControllerRejected': CONTEXT_CHANGED}
 GLITCH = 'that one glitched on my end. ping me again.'
-NOTICES['controller unavailable'] = UNREACHABLE
-OUTAGES = ('controller unavailable', 'check failed: ControllerUnavailable')
 
 
 def notice_for(reason):
@@ -156,9 +154,6 @@ class Invitation:
             if fenced and revision is None:  # Not read yet, e.g. already stale as it came in: compare from now.
                 try:
                     revision = await self.agent.revision(self.event.author.id)
-                except ControllerUnavailable:
-                    if reason not in OUTAGES:
-                        return None
                 except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
                     return None
             if not await self.access():
@@ -169,10 +164,8 @@ class Invitation:
                 return None
             if reason == 'message changed' and current.edited_at is None:
                 text = GLITCH  # Not the member's edit, so don't say it was.
-            # Last, so an erasure during the checks above still counts. An outage can't be checked
-            # against itself, so only a known erasure silences the notice saying so.
-            erased = fenced and await self.agent.erasure(self.event.author.id, self.forgotten, revision)
-            if erased and not (reason in OUTAGES and erased == 'check failed: ControllerUnavailable'):
+            # Last, so an erasure during the checks above still counts.
+            if fenced and await self.agent.erasure(self.event.author.id, self.forgotten, revision):
                 return None
             return text
         except (discord.HTTPException, commands.UserFeedbackCheckFailure, ValueError, AttributeError, TypeError):
