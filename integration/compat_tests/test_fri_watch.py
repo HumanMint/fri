@@ -962,6 +962,88 @@ def test_an_outage_over_before_its_dm_landed_sends_nothing_late(monkeypatch, tmp
     asyncio.run(scenario())
 
 
+def test_a_dm_that_lands_after_gene_recovered_is_corrected_at_once(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        dm.hang = asyncio.Event()  # Discord holds the send, say under a long rate limit.
+        try:
+            with patch('fri.fri_watch.DELIVERY', 0.01):
+                for _ in range(CHECKS):
+                    await fri.watcher.check()
+                fri.api = AsyncMock(return_value=GOOD)
+                await fri.watcher.check()  # Gene is back while the DM is still in flight.
+                assert not fri.watcher.state['alert']['open'] and not dm.sends
+                dm.hang.set()
+                await fri.watcher.delivering
+            alert = fri.watcher.state['alert']
+            [(mid, content)] = dm.edits
+            assert len(dm.sends) == 1 and dm.messages[mid].content == content == alert['text'] == alert['shown']
+            assert 'back at' in content
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_whose_text_keeps_changing_mid_edit_catches_up_without_running_out_of_stack(monkeypatch, tmp_path, caplog):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        partial, edits = dm.get_partial_message, []
+        def flapping(mid):
+            async def edit(**options):
+                await partial(mid).edit(**options)
+                edits.append(options['content'])
+                if len(edits) < 1500:  # A health pass changes what the DM should say before Discord replies.
+                    fri.watcher.state['alert']['text'] = f'outage, take {len(edits)}'
+            return SimpleNamespace(edit=edit)
+        try:
+            for _ in range(CHECKS):
+                await fri.watcher.check()
+            dm.get_partial_message = flapping
+            fri.watcher.state['alert']['text'] = 'outage, take 0'
+            await fri.watcher.deliver()
+            alert = fri.watcher.state['alert']
+            assert len(edits) == 1500 and dm.messages[556].content == alert['text'] == alert['shown']
+            assert 'deliver failed' not in caplog.text
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_owner_already_knows_only_once_the_dm_shows_the_relapse(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        dm = owner_dm(fri)
+        clock = SimpleNamespace(now=1_000_000.0)
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now))
+        stale, good = {'heartbeat_age_seconds': 300, 'runtime': {}}, GOOD
+        async def checks(count, health):
+            fri.api = AsyncMock(return_value=health)
+            for _ in range(count):
+                clock.now += 120
+                await fri.watcher.check()
+        try:
+            await checks(CHECKS, stale)
+            assert fri.watcher.refusal().endswith('owner already knows.')
+            await checks(1, good)
+            recovered = dm.messages[556].content
+            dm.fail_edit = http(500)  # The relapse's edit doesn't land: the DM still says gene is back.
+            await checks(CHECKS, stale)
+            assert dm.messages[556].content == recovered and fri.watcher.refusal() == NOT_TAKING
+            dm.fail_edit = None
+            await checks(1, stale)
+            assert dm.messages[556].content != recovered and fri.watcher.refusal().endswith('owner already knows.')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_deleted_dm_is_resent_while_the_outage_lasts_and_dropped_after(monkeypatch, tmp_path):
     async def scenario():
         fri = configured(monkeypatch)
@@ -1003,7 +1085,8 @@ def test_quick_control_with_gene_down_answers_at_once_without_charging_or_queuei
             assert result.reply == NOT_TAKING
             assert '/controls/catalog' in paths
             assert '/chat/operations/admit' not in paths and '/controls' not in paths
-            fri.watcher.state = {'alert': {'open': True, 'kind': 'stale', 'text': 'x', 'message_id': '556'}}
+            fri.watcher.state = {'alert': {'open': True, 'kind': 'stale', 'text': 'x', 'message_id': '556',
+                                           'shown': 'x'}}
             result = await fri.talk(123, 1, 20, actual.content, 'public', event=actual)
             assert result.reply == NOT_TAKING+' owner already knows.'
             client.post('/runtime/controls/poll', headers=headers('runtime'), json={'actions': ['queue']})
