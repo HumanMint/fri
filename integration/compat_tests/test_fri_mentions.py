@@ -1233,7 +1233,11 @@ def test_an_erasure_during_a_pings_last_checks_stops_the_reply(monkeypatch, tmp_
             assert len(seen) >= 2
             event.reply.assert_not_awaited()
             assert not any(path == '/chat/turn' for path, _ in calls)
-            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+            # A Gene erasure during the last look outside a configured channel is now caught by the
+            # nearby authors' privacy check that runs after the refetches: Gene refuses the fenced grant.
+            reason = ('reply withheld: check failed: ControllerRejected' if (channel_id, erasure) == (8, 'gene')
+                      else 'author privacy changed')
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: {reason}']
         finally:
             await fri.close()
     asyncio.run(scenario())
