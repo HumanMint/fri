@@ -38,6 +38,12 @@ def fingerprint(message):
                   for a in message.attachments))
 
 
+def snapshot(message):
+    """A nearby post as read: its fingerprint, and the GIF link previews look() may have inspected,
+    which live in the embeds (a poster can swap or remove them without an edit time)."""
+    return fingerprint(message), tuple(gif_previews(message))
+
+
 class Invitation:
     def __init__(self, agent, message):
         self.agent, self.fri, self.event = agent, agent.fri, message
@@ -126,7 +132,7 @@ class Invitation:
             if check_evidence and self.grant:
                 for mid, event in self.events.items():
                     current = await self.event.channel.fetch_message(mid)
-                    if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
+                    if current.webhook_id or current.author.bot or snapshot(current) != self.snapshots[mid]:
                         return self.refuse('nearby message changed')
                 # Last, after every Discord wait, so an opt-out during the refetches above still counts.
                 profiles = await self.profile_sources(list(self.events.values()))
@@ -227,7 +233,7 @@ class Invitation:
                 continue
             self.profiles[user] = profile
             self.events[item.id] = item
-            self.snapshots[item.id] = fingerprint(item)
+            self.snapshots[item.id] = snapshot(item)
             self.rows = [row for row in self.rows if row['source']['id'] != str(item.id)]
             self.rows.append({'source': discord_source(item).evidence(), 'text': clean(item.content, 500),
                               'privacy_revision': profile['revision'], 'referenced': item.id == reference_id,
@@ -242,7 +248,7 @@ class Invitation:
         # Without one image the ping points at, "which of these" needs all of them; look() keeps the newest that fit.
         self.images = [] if self.image else [m for m in self.events.values() if m.attachments or gif_previews(m)]
         # Contextual images use attachments, or a GIF link's Discord-made preview. Never other embeds or URLs.
-        if self.image and sources(self.image, gifs=True) != [str(a.url) for a in self.image.attachments]:
+        if self.image and sources(self.image) != [str(a.url) for a in self.image.attachments]:
             self.image = None
         await self.require_current()
 
