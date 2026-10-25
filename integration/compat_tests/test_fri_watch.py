@@ -141,7 +141,7 @@ def test_relapse_inside_half_an_hour_edits_the_last_dm_and_later_ones_send_a_new
         dm = owner_dm(fri)
         sends, edits = dm.sends, dm.edits
         clock = [time.time()]
-        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
         async def checks(count):
             for _ in range(count):
                 clock[0] += 120
@@ -367,7 +367,7 @@ def test_a_dm_discord_took_long_after_the_attempt_is_still_found(monkeypatch, tm
             sent.created_at = datetime.datetime.fromtimestamp(clock.now, datetime.timezone.utc)
             raise http(500) if way == 'failed' else Crash()  # Fri never heard back.
         try:
-            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now)):
+            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now)):
                 for _ in range(CHECKS-1):
                     await fri.watcher.check()
                 dm.send = slow
@@ -490,7 +490,7 @@ def test_fri_waits_out_a_controller_down_at_startup_and_still_tells_the_owner(mo
         fri.data = tmp_path
         dm = owner_dm(fri)
         clock, reads = [time.time()], []
-        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
         async def api(method, path, value=None):
             reads.append(path)
             if path == '/fri/contract':
@@ -517,7 +517,7 @@ def test_reads_stay_an_interval_apart_from_startup_into_the_gateway_loop(monkeyp
         dm = owner_dm(fri)
         start = time.time()
         clock, reads = [start], []
-        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
         async def api(method, path, value=None):
             if path == '/fri/contract':
                 clock[0] += 10
@@ -555,7 +555,7 @@ def test_startup_waits_out_every_controller_read_it_needs(monkeypatch, tmp_path)
         fri.data = tmp_path
         dm = owner_dm(fri)
         clock, reads = [time.time()], []
-        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
         async def api(method, path, value=None):
             reads.append(path)
             if path == '/fri/contract':
@@ -611,7 +611,7 @@ def test_a_clock_that_went_back_during_a_slow_read_still_starts_a_fresh_streak(m
             raise ControllerUnavailable(UNREACHABLE)
         fri.api = slow
         try:
-            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now)):
+            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now, monotonic=time.monotonic)):
                 await fri.watcher.check()
             assert fri.watcher.state['bad'] == 1 and not dm.sends
         finally:
@@ -632,7 +632,7 @@ def test_a_clock_that_went_back_mid_read_still_starts_a_fresh_streak(monkeypatch
             raise ControllerUnavailable(UNREACHABLE)
         fri.api = corrected
         try:
-            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now)):
+            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now, monotonic=time.monotonic)):
                 await fri.watcher.check()
             assert fri.watcher.state['bad'] == 1 and fri.watcher.state['alert'] is None and not dm.sends
         finally:
@@ -640,32 +640,74 @@ def test_a_clock_that_went_back_mid_read_still_starts_a_fresh_streak(monkeypatch
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('jump', [-3600, 3600])
-def test_a_clock_change_mid_pass_never_stalls_or_rushes_the_watch(monkeypatch, tmp_path, jump):
+@pytest.mark.parametrize('jump', [-3600, -30, 3600])
+@pytest.mark.parametrize('when', ['mid read', 'between passes'])
+def test_a_wall_clock_step_never_stalls_skips_or_rushes_the_watch(monkeypatch, tmp_path, jump, when):
     class Stop(Exception):
         pass
     async def scenario():
         fri = configured(monkeypatch)
         fri.data = tmp_path
-        fri.wait_until_ready = AsyncMock()
-        clock = SimpleNamespace(now=time.time())
+        clock = SimpleNamespace(now=time.time(), monotonic=1000.0)
         reads, sleeps = [], []
         async def api(method, path, value=None):
-            reads.append(path)
-            clock.now += jump  # The host clock is corrected while a read is underway.
+            reads.append(clock.monotonic)
+            if when == 'mid read':
+                clock.now += jump  # The host clock is corrected while a read is underway.
             return GOOD
         async def sleep(delay):
             sleeps.append(delay)
             clock.now += delay
+            clock.monotonic += delay
+            if when == 'between passes':
+                clock.now += jump
             if len(sleeps) == 4:
                 raise Stop
         fri.api = api
         try:
-            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now)), \
+            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.monotonic)), \
                     patch('fri.fri.asyncio.sleep', sleep), pytest.raises(Stop):
                 await fri.keep_watch()
-            # The first pass reads at once (no last read); each later pass is an interval after the one before.
-            assert sleeps[0] == 0 and sleeps[1:] == [pytest.approx(120, abs=1)]*3 and len(reads) == 3
+            # The first pass reads at once (no last read); each later pass reads an interval after the one before.
+            assert sleeps[0] == 0 and sleeps[1:] == [pytest.approx(120, abs=1)]*3
+            assert reads == [1000, pytest.approx(1120, abs=1), pytest.approx(1240, abs=1)]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_streak_runs_on_through_a_wall_clock_step_while_fri_runs(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        dm = owner_dm(fri)
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        clock = SimpleNamespace(now=1_000_000.0, monotonic=1000.0)
+        try:
+            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.monotonic)):
+                for step in (0, -3600, 3600):  # Reads two minutes apart, whatever the wall clock says.
+                    clock.now += 120+step
+                    clock.monotonic += 120
+                    await fri.watcher.check()
+            assert fri.watcher.state['bad'] == CHECKS and len(dm.sends) == 1
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_watch_reads_and_alerts_while_the_gateway_is_still_down(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        dm = owner_dm(fri)  # Discord's HTTP API works; its gateway doesn't.
+        fri.wait_until_ready = asyncio.Event().wait
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        fri.watcher.load().update(bad=CHECKS-1, kind='unreachable', since=time.time()-240,
+                                  checked=time.time()-120)  # Startup's wait read twice, then the controller came up.
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(fri.keep_watch(), 1)
+            assert fri.api.await_count == 1 and len(dm.sends) == 1
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -779,7 +821,7 @@ def test_the_relapse_window_starts_when_the_dm_actually_went_out(monkeypatch, tm
         fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
         dm = owner_dm(fri)
         clock = [time.time()]
-        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
         async def checks(count):
             for _ in range(count):
                 clock[0] += 120
@@ -807,7 +849,7 @@ def test_the_relapse_window_counts_from_when_discord_made_the_dm_not_its_late_re
         fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
         dm = owner_dm(fri)
         clock = SimpleNamespace(now=1_000_000.0)
-        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now))
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now))
         quick = dm.send
         async def late(content, **options):
             sent = await quick(content, **options)
@@ -841,7 +883,7 @@ def test_an_edit_whose_reply_was_lost_is_redone_even_back_to_the_text_shown_befo
         fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
         dm = owner_dm(fri)
         clock = SimpleNamespace(now=time.time())
-        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now))
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now))
         async def check():
             clock.now += 120
             await fri.watcher.check()
@@ -877,7 +919,7 @@ def test_a_dm_still_missing_its_recovery_note_carries_the_next_outage(monkeypatc
         fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
         dm = owner_dm(fri)
         clock = [time.time()]
-        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
         async def checks(count):
             for _ in range(count):
                 clock[0] += 120
@@ -1080,6 +1122,29 @@ def test_no_outage_notice_after_fri_already_answered():
             await agent.handle(posted)
         posted.reply.assert_not_awaited()
         assert not agent.unreachable_notices
+    asyncio.run(scenario())
+
+
+def test_the_notice_s_five_minutes_start_when_discord_took_it():
+    async def scenario():
+        agent = down_agent()
+        clock = SimpleNamespace(now=1000.0)
+        landed, inflight = [], []
+        async def slow(*args, **kwargs):
+            inflight.append(await agent.unreachable(message()))  # Another message while this one is in flight.
+            clock.now += 290  # Discord took nearly five minutes to accept it, under a long rate limit.
+            landed.append(clock.now)
+        async def quick(*args, **kwargs):
+            landed.append(clock.now)
+        first, second, third = message(), message(), message()
+        first.reply.side_effect = slow
+        second.reply.side_effect = third.reply.side_effect = quick
+        with patch('fri.fri_agent.time', SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now)):
+            for event, wait in ((first, 0), (second, 11), (third, 290)):
+                clock.now += wait
+                with pytest.raises(ControllerUnavailable):
+                    await agent.handle(event)
+        assert inflight == [False] and landed == [1290, 1591]  # Then 11 s and 301 s after it landed.
     asyncio.run(scenario())
 
 

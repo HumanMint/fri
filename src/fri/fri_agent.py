@@ -112,7 +112,7 @@ class Agent:
         self.heartbeat_started = self.heartbeat_finished = 0
         self.heartbeat_status = 'starting'
         self.stages = {}
-        self.unreachable_notices = {}  # channel: when Fri last said it can't reach the controller.
+        self.unreachable_notices = {}  # channel: when Discord took Fri's notice (monotonic), or None in flight.
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
 
     @property
@@ -456,11 +456,11 @@ class Agent:
         # ping keeps its own gates and stays quiet.
         if message.guild and not self.allowed(message.channel) or not await self.still_addressed(message, answering):
             return False
-        now = time.time()
-        self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if now-v < 300}
+        now = time.monotonic()
+        self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if v is None or now-v < 300}
         if message.channel.id in self.unreachable_notices:
             return False
-        self.unreachable_notices[message.channel.id] = now
+        self.unreachable_notices[message.channel.id] = None  # The five minutes start once members can see it.
         posted = False
         try:
             await message.reply(UNREACHABLE, allowed_mentions=NO_MENTIONS, mention_author=False)
@@ -468,7 +468,9 @@ class Agent:
         except discord.HTTPException:
             LOG.info('Controller outage notice was not delivered')
         finally:  # Nobody saw it, whatever stopped it, so the next message may try.
-            if not posted and self.unreachable_notices.get(message.channel.id) == now:
+            if posted:
+                self.unreachable_notices[message.channel.id] = time.monotonic()
+            else:
                 del self.unreachable_notices[message.channel.id]
         return posted
 

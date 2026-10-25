@@ -82,6 +82,7 @@ class Watch:
         self.fri = fri
         self.state = None
         self.delivering = None
+        self.read_at = None  # time.monotonic() at this process's last read.
 
     @property
     def path(self):
@@ -106,14 +107,21 @@ class Watch:
         alert = self.load()['alert']
         return bool(alert and alert.get('open') and alert.get('kind') in kinds and alert.get('message_id'))
 
+    def since(self):
+        """Seconds since the last read. Once this process has read, by the monotonic clock, so a stepped
+        wall clock can't skip or rush a read; before that, by the wall time saved before a restart."""
+        if self.read_at is not None:
+            return time.monotonic()-self.read_at
+        return time.time()-self.load()['checked']
+
     def wait(self):
         """Seconds until the next read is due, so the loop's first pass lands an interval after the last read."""
-        since = time.time()-self.load()['checked']
+        since = self.since()
         return 0 if since < 0 else max(0, INTERVAL-since)
 
     def due(self, slack=0):
         """Whether a read is due, an interval after the last one. `slack` covers a read's own latency."""
-        since = time.time()-self.load()['checked']
+        since = self.since()
         return since >= INTERVAL-slack or since < 0  # A last read "in the future" means the clock went back.
 
     def refusal(self, offered=()):
@@ -145,12 +153,18 @@ class Watch:
     async def observe(self):
         """Decides what the owner's DM should say; `deliver` makes Discord show it."""
         state = self.load()
-        start = time.time()  # Before the read, so its own latency can't hide a clock that moved back.
+        start, began = time.time(), time.monotonic()  # Before the read, so its latency can't hide a step.
         kind, detail = await self.read()
         now = time.time()
-        if not (0 <= start-state['checked'] <= now-state['checked'] <= 3*INTERVAL):
-            state['bad'] = 0  # Fri was away, or the clock moved back before or during this read: no streak.
-        state['checked'] = now
+        if self.read_at is None:
+            # The last read was before a restart, dated only by the wall clock. A clock that moved back,
+            # before or during this read, leaves its age unknown.
+            recent = 0 <= start-state['checked'] <= now-state['checked'] <= 3*INTERVAL
+        else:  # This process read last, by the monotonic clock, which never steps.
+            recent = began-self.read_at <= 3*INTERVAL
+        if not recent:
+            state['bad'] = 0  # Fri was away, or can't tell how long: reads from before don't make a streak.
+        state['checked'], self.read_at = now, time.monotonic()
         alert = state['alert']
         if kind == 'ok':
             state.update(bad=0, kind='')

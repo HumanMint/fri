@@ -253,7 +253,10 @@ Fri can't restart anything. It only notices and says so.
 - **Owner DM per outage.** Fri's own watch task reads `/controls/health` every 2 minutes, with
   no model call, apart from the agent heartbeat and owner DM loop. It's a plain asyncio task
   timed on the event loop's monotonic clock, not a `tasks.loop`, which times its sleeps by the
-  wall clock: a host clock set back an hour mid-pass would have stalled it for an hour. After 3 bad reads in a row it
+  wall clock: a host clock set back an hour mid-pass would have stalled it for an hour. Once Fri
+  has read in this process, the spacing between reads and the bad-read streak also follow the
+  monotonic clock, so a stepped wall clock can't skip a read or break a streak. It doesn't wait
+  for the gateway: reads and the DM go over Discord's HTTP API. After 3 bad reads in a row it
   DMs the owner once. A bad read is one of: Gene's heartbeat missing or at least 60 s old, Gene
   not connected to Discord, Gene's command runner stopped, the controller unreachable (transport
   error, 5xx, or no answer in 10 s), or the controller rejecting the read (4xx, such as a contract
@@ -279,9 +282,10 @@ Fri can't restart anything. It only notices and says so.
   then `/agent/state`) every 10 s before it joins the gateway, instead of exiting. Discord's HTTP API already works then, so the same watch reads,
   once per 2 minutes, still DM the owner. Reads stay about 2 minutes apart across that wait, the
   loop's first pass and restarts, so a restart never shortens the 3-read debounce: the loop's
-  first pass waits until an interval after the last read, rather than skipping a read. A last read
-  dated in the future, or a clock that went back during the read itself, starts a fresh streak
-  instead of muting the watch or counting toward an alert. Members see Fri offline until the controller answers, and
+  first pass waits until an interval after the last read, rather than skipping a read. Across a
+  restart only the saved wall time dates the last read, so a last read dated in the future, or a
+  clock that went back during the first read itself, starts a fresh streak instead of muting the
+  watch or counting toward an alert. Members see Fri offline until the controller answers, and
   `fri health` waits too. A rejected or incompatible contract still stops Fri at once, and so does
   a success that isn't JSON (a wrong URL or a proxy's page), since waiting won't fix it.
 - **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
@@ -304,7 +308,9 @@ Fri can't restart anything. It only notices and says so.
   discord.py updates its cached copy in place. Before a reply has started, a channel message must
   also still be addressed, and an @mention must pass its channel and access checks with Fri
   enabled. A posted notice counts as Fri's answer to a ping. A notice that
-  fails to post, for any reason, doesn't use up those 5 minutes. Ambient chimes stay quiet, and so
+  fails to post, for any reason, doesn't use up those 5 minutes, and they count from when Discord
+  took the notice, not from when Fri started sending it (a slow send under a rate limit would
+  otherwise leave a second notice due moments after the first appeared). Ambient chimes stay quiet, and so
   does a message Fri already answered. Mentions outside configured channels keep their own gates
   and stay silent. The same text replaces the old "workshop controller is
   temporarily unavailable" wherever that error was shown, and a controller 5xx's detail goes to

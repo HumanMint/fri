@@ -778,7 +778,7 @@ class Fri(discord.Client):
         await self.watcher.check(observe=self.watcher.due(slack=15))
 
     async def before_watch(self):
-        await self.wait_until_ready()
+        # No wait for the gateway: the watch reads and DMs over HTTP, as it does during startup's wait.
         await asyncio.sleep(self.watcher.wait())  # Not a pass early, which would skip its read and wait a whole one more.
 
     @tasks.loop(seconds=10)
