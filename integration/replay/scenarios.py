@@ -312,6 +312,28 @@ PENDING = Scenario(
     [Check('the clarification was armed', lambda r: r.inspections['armed']),
      Check('the derived question is gone after the erasure', lambda r: r.stored(BO)['pending'] is None)])
 
+def recap_from_read(replay):
+    shown = json.loads(replay.transport.last_payload['input'][-1]['content'])
+    replay.inspections['caught_up'] = shown['action_result_untrusted']
+    return reply('ash found a modpack that runs and kit blamed lag again. so, nothing')
+
+
+CATCH_UP = Scenario(
+    'catch_up_since_last_message',
+    'Asking what they missed reads what others said since the asker last spoke, and keeps a breadcrumb.',
+    [Say(BO, 'ok gn yall', label='left'), Wait(3600), Say(ASH, 'found a modpack that actually runs'), Wait(60),
+     Say(KIT, 'lag again, not my fault'), Wait(3600), Say(BO, 'back'), Wait(30),
+     Say(BO, 'fri what did i miss', label='ask')],
+    {'conversation': [act('read_recent', channel_id='1', window='since_my_last_message'), recap_from_read]},
+    [Check('the catch-up gets a generated answer', lambda r: answered(r, 'ask')),
+     Check('one channel read, then the answer', lambda r: route(r, 'ask')['tools'] == ['read_recent']
+           and route(r, 'ask')['conversation_calls'] == 2, scripted_only=True),
+     Check('the read covers others since the asker left, not the asker coming back',
+           lambda r: [row['name'] for row in r.inspections['caught_up']['messages']] == ['ash', 'kit']
+           and r.inspections['caught_up']['stopped_at'] == 'your_last_message', scripted_only=True),
+     Check('other members\' words are kept only as a breadcrumb', lambda r: placeholder_only(r, 'ask')
+           and 'modpack' not in json.dumps(r.stored(BO)))])
+
 def answer_without_seeing_denver(replay):
     shown = json.dumps(replay.transport.last_payload['input'][-1]).lower()
     assert 'denver' not in shown, 'erased content reached the model through a Fri reference'
@@ -345,5 +367,6 @@ REQUEST_STATUS = Scenario(
      Check('no request text in a public channel', lambda r: first_call(r, 'ask')['request_titles'] == 0)])
 
 SCENARIOS = [CLOSING, OPEN_QUESTION, WEB_CLARIFICATION, OUTSIDE_MENTION, KEYWORDS, ERASURE, REPLY_TARGET,
+             CATCH_UP,
              DELIVERY_FAILURE, TOOL_CONTINUITY, GROUP_VIEW, MIDTURN_ERASURE, HISTORY, HISTORY_MIDTURN, SUMMARY,
              FRI_REFERENCE, PENDING, REFERENCE_AFTER_ERASURE, REQUEST_STATUS]
