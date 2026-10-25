@@ -631,20 +631,24 @@ class Agent:
         while True:
             if not self.turns.ready(user, message.id):
                 if not noticed and user in self.fri.busy:
-                    noticed, refusal, erasure = True, None, None  # Why not, if the checks before the notice fail.
+                    noticed, refusal, erasure, exclusion = True, None, None, None  # Why not, if the checks before the notice fail.
                     async def eligible():  # Run just before the notice posts.
-                        nonlocal refusal, erasure
+                        nonlocal refusal, erasure, exclusion
                         try:
                             if invitation and not await invitation.current():
                                 refusal = invitation.refusal
+                            elif dm and (exclusion := await self.excluded(message, dm, None, privacy, text)):
+                                pass  # A DM's own gates: still a member, DMs still on.
                             else:
                                 erasure = await self.erasure(user, *since)
                         except ControllerUnavailable:
                             erasure = 'check failed: ControllerUnavailable'  # Said below, as an outage.
-                        return not (refusal or erasure)
+                        return not (refusal or erasure or exclusion)
                     await self.fri.waiting_notices.send(message, eligible)  # Deleted once a reply to them lands.
                     if refusal:
                         return await self.withheld(message, events, refusal, invitation, logged=f'reply withheld: {refusal}')
+                    if exclusion:
+                        return self.missed(events, exclusion)
                     if erasure:
                         return await self.dropped(message, events, erasure, invitation, since, burst)
                 try:
@@ -657,6 +661,10 @@ class Agent:
             if recheck:
                 if reason := await self.erasure(user, *since):
                     return await self.dropped(message, events, reason, invitation, since, burst)
+                # Each message as Discord has it now: one edited or deleted while it waited, maybe to take
+                # it back, is neither answered nor saved. A ping's invitation checks its own message.
+                if not invitation and not await self.unedited(events):
+                    return self.missed(events, 'message changed')
                 if reason := await self.excluded(message, dm, invitation, privacy, text):
                     return self.missed(events, reason)
                 if time.time() >= until:
@@ -673,6 +681,13 @@ class Agent:
             if outcome is not BUSY:
                 return
             recheck = True  # E.g. they erased while a panel or ambient reply kept this one waiting.
+
+    async def unedited(self, events):
+        """Every message of a burst that waited is still there and never edited (see still_addressed)."""
+        for event in events:
+            if not await self.still_addressed(event, answering=True):
+                return False
+        return True
 
     async def excluded(self, message, dm, invitation=None, privacy=None, text=''):
         """Why a message that waited (its turn, or another control) is no longer one Fri answers, by
