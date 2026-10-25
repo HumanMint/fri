@@ -14,12 +14,10 @@ posting or learning permission, and never adds a channel to an ambient allowlist
 The controller applies the existing member allowance. Disabled mode and in-progress
 reply notices keep their existing behavior. The runtime rechecks the current event,
 member roles, channel/thread permissions, source contents and privacy before output.
-Each recheck keeps the one-by-one order but sends reads that don't depend on each other
-together: the channel, roles and both members (a thread's parent after its channel), then the
-ping, then the grant's privacy from the controller, then the nearby messages and the image post.
-After the model answers, a ping is rechecked before each tool acts, before the model hears the
-turn again, and once right before sending; that last check also covers its image post, including
-a photo the author posted just before the ping.
+After the model answers, a ping is rechecked before each tool acts, before the model hears
+the turn again, and once right before sending; checks repeated with nothing in between are
+gone. That last check reads the ping again after its privacy read, and also covers its image
+post, including a photo the author posted just before the ping.
 In configured channels, local privacy/usage utilities, exact controls and accepted
 operational follow-ups retain their existing admission before any social allowance.
 New conversation and on-demand surrounding context still need normal chat admission;

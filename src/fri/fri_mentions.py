@@ -1,6 +1,5 @@
 """One live ping invites bounded evidence, never ambient collection or new tools."""
 
-import asyncio
 import copy
 import datetime as dt
 import time
@@ -31,18 +30,6 @@ GLITCH = 'that one glitched on my end. ping me again.'
 
 def notice_for(reason):
     return NOTICES.get(reason, GLITCH if reason.startswith('check failed: ') else None)
-
-
-async def together(*reads):
-    """Send Discord reads at once: each comes back as its result or the exception it raised, to be
-    judged in the order a one-by-one check would have read them (see settled)."""
-    return await asyncio.gather(*reads, return_exceptions=True)
-
-
-def settled(result):
-    if isinstance(result, BaseException):
-        raise result
-    return result
 
 
 def fingerprint(message):
@@ -104,11 +91,7 @@ class Invitation:
             return self.refuse('fri disabled')
         if guild.id != self.fri.guild_id and not self.agent.allowed(event.channel):
             return self.refuse('outside the main server')
-        # None of these depends on another, so they go out together. The message reads come after.
-        channel, roles, author, fri = await together(
-            guild.fetch_channel(event.channel.id), guild.fetch_roles(), guild.fetch_member(event.author.id),
-            guild.fetch_member(self.fri.user.id))
-        channel = settled(channel)
+        channel = await guild.fetch_channel(event.channel.id)
         if channel.id != event.channel.id or channel.guild.id != guild.id:
             return self.refuse('channel changed')
         thread = isinstance(channel, discord.Thread)
@@ -122,11 +105,11 @@ class Invitation:
             return self.refuse('nsfw channel')
         # Current role permissions matter as well as fresh channel overwrites.
         fresh_guild = copy.copy(guild)
-        fresh_guild._roles = {role.id: role for role in settled(roles)}
+        fresh_guild._roles = {role.id: role for role in await guild.fetch_roles()}
         parent = copy.copy(parent)
         parent.guild = fresh_guild
-        for user, member in ((event.author.id, author), (self.fri.user.id, fri)):
-            member = settled(member)
+        for user in (event.author.id, self.fri.user.id):
+            member = await guild.fetch_member(user)
             if member.id != user or (user == event.author.id and member.bot):
                 return self.refuse('member changed')
             permissions = parent.permissions_for(member)
@@ -134,6 +117,11 @@ class Invitation:
                     (permissions.send_messages_in_threads if thread else permissions.send_messages)):
                 return self.refuse('missing permissions')
         return True
+
+    def unchanged(self, current):
+        """The ping as Discord has it now is still the one that came in, and still pings Fri."""
+        return (current.id == self.event.id and not current.author.bot and not current.webhook_id and
+                fingerprint(current) == self.original and explicit_mention(current, self.fri.user.id))
 
     async def current(self, *, check_evidence=True, control=False):
         try:
@@ -144,26 +132,25 @@ class Invitation:
                 return self.refuse('clock skew')
             if not await self.access(control=control):
                 return False
-            current = await self.event.channel.fetch_message(self.event.id)  # After access, as it stands now.
-            if (current.id != self.event.id or current.author.bot or current.webhook_id or
-                    fingerprint(current) != self.original or not explicit_mention(current, self.fri.user.id)):
+            current = await self.event.channel.fetch_message(self.event.id)
+            if not self.unchanged(current):
                 return self.refuse('message changed')
             if check_evidence and self.grant:
-                # After the reads above, so an erasure during them still counts.
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
-                # After the privacy read, so a delete during it still shows: the nearby messages, and an
-                # image post that isn't one of them or the ping (e.g. their photo just before it).
-                image = self.image if self.image is not None and self.image.id != self.event.id and (
-                    self.image.id not in self.events) else None
-                later = [*self.events, *([image.id] if image else [])]
-                fetched = dict(zip(later, await together(*(self.event.channel.fetch_message(mid) for mid in later))))
-                for mid in self.events:
-                    nearby = settled(fetched[mid])
-                    if nearby.webhook_id or nearby.author.bot or fingerprint(nearby) != self.snapshots[mid]:
+                for mid, event in self.events.items():
+                    current = await self.event.channel.fetch_message(mid)
+                    if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
                         return self.refuse('nearby message changed')
-                if image and fingerprint(settled(fetched[image.id])) != self.image_snapshot:
+                # The ping again, as an edit during the privacy read would otherwise go unseen.
+                if not self.unchanged(await self.event.channel.fetch_message(self.event.id)):
+                    return self.refuse('message changed')
+            # The image post it inspects, when that's neither the ping nor a nearby message (e.g. their
+            # photo just before the ping), so the check before sending covers every image the model saw.
+            image = self.image
+            if check_evidence and image is not None and image.id != self.event.id and image.id not in self.events:
+                if fingerprint(await self.event.channel.fetch_message(image.id)) != self.image_snapshot:
                     return self.refuse('image changed')
             return True
         except ControllerUnavailable:

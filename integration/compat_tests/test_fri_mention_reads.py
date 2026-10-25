@@ -1,5 +1,5 @@
-"""How many Discord reads an @mention waits on: each check stays, but reads that don't depend on one
-another go out together, and a check repeated with nothing in between is gone (roadmap item 5)."""
+"""How many Discord reads an @mention waits on (roadmap item 5): every check that guards something
+stays, in its one-by-one order, and a check repeated with nothing in between is gone."""
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -54,12 +54,12 @@ def counted_environment(monkeypatch, tmp_path):
     return fri, agent, store, channel, message, calls, rows, reads
 
 
-# Each ping check: the access reads together, then the ping, then (once admitted) the controller's privacy
-# read and the nearby messages and image post together, the same order as one by one.
-BEFORE = {'plain': (13, 7), 'image': (17, 8), 'image and tool': (17, 8)}
-# After the model: the ping's last check, which covers its image. The tool adds its own checks before
-# acting, its read, and one before the model hears the turn again.
-AFTER = {'plain': (5, 2), 'image': (5, 2), 'image and tool': (40, 19)}
+# Before the model, unchanged but for one more read of the ping after the image post's privacy read.
+BEFORE = {'plain': (13, 13), 'image': (18, 18), 'image and tool': (18, 18)}
+# After the model: the ping's last check (its access, the ping before and after the privacy read), which
+# covers its image. The tool adds its own checks before acting, its read, and one before the model hears
+# the turn again.
+AFTER = {'plain': (6, 6), 'image': (6, 6), 'image and tool': (47, 47)}
 
 
 @pytest.mark.parametrize('case', ['plain', 'image', 'image and tool'])
@@ -92,8 +92,8 @@ def test_an_at_mention_waits_on_few_discord_rounds(monkeypatch, tmp_path, case):
 
 @pytest.mark.parametrize('failing', ['channel', 'roles', 'author', 'fri', 'message'])
 @pytest.mark.parametrize('moved', [False, True])
-def test_reads_sent_together_are_judged_in_the_order_one_by_one_reads_were(monkeypatch, tmp_path, failing, moved):
-    # A read that fails behind an earlier refusal doesn't change why the ping can't be answered.
+def test_a_failed_read_behind_an_earlier_refusal_keeps_that_refusal(monkeypatch, tmp_path, failing, moved):
+    # Why the ping can't be answered stays the first reason its reads give.
     from fri.fri_mentions import Invitation
     async def scenario():
         fri, agent, _, channel, message, _, rows, _ = counted_environment(monkeypatch, tmp_path)

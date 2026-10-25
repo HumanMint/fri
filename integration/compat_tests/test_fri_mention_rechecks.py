@@ -1,11 +1,13 @@
 """What the checks #53 kept still cover, from its Codex reviews: a ping's preceding photo, nearby messages
 deleted during the privacy read that follows the Discord reads, images on turns that aren't pings, a ping
-edited while its access reads are out, and an image withdrawn before a follow-up model call."""
+edited while its access reads are out, an image withdrawn before a follow-up model call, a follow-up without a grant, and a ping edited or
+its author's access revoked during its last check."""
 import asyncio
 import copy
 import datetime as dt
 import inspect
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -13,6 +15,7 @@ import discord
 import httpx
 import pytest
 
+from compat_tests.test_fri_continuity import arm, origin
 from compat_tests.test_fri_mentions import attachment, burst, environment
 from fri.fri_chat import Chat, ChatResult
 
@@ -336,4 +339,147 @@ def test_withdrawn_ping_image_does_not_reach_followup_model(monkeypatch, tmp_pat
         finally:
             await fri.close()
 
+    asyncio.run(scenario())
+
+
+SECRET = 'the screenshot contains a medical diagnosis'
+
+
+def live_fetch(channel, rows):
+    async def fetch(mid):
+        if mid not in rows:
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'deleted')
+        return rows[mid]
+    channel.fetch_message.side_effect = fetch
+
+
+@pytest.mark.parametrize('change', ['delete', 'remove_attachment'])
+def test_pending_followup_rechecks_preceding_photo(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        question = 'what is the current Python release?'
+        original = message(question, age=60)
+        body = origin(goal='web', text=question)
+        body['source'].update(id=str(original.id), display_name=original.author.display_name)
+        arm(store, body, topic=question)
+        photo = message('', age=10, attachments=[attachment(1)])
+        event = message('<@99> the stable one, and what does my screenshot say?')
+        event.reply.return_value = SimpleNamespace(id=event.id + 1, content=SECRET)
+        live_fetch(channel, rows)
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(return_value='data:image/png;base64,aGVsbG8='))
+        async def respond(_, context):
+            assert context['images'] and context['image_event'].id == photo.id
+            assert set(context['actions']) == {'web_search'}
+            if change == 'delete':
+                del rows[photo.id]
+            else:
+                edited = copy.copy(photo)
+                edited.attachments = []
+                edited.edited_at = dt.datetime.now(dt.timezone.utc)
+                rows[photo.id] = edited
+            return ChatResult(status='completed', reply=SECRET)
+        fri.chat_once.side_effect = respond
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert any(path == '/chat/operations/admit' for path, _ in calls)
+            assert not any(path == '/chat/mentions/admit' for path, _ in calls)
+            replies = [call.args[0] for call in event.reply.await_args_list]
+            saved = store.chat_context('123', 'public:1', '20')
+            exposed = (any(SECRET in reply for reply in replies), SECRET in str(saved))
+            assert exposed == (False, False), exposed
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_member_revoked_while_channel_fetch_is_inflight(monkeypatch, tmp_path, channel_id):
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message('<@99> sensitive medical detail')
+        event.reply.return_value = SimpleNamespace(id=event.id + 1, content=SECRET)
+        live_fetch(channel, rows)
+        fri.chat_once.return_value = ChatResult(status='completed', reply=SECRET)
+        state = {'allowed': True, 'changed': False}
+        allowed = discord.Permissions.all()
+        denied = discord.Permissions.none()
+        channel.permissions_for = lambda member: allowed if getattr(member, 'allowed', True) else denied
+        async def member(user):
+            return SimpleNamespace(id=user, bot=user == 99, allowed=user == 99 or state['allowed'])
+        async def fetched_channel(cid):
+            if fri.chat_once.await_count and not state['changed']:
+                await REAL_SLEEP(0)  # Other independently dispatched reads can finish first.
+                state.update(allowed=False, changed=True)
+            return channel
+        channel.guild.fetch_channel.side_effect = fetched_channel
+        channel.guild.fetch_member.side_effect = member
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert state['changed']
+            replies = [call.args[0] for call in event.reply.await_args_list]
+            saved = store.chat_context('123', f'public:{channel_id}', '20')
+            exposed = (any(SECRET in reply for reply in replies), SECRET in str(saved))
+            assert exposed == (False, False), exposed
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel_id', [1, 8])
+@pytest.mark.parametrize('image', [False, True])
+@pytest.mark.parametrize('workflow', ['plain', 'tool', 'gene_receipt'])
+def test_ping_changed_during_post_model_profile_read(monkeypatch, tmp_path, channel_id, image, workflow):
+    if workflow == 'gene_receipt' and channel_id == 8:
+        pytest.skip('Gene receipts are unavailable outside configured channels')
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message('<@99> what does my sensitive screenshot say?' if image else '<@99> sensitive medical detail',
+                        attachments=[attachment(channel_id)] if image else [])
+        event.reply.return_value = SimpleNamespace(id=event.id + 1, content=SECRET)
+        live_fetch(channel, rows)
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(return_value='data:image/png;base64,aGVsbG8='))
+        completed, model_calls = [], []
+        async def respond(_, context):
+            model_calls.append(context)
+            if workflow == 'tool' and len(model_calls) == 1:
+                return ChatResult(status='completed', action={'kind': 'web_search', 'query': question})
+            if workflow == 'gene_receipt':
+                assert context['gene_receipts']
+            completed.append(True)
+            return ChatResult(status='completed', reply=SECRET)
+        question = 'what is the current Python release?'
+        if workflow == 'tool':
+            event.content += ' also ' + question
+            monkeypatch.setattr('fri.fri_actions.lookup', AsyncMock(return_value=({'query': question,
+                'answer': 'Public release information', 'sources': ['https://www.python.org/'],
+                'checked_at': dt.datetime.now(dt.timezone.utc).isoformat()}, {}, 'completed')))
+        fri.chat_once.side_effect = respond
+        api, changed = fri.api, []
+        async def checked(method, path, payload=None):
+            if workflow == 'gene_receipt' and path == '/controls/recent':
+                return {'receipts': [{'id': 'r1', 'channel_id': '1', 'action': 'pause', 'argument': '',
+                    'state': 'finished', 'at': time.time(), 'grounded': True,
+                    'result': {'done': True, 'output': 'Paused'}}]}
+            result = await api(method, path, payload)
+            if path == '/chat/mentions/profiles' and completed and not changed:
+                edited = copy.copy(event)
+                edited.content = '<@99> never mind'
+                edited.attachments = []
+                edited.edited_at = dt.datetime.now(dt.timezone.utc)
+                rows[event.id] = edited
+                changed.append(True)
+            return result
+        fri.api = checked
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert changed
+            replies = [call.args[0] for call in event.reply.await_args_list]
+            saved = store.chat_context('123', f'public:{channel_id}', '20')
+            exposed = (any(SECRET in reply for reply in replies), SECRET in str(saved))
+            assert exposed == (False, False), exposed
+        finally:
+            await fri.close()
     asyncio.run(scenario())
