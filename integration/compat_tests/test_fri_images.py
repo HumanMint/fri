@@ -68,7 +68,7 @@ def test_images_not_loaded_from_nonmessage_missing_or_unsupported_attachments(mo
         await attach({}, event, '')
         loader.assert_not_awaited()
         event.attachments[0].content_type = 'video/mp4'
-        with pytest.raises(commands.UserFeedbackCheckFailure, match='still images'):
+        with pytest.raises(commands.UserFeedbackCheckFailure, match='Videos are not supported'):
             await attach({}, event, 'what is this?')
         loader.assert_not_awaited()
     asyncio.run(scenario())

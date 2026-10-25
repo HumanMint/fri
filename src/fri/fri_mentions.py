@@ -11,7 +11,7 @@ from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import ControllerUnavailable
 from .fri_images import details
-from .fri_meme_media import sources
+from .fri_meme_media import gif_previews, sources
 from .privacy import clean
 
 NEARBY_SECONDS = 6 * 3600  # "The memes above" in a slow channel can be hours old; MAX_MESSAGES still bounds it.
@@ -184,9 +184,9 @@ class Invitation:
         elif referenced and referenced.attachments:
             self.image = referenced
         # Without one image the ping points at, "which of these" needs all of them; look() keeps the newest that fit.
-        self.images = [] if self.image else [m for m in self.events.values() if m.attachments]
-        # Contextual images use attachments only. Never follow embeds or pasted URLs.
-        if self.image and sources(self.image) != [str(a.url) for a in self.image.attachments]:
+        self.images = [] if self.image else [m for m in self.events.values() if m.attachments or gif_previews(m)]
+        # Contextual images use attachments, or a GIF link's Discord-made preview. Never other embeds or URLs.
+        if self.image and sources(self.image, gifs=True) != [str(a.url) for a in self.image.attachments]:
             self.image = None
         await self.require_current()
 

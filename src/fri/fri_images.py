@@ -6,7 +6,7 @@ import discord
 import httpx
 
 from . import feedback as commands
-from .fri_meme_media import load_image, sources
+from .fri_meme_media import gif_previews, load_image, sources, stills
 
 CHANGED = ('The image request changed while I was checking it. Any earlier tool actions keep '
            'their recorded outcomes; check their status before retrying. Ask again with the current attachment.')
@@ -74,8 +74,9 @@ def image_context(context):
 async def look(context, posts, *, invitation=None):
     """Look at still images that a read turned up, newest first, within this call's image budget.
 
-    Other people's posts count only through their own attachments, never embeds or pasted links,
-    which could point anywhere. A post that won't load is just not inspected; the model is told
+    Other people's posts count only through their own attachments, or the preview Discord made of a
+    GIF link they sent, never other embeds or pasted links, which could point anywhere. A GIF is
+    seen as its first frame. A post that won't load is just not inspected; the model is told
     which posts it saw and how many it didn't."""
     from .fri_context import discord_source
     images = list(context.get('images', []))
@@ -89,13 +90,13 @@ async def look(context, posts, *, invitation=None):
         if post.id in seen:
             continue
         seen.add(post.id)
-        urls = sources(post, MAX_IMAGES)
-        if not urls or urls != [str(a.url) for a in post.attachments] or len(urls) > budget:
+        urls = sources(post, MAX_IMAGES, gifs=True)
+        if not urls or urls != [str(a.url) for a in post.attachments]+gif_previews(post) or len(urls) > budget:
             skipped += 1
             continue
         budget -= len(urls)
         picked.append((post, urls))
-    loads = await asyncio.gather(*(load_image(url, post.channel.id) for post, urls in picked for url in urls),
+    loads = await asyncio.gather(*(load_image(url, post.channel.id, gifs=True) for post, urls in picked for url in urls),
                                  return_exceptions=True)
     for value in loads:
         if isinstance(value, BaseException) and not isinstance(value, (httpx.HTTPError, TimeoutError, ValueError)):
@@ -108,7 +109,7 @@ async def look(context, posts, *, invitation=None):
             continue
         size += sum(map(len, loaded))
         inspected.append({'images': list(range(len(images)+1, len(images)+len(loaded)+1)),
-                          'source': discord_source(post).evidence()})
+                          'source': discord_source(post).evidence(), **({'still': 'gif first frame'} if stills(post) else {})})
         images += loaded
         reads.append({'event': post, 'sources': urls, 'invitation': invitation})
         looked += 1
@@ -159,12 +160,13 @@ async def attach(context, event, text, *, source=None, invitation=None):
     # external embeds, referenced posts, or images from recent channel context.
     if not isinstance(getattr(source, 'embeds', None), (list, tuple)):
         return
-    urls = sources(source)
+    urls = sources(source, gifs=True)
     attachment_urls = [str(a.url) for a in attachments]
     if urls is None or urls != attachment_urls:
-        raise commands.UserFeedbackCheckFailure('Attach up to two non-spoiler PNG, JPEG or WebP still images, up to 4 MB each. Videos and GIFs are not supported.')
+        raise commands.UserFeedbackCheckFailure('Attach up to two non-spoiler PNG, JPEG, WebP or GIF images, up to 4 MB each '
+                                                '(8 MB for a GIF, which I see as its first frame). Videos are not supported.')
     try:
-        context['images'] = [await load_image(url, event.channel.id) for url in urls]
+        context['images'] = [await load_image(url, event.channel.id, gifs=True) for url in urls]
     except (httpx.HTTPError, TimeoutError, ValueError):
         raise commands.UserFeedbackCheckFailure('I couldn’t inspect that image. Try a small PNG, JPEG or WebP attachment.') from None
     context['image_sources'] = urls
@@ -193,7 +195,7 @@ async def unchanged(context, event):
         return ((image.author.id == event.author.id or
                  (invitation and image.author.id == source.author.id)) and not getattr(image.author, 'bot', False) and not image.webhook_id and
                 image.channel.id == event.channel.id and image.content == source.content and
-                image.edited_at == source.edited_at and sources(image) == context['image_sources'])
+                image.edited_at == source.edited_at and sources(image, gifs=True) == context['image_sources'])
     except discord.HTTPException:
         return False
 
@@ -216,7 +218,7 @@ async def looked_unchanged(context):
             # The same author as when read: the reads that call look() admit no bot but Fri itself.
             if (current.id != post.id or current.author.id != post.author.id or
                     current.webhook_id or current.channel.id != post.channel.id or current.content != post.content or
-                    current.edited_at != post.edited_at or sources(current, MAX_IMAGES) != read['sources']):
+                    current.edited_at != post.edited_at or sources(current, MAX_IMAGES, gifs=True) != read['sources']):
                 return False
         return True
     except discord.HTTPException:

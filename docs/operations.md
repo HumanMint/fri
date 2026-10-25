@@ -26,7 +26,9 @@ images are inspected in one model call, the current attachments and the referenc
 first, then the newest nearby posts' own attachments; Fri picks among several instead
 of asking which one. A speaker's own post keeps the two-image limit; a nearby gallery
 post can use the whole budget. Each image stays a non-spoiler PNG/JPEG/WebP, 4 MB,
-twenty million pixels; external embeds, GIFs and videos are not inspected by this path.
+twenty million pixels. A GIF (an upload up to 8 MB, or the preview Discord's own proxy made of a
+Tenor or Giphy link the poster sent) counts as one image: its first frame, scaled to fit 1024 px.
+Other external embeds and videos are not inspected by this path.
 A pasted message link or a replied-to post is opened only when the speaker and Fri can
 read it now (fetched overwrites and roles); from a server channel, only when it is this
 channel or one that keeps no role or member out. Every post a read or a link showed is
