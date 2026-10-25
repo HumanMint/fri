@@ -45,9 +45,10 @@ def test_a_run_of_presentation_selectors_cannot_hide_text():
     ('"\ufe0f', '"\\"\\ufe0f"'),
     ('a\ufe0fb\ufe0ec\ufe0f', '"a\\ufe0fb\\ufe0ec\\ufe0f"'),  # Letters can't carry hidden bits.
     ('1\ufe0f2\ufe0e', '"1\\ufe0f2\\ufe0e"'), ('\u2800\ufe0f', '"\\u2800\\ufe0f"'),
+    ('■\ufe0e■\ufe0f★\ufe0f', '"■\\ufe0e■\\ufe0f★\\ufe0f"'),  # Symbols a selector doesn't restyle.
     ({'❤\ufe0f\u200b': 1}, '{"❤\ufe0f\\u200b": 1}'),  # Keys follow the same rules.
 ])
-def test_presentation_selectors_count_only_straight_after_an_emoji_in_the_same_string(value, expected):
+def test_presentation_selectors_count_only_straight_after_an_emoji_they_restyle(value, expected):
     assert model_json(value) == expected
     assert json.loads(model_json(value)) == value
 
@@ -61,3 +62,35 @@ def test_emoji_reactions_cost_a_third_of_the_characters():
 def test_structure_and_quotes_are_unchanged():
     value = {'a': ['"quoted"', 'back\\slash', 'line\nbreak', 1, None, True], 'nested': {'k': 'v'}}
     assert model_json(value) == json.dumps(value)
+
+
+@pytest.mark.parametrize('value', [
+    {3: 'a', 2.5: 'b', True: 'c', None: 'd', 'e': float('nan')},  # json.dumps' key conversion.
+    [[[[]]]], ((1, 2), ('x',)), {'a': {'b': {'c': ['d', 1e100, -0.0]}}},
+])
+def test_traversal_matches_json_dumps(value):
+    assert model_json(value) == json.dumps(value)
+
+
+def test_deep_nesting_works_as_in_json_dumps():
+    value = []
+    for _ in range(350):
+        value = [value]
+    assert model_json(value) == json.dumps(value)
+
+
+@pytest.mark.parametrize('value,error', [
+    ({(1, 2): 'x'}, TypeError), ({'k': object()}, TypeError), ({'k': b'bytes'}, TypeError),
+])
+def test_unsupported_values_raise_as_in_json_dumps(value, error):
+    with pytest.raises(error):
+        json.dumps(value)
+    with pytest.raises(error):
+        model_json(value)
+
+
+def test_a_circular_value_raises_as_in_json_dumps():
+    value = []
+    value.append(value)
+    with pytest.raises(ValueError, match='Circular reference'):
+        model_json(value)
