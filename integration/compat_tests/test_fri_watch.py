@@ -15,6 +15,7 @@ from compat_tests.test_fri_actions import harness
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_runtime import configured, event
 from compat_tests.test_gene_controls import control_body, controls_api  # noqa: F401
+from fri.fri import patiently
 from fri.fri_agent import Agent
 from fri.fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
 from fri.fri_watch import CHECKS, NOT_OFFERED, NOT_TAKING, Watch, health_requested
@@ -1120,6 +1121,30 @@ def test_a_dead_controller_at_the_last_recheck_answers_the_whole_burst(monkeypat
     assert not [r for r in caplog.records if r.getMessage().startswith('Mention ')]
 
 
+@pytest.mark.parametrize('nsfw', [False, True])
+def test_a_mention_that_opened_the_burst_keeps_its_gates_for_the_notice(monkeypatch, tmp_path, nsfw):
+    async def scenario():
+        fri, agent, _, _, channel, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = make_message('<@99> can you help?'), make_message('one more thing')
+        api = fri.api
+        async def context_down(method, path, value=None):
+            if path == '/chat/context':
+                channel.nsfw = nsfw  # Changed while the burst's reply was underway.
+                raise ControllerUnavailable(UNREACHABLE)
+            return await api(method, path, value)
+        fri.api = context_down
+        try:
+            await asyncio.gather(agent.handle(first), agent.handle(second))  # Real waits form the burst.
+            replies = [call.args for event in (first, second) for call in event.reply.await_args_list]
+            if nsfw:
+                assert not replies and not {first.id, second.id} & set(agent.responded)
+            else:
+                assert replies == [(UNREACHABLE,)] and {first.id, second.id} <= set(agent.responded)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_an_admitted_mention_gets_the_notice_if_the_controller_dies_after_inference(monkeypatch, tmp_path):
     from fri.fri_chat import ChatResult
     async def scenario():
@@ -1269,4 +1294,42 @@ def test_controller_transport_errors_are_typed_as_unavailable(monkeypatch):
             await fri.api('GET', '/fri/contract')
         fri.session = None
         await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('status,body', [(401, 'text'), (403, 'html'), (404, 'garbled'), (502, 'html')])
+def test_a_refusal_that_isnt_json_is_still_a_refusal(monkeypatch, tmp_path, status, body):
+    """A proxy's or a wrong URL's own error page: the status decides, never the body."""
+    import aiohttp
+    class Response:
+        def __init__(self):
+            self.status = status
+        async def json(self):
+            if body == 'garbled':
+                raise json.JSONDecodeError('Expecting value', '<', 0)
+            raise aiohttp.ContentTypeError(SimpleNamespace(real_url='http://controller/fri/contract'), (),
+                                           message=f'unexpected mimetype: text/{body}')
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *exc):
+            return False
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.session = request = SimpleNamespace(calls=0)
+        def start(*args, **kwargs):
+            request.calls += 1
+            return Response()
+        request.request = start
+        try:
+            if status < 500:
+                with pytest.raises(ControllerRejected) as caught:  # Startup stops at once, as on any rejection.
+                    await asyncio.wait_for(patiently(fri, lambda: fri.api('GET', '/fri/contract')), 5)
+                assert caught.value.status == status and request.calls == 1
+                assert await fri.watcher.read() == ('rejected', {})
+            else:
+                assert await fri.watcher.read() == ('unreachable', {})
+        finally:
+            fri.session = None
+            await fri.close()
     asyncio.run(scenario())

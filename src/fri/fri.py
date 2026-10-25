@@ -218,7 +218,7 @@ class Fri(discord.Client):
                     headers={'Authorization': 'Bearer ' + self.token, 'X-Fri-Contract': PROTOCOL}) as response:
                 try:
                     data = await response.json()
-                except (ValueError, RecursionError):
+                except (ValueError, RecursionError, aiohttp.ContentTypeError):  # A proxy's HTML or text page.
                     if response.status < 400:
                         raise
                     data = None  # A refusal keeps its status when its JSON can't be read; a non-JSON reply isn't the controller's.

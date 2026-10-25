@@ -259,7 +259,8 @@ Fri can't restart anything. It only notices and says so.
 - **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed
   to Fri in a configured channel) whose controller read fails, before or while replying, gets one
   fixed notice per channel per 5 minutes instead of silence. A mention Fri already admitted only
-  needs its Discord-side checks for this notice, since the notice carries no evidence; a privacy
+  needs its Discord-side checks for this notice, since the notice carries no evidence. An @mention
+  earlier in a burst still gets those checks when the reply answers a later, unmentioned message. A privacy
   recheck that can't reach the controller leads to the notice, not silence. Every notice first
   fetches the message as Discord has it now: it must still exist and never have been edited, since
   discord.py updates its cached copy in place. Before a reply has started, a channel message must
@@ -368,7 +369,8 @@ as needing a reconnect. Each refusal sends the owner one DM; a token that works 
 between, even briefly, makes the next refusal a new one.
 Network, rate-limit, provider and disk failures, including a malformed renewal
 response, ask members to retry. A renewal that can't be saved still keeps a rotated
-refresh token. A controller 4xx whose JSON body can't be read keeps its status.
+refresh token. A controller 4xx whose JSON body can't be read keeps its status, including a
+proxy's HTML or text error page, so it's a refusal (startup stops), never an outage.
 
 ## New installations
 

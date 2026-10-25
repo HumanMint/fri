@@ -604,8 +604,14 @@ class Agent:
 
         async def outage():
             # The fixed notice carries no evidence, so only the Discord-side checks apply, not a controller read.
-            if invitation and not await invitation.current(check_evidence=False):
-                return missed(f'reply withheld: {invitation.refusal}')
+            # A mention earlier in the burst keeps its gates too, though the reply answers a later message.
+            from .fri_mentions import Invitation
+            gates = [invitation] if invitation else [
+                Invitation(self, event) for event in events[1:] if getattr(event, 'guild', None) and
+                event.guild.id == self.fri.guild_id and explicit_mention(event, self.fri.user.id)]
+            for gate in gates:
+                if not await gate.current(check_evidence=False):
+                    return missed(f'reply withheld: {gate.refusal}')
             if not ambient and await self.unreachable(message, answering=True):
                 self.answered(events)
             else:
