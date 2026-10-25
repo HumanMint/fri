@@ -452,6 +452,7 @@ class Actions:
         returned, others, left, full = asked-RETURN_SECONDS, False, None, False
         records, scanned, profiles, shown, size, posts, newest = [], 0, {}, {}, 0, [], 0
         notes = {} if catch_up else self.agent.ensure_memes().notes()  # Memes Fri reacted to lately.
+        stale = []  # Notes on posts edited, or by members whose privacy changed, since Fri reacted.
         async for message in (channel.pins(limit=PINS) if pins else channel.history(**options)):
             scanned, newest = scanned+1, max(newest, message.id)
             if message.author.bot or message.webhook_id or (floor and message.created_at.timestamp() < floor):
@@ -490,9 +491,11 @@ class Actions:
             shown[message.id] = (user, message.content, message.edited_at)
             records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
                             'at': message.created_at.isoformat(), 'text': clean(message.content, 500), **details(message),
-                            **reacted(notes, message, profile)})
+                            **reacted(notes, message, profile, stale)})
             if carries:
                 posts.append(message)
+        if stale:
+            self.agent.ensure_memes().drop(stale)
         result = {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
                   'scanned': scanned, 'messages': records if pins else list(reversed(records)),  # Pins: newest pinned first.
                   'lookback_floor': floor if pins else after,

@@ -221,7 +221,7 @@ class Invitation:
                 continue
             accepted.append(item)
         profiles = await self.profile_sources(accepted)
-        notes = self.agent.ensure_memes().notes()
+        notes, stale = self.agent.ensure_memes().notes(), []
         for item in sorted(accepted, key=lambda m: m.id):
             user = str(item.author.id)
             profile = profiles.get(user)
@@ -233,7 +233,8 @@ class Invitation:
             self.rows = [row for row in self.rows if row['source']['id'] != str(item.id)]
             self.rows.append({'source': discord_source(item).evidence(), 'text': clean(item.content, 500),
                               'privacy_revision': profile['revision'], 'referenced': item.id == reference_id,
-                              **details(item), **reacted(notes, item, profile)})
+                              **details(item), **reacted(notes, item, profile, stale)})
+        self.agent.ensure_memes().drop(stale)
         self.rows.sort(key=lambda row: int(row['source']['id']))
         own = event if event.attachments else None
         referenced = self.events.get(reference_id)

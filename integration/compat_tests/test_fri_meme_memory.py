@@ -98,3 +98,67 @@ def test_a_read_shows_fris_own_reaction_and_what_it_saw(monkeypatch, tmp_path):
 def test_the_models_are_told_the_truth_about_what_is_kept():
     assert "it's kept for a few days so" in INSTRUCTION and "isn't posted or retained" not in INSTRUCTION
     assert 'fri_reacted' in INSTRUCTIONS
+
+
+def test_a_note_expires_after_three_days_even_with_meme_checks_off(harness):  # noqa: F811
+    async def scenario():
+        h = harness
+        post = h.add(attachments=[attachment()])
+        await h.agent.memes.check()
+        assert post.id in h.agent.memes.notes()
+        h.scheduler.update({'meme_enabled': False}, 2, '10')
+        h.agent.state = h.scheduler.state()
+        h.clock[0] += 4*86400
+        assert h.agent.memes.notes() == {}  # Hidden at once,
+        h.agent.memes.expire()  # and gone from disk on the next heartbeat, which expires notes every tick.
+        assert 'A joke' not in h.agent.memes.path.read_text()
+    asyncio.run(scenario())
+
+
+def test_a_note_on_an_edited_post_or_a_changed_author_is_dropped_when_read(harness, monkeypatch, tmp_path):  # noqa: F811
+    async def scenario():
+        h = harness
+        post = h.add(attachments=[attachment()])
+        await h.agent.memes.check()
+        stale = []
+        post.edited_at = dt.datetime.fromtimestamp(h.clock[0]+1, dt.timezone.utc)
+        assert reacted(h.agent.memes.notes(), post, await h.agent.profile(3, 11), stale) == {} and stale == [post.id]
+        h.agent.memes.drop(stale)
+        assert h.agent.memes.notes() == {} and 'A joke' not in h.agent.memes.path.read_text()
+    asyncio.run(scenario())
+
+
+def test_an_erasure_while_the_reaction_sends_is_not_written_back(harness):  # noqa: F811
+    async def scenario():
+        h = harness
+        post = h.add(attachments=[attachment()])
+
+        async def erase(_emoji):  # They erase while Discord takes the reaction.
+            h.store.personal_control('11', 'disable')
+            h.agent.forget(11, erased=True)
+        post.add_reaction.side_effect = erase
+        await h.agent.memes.check()
+        post.add_reaction.assert_awaited_once()
+        assert h.agent.memes.notes() == {} and 'A joke' not in h.agent.memes.path.read_text()
+    asyncio.run(scenario())
+
+
+def test_forgetting_still_clears_everything_else_when_the_meme_state_is_broken(tmp_path):
+    from fri.fri_agent import Agent
+
+    for broken in ('[]', 'null', '"broken"', '{not json'):
+        agent = Agent(SimpleNamespace(data=tmp_path))
+        agent.pending[(3, 11)] = {'request': 'something'}
+        agent.recent[3].append({'user_id': '11', 'text': 'something'})
+        (tmp_path/'meme-attention.json').write_text(broken)
+        agent.forget(11, erased=True)
+        assert (3, 11) not in agent.pending and not list(agent.recent[3])
+
+
+def test_a_note_missing_a_field_is_never_shown(tmp_path):
+    agent = SimpleNamespace(fri=SimpleNamespace(data=tmp_path))
+    memes = Memes(agent)
+    with memes.state() as state:
+        state['entries']['100'] = {'at': __import__('time').time(), 'status': 'reacted', 'channel': '3',
+                                   'author': '11', 'revision': 0, 'note': 'A joke', 'edited': None}
+    assert memes.notes() == {}

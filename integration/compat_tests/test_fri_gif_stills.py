@@ -2,17 +2,27 @@
 
 import asyncio
 import base64
+import copy
 import io
+import json
+import struct
+import zlib
+from functools import partial
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import discord
 import httpx
 import pytest
 from PIL import Image
 
 from compat_tests.test_fri_looking import loads, picture, read_harness
+from compat_tests.test_fri_mentions import environment
 from fri.fri_actions import Actions
-from fri.fri_images import look, looked_unchanged
-from fri.fri_meme_media import GIF_BYTES, STILL_SIDE, allowed_url, load_image, sources
+from fri.fri_chat import Chat
+from fri.fri_images import attach, look, looked_unchanged
+from fri.fri_meme_media import GIF_BYTES, STILL_SIDE, Still, allowed_url, load_image, sources
+from fri.fri_mentions import Invitation
 
 ATTACHMENT = 'https://cdn.discordapp.com/attachments/1/2/dance.gif'
 PREVIEW = 'https://images-ext-1.discordapp.net/external/abc/https/media.tenor.com/x/dance.png'
@@ -124,6 +134,113 @@ def test_an_uploaded_gif_the_speaker_replied_to_is_looked_at(monkeypatch, tmp_pa
         context = {}
         try:
             assert (await look(context, [gif]))['images_inspected'] == 1
+            assert context['inspected_images'][0]['still'] == 'gif first frame'
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def broken_apng():
+    """A two-frame APNG with an empty iCCP chunk after its first IDAT: Pillow opens it, then a
+    decoder raises IndexError (the round-1 review's fixture)."""
+    def chunk(kind, data):
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+    out = io.BytesIO()
+    Image.new('RGB', (16, 16), 'red').save(out, 'PNG', save_all=True,
+                                         append_images=[Image.new('RGB', (16, 16), 'blue')], duration=100, loop=0)
+    body = out.getvalue()
+    start = body.index(b'IDAT') - 4
+    end = start + struct.unpack('>I', body[start:start+4])[0] + 12
+    return body[:end] + chunk(b'iCCP', b'') + body[end:]
+
+
+@pytest.mark.parametrize('path', ['load', 'look', 'attach'])
+def test_an_animation_pillow_chokes_on_is_just_not_inspected(monkeypatch, path):
+    async def scenario():
+        transport = serve(broken_apng(), 'image/png')
+        if path == 'load':
+            with pytest.raises(ValueError):
+                await load_image(ATTACHMENT, 1, transport=transport, gifs=True)
+            return
+        monkeypatch.setattr('fri.fri_images.load_image', partial(load_image, transport=transport))
+        image = picture(1, 'broken.png')
+        post = Mock(spec=discord.Message, id=123, content='what is this?', channel=SimpleNamespace(id=1),
+                    guild=SimpleNamespace(id=123), author=SimpleNamespace(id=20, bot=False), webhook_id=None,
+                    attachments=[image], embeds=[], edited_at=None)
+        if path == 'look':  # Skipped, not a crash.
+            assert (await look({}, [post])) == {'images_inspected': 0, 'images_not_inspected': 1}
+        else:  # The usual "couldn't inspect that image" answer, not a crash.
+            from fri import feedback as commands
+            with pytest.raises(commands.UserFeedbackCheckFailure, match='couldn’t inspect'):
+                await attach({}, post, post.content)
+    asyncio.run(scenario())
+
+
+def tenor_embed(url=PREVIEW):
+    return discord.Embed.from_dict({'type': 'gifv', 'url': 'https://tenor.com/view/dance-123',
+                                    'video': {'url': 'https://media.tenor.com/x/dance.mp4'},
+                                    'thumbnail': {'proxy_url': url, 'url': 'https://media.tenor.com/x/dance.png'}})
+
+
+@pytest.mark.parametrize('change', ['none', 'removed', 'swapped'])
+def test_a_mentions_nearby_gif_swapped_after_the_look_fails_the_recheck(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path)
+        post = message('https://tenor.com/view/dance-123', user=30, age=60)
+        post.embeds = [tenor_embed()]
+        event = message('<@99> which gif is this?')
+        loads(monkeypatch)
+        try:
+            invitation = await Invitation.create(agent, event)
+            assert (await invitation.admit())['allowed']
+            await invitation.collect()
+            context = {}
+            assert (await invitation.look(context))['images_inspected'] == 1
+            if change != 'none':  # Same text, attachments and edit time: only the embed differs.
+                changed = copy.copy(post)
+                changed.embeds = [] if change == 'removed' else [tenor_embed(PREVIEW.replace('dance', 'other'))]
+                rows[post.id] = changed
+            assert await looked_unchanged(context) == (change == 'none')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_speakers_own_gif_is_labelled_a_first_frame_for_the_model(monkeypatch):
+    async def scenario():
+        async def load(url, channel, **_):
+            return Still('data:image/png;base64,frame')
+        monkeypatch.setattr('fri.fri_images.load_image', load)
+        own = Mock(spec=discord.Message, id=123, content='what is this doing?', channel=SimpleNamespace(id=1),
+                   guild=SimpleNamespace(id=123), author=SimpleNamespace(id=20, bot=False), webhook_id=None,
+                   attachments=[picture(1, 'dance.gif', 'image/gif')], embeds=[], edited_at=None)
+        context = {}
+        await attach(context, own, own.content)
+        assert context['image_still'] == 'gif first frame'
+        seen = []
+
+        def handler(request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(500)
+        chat = Chat(SimpleNamespace(access_token=lambda: 'test'), httpx.MockTransport(handler))
+        from compat_tests.test_fri_chat import CONTEXT
+        await chat.respond('what is this doing?', {**CONTEXT, **context})
+        sent = seen[0]['input'][-1]['content']
+        assert json.loads(sent[0]['text'])['speaker_image_still'] == 'gif first frame'
+    asyncio.run(scenario())
+
+
+def test_a_nearby_animated_png_or_webp_is_labelled_too(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channel, rows, post = read_harness(monkeypatch, tmp_path)
+        apng = post('', attachments=[picture(1, 'spin.png')])
+
+        async def load(url, channel, **_):  # It downloads as an animated PNG and comes back as a frame.
+            return Still('data:image/png;base64,frame')
+        monkeypatch.setattr('fri.fri_images.load_image', load)
+        context = {}
+        try:
+            await look(context, [apng])
             assert context['inspected_images'][0]['still'] == 'gif first frame'
         finally:
             await fri.close()

@@ -6,7 +6,7 @@ import discord
 import httpx
 
 from . import feedback as commands
-from .fri_meme_media import gif_previews, load_image, sources, stills
+from .fri_meme_media import gif_previews, load_image, sources
 
 CHANGED = ('The image request changed while I was checking it. Any earlier tool actions keep '
            'their recorded outcomes; check their status before retrying. Ask again with the current attachment.')
@@ -121,7 +121,7 @@ async def look(context, posts, *, invitation=None):
             size += sum(map(len, loaded))
             inspected.append({'images': list(range(len(images)+1, len(images)+len(loaded)+1)),
                               'source': discord_source(post).evidence(),
-                              **({'still': 'gif first frame'} if stills(post) else {})})
+                              **({'still': 'gif first frame'} if first_frames(loaded) or gif_previews(post) else {})})
             images += loaded
             reads.append({'event': post, 'sources': urls, 'invitation': invitation})
             budget -= len(urls)
@@ -130,6 +130,11 @@ async def look(context, posts, *, invitation=None):
     if looked:
         context.update(images=images, image_reads=reads, inspected_images=inspected)
     return {'images_inspected': looked, 'images_not_inspected': skipped}
+
+
+def first_frames(images):
+    """Whether any of these loaded images is only an animation's first frame."""
+    return any(getattr(image, 'first_frame', False) for image in images)
 
 
 def has_attachments(event):
@@ -181,6 +186,8 @@ async def attach(context, event, text, *, source=None, invitation=None):
                                                 '(8 MB for a GIF, which I see as its first frame). Videos are not supported.')
     try:
         context['images'] = [await load_image(url, event.channel.id, gifs=True) for url in urls]
+        if first_frames(context['images']):
+            context['image_still'] = 'gif first frame'  # Their own animation, seen as one frame.
     except (httpx.HTTPError, TimeoutError, ValueError):
         raise commands.UserFeedbackCheckFailure('I couldn’t inspect that image. Try a small PNG, JPEG or WebP attachment.') from None
     context['image_sources'] = urls
@@ -227,7 +234,9 @@ async def looked_unchanged(context):
                     if not await invitation.current():
                         return False
                     invitations.append(invitation)
-                continue
+                # Its fingerprint covers attachments; a gif link's preview lives in the embeds, so refetch.
+                if read['sources'] == [str(a.url) for a in post.attachments]:
+                    continue
             current = await post.channel.fetch_message(post.id)
             # The same author as when read: the reads that call look() admit no bot but Fri itself.
             if (current.id != post.id or current.author.id != post.author.id or
