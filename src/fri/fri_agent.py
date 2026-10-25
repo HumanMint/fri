@@ -94,7 +94,7 @@ class Agent:
         self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
         self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
         self.seen = {}
-        self.held = {}  # Per channel: IDs passed by self.seen while their routing was unresolved.
+        self.held = {}  # Per channel: rows passed by self.seen while their routing was unresolved, by ID.
         self.last_attention = {}
         self.last_spoke = {}
         self.acknowledged = {}
@@ -204,8 +204,12 @@ class Agent:
         self.recent[channel] = deque((r for r in self.recent[channel] if r['at'] > now-900), maxlen=30)
         return list(self.recent[channel])
 
-    async def context_messages(self, channel, raw_errors=False):
+    async def context_messages(self, channel, raw_errors=False, kept=()):
         rows = self.messages(channel)
+        if kept:  # Deferred rows attention still owes a decision, even once newer chat pushed them out.
+            present, now = {r['id'] for r in rows}, time.time()
+            rows = sorted(rows+[r for r in kept if r['id'] not in present and r['at'] > now-900],
+                          key=lambda r: int(r['id']))
         source = self.fri.get_channel(channel)
         parent = getattr(source, 'parent_id', None) or channel
         profiles, accepted, stale = {}, [], set()
@@ -247,6 +251,8 @@ class Agent:
         for key, rows in self.recent.items():
             self.recent[key] = deque((r for r in rows if r['user_id'] != str(user) and str(user) not in
                                       {p['user_id'] for p in r.get('provenance', [])}), maxlen=30)
+        for key, rows in self.held.items():
+            self.held[key] = {i: r for i, r in rows.items() if r['user_id'] != str(user)}
         for key in list(self.active):
             if key[1] == user:
                 del self.active[key]
@@ -288,7 +294,8 @@ class Agent:
             result, counters, status = {}, {}, 'interrupted'
         if status == ERASED:
             return ERASED
-        await self.record('owner_settings', model, effort, counters, status)
+        # Saved, not delivered here: a slow usage report mustn't hold up the reply or the Sol call.
+        await self.record('owner_settings', model, effort, counters, status, deliver=False)
         return status != 'completed' or result.get('answer') == 'settings_change'
 
     async def owner_control(self, message, text, forgotten=None):
@@ -833,17 +840,20 @@ class Agent:
     async def attend(self):
         now = time.time()
         for channel_id in list(self.recent):
-            records = await self.context_messages(channel_id, raw_errors=True)
             # Messages the direct path answers stay in records as context but aren't decided again here.
             # One that may still be taken waits for a later beat, without holding up the rest.
+            held = self.held.get(channel_id, {})
+            records = await self.context_messages(channel_id, raw_errors=True, kept=held.values())
             routing = {r['id'] for r in records if self.routing(r)}
-            held = self.held.get(channel_id, set())
             fresh = [r for r in records if not r.get('fri') and r['id'] not in self.direct and r['id'] not in routing
                      and (int(r['id']) > self.seen.get(channel_id, 0) or r['id'] in held)]
             if not fresh or now-self.last_attention.get(channel_id, 0) < self.config['heartbeat_seconds']:
                 continue
             self.seen[channel_id] = max(self.seen.get(channel_id, 0), *(int(r['id']) for r in fresh))
-            self.held[channel_id] = {i for i in routing if int(i) < self.seen[channel_id]}
+            # Only rows still buffered or held: one erased while the privacy reads ran stays gone.
+            live = {r['id'] for r in self.recent[channel_id]} | set(self.held.get(channel_id, {}))
+            self.held[channel_id] = {r['id']: r for r in records if r['id'] in routing and r['id'] in live and
+                                     int(r['id']) < self.seen[channel_id]}
             self.last_attention[channel_id] = now
             errors = any(r['gene_error'] for r in fresh)
             if now-self.last_spoke.get(channel_id, 0) < 600 and not errors:
@@ -871,7 +881,7 @@ class Agent:
                     await self.investigate(channel_id, selected)
             elif result.get('action') == 'reply' and self.config['proactive'] and not selected['gene_error']:
                 # Newer messages may have resolved the question while Luna was running.
-                current = await self.context_messages(channel_id)
+                current = await self.context_messages(channel_id, kept=held.values())
                 if not current or current[-1]['id'] != records[-1]['id']:
                     continue
                 message = await channel.fetch_message(int(selected['id']))

@@ -455,8 +455,8 @@ def routed_channel(**config):
     return agent
 
 
-def member_row(mid, text='anyone know why the build is broken?'):
-    return {'id': str(mid), 'user_id': '11', 'name': 'friend', 'text': text, 'at': time.time(),
+def member_row(mid, text='anyone know why the build is broken?', user=11):
+    return {'id': str(mid), 'user_id': str(user), 'name': 'friend', 'text': text, 'at': time.time(),
             'revision': 0, 'gene_error': False}
 
 
@@ -484,6 +484,30 @@ def test_attention_decides_a_gene_error_while_a_member_message_is_still_routed(t
         assert await beat(agent) == (None if taken else ['100'])  # Kept its place behind the error.
         assert await beat(agent) is None
         agent.investigate.assert_awaited_once()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erased', [None, 'forget me', 'panel'])
+def test_a_deferred_message_keeps_its_place_after_newer_chat_pushes_it_out(erased):
+    async def scenario():
+        agent = routed_channel()
+        agent.run.return_value = ({'action': 'investigate', 'source_id': '101', 'reason': ''}, {}, 'completed')
+        agent.recent[456].extend([member_row(100), {'id': '101', 'user_id': '7', 'name': 'Gene',
+                                  'text': 'Error: queue failed', 'at': time.time(), 'gene_error': True}])
+        agent.handling[100] += 1
+        assert await beat(agent) == ['101']
+        agent.recent[456].extend(member_row(mid, 'any idea?', user=12) for mid in range(102, 132))
+        assert '100' not in {row['id'] for row in agent.recent[456]}  # Out of the 30-message buffer.
+        if erased == 'forget me':
+            agent.forget(11)
+        elif erased == 'panel':
+            agent.profile.side_effect = lambda channel, user: {'enabled': True, 'revision': int(str(user) == '11')}
+        agent.handling.clear()  # The direct path didn't take it.
+        offered = await beat(agent)
+        assert offered == ([] if erased else ['100'])+[str(mid) for mid in range(102, 132)]
+        assert ('100' in {row['id'] for row in agent.run.await_args.args[2]['recent']}) is not erased
+        assert not agent.held[456]
+        assert await beat(agent) is None
     asyncio.run(scenario())
 
 

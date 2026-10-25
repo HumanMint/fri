@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import json
 from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -111,7 +112,8 @@ def test_owner_chat_with_settings_words_skips_the_sol_settings_call(monkeypatch,
         # Only the owner's words go to the attention model, never settings, notes or ranges.
         assert calls == [{'data': {'message': text}, 'model': 'gpt-6-luna', 'effort': 'low',
                           'answers': ['settings_change', 'other']}]
-        agent.record.assert_awaited_once_with('owner_settings', 'gpt-6-luna', 'low', {'input_tokens': 40}, 'completed')
+        agent.record.assert_awaited_once_with('owner_settings', 'gpt-6-luna', 'low', {'input_tokens': 40}, 'completed',
+                                              deliver=False)
         await fri.close()
     asyncio.run(scenario())
 
@@ -426,6 +428,33 @@ def test_a_stalled_settings_check_gives_way_to_the_sol_preview(monkeypatch, tmp_
             assert message.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
             assert agent.control_queue == []
         finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_slow_usage_report_does_not_hold_up_the_settings_call(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
+        monkeypatch.setattr('fri.fri_agent.CHECK_SECONDS', 0.05)
+        async def analyze(*args, **kwargs):
+            await asyncio.Event().wait()  # The check stalls, so the Sol call takes over.
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        reporting = asyncio.Event()
+        async def flush_usage():
+            await reporting.wait()  # The controller is slow to take usage reports.
+        fri.flush_usage = AsyncMock(side_effect=flush_usage)
+        agent.run = AsyncMock(return_value=({'explanation': '', 'changes': [
+            {'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'))
+        message = owner_message()
+        try:
+            assert await asyncio.wait_for(agent.owner_control(message, 'set heartbeat to 10 minutes'), 2)
+            assert message.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
+            fri.flush_usage.assert_not_awaited()  # The usage loop delivers the saved receipt.
+            saved = [json.loads(path.read_text()) for path in (tmp_path/'usage').glob('*.json')]
+            assert [(r['role'], r['status']) for r in saved] == [('owner_settings', 'interrupted')]
+        finally:
+            reporting.set()
             await fri.close()
     asyncio.run(scenario())
 
