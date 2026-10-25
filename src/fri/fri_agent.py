@@ -817,8 +817,8 @@ class Agent:
             return
         dm = message.guild is None
         if dm:
-            if message.author.bot or not self.config['support_dms'] or not await self.member(message.author.id):
-                return
+            if message.author.bot or not self.config['support_dms'] or not await self.member(message.author.id, fresh=True):
+                return  # Fresh: someone who just left mustn't hear server context through a cached lookup.
         elif not self.allowed(message.channel):
             # An outside ping is one event, never a new ambient/active channel.
             if message.guild.id != self.fri.guild_id or not explicit_mention(message, self.fri.user.id):
@@ -868,6 +868,8 @@ class Agent:
         if not dm and not message.author.bot:
             if (profile := await self.incoming(message, invitation, parent, forgotten, control=bool(privacy))) is None:
                 return
+            if not privacy and self.forgotten.get(message.author.id, 0) != forgotten:
+                return self.miss(message, 'author privacy changed')  # During that read: it may be from after.
             observed = profile.get('revision', 0)
             if profile['enabled'] and not privacy and not before_removal(message.id, profile):
                 if directed is not None or channel == self.dedicated:
@@ -888,6 +890,8 @@ class Agent:
                 raise  # Its notice is the outage notice (see listen).
             except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
                 return await self.unreadable(message, [message], exc, invitation, forgotten)
+            if self.forgotten.get(message.author.id, 0) != forgotten:
+                return self.miss(message, 'author privacy changed')
         if message.id in self.replying:
             return  # A redelivered event: its reply is already being delivered or recorded.
         recording = self.recording.get((channel, message.author.id))

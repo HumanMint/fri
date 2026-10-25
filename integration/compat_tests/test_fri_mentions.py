@@ -1773,6 +1773,61 @@ def test_a_bursts_notice_goes_to_a_ping_that_still_stands(monkeypatch, tmp_path,
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('kind', ['by name', 'ping', 'dm'])
+def test_a_message_whose_arrival_read_spans_their_forget_me_never_reaches_the_model(monkeypatch, tmp_path, caplog, kind):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message(('<@99> ' if kind == 'ping' else 'fri ')+'remember the private marker')
+        if kind == 'dm':
+            agent.config['support_dms'] = True
+            agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+            event.guild = None
+        fri.chat_once.return_value = ChatResult(status='completed', reply='noted')
+        profile, erased = agent.profile, False
+        async def slow(channel, user):
+            nonlocal erased
+            if user == 20 and not erased:  # Their 'forget me' runs before this read comes back.
+                erased = True
+                agent.forget(20, erased=True)
+                store.clear_chats('20')
+            return await profile(channel, user)
+        agent.profile = slow
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert erased
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert not any(row['id'] == str(event.id) for rows in agent.recent.values() for row in rows)
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            if kind == 'ping':
+                assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_from_someone_who_just_left_is_not_answered_from_the_cache(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = SimpleNamespace(id=20)
+        agent.member = AsyncMock(side_effect=lambda *_, fresh=False, **__: None if fresh else present)
+        event = message('what is ash working on?')
+        event.guild = None
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/context' for path, _ in calls)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('stays', [True, False])
 def test_a_queued_dm_needs_a_current_member_when_its_turn_comes(monkeypatch, tmp_path, stays):
     async def scenario():
