@@ -51,7 +51,9 @@ def sources(message, most=2, *, gifs=False):
     return result
 
 
-def allowed_url(url, channel):
+def allowed_url(url, channel, *, previews=False):
+    """previews: also Discord's images-ext embed proxy, which serves a GIF link's still preview. Only
+    the look path asks for it, so the meme reactions keep their old reach."""
     try:
         parsed = urlsplit(url)
         return (parsed.scheme == 'https' and not parsed.username and not parsed.password and
@@ -59,14 +61,14 @@ def allowed_url(url, channel):
                 ((parsed.hostname in ('cdn.discordapp.com', 'media.discordapp.net') and
                   parsed.path.startswith(f'/attachments/{channel}/')) or
                  ((parsed.hostname == 'media.discordapp.net' or
-                   re.fullmatch(r'images-ext-\d\.discordapp\.net', parsed.hostname or '')) and
+                   (previews and re.fullmatch(r'images-ext-\d\.discordapp\.net', parsed.hostname or ''))) and
                   parsed.path.startswith('/external/'))))
     except ValueError:
         return False
 
 
-async def load_image(url, channel, *, transport=None):
-    if not allowed_url(url, channel):
+async def load_image(url, channel, *, transport=None, previews=False):
+    if not allowed_url(url, channel, previews=previews):
         raise ValueError('Image source is outside the Discord CDN scope')
     async with asyncio.timeout(25):
         # No Discord or subscription Authorization headers are sent to the CDN.

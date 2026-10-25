@@ -107,7 +107,8 @@ async def look(context, posts, *, invitation=None):
         if not picked:
             break
         tried += sum(len(urls) for _, urls in picked)
-        loads = await asyncio.gather(*(load_image(url, post.channel.id) for post, urls in picked for url in urls),
+        loads = await asyncio.gather(*(load_image(url, post.channel.id, previews=True) for post, urls in picked
+                                       for url in urls),
                                      return_exceptions=True)
         for value in loads:
             if isinstance(value, BaseException) and not isinstance(value, (httpx.HTTPError, TimeoutError, ValueError)):
