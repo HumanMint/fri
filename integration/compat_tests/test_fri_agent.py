@@ -259,7 +259,8 @@ def test_private_context_never_receives_public_buffer_and_nonmembers_cannot_dm()
         agent.profile.assert_not_awaited()
         agent.member = AsyncMock(return_value=None)
         agent.respond = AsyncMock()
-        await agent.handle(SimpleNamespace(guild=None, author=SimpleNamespace(id=11, bot=False), webhook_id=None))
+        await agent.handle(SimpleNamespace(id=1, channel=SimpleNamespace(id=5), guild=None,
+                                           author=SimpleNamespace(id=11, bot=False), webhook_id=None))
         agent.respond.assert_not_awaited()
     asyncio.run(scenario())
 

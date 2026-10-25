@@ -37,6 +37,24 @@ image selection removed for that turn. Explicit reply references load only their
 direct target initially, and keep their source and persistence guards. The current
 attachments and existing immediate own-photo pairing remain available directly.
 
+Freshness checks compare author and event IDs, never display names. A gateway event shows
+the member's server nickname, but a fetched copy of the same message shows their global
+name, because Fri has no members intent or member cache.
+
+Every ping to Fri from a member (a mention, a reply ping or Fri's role pill) that gets no
+lasting reply is logged once at INFO, with only its channel and message IDs:
+`Mention <channel>/<message> not answered: <reason>`. A reason is a gate or an error type,
+never content or names. Examples: `not a visible user mention` (the role pill, or a mention
+in quotes or code), `message changed`, `stale event`, `missing permissions`, `fri disabled`,
+`author privacy changed`, `burst too long`, `earlier reply still running` (its waiting
+notice is deleted once that reply lands), `social cooldown` (after the cooldown's one
+notice), `image share withdrawn`, `reply withheld: <recheck>` when a recheck failed after
+composing, and an exception type such as `Forbidden`. A burst's earlier messages are
+logged under the reason its last message got. A reply, a notice, a preview or a reaction
+counts as an answer. Bots, webhooks and DMs aren't logged. If Discord redelivers an event
+while its first delivery, or the burst holding it, is still being handled, the copy is
+ignored; a later copy is logged only under its first delivery.
+
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.
 They do not prove Discord delivery or live model interpretation of a particular meme.
