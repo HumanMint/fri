@@ -798,7 +798,7 @@ class Agent:
             forgotten = self.forgotten.get(message.author.id, 0)  # Their own request isn't an erasure since.
         observed = None  # The author's privacy revision as first read for this message.
         if not dm and not message.author.bot:
-            if (profile := await self.incoming(message, invitation, parent, forgotten)) is None:
+            if (profile := await self.incoming(message, invitation, parent, forgotten, control=bool(privacy))) is None:
                 return
             observed = profile.get('revision', 0)
             if profile['enabled'] and not privacy and not before_removal(message.id, profile):
@@ -815,6 +815,8 @@ class Agent:
             try:
                 observed = await self.revision(message.author.id)
             except ControllerUnavailable:
+                if self.forgotten.get(message.author.id, 0) != forgotten:
+                    return self.miss(message, 'author privacy changed')
                 raise  # Its notice is the outage notice (see listen).
             except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
                 return await self.unreadable(message, [message], exc, invitation, forgotten)
@@ -888,16 +890,19 @@ class Agent:
             for event in earlier:
                 self.settle(event)
 
-    async def incoming(self, message, invitation, channel, forgotten):
+    async def incoming(self, message, invitation, channel, forgotten, *, control=False):
         """The author's profile as a message to Fri comes in. A ping keeps it, and the local erasures
         so far, as the baseline its notices compare with. None once a ping was told why it can't be
-        answered; other messages raise as before."""
+        answered, or the author erased during the read; other messages raise as before."""
         if invitation:
             invitation.forgotten = forgotten
         try:
             profile = await self.profile(channel, message.author.id)
         except ControllerUnavailable:
-            raise  # Its notice is the outage notice (see listen).
+            if not control and self.forgotten.get(message.author.id, 0) != forgotten:
+                self.miss(message, 'author privacy changed')  # So no outage notice either.
+                return None
+            raise  # Its notice is the outage notice (see listen). A privacy control's isn't fenced.
         except commands.UserFeedbackCheckFailure as exc:
             if not invitation:
                 raise

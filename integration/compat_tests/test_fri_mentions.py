@@ -1980,6 +1980,44 @@ def test_settings_changed_during_a_queued_messages_member_lookup_stop_it(monkeyp
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('kind', ['ping', 'addressed', 'dm'])
+def test_no_outage_notice_for_a_message_whose_author_erased_during_its_arrival_read(monkeypatch, tmp_path, caplog, kind):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message({'ping': '<@99> you there?', 'addressed': 'fri you there?', 'dm': 'you there?'}[kind])
+        if kind == 'dm':
+            event.guild = None
+            agent.config['support_dms'] = True
+            agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+        started, failed = asyncio.Event(), asyncio.Event()
+        async def down(*_):
+            started.set()
+            await failed.wait()
+            raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+        if kind == 'dm':
+            agent.revision = down
+        else:
+            agent.profile = down
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                await asyncio.wait_for(started.wait(), 5)
+                agent.forget(20, erased=True)  # Their "forget me" landed while the read was out.
+                failed.set()
+                await asyncio.wait_for(task, 5)
+            await real_sleep(0)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            if kind == 'ping':
+                assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
+        finally:
+            failed.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('member', [True, False])
 def test_a_dm_low_battery_needs_a_current_member(monkeypatch, tmp_path, member):
     async def scenario():
