@@ -7,7 +7,7 @@ import discord
 
 from . import feedback as commands
 from .fri_context import discord_source
-from .fri_memory import note_place, profiled
+from .fri_memory import clip, note_place, profiled, units
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
@@ -64,7 +64,7 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
         where = f" · {place(cog, scope, entry)}" if profiles and 'scope' in entry else ''
         line = (f"• {entry['category']}{where}: {discord.utils.escape_markdown(entry['evidence'])} "
                 f"(expires <t:{int(entry['expires_at'])}:d>)")
-        if len('\n\n'.join(lines+listed+[line])) > 3500:  # Room for the footer inside an embed's 4096.
+        if units('\n\n'.join(lines+listed+[line])) > 3500:  # Room for the footer inside an embed's 4096.
             break
         listed.append(line)
     lines += listed
@@ -110,9 +110,9 @@ class MemoryView(MemoryLauncher):
         if state['entries']:
             choose = discord.ui.Select(placeholder='Choose a saved preference',
                 custom_id='fri:memory:choose:'+uuid.uuid4().hex, options=[discord.SelectOption(
-                    label=row['evidence'][:100], value=str(row['id']),
-                    description=(row['category']+(' · '+place(cog, scope, row) if getattr(cog, 'profiles', False)
-                                                  and 'scope' in row else ''))[:100],
+                    label=clip(row['evidence'], 100), value=str(row['id']),
+                    description=clip(row['category']+(' · '+place(cog, scope, row) if getattr(cog, 'profiles', False)
+                                                      and 'scope' in row else ''), 100),
                     default=row['id'] == selected) for row in state['entries'][:SHOWN]])
             async def choose_entry(interaction):
                 if await self.interaction_check(interaction):

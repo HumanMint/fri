@@ -93,6 +93,8 @@ def turn_provenance(context, speaker, actions=None):
     inherited = [item for turn in context.get('turns', []) for item in turn.get('provenance', [])]
     inherited += (context.get('pending') or {}).get('provenance', [])
     inherited += context.get('summary_provenance', []) + context.get('reference_provenance', [])
+    # A member's words from another channel can repeat someone else's: inherit what they drew on.
+    inherited += [item for row in context.get('elsewhere', []) for item in row.get('provenance', [])]
     for item in inherited:
         add(item['user_id'], item['revision'])
     for row in context.get('recent', []):

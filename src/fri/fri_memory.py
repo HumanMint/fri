@@ -76,6 +76,22 @@ def memory_intent(text):
     return None
 
 
+def units(text):
+    """Discord counts message and embed lengths in UTF-16 code units, so an emoji counts twice."""
+    return len(text.encode('utf-16-le'))//2
+
+
+def clip(text, limit):
+    """At most limit UTF-16 code units, never splitting a character."""
+    kept, used = [], 0
+    for char in text:
+        used += 2 if ord(char) > 0xFFFF else 1
+        if used > limit:
+            break
+        kept.append(char)
+    return ''.join(kept)
+
+
 def profiled(fri, scope):
     """Ask for the member's profile when the controller keeps them; otherwise the request is unchanged."""
     return {**scope, 'profiles': True} if getattr(fri, 'profiles', False) else scope
@@ -116,7 +132,7 @@ def describe_profile(enabled, groups, private):
     for heading, notes in groups:
         for index, note in enumerate(notes):
             line = ('\n**'+heading+'**' if index == 0 else '')+'\n- '+note
-            if hidden or len(''.join(lines))+len(line)+len(footer) > 1800:
+            if hidden or units(''.join(lines)+line+footer) > 1800:
                 hidden += 1  # Discord's limit. Once one is left out, the rest go too, headings intact.
             else:
                 lines.append(line)

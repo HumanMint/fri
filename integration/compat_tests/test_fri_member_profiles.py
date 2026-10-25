@@ -200,11 +200,12 @@ def test_elsewhere_carries_only_the_members_words_and_goes_with_its_sources(monk
             await w.say(GENERAL, 'fri where was that again')
             assert [row['input'] for row in model_context(w)['elsewhere']] == ['what did ash say']
             assert 'denver' not in json.dumps(model_context(w), default=str)
-            # Ash's words never reached this turn, so it doesn't depend on them.
-            assert {'user_id': '30', 'revision': 0} not in turns(w)[-1]['provenance']
-            w.store.personal_control('30', 'disable')  # The exchange built on ash still goes.
+            # The member's words can repeat ash's, so this reply depends on ash too.
+            assert {'user_id': '30', 'revision': 0} in turns(w)[-1]['provenance']
+            w.store.personal_control('30', 'disable')  # Ash's privacy change reaches both replies.
             await w.say(GENERAL, 'fri and now?')
             assert model_context(w)['elsewhere'] == []
+            assert [t['input'] for t in w.store.chat_context('123', 'public:1', '20')['turns']] == ['fri and now?']
         finally:
             await w.fri.close()
     run(scenario)
@@ -322,6 +323,32 @@ def test_places_and_overview_fit_discord():
     text = describe_profile(True, groups, private=True)
     assert len(text) <= 1950 and text.count('**') == 2 and 'more in My memory' in text
     assert describe_profile(True, [], private=False).startswith('memory’s on. nothing kept that this channel')
+
+
+def test_emoji_heavy_memory_fits_discord_in_utf16_units(monkeypatch, tmp_path):
+    def units(text):
+        return len(text.encode('utf-16-le'))//2
+    emoji = 'I like '+'🎮'*86
+    assert units(describe_profile(True, [('across the server', [emoji]*15), ('only here', [emoji]*10)], True)) <= 2000
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        entries = [{'id': i, 'category': 'games', 'evidence': emoji, 'at': time.time(), 'expires_at': time.time()+86400,
+                    'scope': 'server', 'origin': None} for i in range(25)]
+        state = {'enabled': True, 'revision': 0, 'entries': entries}
+        scope = {'guild_id': '123', 'user_id': '20', 'channel_id': '456', 'conversation_id': 'private:900'}
+        interaction = Mock(spec=discord.Interaction, guild_id=None, channel_id=DM, user=SimpleNamespace(id=20))
+        shown = AsyncMock()
+        monkeypatch.setattr('fri.fri_panel.reply', shown)
+        monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+        try:
+            await show(w.fri, interaction, scope, state=state)
+            assert units(shown.await_args.kwargs['embed'].description) <= 4096
+            options = MemoryView(w.fri, scope, state).children[0].options
+            assert all(units(o.label) <= 100 and units(o.description) <= 100 for o in options)
+            assert not any('\ud83c' in o.label for o in options)  # No half of an emoji left behind.
+        finally:
+            await w.fri.close()
+    run(scenario)
 
 
 def test_panel_labels_notes_and_stays_inside_discords_limits(monkeypatch, tmp_path):
