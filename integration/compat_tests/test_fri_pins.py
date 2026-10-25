@@ -153,3 +153,18 @@ def test_details_mark_a_pinned_post_only_when_discord_says_so():
     channel = SimpleNamespace(id=1)
     assert details(SimpleNamespace(channel=channel, guild=None, pinned=True)) == {'pinned': True}
     assert details(Mock(spec=discord.Message)) == {}  # A mock's attribute isn't Discord saying so.
+
+
+def test_a_catch_up_marks_a_pinned_post_too(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channel, rows, post, pin, _, _ = pinned(monkeypatch, tmp_path)
+        post('nothing to see', user=40, age=600)
+        pin('server ip is play.example.net', user=50, age=300)
+        actions = Actions(agent, 20, 999, False)
+        actions.event = SimpleNamespace(id=discord.utils.time_snowflake(discord.utils.utcnow()), channel=SimpleNamespace(id=999))
+        try:
+            receipt = await actions.execute({'kind': 'read_recent', 'channel_id': '1', 'window': 'since_my_last_message'})
+            assert [row.get('pinned') for row in receipt['messages']] == [None, True]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
