@@ -372,15 +372,23 @@ class Agent:
     async def erased(self, user, forgotten, revision=None):
         """Why a member's earlier message must now go unanswered: they erased since, here or (with a
         revision to compare) through the panel, Gene or Red. None if it still stands."""
-        if self.forgotten.get(user, 0) != forgotten:
+        current, failed = revision, None
+        if revision is not None:
+            try:
+                current = await self.revision(user)
+            except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
+                failed = 'check failed: '+type(exc).__name__  # Unverified, so treated as erased.
+        # After the read, so a forget() while it was in flight still counts.
+        if self.forgotten.get(user, 0) != forgotten or (not failed and current != revision):
             return 'author privacy changed'
-        if revision is None:
-            return None
-        try:
-            current = await self.revision(user)
-        except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
-            return 'check failed: '+type(exc).__name__  # Unverified, so treated as erased.
-        return 'author privacy changed' if current != revision else None
+        return failed
+
+    async def dropped(self, message, events, reason, invitation=None):
+        """Drop a message whose author may have erased: quietly, unless all that's known is that the
+        controller can't be reached to check, which is worth saying."""
+        if reason == 'check failed: ControllerUnavailable':
+            return await self.withheld(message, events, 'controller unavailable', invitation)
+        return self.missed(events, reason)
 
     async def recharging(self, message, dm):
         """A cooldown's notice shows once. A later message to Fri in it gets a low battery, not silence."""
@@ -398,25 +406,31 @@ class Agent:
         except discord.HTTPException:
             return False
 
-    async def take_turn(self, message, text, dm, *, burst=(), invitation=None, revision=None):
+    async def take_turn(self, message, text, dm, *, burst=(), invitation=None, forgotten=None, revision=None):
         """One direct reply per member at a time, in the order their messages were sent. A message that
         comes in mid-reply waits through that reply's delivery and save, then is answered, unless its
-        author erased since `revision`, their privacy revision when it came in."""
+        author erased since it came in: since `forgotten` local erasures and privacy `revision`."""
         from .fri_pending import cancelled
         user = message.author.id
         events = [message, *(event for _, event, _ in burst if event is not message)]
-        forgotten, privacy = self.forgotten.get(user, 0), memory_intent(text)
+        privacy = memory_intent(text)
+        if forgotten is None:
+            forgotten = self.forgotten.get(user, 0)
         until = discord.utils.snowflake_time(message.id).timestamp()+QUEUE_SECONDS
         if revision is None and not privacy:  # Privacy controls don't depend on this read.
             try:
                 revision = await self.revision(user)
-            except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
-                return await self.withheld(message, events, 'controller unavailable', invitation)
+            except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
+                if self.forgotten.get(user, 0) != forgotten:
+                    return self.missed(events, 'author privacy changed')
+                reason = 'controller unavailable' if isinstance(exc, ControllerUnavailable) else 'check failed: '+type(exc).__name__
+                return await self.withheld(message, events, reason, invitation)
+        since = None if privacy else (forgotten, revision)  # A privacy control always hears how it went.
         recheck, noticed = False, False  # Recheck erasure and the deadline before the next attempt.
         if privacy or cancelled(text):
             # Privacy controls and cancelling don't wait their turn (see Fri.talk). A cancel did wait in
             # receive() for a delivered reply to be saved, so it cancels what that reply asked.
-            if await self.reply_once(message, text, dm, burst=burst, invitation=invitation) is not BUSY:
+            if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since) is not BUSY:
                 return
             recheck = True
         while True:
@@ -426,8 +440,8 @@ class Agent:
                     if invitation and not await invitation.current():
                         return await self.withheld(message, events, invitation.refusal, invitation,
                                                    logged=f'reply withheld: {invitation.refusal}')
-                    if reason := await self.erased(user, forgotten, revision):
-                        return self.missed(events, reason)
+                    if reason := await self.erased(user, *since):
+                        return await self.dropped(message, events, reason, invitation)
                     await self.fri.waiting_notices.send(message)  # Deleted once a reply to them lands.
                 try:
                     async with asyncio.timeout(until-time.time()):
@@ -437,8 +451,8 @@ class Agent:
                     pass  # Told below, unless they erased meanwhile.
                 recheck = True
             if recheck:
-                if reason := await self.erased(user, forgotten, revision):
-                    return self.missed(events, reason)
+                if reason := await self.erased(user, *since):
+                    return await self.dropped(message, events, reason, invitation)
                 if time.time() >= until:
                     return await self.withheld(message, events, 'stale event', invitation,
                                                logged='earlier reply still running')
@@ -447,7 +461,7 @@ class Agent:
                     continue  # Another reply started during those checks.
             self.turns.take(user, message.id)
             try:
-                outcome = await self.reply_once(message, text, dm, burst=burst, invitation=invitation)
+                outcome = await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since)
             finally:
                 self.turns.release(user)
             if outcome is not BUSY:
@@ -518,9 +532,9 @@ class Agent:
                                  else 'not a visible user mention')
             from .fri_mentions import Invitation
             invitation = await Invitation.create(self, message)
-            if invitation and await self.arrived(message, invitation, self.fri.workshop_id) is not None:
+            if invitation and await self.incoming(message, invitation, self.fri.workshop_id, forgotten) is not None:
                 await self.respond(message, await addressed_text(message, self.fri.user.id), invitation=invitation,
-                                   revision=invitation.revision)
+                                   forgotten=forgotten, revision=invitation.revision)
             return
         channel = message.channel.id
         parent = getattr(message.channel, 'parent_id', None) or channel
@@ -551,9 +565,10 @@ class Agent:
                 return
         if privacy:
             self.forget(message.author.id)
+            forgotten = self.forgotten.get(message.author.id, 0)  # Their own request isn't an erasure since.
         observed = None  # The author's privacy revision as first read for this message.
         if not dm and not message.author.bot:
-            if (profile := await self.arrived(message, invitation, parent)) is None:
+            if (profile := await self.incoming(message, invitation, parent, forgotten)) is None:
                 return
             observed = profile.get('revision', 0)
             if profile['enabled'] and not privacy:
@@ -621,10 +636,10 @@ class Agent:
         self.handling.update(event.id for event in earlier)  # Until this reply answers for them too.
         try:
             if len(burst) > 1:
-                await self.respond(message, directed or text, dm, burst=burst, revision=observed,
+                await self.respond(message, directed or text, dm, burst=burst, forgotten=forgotten, revision=observed,
                                    **({'invitation': invitation} if invitation else {}))
             else:
-                await self.respond(message, directed or text, dm, revision=observed,
+                await self.respond(message, directed or text, dm, forgotten=forgotten, revision=observed,
                                    **({'invitation': invitation} if invitation else {}))
         except BaseException as exc:
             for event in earlier:
@@ -635,18 +650,20 @@ class Agent:
             for event in earlier:
                 self.settle(event)
 
-    async def arrived(self, message, invitation, channel):
-        """The author's profile as a message to Fri comes in, its revision kept as a ping's baseline.
-        None once a ping was told the controller is down; other messages raise as before."""
+    async def incoming(self, message, invitation, channel, forgotten):
+        """The author's profile as a message to Fri comes in. A ping keeps it, and the local erasures
+        so far, as the baseline its notices compare with. None once a ping was told why it can't be
+        answered; other messages raise as before."""
         try:
             profile = await self.profile(channel, message.author.id)
-        except commands.UserFeedbackCheckFailure:
+        except commands.UserFeedbackCheckFailure as exc:
             if not invitation:
                 raise
-            await self.withheld(message, [message], 'controller unavailable', invitation)
+            reason = 'controller unavailable' if isinstance(exc, ControllerUnavailable) else 'check failed: '+type(exc).__name__
+            await self.withheld(message, [message], reason, invitation)
             return None
         if invitation:
-            invitation.revision = profile.get('revision', 0)
+            invitation.forgotten, invitation.revision = forgotten, profile.get('revision', 0)
         return profile
 
     def ambient_ready(self, channel, user):
@@ -667,7 +684,9 @@ class Agent:
         finally:
             self.replying.discard(message.id)
 
-    async def reply_once(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None):
+    async def reply_once(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None, since=None):
+        # `since`: the author's (local erasures, privacy revision) as the message came in. A ping's
+        # error or a low battery doesn't go out once they erased after it.
         events = [message, *(event for _, event, _ in burst if event is not message)]  # This turn answers for all.
         def missed(reason):
             for event in events:
@@ -694,8 +713,12 @@ class Agent:
         except commands.UserFeedbackCheckFailure as exc:
             if invitation and not await invitation.current():
                 return await withhold()
-            if invitation and isinstance(exc, ControllerUnavailable):
-                return await self.withheld(message, events, 'controller unavailable', invitation)
+            if invitation and since:
+                if isinstance(exc, (ControllerRejected, ControllerUnavailable)):  # A fixed line, not its text.
+                    reason = 'controller unavailable' if isinstance(exc, ControllerUnavailable) else 'check failed: ControllerRejected'
+                    return await self.withheld(message, events, reason, invitation)
+                if reason := await self.erased(message.author.id, *since):
+                    return await self.dropped(message, events, reason, invitation)
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
@@ -729,7 +752,8 @@ class Agent:
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if not result.reply:
-            if result.status == 'cooldown' and not ambient and await self.recharging(message, dm):
+            if (result.status == 'cooldown' and not ambient and not (since and await self.erased(message.author.id, *since))
+                    and await self.recharging(message, dm)):
                 self.explained(events, 'social cooldown')
             else:
                 missed('social cooldown' if result.status == 'cooldown' else 'empty reply')

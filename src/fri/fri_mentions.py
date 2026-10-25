@@ -9,6 +9,7 @@ import discord
 from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
+from .fri_errors import ControllerUnavailable
 from .fri_meme_media import sources
 from .privacy import clean
 
@@ -151,9 +152,11 @@ class Invitation:
             if revision is None:  # Not read yet, e.g. already stale as it came in: compare from now.
                 try:
                     revision = await self.agent.revision(self.event.author.id)
-                except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
+                except ControllerUnavailable:
                     if reason not in OUTAGES:
                         return None
+                except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
+                    return None
             if not await self.access():
                 return None
             current = await self.event.channel.fetch_message(self.event.id)
