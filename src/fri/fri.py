@@ -333,8 +333,6 @@ class Fri(discord.Client):
     async def chat_once(self, text, context):
         async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
             fence = context.get('fence')
-            if fence and fence.get('gate'):
-                await fence['gate']()
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
@@ -351,6 +349,9 @@ class Fri(discord.Client):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
                 if actions and actions.sources and not actions.sources <= set(await actions.channels(fresh=True)):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
+                # A DM's own gates after those Discord waits, so a member who left during them is caught.
+                if fence.get('gate'):
+                    await fence['gate']()
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
                     context, fence['turn']['user_id'], fence['actions'])})
             # A channel closed while Fri gathered context: what was said there stays there.
