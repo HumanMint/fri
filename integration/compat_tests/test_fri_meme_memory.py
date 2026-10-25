@@ -58,12 +58,6 @@ def test_forgetting_a_member_drops_what_fri_saw_in_their_memes(harness):  # noqa
     asyncio.run(scenario())
 
 
-def test_forgetting_without_any_meme_state_writes_nothing(tmp_path):
-    agent = SimpleNamespace(fri=SimpleNamespace(data=tmp_path/'fri'))
-    Memes(agent).forget(11)
-    assert not (tmp_path/'fri').exists()
-
-
 def test_a_note_shows_only_while_the_author_and_the_post_are_as_they_were():
     edited = dt.datetime(2026, 10, 25, tzinfo=dt.timezone.utc)
     now = __import__('time').time()
@@ -98,7 +92,7 @@ def test_a_read_shows_fris_own_reaction_and_what_it_saw(monkeypatch, tmp_path):
 
 
 def test_the_models_are_told_the_truth_about_what_is_kept():
-    assert "it's kept for a few days so" in INSTRUCTION and "isn't posted or retained" not in INSTRUCTION
+    assert "kept in memory for up to\na few days" in INSTRUCTION and "isn't posted or retained" not in INSTRUCTION
     assert 'fri_reacted' in INSTRUCTIONS
 
 
@@ -157,58 +151,17 @@ def test_forgetting_still_clears_everything_else_when_the_meme_state_is_broken(t
         assert (3, 11) not in agent.pending and not list(agent.recent[3])
 
 
-def test_a_note_missing_a_field_is_never_shown(tmp_path):
-    agent = SimpleNamespace(fri=SimpleNamespace(data=tmp_path))
-    memes = Memes(agent)
-    with memes.state() as state:
-        state['entries']['100'] = {'at': __import__('time').time(), 'status': 'reacted', 'channel': '3',
-                                   'author': '11', 'revision': 0, 'note': 'A joke', 'edited': None}
-    assert memes.notes() == {}
-
-
-def test_a_note_missing_its_edit_time_is_never_shown_and_never_crashes_a_read(monkeypatch, tmp_path):
-    async def scenario():
-        fri, agent, channel, rows, post = read_harness(monkeypatch, tmp_path)
-        meme = post('', age=600, attachments=[picture(1, 'gigachad.png')])
-        memes = Memes(SimpleNamespace(fri=SimpleNamespace(data=tmp_path/'memes')))
-        with memes.state() as state:
-            state['entries'][str(meme.id)] = {'at': __import__('time').time(), 'status': 'reacted', 'channel': '1',
-                                              'author': '30', 'revision': 0, 'emoji': '🗿', 'note': 'a desk'}
-        agent.ensure_memes = lambda: memes
-        actions = Actions(agent, 20, 999, False)
-        actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
-        try:
-            rows = (await actions.execute({'kind': 'read_recent', 'channel_id': '1', 'window': 'recent'}))['messages']
-            assert rows and 'fri_reacted' not in rows[0]
-        finally:
-            await fri.close()
-    asyncio.run(scenario())
-
-
-def test_an_opt_out_through_gene_drops_the_note_at_the_next_meme_check(harness):  # noqa: F811
+def test_an_opt_out_through_gene_drops_the_note_even_with_meme_checks_off(harness):  # noqa: F811
     async def scenario():
         h = harness
         h.add(attachments=[attachment()])
         await h.agent.memes.check()
         assert h.agent.memes.notes()
+        h.scheduler.update({'meme_enabled': False}, 2, '10')
+        h.agent.state = h.scheduler.state()
         h.store.personal_control('11', 'disable')  # Not through Fri, so no local forget().
-        h.clock[0] += 1801
-        await h.agent.memes.check()
-        assert h.agent.memes.notes() == {} and 'A joke' not in h.agent.memes.path.read_text()
-    asyncio.run(scenario())
-
-
-def test_an_invalid_limit_elsewhere_never_stops_an_erasure_or_an_expiry(harness):  # noqa: F811
-    async def scenario():
-        h = harness
-        h.add(attachments=[attachment()])
-        await h.agent.memes.check()
-        data = json.loads(h.agent.memes.path.read_text())
-        data['next_check'] = 'broken'
-        h.agent.memes.path.write_text(json.dumps(data))
-        h.agent.forget(11, erased=True)
-        assert 'A joke' not in h.agent.memes.path.read_text()
-        assert json.loads(h.agent.memes.path.read_text())['next_check'] == 'broken'  # Left for the owner.
+        await h.agent.memes.verify(now=h.clock[0]+601)  # What each heartbeat runs, every ten minutes.
+        assert h.agent.memes.notes() == {}
     asyncio.run(scenario())
 
 
@@ -220,3 +173,34 @@ def test_a_note_that_expires_during_a_read_is_not_shown():
             'at': time.time()-3*86400-1}
     stale = []
     assert reacted({5: note}, post, {'revision': 2}, stale) == {} and stale == [5]
+
+
+def test_notes_never_reach_the_state_file_so_a_restart_or_rollback_keeps_none(harness):  # noqa: F811
+    async def scenario():
+        h = harness
+        h.agent.run.return_value = ({'reaction': '🗿', 'confidence': 'high', 'observation': 'gigachad at a desk'},
+                                    {}, 'completed')
+        m = h.add(attachments=[attachment()])
+        await h.agent.memes.check()
+        assert h.agent.memes.notes()[m.id]['note'] == 'gigachad at a desk'
+        entry = json.loads(h.agent.memes.path.read_text())['entries'][str(m.id)]
+        assert 'gigachad' not in h.agent.memes.path.read_text() and not {'author', 'note', 'emoji'} & entry.keys()
+        assert Memes(h.agent).notes() == {}  # A restarted Fri, or an older one, finds nothing to keep or erase.
+    asyncio.run(scenario())
+
+
+def test_the_heartbeat_expires_notes_even_when_gene_is_down(monkeypatch, tmp_path):
+    import time
+
+    from fri.fri_agent import Agent
+    from fri.fri_errors import ControllerUnavailable
+
+    async def scenario():
+        async def down(*_, **__):
+            raise ControllerUnavailable('down')
+        agent = Agent(SimpleNamespace(data=tmp_path, api=down, guild_id=123, owner_id=10, workshop_id=456))
+        agent.ensure_memes().noted[5] = {'at': time.time()-3*86400-1, 'channel': 3, 'author': '11', 'revision': 0,
+                                         'emoji': '🗿', 'note': 'a desk', 'edited': None}
+        await agent.heartbeat.coro(agent)
+        assert agent.heartbeat_status == 'deferred' and agent.memes.noted == {}
+    asyncio.run(scenario())
