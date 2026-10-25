@@ -21,12 +21,12 @@ from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_continuity import arm, origin
 from compat_tests.test_fri_runtime import configured
+from fri.feedback import UserFeedbackCheckFailure
 from fri.fri_actions import Actions
 from fri.fri_addressing import explicit_mention
 from fri.fri_agent import QUEUE_SECONDS, Agent
 from fri.fri_chat import Chat, ChatResult
 from fri.fri_errors import ControllerRejected
-from fri.feedback import UserFeedbackCheckFailure
 from fri.fri_mentions import CONTEXT_CHANGED, GLITCH, NOTICES, Invitation
 from fri.fri_notices import ReplyInProgress
 
