@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 from gene.config import Settings
 from gene.fri_agent_store import AgentStore
+from gene.fri_memory_store import edit, entries, save
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import CONTEXT, response_event
@@ -91,16 +92,16 @@ def world(monkeypatch, tmp_path):
     fri.chat_once = AsyncMock(return_value=ChatResult(status='completed', reply='bold of you'))
     ids = iter(range(10**6))
 
-    def message(cid, text, user=20):
-        mid = discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)) + next(ids)
+    def message(cid, text, user=20, age=0):
+        mid = discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)-dt.timedelta(seconds=age)) + next(ids)
         channel = channels[cid]
         return Mock(spec=discord.Message, id=mid, content=text, channel=channel, guild=channel.guild,
                     author=SimpleNamespace(id=user, display_name=f'member {user}', bot=False), webhook_id=None,
                     mentions=[], reference=None, attachments=[], embeds=[], edited_at=None)
 
-    async def say(cid, text, reply='bold of you', notes=(), user=20):
+    async def say(cid, text, reply='bold of you', notes=(), user=20, age=0):
         fri.chat_once.return_value = ChatResult(status='completed', reply=reply, notes=list(notes))
-        event = message(cid, text, user)
+        event = message(cid, text, user, age)
         result = await fri.talk(123, cid, user, text, 'private' if cid == DM else 'public', f'member {user}', event=event)
         sent = SimpleNamespace(id=event.id+1, content=result.reply, edit=AsyncMock(), reply=AsyncMock())
         saved = await fri.record_turn(result, sent) if result.turn else None
@@ -224,6 +225,30 @@ def test_a_reply_drawing_on_a_note_from_a_restricted_time_stays_in_its_channel(m
             context = model_context(w)
             assert [row['input'] for row in context['elsewhere']] == ['fri what music do i like']
             assert 'private jazz' not in json.dumps(context, default=str)
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_removed_preference_stays_gone_from_queued_messages_and_other_excerpts(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            with w.store.connection() as db:  # Background learning kept a longer excerpt in #gaming.
+                save(db, '123', 'public:2', '20', ('hobbies', 'I like Minecraft modpacks'), time.time())
+            listed = entries(w.store, '123', 'private:900', '20')
+            removal = {'kind': 'discord_interaction', 'id': str(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc))),
+                       'user_id': '20', 'display_name': 'friend', 'channel_id': '900', 'guild_id': None}
+            profile = next(row for row in listed['entries'] if row['scope'] == 'server')
+            edit(w.store, '123', 'private:900', '20', profile['id'], listed['revision'], removal, 'remove')
+            # Sent before the removal, answered after it: Fri replies but keeps nothing.
+            result, saved, _ = await w.say(GENERAL, 'fri I like Minecraft modpacks', 'ok',
+                                           note('I like Minecraft modpacks', 'hobbies'), age=3)
+            assert result.reply == 'ok' and saved == {'ok': True, 'first_memory': False}
+            await w.say(GAMING, 'fri what should i play')
+            assert 'Minecraft' not in json.dumps(model_context(w), default=str)
+            assert entries(w.store, '123', 'private:900', '20')['entries'] == []
         finally:
             await w.fri.close()
     run(scenario)

@@ -195,10 +195,12 @@ the turn inherits their provenance, since a member's words can repeat someone el
 removes what was built on them here too.
 "What do you remember about me?" in public lists only what that channel can see. In a DM it lists
 every note with where it shows, and My memory there edits any of them; the panel shows the first 25.
-Editing a profile note clears the member's saved chats across the server, removes the same words
-wherever a single channel kept them (under any category), and stops background learning from using
-anything the member said before the edit, anywhere in the server: no note, archive observation or
-channel summary comes from those messages, however it's phrased. "Forget me" is unchanged and erases everything. At
+Editing a profile note clears the member's saved chats and research receipts across the server, removes
+the same words, or an excerpt containing or contained in them, wherever a single channel kept them
+(under any category), and stops background learning from using anything the member said before the
+edit, anywhere in the server: no note, archive observation or channel summary comes from those
+messages, however it's phrased. A message sent before the edit but answered after it gets its reply
+and keeps nothing. "Forget me" is unchanged and erases everything. At
 startup Fri logs how many configured channels are readable by everyone. If that's none, profiles
 never fill, and the server's channel permissions are the thing to look at.
 
