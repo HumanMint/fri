@@ -107,6 +107,7 @@ class Agent:
         self.presence = None
         self.heartbeat_started = self.heartbeat_finished = 0
         self.heartbeat_status = 'starting'
+        self.stages = {}
 
     @property
     def config(self):
@@ -145,8 +146,8 @@ class Agent:
             return  # The owner review loop delivers it.
         try:
             await self.fri.flush_usage()
-        except commands.UserFeedbackCheckFailure:
-            LOG.warning('Agent usage queued for delivery')
+        except Exception as exc:  # The receipt is on disk; the owner review loop retries delivery.
+            LOG.warning('Agent usage queued for delivery: %s', type(exc).__name__)
 
     async def run(self, role, instruction, data, schema, model=None, effort=None, *, images=()):
         model = model or self.config[role+'_model']
@@ -828,36 +829,60 @@ class Agent:
             'body': body})
         self.last_spoke[channel] = time.time()
 
+    async def check_presence(self):
+        if self.config.get('status_enabled') or self.presence:
+            from .fri_presence import Presence
+            if self.presence is None:
+                self.presence = Presence(self)
+            await self.presence.check()
+
+    async def check_memes(self):
+        from .fri_memes import Memes
+        if self.memes is None:
+            self.memes = Memes(self)
+        await self.memes.check()
+
+    async def stage(self, name, step, *switches, when=None):
+        """One heartbeat stage. A failure is logged by class and recorded, and never skips later stages."""
+        now = time.time()
+        try:
+            # Older controllers send no reply_check_* settings; a missing switch is off.
+            if not all(self.config.get(key) for key in switches) or (when and not when()):
+                self.stages.pop(name, None)
+                return True
+            await step()
+        except Exception as exc:  # CancelledError is a BaseException, so stopping the loop still works.
+            LOG.warning('Fri heartbeat stage %s deferred: %s', name, type(exc).__name__)
+            self.stages[name] = {'at': now, 'last_ok': self.stages.get(name, {}).get('last_ok'),
+                                 'error': type(exc).__name__}
+            return False
+        self.stages[name] = {'at': now, 'last_ok': now, 'error': None}
+        return True
+
     @tasks.loop(seconds=30)
     async def heartbeat(self):
         self.heartbeat_started = time.time()
         try:
             self.state = await self.fri.api('GET', '/agent/state')
-            if self.config['status_enabled'] or self.presence:
-                from .fri_presence import Presence
-                if self.presence is None:
-                    self.presence = Presence(self)
-                await self.presence.check()
-            from .fri_workspace import deliver_one
-            await deliver_one(self.fri)
-            from .fri_social import deliver_one as deliver_reminder
-            await deliver_reminder(self.fri)
-            await self.send_reports()
-            if self.config['enabled']:
-                await self.learn()
-                await self.attend()
-                if self.config['meme_enabled']:
-                    from .fri_memes import Memes
-                    if self.memes is None:
-                        self.memes = Memes(self)
-                    await self.memes.check()
-                from .fri_reply_checks import CAPABILITY, check
-                if self.config.get('reply_check_enabled') and CAPABILITY in self.fri.capabilities:
-                    await check(self)
-            self.heartbeat_status = 'ok'
-        except (commands.UserFeedbackCheckFailure, discord.HTTPException, TimeoutError, ValueError, KeyError):
+        except Exception as exc:  # A bad tick never ends the loop; the next one retries.
             self.heartbeat_status = 'deferred'
-            LOG.warning('Fri heartbeat deferred; no authority or approval inferred')
+            LOG.warning('Fri heartbeat deferred: %s; no authority or approval inferred', type(exc).__name__)
+        else:
+            from .fri_reply_checks import CAPABILITY
+            from .fri_reply_checks import check as check_replies
+            from .fri_social import deliver_one as deliver_reminder
+            from .fri_workspace import deliver_one as deliver_post
+            # An undeliverable owner report or a broken meme check must not silence attention.
+            results = [await self.stage('presence', self.check_presence),
+                       await self.stage('posts', lambda: deliver_post(self.fri)),
+                       await self.stage('reminders', lambda: deliver_reminder(self.fri)),
+                       await self.stage('reports', self.send_reports),
+                       await self.stage('learning', self.learn, 'enabled'),
+                       await self.stage('attention', self.attend, 'enabled'),
+                       await self.stage('memes', self.check_memes, 'enabled', 'meme_enabled'),
+                       await self.stage('reply_checks', lambda: check_replies(self), 'enabled', 'reply_check_enabled',
+                                        when=lambda: CAPABILITY in self.fri.capabilities)]
+            self.heartbeat_status = 'ok' if all(results) else 'deferred'
         finally:
             self.heartbeat_finished = time.time()
 
