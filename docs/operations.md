@@ -383,12 +383,18 @@ Fri can't restart anything. It only notices and says so.
   heartbeat waits on that same pass.
 - **Tell reporter.** The owner's deployed DM for a repair a member reported (including one the owner
   finished after its checks handed it over) gets a **Tell reporter** button, when the controller
-  offers `requester-notices` and the report is still on record. A tap claims the controller's mark,
-  checks the report again (still there, still the member's, in a configured channel Fri can post in
-  and not an archived thread, or their DM while they're still in the server), and replies to it once
-  with a fixed line, mentions off and no request text. A send Discord refused (a 4xx, rate limits
-  included) can be tapped again. One that may have posted is never retried. The owner sees the
-  outcome privately, and the button goes away once the reply is sent.
+  offers `requester-notices` and the report is still on record. A tap first reads Discord: Fri must
+  be on with proactive posts on, the member still in the server, and the report still there and
+  still theirs, in a configured channel Fri can post in and not an archived thread, or in their DM
+  while support DMs are on. Only then does it claim the controller's mark, which refuses an erased
+  report, a rollback since the repair, or any newer release now live, and checks the config and
+  channel once more with nothing awaited before the send. So a change while Discord answered stops
+  the reply. It replies to the report once with a fixed line, mentions off and no request text, and
+  records the outcome as the owner. A send Discord refused (a 4xx, rate limits included) can be
+  tapped again. One that may have posted is never retried. The owner sees the outcome privately, and
+  the button goes away once the reply is sent.
+- **The 👀.** Filing a Gene error waits up to 5 s on the reaction, then lets attention move on. A
+  reaction stuck in a Discord rate limit finishes on its own and is never cancelled.
 
 ## Existing installation migration
 

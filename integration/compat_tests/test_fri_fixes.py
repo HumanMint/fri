@@ -5,7 +5,7 @@ import datetime as dt
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import discord
 import httpx
@@ -367,8 +367,8 @@ def test_nothing_posts_when_the_report_is_not_reachable_now(world, change):
         assert not offers_tell(world.fri, notice)
     text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
     assert not sent and text.startswith('didn’t send it') and not world.sent
-    with world.store.connection() as db:
-        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
+    with world.store.connection() as db:  # Read before the claim, so nothing is held: a later tap can still try.
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone() is None
 
 
 def test_no_button_without_the_capability_or_for_a_bot_or_unshipped_job(world):
@@ -411,4 +411,135 @@ def test_tell_buttons_are_the_owners_on_fris_own_dms_only(monkeypatch):
         told.reset_mock()
         await button.callback(event)
         told.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def released(store, sha='c'*40):
+    """An ordinary request shipped after the repair, so the repair isn't the live release anymore."""
+    job = store.request('123', '30', 'message-later', 'https://discord.com/channels/123/456/1', 'Add a vote command')
+    ship(store, job['id'], sha)
+
+
+def rolled_back(store):
+    rollback = store.rollback('123', 'owner')
+    deploying = store.claim_deploy()
+    assert deploying['id'] == rollback['id']
+    store.finish_deploy(deploying['id'], deploying['lease'], True, 'Rolled back.')
+
+
+@pytest.mark.parametrize('change', ['rolled_back', 'erased', 'released', 'archived', 'not_allowed', 'proactive_off'])
+def test_a_change_while_discord_reads_the_report_still_stops_the_reply(world, change):
+    report, job_id, _ = reported(world)
+
+    def meanwhile(id):
+        if change == 'rolled_back':
+            rolled_back(world.store)
+        if change == 'erased':
+            world.store.erase_user(str(MEMBER))
+        if change == 'released':
+            released(world.store)
+        if change == 'archived':
+            world.room.archived = True
+        if change == 'not_allowed':
+            world.agent.state['channels'] = []
+            world.fri.workshop_id = 1
+        if change == 'proactive_off':
+            world.agent.state['config']['proactive'] = False
+        return report
+
+    world.room.fetch_message = AsyncMock(side_effect=meanwhile)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent
+    with world.store.connection() as db:
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone() is None
+
+
+def test_a_newer_release_before_the_tap_stops_the_reply(world):
+    report, job_id, _ = reported(world)
+    released(world.store)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'newer release' in text
+
+
+@pytest.mark.parametrize('change', ['proactive_off', 'not_allowed', 'archived'])
+def test_a_change_while_the_claim_is_out_stops_the_reply_and_frees_it(world, change):
+    report, job_id, _ = reported(world)
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        result = await api(method, path, body)
+        if path.endswith('/requester-notice'):
+            if change == 'proactive_off':
+                world.agent.state['config']['proactive'] = False
+            if change == 'not_allowed':
+                world.agent.state['channels'] = []
+                world.fri.workshop_id = 1
+            if change == 'archived':
+                world.room.archived = True
+        return result
+
+    world.fri.api.side_effect = meanwhile
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and text.startswith('didn’t send it')
+    with world.store.connection() as db:  # Recorded as refused, so a later tap may try again.
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
+
+
+def test_the_outcome_is_recorded_as_the_owner_on_this_server(world):
+    _, job_id, _ = reported(world)
+    asyncio.run(tell(world.fri, job_id, OWNER))
+    [finish] = [c.args for c in world.fri.api.await_args_list if c.args[1].endswith('/finish')]
+    assert finish[2]['guild_id'] == '123' and finish[2]['user_id'] == str(OWNER) and finish[2]['state'] == 'sent'
+
+
+@pytest.mark.parametrize('change', ['left', 'disabled', 'proactive_off'])
+def test_a_public_report_needs_the_member_still_here_and_fri_posting(world, change):
+    report, job_id, _ = reported(world)
+    if change == 'left':
+        world.agent.member = AsyncMock(return_value=None)
+    if change == 'disabled':
+        world.agent.state['config']['enabled'] = False
+    if change == 'proactive_off':
+        world.agent.state['config']['proactive'] = False
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and text.startswith('didn’t send it')
+    if change == 'left':
+        world.agent.member.assert_awaited_once_with(MEMBER, fresh=True)
+
+
+def test_a_dm_report_waits_for_support_dms(world):
+    report, job_id, _ = reported(world)
+    dm = Mock(spec=discord.DMChannel, id=777, recipient=SimpleNamespace(id=MEMBER), fetch_message=AsyncMock(return_value=report))
+    with world.store.connection() as db:
+        db.execute('UPDATE jobs SET source_url=? WHERE id=?', (f'https://discord.com/channels/@me/777/{report.id}', job_id))
+    world.fri.fetch_channel = AsyncMock(return_value=dm)
+    world.agent.state['config']['support_dms'] = False
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'support dms are off' in text
+    world.agent.state['config']['support_dms'] = True
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert sent and world.sent[0]['target_id'] == '777'
+
+
+def test_a_stalled_reaction_never_holds_up_attention_and_is_never_cancelled(world, monkeypatch):
+    monkeypatch.setattr(fri_fixes, 'MARK', 0.05)
+
+    async def scenario():
+        release = asyncio.Event()
+        error = message(GENE)
+        world.found[error.id] = error
+
+        async def rate_limited(emoji):  # discord.py's global rate-limit wait, which must never be cancelled.
+            await release.wait()
+
+        error.add_reaction = AsyncMock(side_effect=rate_limited)
+        world.agent.run = AsyncMock(return_value=({'summary': 'Evidence uncertain', 'proposed_request': 'Fix it'},
+                                                  {}, 'completed'))
+        await asyncio.wait_for(world.agent.investigate(456, {'id': str(error.id), 'text': 'Track Stuck error'}), 1)
+        [task] = fri_fixes.MARKING
+        assert not task.done() and json.loads((world.fri.data/'gene-fixes.json').read_text())
+        release.set()
+        await task
+        assert not task.cancelled() and not fri_fixes.MARKING
+        error.add_reaction.assert_awaited_once_with('👀')
     asyncio.run(scenario())
