@@ -217,13 +217,15 @@ class Watch:
         for task in done:
             task.result()  # Re-raises only what ends Fri's process; `push` logs its own failures.
 
-    async def catch_up(self, alert):
-        """A pass may have changed the text while Discord took the last one (say, Gene recovered while a
-        slow send was underway): show the new text now, not a pass later."""
-        if alert is self.load()['alert'] and alert.get('shown') != alert['text']:
-            await self.push(alert)
-
     async def push(self, alert):
+        """Delivers until Discord shows what's intended now. A pass may change the text while Discord takes
+        the last one (say, Gene recovered while a slow send was underway), and that shouldn't wait a pass."""
+        while await self.deliver_once(alert):
+            if alert is not self.load()['alert'] or alert.get('shown') == alert['text']:
+                return
+
+    async def deliver_once(self, alert):
+        """One send or edit; True once Discord confirmed it."""
         try:
             channel = self.fri.get_channel(int(alert['channel_id'])) if alert.get('channel_id') else None
             if channel is None:
@@ -250,7 +252,7 @@ class Watch:
                 if not alert['open']:  # Over before the owner heard; a late DM about it is noise.
                     alert['shown'] = text
                     self.save()
-                    return
+                    return False
                 alert.update(attempted=text, attempted_at=time.time())
                 alert.pop('settled', None)
                 self.save()
@@ -267,7 +269,7 @@ class Watch:
                              sent=made.timestamp() if made else time.time())
                 self.save()
                 LOG.warning('Owner told about a Gene outage: %s', alert['kind'])
-                return await self.catch_up(alert)
+                return True
             # Unknown until Discord confirms: an edit whose reply is lost may have landed, so until one is
             # confirmed the next pass edits again, even back to the text the DM showed before.
             alert['shown'] = None
@@ -285,12 +287,13 @@ class Watch:
                     alert['shown'] = text
                     LOG.info('Outage DM is gone; its recovery note was dropped')
                 self.save()
-                return
+                return False
             alert['shown'] = text
             self.save()
-            await self.catch_up(alert)
+            return True
         except Exception as exc:  # It runs on its own, so nobody else would hear; the next pass tries again.
             LOG.warning('Gene watch deliver failed: %s', type(exc).__name__)
+            return False
 
     def save(self):
         private_json(self.path, self.state)

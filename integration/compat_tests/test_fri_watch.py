@@ -987,6 +987,34 @@ def test_a_dm_that_lands_after_gene_recovered_is_corrected_at_once(monkeypatch, 
     asyncio.run(scenario())
 
 
+def test_a_dm_whose_text_keeps_changing_mid_edit_catches_up_without_running_out_of_stack(monkeypatch, tmp_path, caplog):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        partial, edits = dm.get_partial_message, []
+        def flapping(mid):
+            async def edit(**options):
+                await partial(mid).edit(**options)
+                edits.append(options['content'])
+                if len(edits) < 1500:  # A health pass changes what the DM should say before Discord replies.
+                    fri.watcher.state['alert']['text'] = f'outage, take {len(edits)}'
+            return SimpleNamespace(edit=edit)
+        try:
+            for _ in range(CHECKS):
+                await fri.watcher.check()
+            dm.get_partial_message = flapping
+            fri.watcher.state['alert']['text'] = 'outage, take 0'
+            await fri.watcher.deliver()
+            alert = fri.watcher.state['alert']
+            assert len(edits) == 1500 and dm.messages[556].content == alert['text'] == alert['shown']
+            assert 'deliver failed' not in caplog.text
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_owner_already_knows_only_once_the_dm_shows_the_relapse(monkeypatch, tmp_path):
     async def scenario():
         fri = configured(monkeypatch)
