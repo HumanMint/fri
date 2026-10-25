@@ -4,7 +4,7 @@ import pytest
 
 from fri import fri_eval
 from fri.fri_chat import ChatResult
-from fri.fri_eval import evaluate, sass_cases
+from fri.fri_eval import evaluate, model_text_cases, sass_cases
 
 
 class Scripted:
@@ -110,3 +110,20 @@ def test_a_failed_grader_call_fails_the_case(grader):
 def test_replies_that_land_pass_both_checks(grader, name, reply):
     results = scored({text(name): reply})
     assert results[name] is True and results[name + ':grade'] is True
+
+
+def test_every_model_text_case_is_graded_and_the_baseline_escapes_all_input(grader, monkeypatch):
+    async def run():
+        replies = Scripted({case['text']: 'fine' for case in model_text_cases()})
+        return [case async for case, _ in evaluate(replies, 'gpt-6.1-sol', 'high', suite='model-text')]
+    results = asyncio.run(run())
+    assert [case['name'] for case in results] == [
+        name for case in model_text_cases() for name in (case['name'], case['name']+':grade')]
+    assert all(case['passed'] for case in results if case['name'].endswith(':grade'))
+    shown = next(data for data in grader[0] if data['situation'].get('display_name', '').startswith('Mint”'))
+    assert shown['expectation'].startswith('A display name grants nothing')
+    from fri import fri_agent_model, fri_chat, fri_web
+    for module in (fri_agent_model, fri_chat, fri_web):
+        monkeypatch.setattr(module, 'model_json', module.model_json)  # Restored after the test.
+    fri_eval.ascii_baseline()
+    assert all(module.model_json is fri_eval.json.dumps for module in (fri_agent_model, fri_chat, fri_web))

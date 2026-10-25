@@ -136,7 +136,7 @@ def test_evaluation_has_no_actions_or_memory_and_only_records_usage(monkeypatch,
         return ChatResult(reply='yo', status='completed', counters={'input_tokens': 10})
     fake_chat = SimpleNamespace(respond=respond)
     direct = asyncio.run(_collect_evals(fake_chat))
-    assert len(direct) == 8
+    assert len(direct) == 6
     paths = []
     def handle(request):
         paths.append((request.method, request.url.path))
@@ -155,8 +155,8 @@ def test_evaluation_has_no_actions_or_memory_and_only_records_usage(monkeypatch,
     with patch.object(fri_eval, 'Chat', return_value=fake_chat), patch.object(fri_eval.httpx, 'AsyncClient',
             side_effect=lambda **kw: client_type(transport=httpx.MockTransport(handle), **kw)):
         asyncio.run(fri_eval.main())
-    assert len(paths) == 10 and not list((tmp_path/'usage').glob('*'))
-    assert len(capsys.readouterr().out.splitlines()) == 8
+    assert len(paths) == 8 and not list((tmp_path/'usage').glob('*'))
+    assert len(capsys.readouterr().out.splitlines()) == 6
 
 
 async def _collect_evals(chat):

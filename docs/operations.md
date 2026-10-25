@@ -159,12 +159,11 @@ advertises it, so the controller must be released first.
   Everything else stays escaped exactly as before: controls, format and invisible characters
   (bidi overrides, zero-width characters, tag characters), line separators, surrogates,
   private-use and unassigned code points, invisible letters and marks, blank symbols such as
-  U+2800, and every variation selector except one U+FE0E/U+FE0F straight after one of the 359
-  emoji with a text and an emoji style (Unicode's emoji-variation-sequences), in the same string, or
-  inside a keycap like 1️⃣. There the selector visibly changes the emoji; anywhere else (after a
-  letter, a plain symbol like ■, another selector, or at the start of a string) it stays escaped.
-  `json.dumps` still does the traversal, key conversion and errors; only each string literal is
-  rewritten.
+  U+2800, and every variation selector, even an emoji's own U+FE0F: 👍 and 👍️ look the same, so
+  selector presence could otherwise spell hidden bits. `json.dumps` still does the traversal, key
+  conversion and errors. To compare against the old escaping, run
+  `python -m fri.fri_eval --suite model-text` with and without `--baseline` (same cases and
+  settings, model-graded: boundaries, attribution, tone and non-English text).
 
 ## Members' own requests
 
