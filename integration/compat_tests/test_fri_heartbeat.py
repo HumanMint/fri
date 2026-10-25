@@ -109,7 +109,7 @@ def test_heartbeat_cancellation_still_stops_a_stage():
 
 def notice_runtime(rejected=False):
     owner = SimpleNamespace(send=AsyncMock())
-    fri = SimpleNamespace(owner_id=10, subscription_noticed=False, get_user=lambda _: owner,
+    fri = SimpleNamespace(owner_id=10, subscription_noticed=False, sign_in_notice=None, get_user=lambda _: owner,
                           chat=SimpleNamespace(subscription=SimpleNamespace(rejected=rejected)))
     return fri, owner
 
@@ -132,7 +132,7 @@ def test_rejected_sign_in_sends_one_owner_dm_until_a_token_works_again():
     asyncio.run(scenario())
 
 
-def test_failed_sign_in_notice_retries_and_never_blocks_reviews_or_usage(monkeypatch):
+def test_sign_in_notice_runs_beside_reviews_and_usage_and_retries(monkeypatch):
     async def scenario():
         fri, owner = notice_runtime(rejected=True)
         owner.send.side_effect = RuntimeError('DMs closed')
@@ -141,12 +141,24 @@ def test_failed_sign_in_notice_retries_and_never_blocks_reviews_or_usage(monkeyp
         notify = AsyncMock()
         monkeypatch.setattr('fri.fri.notify_owner', notify)
         await Fri.owner_reviews.coro(fri)
+        await fri.sign_in_notice
         fri.flush_usage.assert_awaited_once()
         notify.assert_awaited_once_with(fri)
-        assert not fri.subscription_noticed
-        owner.send.side_effect = None
-        await Fri.owner_reviews.coro(fri)
-        assert fri.subscription_noticed and owner.send.await_count == 2
+        assert not fri.subscription_noticed  # Logged; a later tick retries.
+        # discord.py sleeps out a rate limit's retry_after inside send(); later ticks must not wait for it.
+        release = asyncio.Event()
+
+        async def rate_limited(*args, **kwargs):
+            await release.wait()
+        owner.send.side_effect = rate_limited
+        for _ in range(3):
+            await Fri.owner_reviews.coro(fri)
+            await asyncio.sleep(0)
+        assert fri.flush_usage.await_count == notify.await_count == 4
+        assert owner.send.await_count == 2 and not fri.sign_in_notice.done()  # One send in flight, not one per tick.
+        release.set()
+        await fri.sign_in_notice
+        assert fri.subscription_noticed
         fri.flush_usage.side_effect = OSError('read-only usage folder')
         await Fri.owner_reviews.coro(fri)  # Logged and retried next tick instead of ending the loop.
     asyncio.run(scenario())

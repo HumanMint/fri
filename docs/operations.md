@@ -249,9 +249,11 @@ can't be parsed, moves to `usage/rejected/` and stops blocking later receipts.
 keep every receipt queued.
 
 A failed subscription renewal logs its cause: exception class, HTTP status and OAuth
-error code, never the response or tokens. Only a refused grant or a missing or incomplete
-saved sign-in is reported as needing a reconnect, and it sends the owner one DM until
-a token works again. Network, rate-limit and provider failures ask members to retry.
+error code, never the response or tokens. Only a refused grant (HTTP 400/401), a
+renewal without the plan scope, or a missing or incomplete saved sign-in is reported
+as needing a reconnect, and it sends the owner one DM until a token works again.
+Network, rate-limit and provider failures, including a malformed renewal response,
+ask members to retry.
 
 ## New installations
 

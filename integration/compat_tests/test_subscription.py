@@ -88,8 +88,14 @@ def test_refused_refresh_needs_the_owner_and_logs_only_its_cause(tmp_path, caplo
     assert 'private' not in caplog.text and json.loads(path.read_text()) == saved
 
 
+MALFORMED = [{}, [], {'access_token': 'private-a', 'token_type': 'Bearer', 'expires_in': 0},
+             {'access_token': 'private-a', 'token_type': 'Bearer', 'expires_in': None},
+             {'access_token': 'private-a', 'token_type': None, 'expires_in': 60}]
+
+
 @pytest.mark.parametrize('outcome', [httpx.Response(503, text='private outage'), httpx.Response(429, json={'error': 'slow down'}),
-                                     httpx.Response(200, text='not json'), httpx.ConnectError('private host')])
+                                     httpx.Response(200, text='not json'), httpx.ConnectError('private host'),
+                                     *(httpx.Response(200, json=body) for body in MALFORMED)])
 def test_transient_refresh_failure_does_not_tell_anyone_to_reconnect(tmp_path, caplog, outcome):
     path = tmp_path / 'session.json'
     saved = expired(path)
@@ -105,14 +111,33 @@ def test_transient_refresh_failure_does_not_tell_anyone_to_reconnect(tmp_path, c
     assert json.loads(path.read_text()) == saved
 
 
-def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_path):
+def test_renewal_without_the_plan_scope_is_a_refusal(tmp_path, caplog):
     path = tmp_path / 'session.json'
-    saved = expired(path)
-    del saved['client_id']
-    private_json(path, saved)
-    session = Subscription(path, httpx.MockTransport(lambda _: pytest.fail('no refresh without a client id')))
-    with pytest.raises(SubscriptionError, match='Reconnect'):
+    expired(path)
+    withdrawn = httpx.Response(200, json={'access_token': 'private-a', 'refresh_token': 'private-r', 'scope': 'openid',
+                                          'token_type': 'Bearer', 'expires_in': 60})
+    session = Subscription(path, httpx.MockTransport(lambda _: withdrawn))
+    with pytest.raises(SubscriptionError, match='Reconnect') as exc:
         session.access_token()
-    assert session.rejected
-    private_json(path, {**saved, 'client_id': 'client', 'expires_at': time.time() + 3600})
+    assert not isinstance(exc.value, SubscriptionUnavailable) and session.rejected
+    assert 'renewal rejected: plan scope missing' in caplog.text and 'private' not in caplog.text
+
+
+@pytest.mark.parametrize('damage', ['expires_at', 'access_token', 'refresh_token', 'client_id', 'ext_agent_host_id',
+                                    'not json', 'not an object'])
+def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_path, caplog, damage):
+    path = tmp_path / 'session.json'
+    saved = expired(path, expires_at=0 if damage in ('refresh_token', 'client_id', 'ext_agent_host_id') else time.time() + 3600)
+    if damage == 'not json':
+        path.write_text('{"access_token": "private')
+    elif damage == 'not an object':
+        path.write_text('["private"]')
+    else:
+        private_json(path, {k: v for k, v in saved.items() if k != damage})
+    session = Subscription(path, httpx.MockTransport(lambda _: pytest.fail('no refresh from an incomplete sign-in')))
+    with pytest.raises(SubscriptionError, match='Reconnect') as exc:
+        session.access_token()
+    assert not isinstance(exc.value, SubscriptionUnavailable) and session.rejected
+    assert 'saved sign-in is unreadable or incomplete' in caplog.text and 'private' not in caplog.text
+    private_json(path, {**saved, 'expires_at': time.time() + 3600})
     assert session.access_token() == 'old' and not session.rejected

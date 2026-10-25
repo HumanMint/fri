@@ -132,6 +132,7 @@ class Fri(discord.Client):
         self.usage_lock = asyncio.Lock()
         self.chat_slots = asyncio.Semaphore(2)
         self.subscription_noticed = False
+        self.sign_in_notice = None
         self.session = None
         self.agent = None
 
@@ -684,19 +685,21 @@ class Fri(discord.Client):
 
     async def subscription_notice(self):
         """One owner DM per refused sign-in. A usable token re-arms it."""
-        if not self.chat.subscription.rejected:
-            self.subscription_noticed = False
-        elif not self.subscription_noticed:
-            owner = self.get_user(self.owner_id) or await self.fetch_user(self.owner_id)
-            await owner.send(SIGN_IN_NOTICE, allowed_mentions=NO_MENTIONS)
-            self.subscription_noticed = True
+        try:
+            if not self.chat.subscription.rejected:
+                self.subscription_noticed = False
+            elif not self.subscription_noticed:
+                owner = self.get_user(self.owner_id) or await self.fetch_user(self.owner_id)
+                await owner.send(SIGN_IN_NOTICE, allowed_mentions=NO_MENTIONS)
+                self.subscription_noticed = True
+        except Exception as exc:  # A later tick retries.
+            LOG.warning('Owner sign-in notice pending: %s', type(exc).__name__)
 
     @tasks.loop(seconds=15)
     async def owner_reviews(self):
-        try:
-            await self.subscription_notice()
-        except Exception as exc:  # Retried next tick; never holds up reviews or usage delivery.
-            LOG.warning('Owner sign-in notice pending: %s', type(exc).__name__)
+        # Its own task: a rate-limited DM sleeps out Discord's retry_after, which must not hold up reviews or usage.
+        if self.sign_in_notice is None or self.sign_in_notice.done():
+            self.sign_in_notice = asyncio.create_task(self.subscription_notice())
         try:
             await self.flush_usage()
             await notify_owner(self)
@@ -738,6 +741,8 @@ class Fri(discord.Client):
             self.agent.close()
         self.health.cancel()
         self.owner_reviews.cancel()
+        if self.sign_in_notice:
+            self.sign_in_notice.cancel()
         await sessions(self).close_all()
         if self.session:
             await self.session.close()
