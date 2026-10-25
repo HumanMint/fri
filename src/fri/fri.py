@@ -842,6 +842,19 @@ class Fri(discord.Client):
             LOG.info('Member profiles: %d of %d configured channels are readable by everyone',
                      sum(server_wide(c) for c in channels), len(channels))
 
+    # With no message cache, Discord's deletes and edits arrive only as raw events.
+    async def on_raw_message_delete(self, payload):
+        if self.agent:
+            self.agent.unsend(payload.channel_id, [payload.message_id])
+
+    async def on_raw_bulk_message_delete(self, payload):
+        if self.agent:
+            self.agent.unsend(payload.channel_id, payload.message_ids)
+
+    async def on_raw_message_edit(self, payload):
+        if self.agent:
+            self.agent.edit(payload.channel_id, payload.message)
+
     async def on_message(self, message):
         if self.agent:
             try:
