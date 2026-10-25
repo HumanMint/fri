@@ -92,8 +92,14 @@ def control_cases():
 def catch_up_cases():
     from .fri_actions import CATCH_UP
     read = {'read_recent': {'channels': [{'channel_id': '555', 'name': 'general'}], 'default_channel_id': '555',
-        'limit': 20, 'max_age_days': 7, 'description': 'Read one small recent text batch when asked. No images.',
+        'limit': 20, 'max_age_days': 7, 'description': 'Read one small recent batch when asked: text, what each post '
+        'carries (image, gif, video, file), and a look at up to four of the newest still images.',
         'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
+    nearby = {'read_recent': {**read['read_recent'], 'limit': 12, 'max_age_days': 0.25,
+        'description': 'Read up to twelve preceding same-channel messages from the last six hours when this mention '
+        'needs nearby conversation, memes or images. Looks at up to four of the newest nearby still images.'}}
+    memes = [{'user_id': user, 'name': name, 'text': '', 'attachments': ['image'], 'at': at}
+             for user, name, at in (('202', 'Ash', 1792900000), ('303', 'Bo', 1792900300))]
     def row(user, name, at, text):
         return {'user_id': user, 'name': name, 'at': f'2026-10-19T{at}+00:00', 'text': text}
     missed = {'kind': 'read_recent', 'window': 'since_my_last_message', 'channel_id': '555', 'channel_name': 'general',
@@ -115,6 +121,9 @@ def catch_up_cases():
         {'name': 'catch_up_partial', 'text': 'fri what did i miss',
          'action_result': {**missed, 'stopped_at': 'message_limit', 'your_last_message_at': None},
          'expect': 'Short recap that says it only covers the latest stretch.'},
+        {'name': 'memes_above_reads_first', 'text': 'whats ur favorite meme out of the memes above',
+         'actions': nearby, 'recent': memes, 'expected_action': 'read_recent',
+         'expect': 'read_recent to look at the memes, unasked. Never asks for a resend.'},
     ]
 
 

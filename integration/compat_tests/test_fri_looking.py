@@ -378,3 +378,12 @@ def test_time_is_measured_from_the_ping(monkeypatch, tmp_path):
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_the_controls_suite_expects_a_read_before_judging_memes():
+    async def run(result):
+        return {case['name']: case.get('passed') async for case, _ in evaluate(Scripted({
+            'whats ur favorite meme out of the memes above': result}), 'gpt-6.1-sol', 'high', suite='controls')}
+    read = ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': '555', 'window': 'recent'})
+    assert asyncio.run(run(read))['memes_above_reads_first'] is True
+    assert asyncio.run(run('resend them and i’ll pick'))['memes_above_reads_first'] is False
