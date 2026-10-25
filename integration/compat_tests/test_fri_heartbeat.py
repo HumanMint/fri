@@ -73,6 +73,36 @@ def test_disabled_stages_do_not_run_or_report(heartbeat, monkeypatch):
     assert 'memes' not in agent.stages and agent.heartbeat_status == 'ok'
 
 
+def test_reply_checks_run_as_their_own_stage(heartbeat, monkeypatch):
+    agent, check = heartbeat.agent, AsyncMock(side_effect=RuntimeError('unexpected'))
+    monkeypatch.setattr('fri.fri_reply_checks.check', check)
+    heartbeat.fri.capabilities = frozenset({'reply-checks'})
+    monkeypatch.setitem(STATE, 'config', {**STATE['config'], 'reply_check_enabled': True})
+    agent.check_memes.side_effect = KeyError('meme')
+    asyncio.run(agent.heartbeat.coro(agent))
+    check.assert_awaited_once_with(agent)  # A broken meme check no longer skips it.
+    assert agent.stages['reply_checks']['error'] == 'RuntimeError' and agent.stages['memes']['error'] == 'KeyError'
+    agent.check_memes.side_effect = check.side_effect = None
+    asyncio.run(agent.heartbeat.coro(agent))
+    assert agent.heartbeat_status == 'ok' and agent.stages['reply_checks']['error'] is None
+    heartbeat.fri.capabilities = frozenset()  # The controller refused reply checks or predates them.
+    asyncio.run(agent.heartbeat.coro(agent))
+    assert check.await_count == 2 and 'reply_checks' not in agent.stages
+
+
+def test_a_controller_without_reply_check_settings_still_runs_every_stage(heartbeat, monkeypatch):
+    agent = heartbeat.agent
+    check = AsyncMock()
+    monkeypatch.setattr('fri.fri_reply_checks.check', check)
+    heartbeat.fri.capabilities = frozenset({'reply-checks'})
+    config = {k: v for k, v in STATE['config'].items() if not k.startswith('reply_check')}
+    monkeypatch.setitem(STATE, 'config', config)
+    asyncio.run(agent.heartbeat.coro(agent))
+    check.assert_not_awaited()
+    assert agent.heartbeat_status == 'ok' and 'reply_checks' not in agent.stages
+    agent.check_memes.assert_awaited_once()
+
+
 @pytest.mark.parametrize('stage', ['state', 'memes'])
 def test_unexpected_errors_never_end_the_heartbeat_loop(heartbeat, stage):
     agent = heartbeat.agent
@@ -176,6 +206,7 @@ def test_sign_in_notice_runs_beside_reviews_and_usage(monkeypatch):
         assert fri.subscription_noticed
         fri.flush_usage.side_effect = OSError('read-only usage folder')
         await Fri.owner_reviews.coro(fri)  # Logged and retried next tick instead of ending the loop.
+        assert notify.await_count == 4  # A stuck usage folder doesn't hold back owner reviews either.
     asyncio.run(scenario())
 
 

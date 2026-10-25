@@ -39,7 +39,7 @@ def valid(value, schema):
     return False
 
 
-async def analyze(chat, instruction, data, model, effort, schema, *, images=()):
+async def analyze(chat, instruction, data, model, effort, schema, *, images=(), headers=None):
     counters, parts, status = {}, {}, 'interrupted'
     try:
         content = json.dumps(data)
@@ -52,7 +52,8 @@ async def analyze(chat, instruction, data, model, effort, schema, *, images=()):
                    'text': {'format': {'type': 'json_schema', 'name': 'fri_internal', 'strict': True, 'schema': schema}}}
         async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=20), trust_env=False,
                                      transport=chat.transport) as client:
-            async with client.stream('POST', RESOURCE+'/responses', json=payload, headers=await chat.headers()) as response:
+            async with client.stream('POST', RESOURCE+'/responses', json=payload,
+                                     headers=headers or await chat.headers()) as response:
                 response.raise_for_status()
                 async for event in events(response.aiter_lines()):
                     key = (event.get('output_index', 0), event.get('content_index', 0))

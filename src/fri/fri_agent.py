@@ -137,10 +137,13 @@ class Agent:
     def close(self):
         self.heartbeat.cancel()
 
-    async def record(self, role, model, effort, counters, status):
+    async def record(self, role, model, effort, counters, status, purpose=None, deliver=True):
         attempt = uuid.uuid4().hex
         private_json(self.fri.data/'usage'/(attempt+'.json'), {'attempt_id': attempt,
-            'role': role, 'model': model, 'effort': effort, 'status': status, 'counters': counters})
+            'role': role, 'model': model, 'effort': effort, 'status': status, 'counters': counters,
+            **({'purpose': purpose} if purpose else {})})
+        if not deliver:
+            return  # The owner review loop delivers it.
         try:
             await self.fri.flush_usage()
         except commands.UserFeedbackCheckFailure:
@@ -251,12 +254,25 @@ class Agent:
         if usage_requested(text):
             return False  # Keep reports in the normal attributed conversation and privacy flow.
         lower = text.lower()
+        if (re.search(r'\breply checks?\b', lower) and re.search(r'\b(show|list|how|what|any|summary|summari[sz]e)\b', lower)
+                and not re.search(r'\b(enable|disable|turn|pause|resume|set|change|stop|start|adjust)\b', lower)):
+            if message.guild:  # Findings are abstract, but they're still about members.
+                await message.reply('dm me for that one.', allowed_mentions=NO_MENTIONS)
+                return True
+            from .fri_reply_checks import describe
+            try:
+                overview = await self.fri.api('POST', '/agent/reply-checks/overview', self.identity(message.author.id))
+            except commands.UserFeedbackCheckFailure:
+                await message.reply('i couldn’t load reply checks right now.', allowed_mentions=NO_MENTIONS)
+                return True
+            await message.reply(describe(overview), allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+            return True
         if re.search(r'\b(refresh|update)\b.*\bmodels?\b', lower):
             catalog = await self.fri.chat.models()
             await self.fri.api('POST', '/chat/models/update', {**self.identity(message.author.id), 'models': catalog})
             await message.reply('available subscription models: '+', '.join(catalog)+'. selected models were kept.', allowed_mentions=NO_MENTIONS)
             return True
-        subject = re.search(r'\b(settings?|heartbeat|personality|system prompt|learning|learn|tone|voice|sarcasm|playful|cooldown|summary|summaries|model|memes?|reactions?|status|presence)\b', lower)
+        subject = re.search(r'\b(settings?|heartbeat|personality|system prompt|learning|learn|tone|voice|sarcasm|playful|cooldown|summary|summaries|model|memes?|reactions?|status|presence|reply checks?)\b', lower)
         inspect = re.search(r'\b(show|list|current)\b.*\b(settings?|configuration|models?|\w+ notes|system prompt)\b|\bhow (often|far)\b', lower)
         change = re.search(r'\b(change|set|adjust|tune|tweak|pause|stop|resume|enable|disable|make|use|be|sound|speak|respond)\b', lower)
         if not subject or not (inspect or change):
@@ -823,11 +839,12 @@ class Agent:
             self.memes = Memes(self)
         await self.memes.check()
 
-    async def stage(self, name, step, *switches):
+    async def stage(self, name, step, *switches, when=None):
         """One heartbeat stage. A failure is logged by class and recorded, and never skips later stages."""
         now = time.time()
         try:
-            if not all(self.config[key] for key in switches):
+            # Older controllers send no reply_check_* settings; a missing switch is off.
+            if not all(self.config.get(key) for key in switches) or (when and not when()):
                 self.stages.pop(name, None)
                 return True
             await step()
@@ -848,6 +865,8 @@ class Agent:
             self.heartbeat_status = 'deferred'
             LOG.warning('Fri heartbeat deferred: %s; no authority or approval inferred', type(exc).__name__)
         else:
+            from .fri_reply_checks import CAPABILITY
+            from .fri_reply_checks import check as check_replies
             from .fri_social import deliver_one as deliver_reminder
             from .fri_workspace import deliver_one as deliver_post
             # An undeliverable owner report or a broken meme check must not silence attention.
@@ -857,7 +876,9 @@ class Agent:
                        await self.stage('reports', self.send_reports),
                        await self.stage('learning', self.learn, 'enabled'),
                        await self.stage('attention', self.attend, 'enabled'),
-                       await self.stage('memes', self.check_memes, 'enabled', 'meme_enabled')]
+                       await self.stage('memes', self.check_memes, 'enabled', 'meme_enabled'),
+                       await self.stage('reply_checks', lambda: check_replies(self), 'enabled', 'reply_check_enabled',
+                                        when=lambda: CAPABILITY in self.fri.capabilities)]
             self.heartbeat_status = 'ok' if all(results) else 'deferred'
         finally:
             self.heartbeat_finished = time.time()

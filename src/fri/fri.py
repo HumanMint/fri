@@ -135,11 +135,14 @@ class Fri(discord.Client):
         self.sign_in_notice = None
         self.session = None
         self.agent = None
+        self.capabilities = frozenset()
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        if not compatible(await self.api('GET', '/fri/contract')):
+        contract = await self.api('GET', '/fri/contract')
+        if not compatible(contract):
             raise RuntimeError('unsupported gene controller contract; fri did not start')
+        self.capabilities = frozenset(contract['capabilities'])
         from .fri_agent import Agent
         self.agent = Agent(self)
         await self.agent.start()
@@ -700,11 +703,15 @@ class Fri(discord.Client):
         # Its own task: a rate-limited DM sleeps out Discord's retry_after, which must not hold up reviews or usage.
         if self.sign_in_notice is None or self.sign_in_notice.done():
             self.sign_in_notice = asyncio.create_task(self.subscription_notice())
+        # Separate, so one undeliverable usage receipt can't hold back owner notifications.
         try:
             await self.flush_usage()
-            await notify_owner(self)
         except Exception as exc:  # Like the heartbeat, a bad tick never ends the loop.
-            LOG.warning('Owner notification or usage delivery pending: %s', type(exc).__name__)
+            LOG.warning('Usage delivery pending: %s', type(exc).__name__)
+        try:
+            await notify_owner(self)
+        except Exception as exc:
+            LOG.warning('Owner notification pending: %s', type(exc).__name__)
 
     @owner_reviews.before_loop
     async def before_reviews(self):

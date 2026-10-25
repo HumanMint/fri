@@ -85,6 +85,36 @@ def control_cases():
         {'name': 'web_later_sources', 'text': 'where did you find that, source?', 'web_research': [research],
          'actions': {**search, 'web_sources': {'description': 'Retrieve saved public sources; query="" selects latest.'}},
          'expect': 'web_sources with empty or exact saved query. No fresh search or hidden reasoning.'},
+        *catch_up_cases(),
+    ]
+
+
+def catch_up_cases():
+    from .fri_actions import CATCH_UP
+    read = {'read_recent': {'channels': [{'channel_id': '555', 'name': 'general'}], 'default_channel_id': '555',
+        'limit': 20, 'max_age_days': 7, 'description': 'Read one small recent text batch when asked. No images.',
+        'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
+    def row(user, name, at, text):
+        return {'user_id': user, 'name': name, 'at': f'2026-10-19T{at}+00:00', 'text': text}
+    missed = {'kind': 'read_recent', 'window': 'since_my_last_message', 'channel_id': '555', 'channel_name': 'general',
+        'scanned': 7, 'stopped_at': 'your_last_message', 'your_last_message_at': '2026-10-19T09:12+00:00',
+        'outcome': 'completed', 'messages': [
+            row(202, 'Ash', '11:40', 'found a modpack that actually runs on the vps'),
+            row(303, 'Bo', '11:42', 'lag again'), row(303, 'Bo', '11:43', 'not my fault btw'),
+            row(202, 'Ash', '12:05', 'movie night friday? 9pm'), row(303, 'Bo', '12:06', 'down')]}
+    return [
+        {'name': 'catch_up_choice', 'text': 'fri what did i miss', 'actions': read,
+         'expect': 'read_recent on 555 with window=since_my_last_message. No guessing without the read.'},
+        {'name': 'look_around_stays_recent', 'text': 'fri whats everyone talking about rn', 'actions': read,
+         'expect': 'read_recent with window=recent, not a catch-up.'},
+        {'name': 'catch_up_recap', 'text': 'fri what did i miss', 'action_result': missed,
+         'expect': 'A couple of short lines: the modpack, Bo blaming lag, Friday 9pm movie night, attributed to '
+                   'Ash and Bo, with a jab riding along. No message-by-message list or invented events.'},
+        {'name': 'catch_up_nothing', 'text': 'fri catch me up', 'action_result': {**missed, 'messages': [], 'scanned': 2},
+         'expect': 'Nothing happened, said deadpan in one line. No invented events.'},
+        {'name': 'catch_up_partial', 'text': 'fri what did i miss',
+         'action_result': {**missed, 'stopped_at': 'message_limit', 'your_last_message_at': None},
+         'expect': 'Short recap that says it only covers the latest stretch.'},
     ]
 
 
