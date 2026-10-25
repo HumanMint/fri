@@ -994,6 +994,8 @@ class Agent:
                     await self.respond(message, message.content[:4000], ambient=True)
 
     async def investigate(self, channel, record):
+        # Watches what it files, so a shipped fix gets one line under the error.
+        from .fri_fixes import follow
         source_channel = self.fri.get_channel(channel)
         if not source_channel or source_channel.guild.id != self.fri.guild_id or not self.allowed(source_channel):
             return
@@ -1026,12 +1028,14 @@ class Agent:
                 repair = {'accepted': False}  # Definite refusal still gets the normal owner review.
             if repair.get('accepted'):
                 self.last_spoke[channel] = time.time()
+                await follow(self, channel, record['id'], repair)
                 return
-        await self.fri.api('POST', '/requests', {**self.identity(self.fri.user.id),
+        job = await self.fri.api('POST', '/requests', {**self.identity(self.fri.user.id),
             'source_id': 'gene-error:'+record['id'], 'channel_id': str(parent),
             'source_url': f'https://discord.com/channels/{self.fri.guild_id}/{channel}/{record["id"]}',
             'body': body})
         self.last_spoke[channel] = time.time()
+        await follow(self, channel, record['id'], job)
 
     async def check_presence(self):
         if self.config.get('status_enabled') or self.presence:
@@ -1072,6 +1076,7 @@ class Agent:
             self.heartbeat_status = 'deferred'
             LOG.warning('Fri heartbeat deferred: %s; no authority or approval inferred', type(exc).__name__)
         else:
+            from .fri_fixes import check as check_fixes
             from .fri_reply_checks import CAPABILITY
             from .fri_reply_checks import check as check_replies
             from .fri_social import deliver_one as deliver_reminder
@@ -1083,6 +1088,7 @@ class Agent:
                        await self.stage('reports', self.send_reports),
                        await self.stage('learning', self.learn, 'enabled'),
                        await self.stage('attention', self.attend, 'enabled'),
+                       await self.stage('fixes', lambda: check_fixes(self), 'enabled'),
                        await self.stage('memes', self.check_memes, 'enabled', 'meme_enabled'),
                        await self.stage('reply_checks', lambda: check_replies(self), 'enabled', 'reply_check_enabled',
                                         when=lambda: CAPABILITY in self.fri.capabilities)]
