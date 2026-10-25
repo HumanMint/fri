@@ -24,6 +24,7 @@ CONTEXT_CHANGED = 'things changed while i was typing. ping me again and i’ll c
 NOTICES = {'stale event': 'took me too long on that one. ping me again if you still need me.',
            'message changed': 'you edited that before i could answer. ping me again with the new version.',
            'nearby message changed': CONTEXT_CHANGED, 'nearby privacy changed': CONTEXT_CHANGED,
+           'image changed': CONTEXT_CHANGED,
            'check failed: ControllerRejected': CONTEXT_CHANGED}
 GLITCH = 'that one glitched on my end. ping me again.'
 
@@ -60,12 +61,20 @@ class Invitation:
                       'channel_id': str(message.channel.id), 'conversation_id': f'public:{message.channel.id}'}
         self.grant = None
         self.rows, self.events, self.profiles, self.snapshots = [], {}, {}, {}
-        self.image = None
+        self.image = None  # The one image post it inspects, snapshotted as chosen (see current).
         self.ambiguous_images = False
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
         self.fetched = {}  # Message ID: Discord's copy as the last passing check read it.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
         self.revision = None  # The author's privacy revision as Fri first read it for this ping.
+
+    @property
+    def image(self):
+        return self._image
+
+    @image.setter
+    def image(self, message):
+        self._image, self.image_snapshot = message, fingerprint(message) if message is not None else None
 
     @classmethod
     async def create(cls, agent, message):
@@ -136,24 +145,30 @@ class Invitation:
                 return self.refuse('stale event')
             if age < -5:
                 return self.refuse('clock skew')
-            evidence = check_evidence and self.grant
-            allowed, fetched = await self.access(control=control, messages=[
-                self.event.id, *(self.events if evidence else ())])
+            allowed, fetched = await self.access(control=control, messages=[self.event.id])
             if not allowed:
                 return False
             current = settled(fetched[self.event.id])
             if (current.id != self.event.id or current.author.bot or current.webhook_id or
                     fingerprint(current) != self.original or not explicit_mention(current, self.fri.user.id)):
                 return self.refuse('message changed')
-            if evidence:
-                # After the Discord reads, so an erasure during them still counts.
+            if check_evidence and self.grant:
+                # After the reads above, so an erasure during them still counts.
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
+                # After the privacy read, so a delete during it still shows: the nearby messages, and an
+                # image post that isn't one of them or the ping (e.g. their photo just before it).
+                image = self.image if self.image is not None and self.image.id != self.event.id and (
+                    self.image.id not in self.events) else None
+                later = [*self.events, *([image.id] if image else [])]
+                fetched.update(zip(later, await together(*(self.event.channel.fetch_message(mid) for mid in later))))
                 for mid in self.events:
                     nearby = settled(fetched[mid])
                     if nearby.webhook_id or nearby.author.bot or fingerprint(nearby) != self.snapshots[mid]:
                         return self.refuse('nearby message changed')
+                if image and fingerprint(settled(fetched[image.id])) != self.image_snapshot:
+                    return self.refuse('image changed')
             self.fetched = {mid: settled(message) for mid, message in fetched.items()}
             return True
         except ControllerUnavailable:

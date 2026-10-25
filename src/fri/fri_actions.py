@@ -233,7 +233,7 @@ class Actions:
             if not await unchanged(self.agent, self.event, self.conversation):
                 return {'blocked': 'The conversation evidence changed. Send a fresh request.'}
         from .fri_images import require_current
-        await require_current(self.image_context, self.event, checked=bool(self.invitation))
+        await require_current(self.image_context, self.event)  # Fresh: the conversation check above awaited.
         channels = await self.channels(fresh=True)
         kind = action.get('kind')
         if not channels:
@@ -559,7 +559,8 @@ class Actions:
 
         With outage, a controller that can't be reached raises instead, so a caller with no receipt to
         keep gives the fixed outage notice rather than an access error. `sending`: only checks before
-        delivery follow, and those cover the ping and the image (see Fri.talk), so they aren't repeated."""
+        delivery follow, and a ping's last one covers it and its image (see Fri.talk), so those two parts
+        aren't repeated for a ping."""
         try:
             if self.invitation and not sending:
                 if not await self.invitation.current():
@@ -571,7 +572,7 @@ class Actions:
                 if not await unchanged(self.agent, self.event, self.conversation):
                     return False
             from .fri_images import unchanged
-            if not sending and not await unchanged(self.image_context, self.event):
+            if not (sending and self.invitation) and not await unchanged(self.image_context, self.event):
                 return False
             channels = await self.channels(fresh=True)
             if not channels or not self.sources <= set(channels):

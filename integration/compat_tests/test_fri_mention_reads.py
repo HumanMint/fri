@@ -56,8 +56,9 @@ def counted_environment(monkeypatch, tmp_path):
 
 BEFORE = {'plain': (13, 5), 'image': (17, 5), 'image and tool': (17, 5)}
 # After the model: one round for the ping's last check, which covers its image. The tool adds its own
-# check before acting, its read, and one before the model hears the turn again.
-AFTER = {'plain': (5, 1), 'image': (5, 1), 'image and tool': (33, 9)}
+# checks before acting (the ping's, then the image's after the conversation read), its read, and one
+# before the model hears the turn again.
+AFTER = {'plain': (5, 1), 'image': (5, 1), 'image and tool': (38, 10)}
 
 
 @pytest.mark.parametrize('case', ['plain', 'image', 'image and tool'])

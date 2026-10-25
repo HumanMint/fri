@@ -1211,8 +1211,7 @@ def test_a_stale_cached_row_does_not_drop_a_message_sent_after_the_erasure(monke
 @pytest.mark.parametrize('channel_id,erasure', [(1, 'local'), (8, 'local'), (8, 'gene')])
 def test_an_erasure_during_a_pings_last_checks_stops_the_reply(monkeypatch, tmp_path, caplog, channel_id, erasure):
     # Fri's own last Discord look, after talk's checks: the ping in a configured channel, where Gene's
-    # grant fence catches its own erasures, and a nearby message outside one. Outside, that look comes
-    # before the grant's privacy read, so Gene's erasure there fails the grant; a local one is caught last.
+    # grant fence catches its own erasures, and a nearby message outside one.
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=channel_id)
@@ -1238,8 +1237,7 @@ def test_an_erasure_during_a_pings_last_checks_stops_the_reply(monkeypatch, tmp_
             assert seen
             event.reply.assert_not_awaited()
             assert not any(path == '/chat/turn' for path, _ in calls)
-            reason = 'reply withheld: check failed: ControllerRejected' if erasure == 'gene' else 'author privacy changed'
-            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: {reason}']
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
         finally:
             await fri.close()
     asyncio.run(scenario())
