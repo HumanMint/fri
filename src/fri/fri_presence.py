@@ -92,7 +92,8 @@ class Presence:
         self.receipt = {k: state[k] for k in ('next_generation', 'last_sent', 'last_result')}
 
     def enabled(self):
-        return self.agent.config['enabled'] and self.agent.config['status_enabled'] and self.fri.status == discord.Status.online
+        config = self.agent.config  # A switch the controller doesn't send is off.
+        return config.get('enabled') and config.get('status_enabled') and self.fri.status == discord.Status.online
 
     def readable(self, channel):
         if (not isinstance(channel, discord.TextChannel) or channel.guild.id != self.fri.guild_id

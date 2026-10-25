@@ -225,7 +225,8 @@ def test_reply_check_usage_survives_a_paired_rollback(controller, tmp_path, monk
     import fri.fri as fri_module
     notify = AsyncMock()
     monkeypatch.setattr(fri_module, 'notify_owner', notify)
-    stuck = SimpleNamespace(flush_usage=AsyncMock(side_effect=commands.UserFeedbackCheckFailure('rejected')))
+    stuck = SimpleNamespace(flush_usage=AsyncMock(side_effect=commands.UserFeedbackCheckFailure('rejected')),
+                            sign_in_notice=None, subscription_notice=AsyncMock())
     asyncio.run(Fri.owner_reviews.coro(stuck))  # Any stuck receipt still leaves owner notices running.
     notify.assert_awaited_once_with(stuck)
 
