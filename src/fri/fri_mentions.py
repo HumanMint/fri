@@ -124,13 +124,14 @@ class Invitation:
                     fingerprint(current) != self.original or not explicit_mention(current, self.fri.user.id)):
                 return self.refuse('message changed')
             if check_evidence and self.grant:
-                profiles = await self.profile_sources(list(self.events.values()))
-                if any(profiles.get(user) != before for user, before in self.profiles.items()):
-                    return self.refuse('nearby privacy changed')
                 for mid, event in self.events.items():
                     current = await self.event.channel.fetch_message(mid)
                     if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
                         return self.refuse('nearby message changed')
+                # Last, after every Discord wait, so an opt-out during the refetches above still counts.
+                profiles = await self.profile_sources(list(self.events.values()))
+                if any(profiles.get(user) != before for user, before in self.profiles.items()):
+                    return self.refuse('nearby privacy changed')
             return True
         except ControllerUnavailable:
             raise  # Nothing changed; the controller is down, and the caller's outage handling says so.

@@ -358,6 +358,10 @@ class Fri(discord.Client):
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
             if fence:  # Checked again before delivery.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
+            # The DM switch again, with nothing to wait on between it and the request: the checks above
+            # wait on Discord and Gene, and the owner can turn DMs off meanwhile.
+            if fence and fence.get('dms') and not fence['dms']():
+                raise GateClosed('dms off')
         result = await self.chat.respond(text, context, ready=ready)
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
@@ -546,6 +550,7 @@ class Fri(discord.Client):
                         if not self.agent.config['support_dms']:
                             raise GateClosed('dms off')
                     context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
+                    context['fence']['dms'] = lambda: self.agent.config['support_dms']
                 result = await self.chat_once(text, context)
                 if invitation:
                     await invitation.require_current()
