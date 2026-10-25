@@ -1773,12 +1773,13 @@ def test_a_bursts_notice_goes_to_a_ping_that_still_stands(monkeypatch, tmp_path,
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('kind', ['by name', 'ping', 'dm'])
+@pytest.mark.parametrize('kind', ['by name', 'ping', 'outside ping', 'dm'])
 def test_a_message_whose_arrival_read_spans_their_forget_me_never_reaches_the_model(monkeypatch, tmp_path, caplog, kind):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
-        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
-        event = message(('<@99> ' if kind == 'ping' else 'fri ')+'remember the private marker')
+        channel_id = 8 if kind == 'outside ping' else 1
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message(('<@99> ' if 'ping' in kind else 'fri ')+'remember the private marker')
         if kind == 'dm':
             agent.config['support_dms'] = True
             agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
@@ -1801,8 +1802,8 @@ def test_a_message_whose_arrival_read_spans_their_forget_me_never_reaches_the_mo
             event.reply.assert_not_awaited()
             assert not any(row['id'] == str(event.id) for rows in agent.recent.values() for row in rows)
             assert not any(path == '/chat/turn' for path, _ in calls)
-            if kind == 'ping':
-                assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
+            if 'ping' in kind:
+                assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
         finally:
             await fri.close()
     asyncio.run(scenario())

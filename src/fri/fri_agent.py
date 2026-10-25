@@ -842,6 +842,8 @@ class Agent:
             from .fri_mentions import Invitation
             invitation = await Invitation.create(self, message)
             if invitation and await self.incoming(message, invitation, self.fri.workshop_id, forgotten) is not None:
+                if self.forgotten.get(message.author.id, 0) != forgotten:
+                    return self.miss(message, 'author privacy changed')  # During that read, as below.
                 await self.respond(message, await addressed_text(message, self.fri.user.id), invitation=invitation,
                                    forgotten=forgotten, revision=invitation.revision)
             return
