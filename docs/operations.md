@@ -155,17 +155,21 @@ advertises it, so the controller must be released first.
   attention.
 - **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
   research) goes through `privacy.model_json`. Letters, marks, numbers, punctuation and symbols
-  arrive as written, so an emoji is one character instead of a 12-character `\u` escape.
-  Everything else stays escaped exactly as before: controls, format and invisible characters
-  (bidi overrides, zero-width characters, tag characters), non-ASCII spaces (their widths differ,
-  so a gap could carry bits), line separators, surrogates, private-use and unassigned code points,
-  invisible letters and marks, blank or zero-width symbols such as U+2800 and U+FFFC, and every
-  variation selector, even an emoji's own U+FE0F: 👍 and 👍️ look the same, so selector presence
-  could otherwise spell hidden bits. `json.dumps` still does the traversal, key conversion and
-  errors. To compare against the old escaping, run `python -m fri.fri_eval --suite model-text`
-  with and without `--baseline` (same cases and settings, model-graded: boundaries, attribution,
-  tone and non-English text). The baseline escapes only Fri's own input; the grader reads both runs
-  the same way. A case whose reply fails, or whose grade fails or is missing, fails the run.
+  arrive as written, so an emoji is one character instead of a 12-character `\u` escape. Everything
+  else stays escaped exactly as before: controls, format and invisible characters (bidi overrides,
+  zero-width characters, tag characters), non-ASCII spaces (their widths differ, so a gap could
+  carry bits), line separators, surrogates, private-use and unassigned code points, invisible
+  letters and marks, blank or zero-width symbols such as U+2800 and U+FFFC, and every variation
+  selector, even an emoji's own U+FE0F: 👍 and 👍️ look the same, so selector presence could otherwise
+  spell hidden bits. For the same reason a combining mark (or Hangul vowel or final jamo) stays
+  escaped when it repeats one already on its character or leaves the character unnormalized: x with
+  one shadda or two, é composed or not, and marks in either order look alike. `json.dumps` still
+  does the traversal, key conversion and errors. To compare against the old escaping, run `python -m
+  fri.fri_eval --suite model-text` with and without `--baseline` (same cases and settings,
+  model-graded: boundaries, attribution, tone, non-English text and hidden carriers). The baseline
+  escapes all of Fri's own model input, internal tasks such as image selection included; the graders
+  pin `privacy.model_json`, so they read both runs the same way. A case whose reply fails, or whose
+  grade fails, fails the run.
 
 ## Members' own requests
 

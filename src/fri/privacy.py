@@ -49,18 +49,38 @@ INVISIBLE = re.compile('[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u2800
                        '\ufe00-\ufe0f\ufffc\U00013441\U00013442\U00016fe4\U0001d159\U0001da7f\U0001da80'
                        '\U000e0100-\U000e01ef]')
 NOT_PRINTABLE_ASCII = re.compile(r'[^\x20-\x7e]')
+CONJOINING = re.compile('[\u1160-\u11ff\ud7b0-\ud7ff]')  # Hangul vowel and final jamo join the syllable before.
 
 
 def visible(char):
     return unicodedata.category(char)[0] in 'LMNPS' and not INVISIBLE.match(char)
 
 
+def joins(char):
+    return unicodedata.category(char)[0] == 'M' or bool(CONJOINING.match(char))
+
+
+def redundant(text, index):
+    """A mark (or conjoining jamo) that repeats one already on its character, or leaves the character
+    unnormalized, draws nothing new: x with one shadda or two, é composed or not, and marks in either
+    order look alike, so the difference could carry hidden bits."""
+    char = text[index]
+    if not joins(char):
+        return False
+    start = index
+    while start and joins(text[start-1]):
+        start -= 1
+    earlier = text[start:index]
+    return char in earlier or not unicodedata.is_normalized('NFC', text[max(start-1, 0):index+1])
+
+
 def model_json(value):
     """JSON for model input with visible text as written: emoji, curly quotes and non-English letters
     stay raw instead of becoming \\u escapes. Controls, format and invisible characters (bidi, zero-width,
-    tags, variation selectors), non-ASCII spaces, line separators, surrogates, private-use and
-    unassigned code points stay escaped. json.dumps does the traversal, key conversion and errors, and
+    tags, variation selectors), non-ASCII spaces, repeated or unnormalized combining marks, line
+    separators, surrogates, private-use and unassigned code points stay escaped. json.dumps does the traversal, key conversion and errors, and
     its output keeps every non-ASCII character inside a string, so ASCII-only output is exactly
     json.dumps'."""
-    return NOT_PRINTABLE_ASCII.sub(lambda match: match.group() if visible(match.group()) else
-                                   json.dumps(match.group())[1:-1], json.dumps(value, ensure_ascii=False))
+    text = json.dumps(value, ensure_ascii=False)
+    return NOT_PRINTABLE_ASCII.sub(lambda match: match.group() if visible(match.group()) and not
+                                   redundant(text, match.start()) else json.dumps(match.group())[1:-1], text)

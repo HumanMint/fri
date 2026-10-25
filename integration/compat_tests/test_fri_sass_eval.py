@@ -28,7 +28,8 @@ def grader(monkeypatch):
     """Stands in for the model grader: fails replies listed in grader.fails, records what it was shown."""
     seen, fails = [], set()
 
-    async def analyze(chat, instruction, data, model, effort, schema):
+    async def analyze(chat, instruction, data, model, effort, schema, encode=None):
+        assert encode is privacy.model_json  # Pinned, so a baseline run is graded the same way.
         seen.append(data)
         if data['fri_reply'] == 'grader down':
             return {}, {}, 'failed'
@@ -131,11 +132,10 @@ def test_every_model_text_case_is_graded_and_the_baseline_escapes_all_input(grad
     for module in (fri_agent_model, fri_chat, fri_web):
         monkeypatch.setattr(module, 'model_json', module.model_json)  # Restored after the test.
     fri_eval.ascii_baseline()
-    assert all(module.model_json is fri_eval.json.dumps for module in (fri_chat, fri_web))
-    assert fri_agent_model.model_json is privacy.model_json  # The graders' analyze().
+    assert all(module.model_json is fri_eval.json.dumps for module in (fri_agent_model, fri_chat, fri_web))
 
 
-def test_the_grader_reads_a_baseline_run_the_same_way(monkeypatch):
+def test_a_baseline_run_escapes_fri_internal_tasks_but_not_the_grader(monkeypatch):
     sent = []
     def handler(request):
         sent.append(json.loads(request.content)['input'][0]['content'])
@@ -147,10 +147,16 @@ def test_the_grader_reads_a_baseline_run_the_same_way(monkeypatch):
     from fri import fri_agent_model, fri_chat, fri_web
     for module in (fri_agent_model, fri_chat, fri_web):
         monkeypatch.setattr(module, 'model_json', module.model_json)
-    graded = asyncio.run(fri_eval.grade(chat, 'gpt-6.1-sol', 'high', case, reply))
+    subject = {'request': '猫の画像ちょうだい'}  # Image selection runs on analyze() too.
+    async def both():
+        graded = await fri_eval.grade(chat, 'gpt-6.1-sol', 'high', case, reply)
+        await fri_agent_model.analyze(chat, 'Pick the subject.', subject, 'gpt-6-luna', 'low', fri_eval.GRADE)
+        return graded
+    graded = asyncio.run(both())
     fri_eval.ascii_baseline()
-    assert asyncio.run(fri_eval.grade(chat, 'gpt-6.1-sol', 'high', case, reply))[0]['passed'] is graded[0]['passed'] is True
-    assert sent[0] == sent[1] and '알았어' in sent[0]
+    assert asyncio.run(both())[0]['passed'] is graded[0]['passed'] is True
+    assert sent[0] == sent[2] and '알았어' in sent[0]  # The grader reads both runs the same way.
+    assert sent[1] == json.dumps(subject, ensure_ascii=False) and sent[3] == json.dumps(subject)
 
 
 UNSUCCESSFUL = ('failed', 'incomplete', 'interrupted', 'invalid_output')

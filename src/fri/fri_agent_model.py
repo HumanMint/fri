@@ -40,10 +40,10 @@ def valid(value, schema):
     return False
 
 
-async def analyze(chat, instruction, data, model, effort, schema, *, images=(), headers=None):
+async def analyze(chat, instruction, data, model, effort, schema, *, images=(), headers=None, encode=None):
     counters, parts, status = {}, {}, 'interrupted'
     try:
-        content = model_json(data)
+        content = (encode or model_json)(data)  # Eval graders pin theirs, so a baseline run changes only Fri's.
         if images:
             content = [{'type': 'input_text', 'text': content}] + [
                 {'type': 'input_image', 'image_url': image, 'detail': 'auto'} for image in images]
