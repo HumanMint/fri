@@ -1,6 +1,7 @@
 """Discord harness for Fri's scoped conversations, heartbeat and owner controls."""
 
 import asyncio
+import copy
 import datetime as dt
 import io
 import json
@@ -652,11 +653,25 @@ class Agent:
             return None
         if not self.allowed(message.channel):
             return 'channel no longer configured'
-        if not invitation:
-            permissions = member and message.channel.permissions_for(member)
-            if not (permissions and permissions.view_channel and permissions.read_message_history):
-                return 'member changed'
+        if not invitation and not (member and await self.can_read(message, member)):
+            return 'member changed'
         return None
+
+    async def can_read(self, message, member):
+        """Whether `member` can read the message's channel now, from fetched overwrites and roles: the
+        cached channel can lag (see Invitation.access)."""
+        guild = message.guild
+        try:
+            channel = await guild.fetch_channel(message.channel.id)
+            parent = await guild.fetch_channel(channel.parent_id) if isinstance(channel, discord.Thread) else channel
+            fresh = copy.copy(guild)
+            fresh._roles = {role.id: role for role in await guild.fetch_roles()}
+        except discord.HTTPException:
+            return False
+        parent = copy.copy(parent)
+        parent.guild = fresh
+        permissions = parent.permissions_for(member)
+        return permissions.view_channel and permissions.read_message_history
 
     async def unreadable(self, message, events, exc, invitation, forgotten):
         """A message whose author's privacy revision couldn't be read as it came in, other than in an

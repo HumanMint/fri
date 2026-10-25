@@ -1785,7 +1785,7 @@ def test_a_dm_privacy_control_that_waited_for_another_needs_a_current_member(mon
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('change', ['stays', 'disabled', 'unconfigured', 'left', 'access lost'])
+@pytest.mark.parametrize('change', ['stays', 'disabled', 'unconfigured', 'left', 'access lost', 'overwrites'])
 def test_a_queued_message_needs_fri_on_and_its_channel_still_configured(monkeypatch, tmp_path, change):
     async def scenario():
         fri, agent, _, controller, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
@@ -1810,6 +1810,11 @@ def test_a_queued_message_needs_fri_on_and_its_channel_still_configured(monkeypa
                 elif change == 'access lost':  # Fri still sees the channel; they no longer do.
                     channel.permissions_for = lambda who: (discord.Permissions.all() if who.id == 99 else
                                                            discord.Permissions.none())
+                elif change == 'overwrites':  # The same, seen only in the channel as fetched now.
+                    denied = copy.copy(channel)
+                    denied.permissions_for = lambda who: (discord.Permissions.all() if who.id == 99 else
+                                                          discord.Permissions.none())
+                    channel.guild.fetch_channel.return_value = denied
                 fri.busy.discard(20)
                 await asyncio.wait_for(task, 5)
             texts = [item.args[0] for item in event.reply.await_args_list]
