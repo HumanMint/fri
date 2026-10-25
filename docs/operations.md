@@ -209,26 +209,25 @@ substituted model. They don't measure how well a live model separates banter fro
 
 Calls whose result can't change what members see are skipped before inference.
 
-- **Attention.** Messages the direct path takes (addressed to Fri, in the dedicated channel, or a
-  follow-up in an active window) stay in the attention model's context but are never offered to it
-  as fresh. A message Fri already answered, reacted to or chose to skip isn't decided twice. A
-  member's message that is still being routed (say, the controller hasn't answered whether it
-  continues a conversation) isn't offered until a later beat shows the direct path didn't take it,
-  and it keeps its place even if newer chat pushes it out of the 30-message buffer meanwhile (still
-  within 15 minutes and still allowed by its author); the rest of the channel, Gene errors included,
-  is decided as usual. Attention checks again that the direct path hasn't taken its pick before
-  sending an ambient reply.
+- **Attention.** Messages the direct path has taken when attention reads the channel (addressed
+  to Fri, in the dedicated channel, or a follow-up in an active window) stay in the attention
+  model's context but are never offered to it as fresh. A message Fri already answered, reacted to
+  or chose to skip isn't decided twice. A message still being routed (say, the controller hasn't
+  answered whether it continues a conversation) is offered as before; attention checks again that
+  the direct path hasn't taken its pick before sending an ambient reply. The direct path can still
+  take a message after that last check, as before this change.
 - **Owner settings.** An owner line that matches the settings words first goes to a yes/no check on
   the attention model with only the owner's words, outside the background model slot, recorded as
-  `owner_settings` usage (saved for the usage loop to deliver, so a slow report never holds up the
-  reply). Only a yes (or a failed check, or one still running after 10 seconds) runs the Sol/high
-  settings call, with typing shown. Anything else takes the normal reply path, even while another
-  settings preview is being prepared. Requests queue as they reach the settings handling, before its
-  controller reads; a request gets the busy note only if an earlier one is still being decided or
-  prepared when it's ready. A line the owner erased after it arrived (during the controller reads,
-  the sign-in, the check, the model slot wait or the Sol call) gets no reply, preview or busy note
-  and never reaches a model after the erasure is seen, like any waiting message. While Fri is
-  disabled the check is skipped, since the normal path can't answer then.
+  `owner_settings` usage. Its receipt and the Sol call's are saved for the usage loop to deliver, so
+  a slow usage report never holds up the preview (a normal reply still delivers pending receipts
+  first, as it always has). Only a yes (or a failed check, or one still running after 10 seconds)
+  runs the Sol/high settings call, with typing shown. Anything else takes the normal reply path,
+  even while another settings preview is being prepared. Requests queue as they reach the settings
+  handling, before its controller reads; a request gets the busy note only if an earlier one is
+  still being decided or prepared when it's ready. A line the owner erased after it arrived (during
+  the controller reads, the sign-in, the check, the model slot wait or the Sol call) gets no reply,
+  preview or busy note and never reaches a model after the erasure is seen, like any waiting
+  message. While Fri is disabled the check is skipped, since the normal path can't answer then.
 - Meme checks are unchanged: an inspection still runs while the reaction budget is closed, because
   the budget can reopen (or the owner can raise it) before the model answers.
 

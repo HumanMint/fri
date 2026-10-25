@@ -432,27 +432,29 @@ def test_a_stalled_settings_check_gives_way_to_the_sol_preview(monkeypatch, tmp_
     asyncio.run(scenario())
 
 
-def test_a_slow_usage_report_does_not_hold_up_the_settings_call(monkeypatch, tmp_path):
+def test_a_slow_usage_report_does_not_hold_up_the_settings_preview(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, _, _ = harness(monkeypatch, tmp_path)
         fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
         monkeypatch.setattr('fri.fri_agent.CHECK_SECONDS', 0.05)
-        async def analyze(*args, **kwargs):
-            await asyncio.Event().wait()  # The check stalls, so the Sol call takes over.
+        async def analyze(chat, instruction, data, model, effort, schema, **kwargs):
+            if 'answer' in schema['properties']:
+                await asyncio.Event().wait()  # The check stalls, so the Sol call takes over.
+            return ({'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]},
+                    {'input_tokens': 900}, 'completed')
         monkeypatch.setattr('fri.fri_agent.analyze', analyze)
         reporting = asyncio.Event()
         async def flush_usage():
             await reporting.wait()  # The controller is slow to take usage reports.
         fri.flush_usage = AsyncMock(side_effect=flush_usage)
-        agent.run = AsyncMock(return_value=({'explanation': '', 'changes': [
-            {'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'))
         message = owner_message()
         try:
             assert await asyncio.wait_for(agent.owner_control(message, 'set heartbeat to 10 minutes'), 2)
             assert message.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
-            fri.flush_usage.assert_not_awaited()  # The usage loop delivers the saved receipt.
+            fri.flush_usage.assert_not_awaited()  # The usage loop delivers both saved receipts.
             saved = [json.loads(path.read_text()) for path in (tmp_path/'usage').glob('*.json')]
-            assert [(r['role'], r['status']) for r in saved] == [('owner_settings', 'interrupted')]
+            assert sorted((r['role'], r['model'], r['status']) for r in saved) == [
+                ('owner_settings', 'gpt-6-luna', 'interrupted'), ('owner_settings', 'gpt-6.1-sol', 'completed')]
         finally:
             reporting.set()
             await fri.close()
