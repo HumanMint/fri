@@ -175,6 +175,45 @@ empty or unavailable lists aren't guessed, an open request isn't drafted again, 
 leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
 on the same model grades it.
 
+## Member profiles
+
+With a controller that advertises `member-profiles`, Fri asks for profiles on its context and memory
+requests, and each member has one profile per server: up to 15 small preferences (three per
+category) that follow them into every conversation in that server, DMs included. Fri decides where a
+note belongs when the turn is saved. Only a channel the server's default role can view counts, with a
+thread judged by its parent, and only public or news threads. Age-restricted channels never count,
+and neither does anything Fri can't resolve. Notes from DMs, the `/fri` panel, restricted channels,
+private threads and outside invitations stay in that one conversation, and the controller refuses a
+profile write from a private conversation. Notes saved before this release stay where they were said.
+Background learning still keeps per channel.
+
+Each turn also sees what the speaker last said to Fri in the server's other readable channels: up to
+two of their messages from the last 12 hours (`with_you_elsewhere_untrusted`). Only their own words
+travel, never Fri's replies, because a reply can draw on a note or exchange that stays in its own
+conversation. Fri re-checks that each channel is still readable by everyone right before each model
+request and again before posting the reply; if one closed meanwhile, the reply stays unsaid. The turn
+inherits their provenance, since a member's words can repeat someone else's: an erasure removes what
+was built on them here too. Every model request is signed in first and then runs the delivery privacy
+check (for an outside @mention, its invitation check), so the words of someone who erased or changed
+their privacy while Fri gathered context are never sent.
+"What do you remember about me?" in public lists only what that channel can see. In a DM it lists
+every note with where it shows, and My memory there edits any of them; the panel shows the first 25.
+An edited note keeps its place: the new wording shows wherever the note did, as its label says.
+Editing a profile note clears the member's saved chats and research receipts across the server, removes
+the same words, or an excerpt containing or contained in them, wherever a single channel kept them
+(under any category), and stops background learning from using anything the member said before the
+edit, anywhere in the server: no note, archive observation or channel summary comes from those
+messages, however it's phrased. A message sent before the edit but answered after it gets its reply
+and keeps nothing: Fri's short-lived channel chatter and reply echoes skip it too. Whether a message
+counts as said in front of everyone is decided when Fri first sees it, so a channel opened while Fri
+replies can't widen it; a channel closed meanwhile narrows it: its excerpts drop out right before each
+model call, and the turn is saved as staying in its channel. "Forget me" is unchanged and erases everything. At
+startup Fri logs how many configured channels are readable by everyone. If that's none, profiles
+never fill, and the server's channel permissions are the thing to look at.
+
+Without the capability (an older controller), Fri sends no audience and doesn't ask for profiles,
+and memory stays per conversation as before.
+
 ## Reply checks
 
 Needs a controller that advertises the optional `reply-checks` capability at startup; against an
@@ -305,6 +344,16 @@ it does not replace it.
 `/srv/fri/release.env` is separate from Gene's `release.env`. A later reviewed Fri
 commit uses the same coordinator. To roll back an independent Fri release, run it
 with the previously retained, compatible full Fri SHA/image.
+
+Before rolling the Gene controller back past member profiles, stop it and run
+`python -m gene.profile_downgrade <controller database>` in the controller's environment. That
+removes profile notes, copies their removals to every configured channel so an older controller saves
+no note from the member's earlier messages, and keeps every conversation's own notes and chats. It
+refuses to run when it can't tell the channels. It never migrates the database, so going below both member
+profiles and turn provenance, it and `gene.provenance_downgrade` can run in either order. A Fri-only rollback needs nothing: an older Fri sends no audience
+and doesn't ask for profiles, so the controller gives it only each conversation's own notes, within the
+limits it was built for. Profile notes stay stored, unseen, until a newer Fri returns or they expire, and
+"forget me" still erases them.
 
 Rollback changes the image/configuration against **current** data. It never restores
 an old controller database, reminder/post receipt, erased memory or subscription

@@ -315,8 +315,8 @@ def test_complete_chat_tool_selection_persistence_and_upload(api, monkeypatch, t
         async def controller(method, path, body=None):
             if path == '/agent/state':
                 return agent.state
-            if path in ('/chat/turn', '/chat/turn/check') and fault == 'recording':
-                raise commands.UserFeedbackCheckFailure('recording unavailable')
+            if path in ('/chat/turn', '/chat/turn/check') and fault == 'recording' and len(seen) == 2:
+                raise commands.UserFeedbackCheckFailure('recording unavailable')  # Once the reply is written.
             return await call(method, path, body)
         fri.api = controller
         network, _ = provider([post()])

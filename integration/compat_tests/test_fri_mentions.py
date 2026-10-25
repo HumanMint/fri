@@ -669,6 +669,29 @@ def test_revocation_during_answer_never_sends_or_saves_context(monkeypatch, tmp_
     asyncio.run(scenario())
 
 
+def test_a_nearby_member_who_forgets_while_fri_signs_in_never_reaches_the_model(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path)
+        message('ash says: the surprise party is friday', user=30, age=60)
+        event = message('<@99> what did ash just say?')
+        sent = []
+
+        def access_token():
+            store.erase_user('30')  # Forgets after Fri read the channel, while it signs in.
+            return 'fictional'
+        fri.chat = Chat(SimpleNamespace(access_token=access_token), httpx.MockTransport(
+            lambda request: sent.append(request) or httpx.Response(500)))
+        del fri.chat_once  # Fri's own model call, with the checks it runs once signed in.
+        try:
+            await agent.handle(event)
+            assert sent == []  # Refused before the request, not only before the reply.
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_outside_invitation_preserves_cooldown_and_blocks_all_nonweb_actions(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
