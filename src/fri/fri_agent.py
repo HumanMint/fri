@@ -552,6 +552,8 @@ class Agent:
             if recheck:
                 if reason := await self.erasure(user, *since):
                     return await self.dropped(message, events, reason, invitation, since)
+                if dm and not (self.config['support_dms'] and await self.member(user, fresh=True)):
+                    return self.missed(events, 'not a member')  # They left while it waited, or DMs closed.
                 if time.time() >= until:
                     return await self.withheld(message, events, 'stale event', invitation or self.ping_among(events, since),
                                                logged='earlier reply still running')

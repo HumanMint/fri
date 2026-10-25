@@ -8,7 +8,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import discord
 import httpx
@@ -1698,6 +1698,42 @@ def test_a_stale_ping_redelivered_after_its_record_expires_is_told_once(monkeypa
             await agent.handle(event)
             assert [item.args for item in event.reply.await_args_list] == [(NOTICES['stale event'],)]
             assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: stale event']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('stays', [True, False])
+def test_a_queued_dm_needs_a_current_member_when_its_turn_comes(monkeypatch, tmp_path, stays):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = SimpleNamespace(id=20)
+        agent.member = AsyncMock(return_value=present)
+        event = message('what is ash working on?')
+        event.guild = None
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='hold on', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        fri.busy.add(20)  # A reply to them that's still going, so this waits its turn.
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                while not event.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                if not stays:  # They leave the server meanwhile.
+                    agent.member = AsyncMock(side_effect=lambda *_, fresh=False, **__: None if fresh else present)
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            if stays:
+                fri.chat_once.assert_awaited_once()
+                assert texts == [str(ReplyInProgress()), 'an answer']
+            else:  # Checked fresh, not from the cache their arrival filled.
+                fri.chat_once.assert_not_awaited()
+                assert not any(path == '/chat/context' for path, _ in calls)
+                assert texts == [str(ReplyInProgress())]
+                assert agent.member.await_args_list == [call(20, fresh=True)]
         finally:
             await fri.close()
     asyncio.run(scenario())
