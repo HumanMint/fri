@@ -35,6 +35,8 @@ from .subscription import Subscription, private_json
 
 LOG = logging.getLogger('fri')
 NO_MENTIONS = discord.AllowedMentions.none()
+SIGN_IN_NOTICE = ('heads up: my chatgpt sign-in stopped working, so every reply fails until you reconnect me. '
+                  'steps are in fri’s docs/operations.md under “New installations”.')
 FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
                 'or say “forget me” any time.')
 MAX_PROVENANCE = 200
@@ -129,6 +131,8 @@ class Fri(discord.Client):
         self.waiting_notices = WaitingNotices(self.busy)
         self.usage_lock = asyncio.Lock()
         self.chat_slots = asyncio.Semaphore(2)
+        self.noticed_refusal = None
+        self.sign_in_notice = None
         self.session = None
         self.agent = None
         self.capabilities = frozenset()
@@ -193,11 +197,18 @@ class Fri(discord.Client):
         try:
             async with self.session.request(method, self.url + path, json=payload,
                     headers={'Authorization': 'Bearer ' + self.token, 'X-Fri-Contract': PROTOCOL}) as response:
-                data = await response.json()
+                try:
+                    data = await response.json()
+                except (ValueError, RecursionError):
+                    if response.status < 400:
+                        raise
+                    data = None  # A refusal keeps its status when its JSON can't be read; a non-JSON reply isn't the controller's.
+                detail = str(data.get('detail', 'Controller rejected this request')) if isinstance(data, dict) else (
+                    'Controller rejected this request')
                 if 400 <= response.status < 500:
-                    raise ControllerRejected(str(data.get('detail', 'Controller rejected this request')))
+                    raise ControllerRejected(detail, response.status)
                 if response.status >= 400:
-                    raise commands.UserFeedbackCheckFailure(str(data.get('detail', 'Controller rejected this request')))
+                    raise commands.UserFeedbackCheckFailure(detail)
                 return data
         except (aiohttp.ClientError, TimeoutError):
             raise commands.UserFeedbackCheckFailure('The workshop controller is temporarily unavailable.') from None
@@ -209,8 +220,30 @@ class Fri(discord.Client):
                     report = json.loads(path.read_text())
                 except FileNotFoundError:
                     continue  # An isolated evaluation process may have delivered this receipt.
-                await self.api('POST', '/chat/usage/report', report)
+                except (ValueError, RecursionError):  # Deeply nested JSON raises RecursionError.
+                    self.set_aside(path, 'unreadable')
+                    continue
+                try:
+                    await self.api('POST', '/chat/usage/report', report)
+                except ControllerRejected as exc:
+                    if exc.status not in (400, 422):
+                        raise  # Credentials or contract: every receipt would fail alike, so all stay queued.
+                    self.set_aside(path, f'HTTP {exc.status}')
+                    continue
                 path.unlink(missing_ok=True)
+
+    def set_aside(self, path, cause):
+        """A receipt the controller refuses can never succeed; keep it for inspection without blocking later ones."""
+        rejected = path.parent / 'rejected'
+        try:
+            rejected.mkdir(mode=0o700, exist_ok=True)
+            path.replace(rejected / path.name)
+        except FileNotFoundError:
+            return
+        except OSError as exc:  # It stays queued and is offered again, after the receipts behind it.
+            LOG.warning('Usage receipt refused (%s) and could not be set aside: %s', cause, type(exc).__name__)
+            return
+        LOG.warning('Usage receipt set aside in usage/rejected: %s', cause)
 
     async def chat_once(self, text, context):
         result = await self.chat.respond(text, context)
@@ -220,8 +253,8 @@ class Fri(discord.Client):
             'status': result.status, 'counters': result.counters})
         try:
             await self.flush_usage()
-        except commands.UserFeedbackCheckFailure:
-            LOG.warning('Usage is saved locally; controller delivery will retry')
+        except Exception as exc:  # The receipt is on disk; a delivery problem must not discard a finished reply.
+            LOG.warning('Usage is saved locally; controller delivery will retry: %s', type(exc).__name__)
         if result.error or result.status != 'completed':
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         return result
@@ -528,8 +561,8 @@ class Fri(discord.Client):
                 payload['reply'] = clean(delivered, 3500)  # E.g. an attachment fallback replaced the answer.
         try:
             saved = await self.api('POST', '/chat/turn', payload)
-        except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError):
-            LOG.warning('Delivered turn was not recorded')  # Includes privacy changes mid-reply.
+        except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError) as exc:
+            LOG.warning('Delivered turn was not recorded: %s', type(exc).__name__)  # Includes privacy changes mid-reply.
             return None
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
             try:
@@ -637,8 +670,8 @@ class Fri(discord.Client):
         if self.agent:
             try:
                 await self.agent.handle(message)
-            except (commands.UserFeedbackCheckFailure, discord.HTTPException):
-                LOG.warning('Fri interaction could not complete')
+            except (commands.UserFeedbackCheckFailure, discord.HTTPException) as exc:
+                LOG.warning('Fri interaction could not complete: %s', type(exc).__name__)
             return
         if (message.author.bot or getattr(message, 'webhook_id', None) or not message.guild or
                 message.guild.id != self.guild_id):
@@ -663,17 +696,32 @@ class Fri(discord.Client):
             await message.reply(notice_text(str(exc))[:1800], mention_author=False, allowed_mentions=NO_MENTIONS)
             await self.waiting_notices.clear(message.author.id)
 
+    async def subscription_notice(self):
+        """One owner DM per refused sign-in, counting a usable token in between as the end of one."""
+        try:
+            refused = self.chat.subscription.refused
+            if refused is not None and refused != self.noticed_refusal:
+                owner = self.get_user(self.owner_id) or await self.fetch_user(self.owner_id)
+                channel = await owner.create_dm()  # Opened here, so a failure to open it retries next tick.
+                self.noticed_refusal = refused  # At most once: a send whose response was lost isn't repeated.
+                await channel.send(SIGN_IN_NOTICE, allowed_mentions=NO_MENTIONS)
+        except Exception as exc:  # A failed lookup retries next tick; a failed send waits for the next refusal.
+            LOG.warning('Owner sign-in notice not sent: %s', type(exc).__name__)
+
     @tasks.loop(seconds=15)
     async def owner_reviews(self):
+        # Its own task: a rate-limited DM sleeps out Discord's retry_after, which must not hold up reviews or usage.
+        if self.sign_in_notice is None or self.sign_in_notice.done():
+            self.sign_in_notice = asyncio.create_task(self.subscription_notice())
         # Separate, so one undeliverable usage receipt can't hold back owner notifications.
         try:
             await self.flush_usage()
-        except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, TimeoutError):
-            LOG.warning('Usage delivery pending')
+        except Exception as exc:  # Like the heartbeat, a bad tick never ends the loop.
+            LOG.warning('Usage delivery pending: %s', type(exc).__name__)
         try:
             await notify_owner(self)
-        except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, TimeoutError):
-            LOG.warning('Owner notification pending')
+        except Exception as exc:
+            LOG.warning('Owner notification pending: %s', type(exc).__name__)
 
     @owner_reviews.before_loop
     async def before_reviews(self):
@@ -692,7 +740,8 @@ class Fri(discord.Client):
             'meme_attention': self.agent.memes.status() if self.agent and self.agent.memes else None,
             'agent_heartbeat': {'running': self.agent.heartbeat.is_running(), 'failed': self.agent.heartbeat.failed(),
                 'started': self.agent.heartbeat_started, 'finished': self.agent.heartbeat_finished,
-                'status': self.agent.heartbeat_status} if self.agent else None,
+                'status': self.agent.heartbeat_status, 'stages': self.agent.stages} if self.agent else None,
+            'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,
             'test_scope': {**test, 'connected': bool(self.is_ready() and test_guild and not test_guild.unavailable),
@@ -709,6 +758,8 @@ class Fri(discord.Client):
             self.agent.close()
         self.health.cancel()
         self.owner_reviews.cancel()
+        if self.sign_in_notice:
+            self.sign_in_notice.cancel()
         await sessions(self).close_all()
         if self.session:
             await self.session.close()

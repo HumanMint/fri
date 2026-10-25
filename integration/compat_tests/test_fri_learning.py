@@ -275,5 +275,6 @@ def test_heartbeat_records_actual_tick_outcome(learning, failure, monkeypatch):
         await agent.heartbeat.coro(agent)
         assert agent.heartbeat_started == agent.heartbeat_finished == clock[0]
         assert agent.heartbeat_status == ('deferred' if failure else 'ok')
-        assert agent.attend.await_count == (0 if failure else 1)
+        assert agent.stages['learning']['error'] == ('ValueError' if failure else None)
+        agent.attend.assert_awaited_once()  # A failed stage no longer skips the ones after it.
     asyncio.run(scenario())
