@@ -291,9 +291,13 @@ class Fri(discord.Client):
 
     async def chat_once(self, text, context):
         async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
-            if fence := context.get('fence'):
-                # The delivery check, run before the request too: the words of anyone in view who erased or
-                # changed their privacy since they were read never reach the model.
+            fence = context.get('fence')
+            # The delivery check, run before the request too: the words of anyone in view who erased or
+            # changed their privacy since they were read never reach the model. An outside @mention has
+            # its invitation's own check instead, as before it replies.
+            if fence and fence.get('invitation'):
+                await fence['invitation'].require_current()
+            elif fence:
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
                     context, fence['turn']['user_id'], fence['actions'])})
             # A channel closed while Fri gathered context: what was said there stays there.
@@ -730,6 +734,7 @@ class Fri(discord.Client):
                 context['actions'] = await actions.available()
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
                 actions.image_context = {k: context[k] for k in ('image_sources', 'image_event', 'image_invitation') if k in context}
+                context['fence'] = {'invitation': invitation, 'shown': set()}  # See chat_once.
                 result = await self.chat_once(text, context)
                 research = None
                 if result.action:

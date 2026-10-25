@@ -194,8 +194,8 @@ conversation. Fri re-checks that each channel is still readable by everyone righ
 request and again before posting the reply; if one closed meanwhile, the reply stays unsaid. The turn
 inherits their provenance, since a member's words can repeat someone else's: an erasure removes what
 was built on them here too. Every model request is signed in first and then runs the delivery privacy
-check, so the words of someone who erased or changed their privacy while Fri gathered context are
-never sent.
+check (for an outside @mention, its invitation check), so the words of someone who erased or changed
+their privacy while Fri gathered context are never sent.
 "What do you remember about me?" in public lists only what that channel can see. In a DM it lists
 every note with where it shows, and My memory there edits any of them; the panel shows the first 25.
 An edited note keeps its place: the new wording shows wherever the note did, as its label says.
