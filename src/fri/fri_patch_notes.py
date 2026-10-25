@@ -6,7 +6,9 @@
 The only recipient is GENE_OWNER_ID; nothing names anyone else. It logs in over REST only, with no
 gateway session, so the running Fri is untouched. Each version reaches the owner once: every part
 has a fixed nonce, FRI_DATA/patch-notes.json lists the parts Discord confirmed, and a part whose
-send was attempted but never confirmed is looked for in the DM before it is sent again."""
+send was attempted but never confirmed is looked for in the DM before it is sent again.
+Exit codes: 0 sent (or already sent), 2 refused (fix the notes or the record), 1 Discord or the
+network failed (a rerun is safe)."""
 
 import argparse
 import asyncio
@@ -21,6 +23,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import aiohttp
 import discord
 
 from .private_files import private_json
@@ -29,6 +32,10 @@ LIMIT = 2000  # Discord's message length, in UTF-16 units.
 MAX_PARTS = 4
 EARLIEST = 1767225600  # 2026-01-01 UTC. No real attempt is older; an older attempt time is damage.
 VERSION = re.compile(r'(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})')
+ID = re.compile(r'[1-9]\d{0,19}')  # A Discord snowflake.
+HASH = re.compile(r'[0-9a-f]{64}')
+TRIED = {'attempted_at', 'sha256'}  # A part's states: {} before its send, then TRIED, then SENT.
+SENT = TRIED | {'message_id', 'channel_id'}
 NO_MENTIONS = discord.AllowedMentions.none()
 
 
@@ -80,13 +87,33 @@ def locked(directory):
         os.close(fd)
 
 
+def text_hash(chunk):
+    return hashlib.sha256(chunk.encode()).hexdigest()
+
+
 def recorded(part):
-    """One part as send() writes it: when it was attempted, and the message Discord confirmed."""
+    """One part as send() writes it: when it was tried and its text's hash, then the message Discord confirmed."""
+    if not isinstance(part, dict) or set(part) not in (set(), TRIED, SENT):
+        return False
     attempted = part.get('attempted_at', EARLIEST)
-    return (isinstance(part, dict) and set(part) <= {'attempted_at', 'message_id', 'channel_id'} and
-            isinstance(attempted, (int, float)) and not isinstance(attempted, bool) and
+    patterns = {'sha256': HASH, 'message_id': ID, 'channel_id': ID}
+    return (isinstance(attempted, (int, float)) and not isinstance(attempted, bool) and
             EARLIEST <= attempted <= time.time() + 86400 and  # A real past attempt: no NaN, no 0, no far future.
-            all(isinstance(part.get(key, '0'), str) and part.get(key, '0').isdigit() for key in ('message_id', 'channel_id')))
+            all(isinstance(part[key], str) and pattern.fullmatch(part[key]) for key, pattern in patterns.items() if key in part))
+
+
+def entry_ok(entry):
+    """A version's notes hash and parts: sends go in order, so sent parts come first, then at most one tried."""
+    states = entry.get('parts') if isinstance(entry, dict) else None
+    if not (isinstance(states, list) and 1 <= len(states) <= MAX_PARTS and all(recorded(part) for part in states) and
+            isinstance(entry.get('sha256'), str) and HASH.fullmatch(entry['sha256'])):
+        return False
+    sizes = [len(part) for part in states]
+    return sizes == sorted(sizes, reverse=True) and sizes.count(len(TRIED)) <= 1
+
+
+def sent_ids(state):
+    return [part['message_id'] for entry in state['versions'].values() for part in entry['parts'] if 'message_id' in part]
 
 
 def load(path):
@@ -95,24 +122,21 @@ def load(path):
         state = json.loads(path.read_text())
     except FileNotFoundError:
         return {'versions': {}}
-    except (OSError, ValueError):  # Unreadable, truncated or not UTF-8 JSON.
+    except (OSError, ValueError, RecursionError):  # Unreadable, truncated, not UTF-8, or nested past Python's limit.
         state = None
     versions = state.get('versions') if isinstance(state, dict) else None
-    if not isinstance(versions, dict) or not all(
-            isinstance(entry, dict) and isinstance(entry.get('sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', entry['sha256'])
-            and isinstance(entry.get('parts'), list) and 1 <= len(entry['parts']) <= MAX_PARTS
-            and all(isinstance(part, dict) and recorded(part) for part in entry['parts'])
-            for entry in versions.values()):
+    if (not isinstance(versions, dict) or not all(entry_ok(entry) for entry in versions.values()) or
+            len(set(sent_ids(state))) != len(sent_ids(state))):  # One message confirms one part.
         raise NotesRefused(f'{path.name} is not a patch-notes record')
     return state
 
 
 async def landed(dm, me, chunk, attempted_at, taken):
     """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
-    Every message since a minute before the attempt is read (clocks drift). Only Fri's own messages
-    with exactly this text count, and never one the record already gives a part: Discord keeps no
-    nonce in history, so that is what tells identical parts and releases apart."""
-    after = dt.datetime.fromtimestamp(attempted_at - 60, dt.timezone.utc)
+    Every message since a minute before the attempt (or before now, if the clock has stepped back) is
+    read. Only Fri's own messages with exactly this text count, and never one the record already gives
+    a part: Discord keeps no nonce in history, so that is what tells identical parts and releases apart."""
+    after = dt.datetime.fromtimestamp(min(attempted_at, time.time()) - 60, dt.timezone.utc)
     async for message in dm.history(limit=None, after=after, oldest_first=True):
         if message.author.id == me and message.content == chunk and str(message.id) not in taken:
             return message
@@ -122,33 +146,45 @@ async def landed(dm, me, chunk, attempted_at, taken):
 async def send(version, text, *, token, owner_id, data, out=print):
     chunks = parts(text)
     digest = hashlib.sha256(json.dumps(chunks).encode()).hexdigest()  # The split, not just the text.
+    hashes = [text_hash(chunk) for chunk in chunks]
     path = data / 'patch-notes.json'
     with locked(data):
         state = load(path)
         entry = state['versions'].get(version)
-        if entry and (entry.get('sha256') != digest or len(entry.get('parts', ())) != len(chunks)):
+        if entry and (entry['sha256'] != digest or len(entry['parts']) != len(chunks)):
             raise NotesRefused(f'{version} was already sent with different notes; use a new version')
         if entry is None:
             entry = state['versions'][version] = {'sha256': digest, 'parts': [{} for _ in chunks]}
+        if any(part.get('sha256', h) != h for part, h in zip(entry['parts'], hashes)):
+            raise NotesRefused(f'{path.name} is not a patch-notes record')
         if all(part.get('message_id') for part in entry['parts']):
             out(f'{version}: all {len(chunks)} parts were already sent')
             return
+        tried = next((part['sha256'] for part in entry['parts'] if set(part) == TRIED), None)
+        twins = sorted(other for other, e in state['versions'].items() if other != version
+                       for part in e['parts'] if set(part) == TRIED and part['sha256'] == tried)
+        if twins:
+            raise NotesRefused(f'{version} and {", ".join(twins)} each have a part with this text that was tried but '
+                               f'never confirmed, and the DM can\'t say whose a message is; check it, then fix {path.name}')
         client = discord.Client(intents=discord.Intents.none())
-        await client.login(token)
         try:
+            await client.login(token)
             owner = await client.fetch_user(owner_id)
             dm = await owner.create_dm()
             for index, (chunk, part) in enumerate(zip(chunks, entry['parts']), 1):
                 if part.get('message_id'):
                     out(f'part {index}/{len(chunks)}: already sent')
                     continue
-                taken = {p['message_id'] for e in state['versions'].values() for p in e['parts'] if 'message_id' in p}
+                taken = set(sent_ids(state))
                 message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, part['attempted_at'], taken)
                 if not message:
-                    part['attempted_at'] = time.time()
+                    part.update(attempted_at=time.time(), sha256=hashes[index - 1])
                     private_json(path, state)
                     message = await dm.send(chunk, nonce=nonce(version, digest, index),
                                             allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+                    if str(message.id) in taken:
+                        raise NotesRefused(f'Discord answered part {index} with message {message.id}, which '
+                                           f'{path.name} already gives another part')
                 part.update(message_id=str(message.id), channel_id=str(dm.id))
                 private_json(path, state)
                 out(f'part {index}/{len(chunks)}: sent as message {message.id} ({length(chunk)} chars)')
@@ -173,12 +209,17 @@ def main(argv=None):
             for index, chunk in enumerate(parts(text), 1):
                 print(f'--- part {index} ({length(chunk)} chars)\n{chunk}')
             return 0
-        asyncio.run(send(args.version, text, token=os.environ['DISCORD_TOKEN'],
-                         owner_id=int(os.environ['GENE_OWNER_ID']),
-                         data=Path(os.getenv('FRI_DATA', '/data'))))
+        token, owner = os.getenv('DISCORD_TOKEN', ''), os.getenv('GENE_OWNER_ID', '')
+        if not token or not ID.fullmatch(owner):
+            raise NotesRefused('DISCORD_TOKEN and GENE_OWNER_ID must be set')
+        asyncio.run(send(args.version, text, token=token, owner_id=int(owner), data=Path(os.getenv('FRI_DATA', '/data'))))
     except NotesRefused as exc:
         print(f'refused: {exc}', file=sys.stderr)
         return 2
+    except (discord.DiscordException, aiohttp.ClientError, OSError) as exc:
+        # Discord said no or the connection failed. Every confirmed part is on record, so a rerun is safe.
+        print(f'failed: {str(exc) or type(exc).__name__}', file=sys.stderr)
+        return 1
     return 0
 
 

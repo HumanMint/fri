@@ -1,8 +1,11 @@
 import asyncio
+import datetime as dt
 import io
 import json
 import types
 
+import aiohttp
+import discord
 import pytest
 
 from fri import fri_patch_notes as notes
@@ -26,7 +29,7 @@ class FakeDM:
         index = len(self.sends)
         if index in self.refused or len(content.encode('utf-16-le')) > 4000:
             raise RuntimeError('discord refused')
-        message = types.SimpleNamespace(id=1000+index, content=content, author=types.SimpleNamespace(id=BOT))
+        message = said(1000+index, content, BOT)
         self.messages.append(message)
         if index in self.lost:
             raise RuntimeError('reply lost')
@@ -34,13 +37,19 @@ class FakeDM:
 
     async def history(self, *, limit, after, oldest_first):
         assert oldest_first and after is not None
-        for message in self.messages[:limit]:
+        for message in [m for m in self.messages if m.created_at > after][:limit]:
             yield message
+
+
+def said(id, content, author):
+    return types.SimpleNamespace(id=id, content=content, author=types.SimpleNamespace(id=author),
+                                 created_at=dt.datetime.now(dt.timezone.utc))
 
 
 class FakeClient:
     instances = []
     dm = None
+    login_error = None
 
     def __init__(self, *, intents):
         self.user = None
@@ -49,6 +58,8 @@ class FakeClient:
 
     async def login(self, token):
         assert token == 'secret-token'
+        if FakeClient.login_error:
+            raise FakeClient.login_error
         self.user = types.SimpleNamespace(id=BOT)
 
     async def fetch_user(self, user_id):
@@ -65,6 +76,7 @@ class FakeClient:
 def dm(monkeypatch):
     FakeClient.instances = []
     FakeClient.dm = FakeDM()
+    FakeClient.login_error = None
     monkeypatch.setattr(notes.discord, 'Client', FakeClient)
     return FakeClient.dm
 
@@ -170,8 +182,7 @@ def test_recovery_looks_past_the_first_page_of_history(dm, tmp_path):
     dm.lost.add(2)
     with pytest.raises(RuntimeError, match='lost'):
         run(text, tmp_path)
-    owner = types.SimpleNamespace(id=OWNER)
-    dm.messages[1:1] = [types.SimpleNamespace(id=500+i, content='hm', author=owner) for i in range(150)]
+    dm.messages[1:1] = [said(500+i, 'hm', OWNER) for i in range(150)]
     run(text, tmp_path)
     assert len(dm.sends) == 2
     record = json.loads((tmp_path / 'patch-notes.json').read_text())['versions']['0.4.0']
@@ -196,6 +207,59 @@ def test_a_part_never_delivered_is_not_confirmed_by_another_parts_message(dm, tm
     assert [p['message_id'] for p in record['parts']] == [str(m.id) for m in mine]
 
 
+def test_recovery_searches_from_now_when_the_attempt_time_is_ahead(dm, tmp_path):
+    text = paragraph(1500, 'a')
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    path = tmp_path / 'patch-notes.json'
+    record = json.loads(path.read_text())
+    record['versions']['0.4.0']['parts'][0]['attempted_at'] += 3600  # A clock that stepped back since.
+    path.write_text(json.dumps(record))
+    run(text, tmp_path)
+    assert len(dm.sends) == 1
+
+
+def test_two_unfinished_releases_with_the_same_text_are_refused_not_guessed(dm, tmp_path):
+    """0.3.9's part never reached Discord and 0.4.0's identical part did: the DM can't say whose it is."""
+    text = paragraph(1500, 's')
+    dm.refused.add(1)
+    with pytest.raises(RuntimeError, match='refused'):
+        run(text, tmp_path, version='0.3.9')
+    dm.lost.add(2)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    for version in ('0.3.9', '0.4.0'):
+        with pytest.raises(notes.NotesRefused, match='never confirmed'):
+            run(text, tmp_path, version=version)
+    assert len(dm.sends) == 2 and len(FakeClient.instances) == 2  # Both refused before login.
+
+
+def test_a_reply_naming_a_message_already_on_record_is_refused(dm, tmp_path, monkeypatch):
+    run(paragraph(10, 'a'), tmp_path, version='0.3.9')
+    earlier = dm.messages[0]
+    async def same(*args, **kwargs):
+        return earlier
+    monkeypatch.setattr(dm, 'send', same)
+    with pytest.raises(notes.NotesRefused, match='already gives another part'):
+        run(paragraph(10, 'b'), tmp_path)
+    notes.load(tmp_path / 'patch-notes.json')  # Still a sound record.
+
+
+def test_a_part_hash_that_disagrees_with_the_notes_is_refused(dm, tmp_path):
+    text = paragraph(1500, 'a')
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    path = tmp_path / 'patch-notes.json'
+    record = json.loads(path.read_text())
+    record['versions']['0.4.0']['parts'][0]['sha256'] = '0' * 64
+    path.write_text(json.dumps(record))
+    with pytest.raises(notes.NotesRefused, match='not a patch-notes record'):
+        run(text, tmp_path)
+    assert len(dm.sends) == 1
+
+
 def test_a_damaged_record_or_a_concurrent_send_is_refused(dm, tmp_path):
     (tmp_path / 'patch-notes.json').write_text('[]')
     with pytest.raises(notes.NotesRefused, match='not a patch-notes record'):
@@ -207,18 +271,46 @@ def test_a_damaged_record_or_a_concurrent_send_is_refused(dm, tmp_path):
     assert dm.sends == []
 
 
+H = '0' * 64
+T = 1790000000  # A real past attempt time.
+TRIED = {'attempted_at': T, 'sha256': H}
+SENT = {**TRIED, 'message_id': '5', 'channel_id': '777'}
+
+
+def record(*parts, more=None):
+    return json.dumps({'versions': {'0.3.0': {'sha256': H, 'parts': list(parts)}, **(more or {})}})
+
+
 @pytest.mark.parametrize('record', [
-    '{"versions": {"0.4.0": {}}}', '{"versions": {"0.4.0": null}}', '{"versions": {"0.4.0": 7}}',
-    '{"versions": {"0.4.0": {"sha256": "x", "parts": [{}]}}}', '{"versions": "x"}', '{"versions": {',
-    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"message_id": 5}]}}}',
-    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": []}}}', b'\xff',
-    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": 1e100}]}}}',
-    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": NaN}]}}}',
-    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": -1}]}}}',
-    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": 0}]}}}',
-    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": 1e-9}]}}}'])
+    pytest.param('{"versions": {"0.4.0": {}}}', id='empty-entry'),
+    pytest.param('{"versions": {"0.4.0": null}}', id='null-entry'),
+    pytest.param('{"versions": {"0.4.0": 7}}', id='number-entry'),
+    pytest.param('{"versions": {"0.4.0": {"sha256": "x", "parts": [{}]}}}', id='bad-hash'),
+    pytest.param('{"versions": "x"}', id='versions-string'),
+    pytest.param('{"versions": {', id='truncated'),
+    pytest.param(b'\xff', id='not-utf8'),
+    pytest.param('[' * 100000 + ']' * 100000, id='nested'),
+    pytest.param(record(), id='no-parts'),
+    pytest.param(record({**SENT, 'message_id': 5}), id='number-id'),
+    pytest.param(record({**SENT, 'message_id': '0'}), id='zero-id'),
+    pytest.param(record({'message_id': '0'}), id='lone-zero-id'),
+    pytest.param(record({'channel_id': '777'}), id='lone-channel'),
+    pytest.param(record({'message_id': '5', 'channel_id': '777'}), id='sent-never-tried'),
+    pytest.param(record({'attempted_at': T}), id='tried-no-hash'),
+    pytest.param(record({**TRIED, 'sha256': 'x'}), id='tried-bad-hash'),
+    pytest.param(record({**TRIED, 'attempted_at': 1e100}), id='far-future'),
+    pytest.param(record({**TRIED, 'attempted_at': float('nan')}), id='nan'),
+    pytest.param(record({**TRIED, 'attempted_at': -1}), id='negative'),
+    pytest.param(record({**TRIED, 'attempted_at': 0}), id='zero-time'),
+    pytest.param(record({**TRIED, 'attempted_at': 1e-9}), id='epoch'),
+    pytest.param(record({**TRIED, 'attempted_at': True}), id='bool-time'),
+    pytest.param(record({}, SENT), id='sent-after-unsent'),
+    pytest.param(record(TRIED, SENT), id='sent-after-tried'),
+    pytest.param(record(TRIED, TRIED), id='two-tried'),
+    pytest.param(record(SENT, more={'0.3.1': {'sha256': H, 'parts': [SENT]}}), id='one-message-two-parts'),
+])
 def test_a_damaged_entry_is_refused_with_exit_2_before_login(monkeypatch, capsys, tmp_path, dm, record):
-    """Truncated JSON, a malformed entry or part, or a null one (which would resend), anywhere in the record."""
+    """Truncated or nested JSON, a malformed entry or part, or a state send() never writes, anywhere in the record."""
     path = tmp_path / 'patch-notes.json'
     path.write_bytes(record if isinstance(record, bytes) else record.encode())
     monkeypatch.setenv('DISCORD_TOKEN', 'secret-token')
@@ -239,6 +331,41 @@ def test_cli_previews_without_credentials_and_checks_the_version(monkeypatch, ca
         with pytest.raises(SystemExit) as exit:
             notes.main(['send', bad])
         assert exit.value.code == 2
+
+
+def test_cli_reports_a_discord_or_network_failure_with_exit_1_and_closes_the_client(monkeypatch, capsys, tmp_path, dm):
+    monkeypatch.setenv('DISCORD_TOKEN', 'secret-token')
+    monkeypatch.setenv('GENE_OWNER_ID', str(OWNER))
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    def cli():
+        monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'notes')))
+        return notes.main(['send', '0.4.0'])
+    async def forbidden(*args, **kwargs):
+        raise discord.Forbidden(types.SimpleNamespace(status=403, reason='Forbidden'),
+                                {'code': 50007, 'message': 'Cannot send messages to this user'})
+    monkeypatch.setattr(dm, 'send', forbidden)
+    assert cli() == 1
+    assert 'failed: 403 Forbidden (error code: 50007)' in capsys.readouterr().err
+    FakeClient.login_error = discord.LoginFailure('Improper token has been passed.')
+    assert cli() == 1
+    FakeClient.login_error = aiohttp.ClientConnectionError('cannot connect')
+    assert cli() == 1
+    assert 'failed: cannot connect' in capsys.readouterr().err
+    assert len(FakeClient.instances) == 3 and all(c.closed for c in FakeClient.instances)
+
+
+@pytest.mark.parametrize('token, owner', [(None, str(OWNER)), ('secret-token', None), ('secret-token', 'me')])
+def test_cli_refuses_a_send_without_its_settings(monkeypatch, capsys, tmp_path, dm, token, owner):
+    for key, value in (('DISCORD_TOKEN', token), ('GENE_OWNER_ID', owner)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'notes')))
+    assert notes.main(['send', '0.4.0']) == 2
+    assert 'refused: DISCORD_TOKEN and GENE_OWNER_ID' in capsys.readouterr().err
+    assert FakeClient.instances == []
 
 
 def test_cli_reports_a_refusal_with_exit_code_2(monkeypatch, capsys, tmp_path, dm):

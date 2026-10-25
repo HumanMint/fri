@@ -460,9 +460,14 @@ counted the way Discord counts them (UTF-16 units, so most emoji count 2).
 `/data/patch-notes.json` records each version's confirmed parts, so a rerun finishes a partial
 send and never repeats a part: a part whose send was attempted but never confirmed is looked for
 in the DM first (Fri's own messages since the attempt with exactly that text, skipping any the
-record already gives another part), and every part carries a fixed nonce. The same version with
-different notes, or a damaged record, is refused (exit 2); send a correction as a new version.
-Members see nothing.
+record already gives another part), and every part carries a fixed nonce. If two versions each
+have an unconfirmed part with the same text, the DM can't say whose a message is, so both are
+refused until someone checks the DM and fixes the record by hand.
+
+Exit codes: 0 sent (or already sent); 2 refused: the same version with
+different notes (send a correction as a new version), notes that don't fit, a damaged record, or
+missing settings; 1 failed: Discord refused or the connection dropped. Every confirmed part is on
+record, so rerunning the same command after a 1 is safe. Members see nothing.
 
 ## Background work and health
 
