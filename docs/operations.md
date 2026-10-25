@@ -67,9 +67,10 @@ They do not prove Discord delivery or live model interpretation of a particular 
 
 "fri what did i miss", or any ask to be caught up, has the model call `read_recent` with
 `window=since_my_last_message`. Fri reads that channel back from the request (the message, or the
-panel interaction), up to 100 messages or 12 hours, and stops at the speaker's last message there.
-Their own messages from the last five minutes ("back", "yo") and ones only bots answered count as
-them coming back, not where they left. Rows carry the author, minute and text cut to 300
+panel interaction), up to 100 messages or 12 hours before it, and stops at the speaker's last
+message there. Their own messages from the five minutes before they asked ("back", "yo") and ones
+only bots answered count as them coming back, not where they left. Both windows are measured from
+the request, so a slow model call doesn't change what the read covers. Rows carry the author, minute and text cut to 300
 characters, without jump links, and stop once the serialized rows would pass 20,000 characters, so
 emoji-heavy chat keeps the newest stretch instead of growing the prompt. The receipt says where the
 read stopped (`your_last_message`, `size_limit`, `message_limit` or `time_limit`) and when the

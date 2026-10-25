@@ -343,18 +343,22 @@ class Actions:
         self.sources.add(channel_id)
         scope = getattr(channel, 'parent_id', None) or channel.id
         after = time.time()-min(7, self.agent.config['history_days'])*86400
+        # A catch-up's window hangs off the request, so a slow model call can't move where they left.
+        asked = time.time()
+        if catch_up and isinstance(getattr(self.event, 'id', None), int):  # A message or a panel interaction.
+            asked = discord.utils.snowflake_time(self.event.id).timestamp()
         if catch_up:
-            after = max(after, time.time()-CATCH_UP_SECONDS)
+            after = max(after, asked-CATCH_UP_SECONDS)
         if channel.id == self.agent.dedicated:
             after = max(after, self.agent.state.get('started', time.time()))
         options = {'limit': 20, 'after': dt.datetime.fromtimestamp(after, dt.timezone.utc), 'oldest_first': False}
         if catch_up:
             options['limit'] = CATCH_UP_MESSAGES
-            if isinstance(getattr(self.event, 'id', None), int):  # A message or a panel interaction.
+            if isinstance(getattr(self.event, 'id', None), int):
                 options['before'] = discord.Object(id=self.event.id)
         # A catch-up stops at the speaker's last message before anyone else spoke. Messages
-        # they sent just now, or that only bots answered, are them coming back, not leaving.
-        returned, others, left, full = time.time()-RETURN_SECONDS, False, None, False
+        # they sent just before asking, or that only bots answered, are them coming back, not leaving.
+        returned, others, left, full = asked-RETURN_SECONDS, False, None, False
         records, scanned, profiles, shown, size = [], 0, {}, {}, 0
         async for message in channel.history(**options):
             scanned += 1

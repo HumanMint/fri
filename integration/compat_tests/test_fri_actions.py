@@ -250,6 +250,22 @@ def test_catch_up_without_a_departure_says_where_it_stopped(monkeypatch, tmp_pat
     asyncio.run(scenario())
 
 
+def test_catch_up_window_hangs_off_the_request_not_a_slow_reply(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, reads = harness(monkeypatch, tmp_path)
+        # "back" came 280 s before the request, which ran a minute late, so it's still them coming back.
+        catch_up_channel(channels, reads, [(20, 'wb', 320), (10, 'back', 340), (20, 'missed event', 1800),
+                                           (10, 'gn', 3600)])
+        actions = Actions(agent, 10, 1, True)
+        actions.event = request(age=60)
+        receipt = await actions.execute(CATCH_UP)
+        assert [row['text'] for row in receipt['messages']] == ['missed event', 'wb']
+        assert receipt['stopped_at'] == 'your_last_message'
+        assert abs(time.time()-60-reads[0]['after'].timestamp()-12*3600) < 5
+        await fri.close()
+    asyncio.run(scenario())
+
+
 def test_catch_up_keeps_the_dedicated_channel_start_floor(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, channels, reads = harness(monkeypatch, tmp_path)
