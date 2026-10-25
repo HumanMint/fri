@@ -229,6 +229,7 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
             'source': source(name=name)}
         context['acknowledgments_enabled'] = suite == 'endings'
         context['images'] = case.get('images', [])
+        context['inspected_images'] = case.get('inspected_images', [])
         result = await chat.respond(case['text'], context)
         if 'expected_modes' in case:
             case['passed'] = result.status == 'completed' and result.response_kind in case['expected_modes']
@@ -274,7 +275,8 @@ GRADE = obj({'verdict': {'type': 'string', 'enum': ['pass', 'fail']}, 'reason': 
 
 async def grade(chat, model, effort, case, result):
     """Model-graded verdict for a sass case: phrase checks can't judge consent, distress, truth or help."""
-    situation = {key: case[key] for key in ('turns', 'recent', 'action_result', 'web_research') if key in case}
+    situation = {key: case[key] for key in ('turns', 'recent', 'action_result', 'web_research',
+                                            'inspected_images', 'image_notes') if key in case}
     verdict, counters, status = await analyze(chat, GRADER, {
         'situation': {**situation, 'available_actions': list(case.get('actions', {})), 'message': case['text']},
         'expectation': case['expect'], 'fri_reply': result.reply, 'fri_action': result.action,
@@ -350,7 +352,31 @@ def sass_cases():
          'requester_is_owner': True, 'max_chars': 700, 'needs': ('queue', 'time', 'timer', 'left', 'remaining', 'eta'),
          'expect': 'Help mode: one concrete design call and a next step '
          '(a request draft is fine). Attitude turned down, no header or sign-off.'},
+        memes_above(),
     ]
+
+
+def memes_above():
+    """The #meme-spam ask: three memes Fri can see right above, newest first, each with its poster."""
+    from .fri_image_eval import shape
+    posters = [('203', 'Sam', 'triangle', (0, 160, 0)), ('202', 'Jo', 'square', (0, 0, 255)),
+               ('201', 'Kev', 'circle', (255, 0, 0))]
+    def posted(user, name, number):
+        mid = str(100000000000000000-number)
+        return {**source(user, name), 'id': mid, 'url': 'https://discord.com/channels/444/555/'+mid}
+    inspected = [{'images': [number], 'source': posted(user, name, number)}
+                 for number, (user, name, _, _) in enumerate(posters, 1)]
+    return {'name': 'pick_from_many_memes', 'text': 'whats ur favorite meme out of the memes above', 'max_chars': 160,
+            'images': [shape(kind, color) for _, _, kind, color in posters], 'inspected_images': inspected,
+            'recent': [{'user_id': user, 'name': name, 'text': '', 'attachments': ['image']}
+                       for user, name, _, _ in reversed(posters)],
+            'banned': ('resend', 're-send', 'send them again', 'reupload', 're-upload', "can't see", 'cannot see',
+                       "don't see", '?'),
+            'needs': ('kev', 'jo', 'sam', 'circle', 'square', 'triangle', 'red', 'blue', 'green'),
+            'image_notes': 'Fri was shown three images: 1 a green triangle posted by Sam, 2 a blue square '
+                           'posted by Jo, 3 a red circle posted by Kev.',
+            'expect': 'Picks one of the three images it was shown, naming it by poster or what is in it, with a '
+                      'few-word reason. No resend request, no claim it cannot see them, no question back.'}
 
 
 def settings_cases():

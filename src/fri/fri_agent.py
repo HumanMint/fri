@@ -21,6 +21,7 @@ from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SETTINGS_GATE, SUMM
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
 from .fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
+from .fri_images import media
 from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
@@ -560,6 +561,13 @@ class Agent:
                 return
         text = clean(raw, 4000)
         if not text:
+            if not message.author.bot and not dm and self.config['enabled'] and media(message):
+                # An uncaptioned meme or pic still belongs in the live view, or "the memes above" is empty.
+                profile = await self.profile(parent, message.author.id)
+                if profile['enabled'] and not before_removal(message.id, profile):
+                    self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
+                        'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
+                        'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
             return self.miss(message, 'no text')
         directed = text if dm else await addressed_text(message, self.fri.user.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
@@ -591,7 +599,8 @@ class Agent:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                     'name': clean(message.author.display_name, 60), 'text': text[:500], 'at': time.time(),
-                    'revision': profile.get('revision', 0), 'gene_error': False})
+                    'revision': profile.get('revision', 0), 'gene_error': False,
+                    **({'attachments': media(message)} if media(message) else {})})
         elif message.author.bot:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})
@@ -950,7 +959,8 @@ class Agent:
         for channel_id in list(self.recent):
             records = await self.context_messages(channel_id, raw_errors=True)
             # Messages the direct path answers stay in records as context but aren't decided again here.
-            fresh = [r for r in records if not r.get('fri') and r['id'] not in self.direct and
+            # A bare image is context for a reply, never something ambient attention answers by itself.
+            fresh = [r for r in records if not r.get('fri') and r['id'] not in self.direct and r['text'] and
                      int(r['id']) > self.seen.get(channel_id, 0)]
             if not fresh or now-self.last_attention.get(channel_id, 0) < self.config['heartbeat_seconds']:
                 continue

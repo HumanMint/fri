@@ -498,7 +498,8 @@ class Fri(discord.Client):
                 if inspect_images:
                     await attach_images(context, event, text, source=image_source, invitation=invitation)
                 if actions:
-                    actions.image_context = {key: context[key] for key in ('image_sources', 'image_event', 'image_invitation') if key in context}
+                    from .fri_images import image_context
+                    actions.image_context = image_context(context)
                 if actions and guild_id == self.guild_id:
                     from .gene_controls import current_music_context, grounded
                     recent = await self.api('POST', '/controls/recent', scope)
@@ -732,7 +733,7 @@ class Fri(discord.Client):
     async def invited_talk(self, invitation, text):
         """Outside the ambient scope, one ping has only conversation and public research."""
         from .fri_context import addressed_content
-        from .fri_images import attach, require_current
+        from .fri_images import attach, image_context, require_current
         from .fri_mentions import force_text
         event, user = invitation.event, invitation.event.author.id
         expected = addressed_content(event.content, self.user.id) or 'hey'
@@ -763,7 +764,8 @@ class Fri(discord.Client):
                 actions.private_evidence = True
                 context['actions'] = await actions.available()
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
-                actions.image_context = {k: context[k] for k in ('image_sources', 'image_event', 'image_invitation') if k in context}
+                await invitation.look(context)  # Up front: an outside ping has no read to decide on.
+                actions.image_context = image_context(context)
                 context['fence'] = {'invitation': invitation, 'shown': set()}  # See chat_once.
                 result = await self.chat_once(text, context)
                 research = None
