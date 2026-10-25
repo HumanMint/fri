@@ -348,11 +348,12 @@ class Fri(discord.Client):
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
             if fence and fence.get('invitation'):
-                await fence['invitation'].require_current()
-                # Its fingerprint doesn't cover embeds, so a gif link's preview it looked at is refetched.
+                # Its fingerprint doesn't cover embeds, so a gif link's preview it looked at is refetched,
+                # first: the invitation's own check below ends with the authors' privacy, after every wait.
                 from .fri_images import looked_unchanged
                 if not await looked_unchanged(context, [fence['invitation']]):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+                await fence['invitation'].require_current()
             elif fence:
                 # What came from a channel they can't see now (a read, an invited look around, Gene's
                 # receipts, a learning report) never reaches the request either. Delivery checks it again.

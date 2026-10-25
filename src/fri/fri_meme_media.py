@@ -11,6 +11,9 @@ import httpx
 MAX_BYTES = 4 * 1024 * 1024
 GIF_BYTES = 8 * 1024 * 1024  # An uploaded GIF; only its first frame is kept.
 MAX_PIXELS = 20_000_000
+# Decoding an animation's canvas takes about 26 bytes a pixel at peak (a 5000x4000 WebP measured over
+# 500 MB), so animations get a far smaller canvas: about 40 MB, well inside the runtime's 384 MB.
+MAX_ANIMATED_PIXELS = 1_500_000
 STILL_SIDE = 1024  # A GIF's first frame is scaled to fit this square before the model sees it.
 MIMES = {'image/png', 'image/jpeg', 'image/webp'}
 
@@ -39,7 +42,7 @@ def sources(message, most=2, *, gifs=False):
     for a in attachments:
         gif = gifs and a.content_type == 'image/gif'
         if ((a.content_type not in MIMES and not gif) or not 0 < a.size <= (GIF_BYTES if gif else MAX_BYTES) or
-                not a.width or not a.height or a.width * a.height > MAX_PIXELS):
+                not a.width or not a.height or a.width * a.height > (MAX_ANIMATED_PIXELS if gif else MAX_PIXELS)):
             return None
         result.append(str(a.url))
     for embed in message.embeds:
@@ -115,7 +118,8 @@ def first_frame(body):
     from PIL import Image, UnidentifiedImageError
     try:
         with Image.open(io.BytesIO(body)) as image:
-            if image.format not in ('GIF', 'PNG', 'WEBP') or image.width * image.height > MAX_PIXELS:
+            # The header's canvas size, before anything is decoded.
+            if image.format not in ('GIF', 'PNG', 'WEBP') or image.width * image.height > MAX_ANIMATED_PIXELS:
                 raise ValueError('Not a supported animated image')
             image.seek(0)
             frame = image.convert('RGBA')

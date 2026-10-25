@@ -9,7 +9,7 @@ import struct
 import zlib
 from functools import partial
 from types import MethodType, SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import discord
 import httpx
@@ -51,7 +51,7 @@ def decoded(url):
 @pytest.mark.parametrize('fmt,mime', [('GIF', 'image/gif'), ('PNG', 'image/png'), ('WEBP', 'image/webp')])
 def test_an_animation_comes_back_as_its_first_frame(fmt, mime):
     async def scenario():
-        body = animation(fmt, size=(3000, 1500))
+        body = animation(fmt, size=(1200, 1000))
         still = decoded(await load_image(ATTACHMENT, 1, transport=serve(body, mime), gifs=True))
         assert getattr(still, 'n_frames', 1) == 1 and max(still.size) == STILL_SIDE
         red, _, blue = still.convert('RGB').getpixel((10, 10))
@@ -289,4 +289,66 @@ def test_an_outside_mentions_gif_preview_is_rechecked_before_the_model_sees_it(m
             assert sent == []
         finally:
             await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('during', [1, 2])
+def test_an_opt_out_during_any_refetch_before_an_outside_request_keeps_the_gif_out(monkeypatch, tmp_path, during):
+    """The gif preview refetch comes before the invitation's own check, whose privacy step is last."""
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path)
+        fri.data = tmp_path
+        post = message('https://tenor.com/view/dance-123 my caption', user=30, age=60)
+        post.embeds = [tenor_embed()]
+        event = message('<@99> pick the best gif above')
+        loads(monkeypatch)
+        fri.chat_once = MethodType(Fri.chat_once, fri)
+        sent, signed_in, fetches = [], False, 0
+
+        def handler(request):
+            sent.append(json.loads(request.content))
+            answer = {'response_kind': 'reply', 'reaction': None, 'reply': 'the dancing one',
+                      'request_draft': None, 'action': None, 'notes': [], 'allow_closing': False}
+            return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(answer)))+'\\n\\n')
+        fri.chat = Chat(SimpleNamespace(access_token=lambda: 'test'), httpx.MockTransport(handler))
+
+        async def headers():
+            nonlocal signed_in
+            signed_in = True
+            return {'Authorization': 'Bearer synthetic'}
+
+        async def fetch(mid):
+            nonlocal fetches
+            if signed_in and mid == post.id:
+                fetches += 1
+                if fetches == during:  # The poster opts out while Fri refetches their post.
+                    store.personal_control('30', 'disable')
+            return rows[mid]
+        fri.chat.headers = headers
+        channel.fetch_message = AsyncMock(side_effect=fetch)
+        try:
+            invitation = await Invitation.create(agent, event)
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await fri.invited_talk(invitation, 'pick the best gif above')
+            assert fetches >= during and sent == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_animation_with_a_huge_canvas_is_refused_before_it_is_decoded():
+    async def scenario():
+        frames = [Image.new('RGBA', (2, 2), color) for color in ('red', 'blue')]
+        out = io.BytesIO()
+        frames[0].save(out, 'WEBP', save_all=True, append_images=frames[1:], duration=100, loop=0, lossless=True)
+        body = bytearray(out.getvalue())
+        offset = body.index(b'VP8X') + 8  # Claim a 5000x4000 canvas: tiny file, ~500 MB to decode.
+        body[offset+4:offset+7] = (4999).to_bytes(3, 'little')
+        body[offset+7:offset+10] = (3999).to_bytes(3, 'little')
+        with pytest.raises(ValueError, match='Not a supported animated image'):
+            await load_image(ATTACHMENT, 1, transport=serve(bytes(body), 'image/webp'), gifs=True)
+        big = SimpleNamespace(attachments=[SimpleNamespace(url=ATTACHMENT, content_type='image/gif', size=100,
+                                                           width=2000, height=1000, is_spoiler=lambda: False)],
+                              embeds=[], content='')
+        assert sources(big, gifs=True) is None  # An uploaded gif that big isn't even downloaded.
     asyncio.run(scenario())
