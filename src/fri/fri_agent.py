@@ -34,6 +34,7 @@ from .subscription import private_json
 LOG = logging.getLogger('fri.agent')
 NO_MENTIONS = discord.AllowedMentions.none()
 GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
+REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long, and how many, delivered IDs are remembered.
 DEFERRED = object()  # The burst holding this message answers, or explains, for it.
 
 
@@ -82,11 +83,12 @@ class Agent:
         self.active = {}
         self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
         self.handling = Counter()  # Discord message IDs being handled now, burst members included.
+        self.delivered = {}  # Discord message ID -> when it first arrived, oldest first.
         self.recording = {}  # (channel, member): set once a delivered reply is recorded.
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
         self.pending = {}
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
-        self.watched = {}  # Recent pings already watched, oldest first, so a redelivery isn't again.
+        self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
         self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
         self.seen = {}
         self.last_attention = {}
@@ -321,10 +323,18 @@ class Agent:
                      self.misses.pop(event.id) or reason or 'no reply')
 
     async def handle(self, message):
-        # Discord can redeliver an event. While its first delivery, or the burst holding it, is still
-        # being handled, that answers for both; a later copy meets the reply guards and spent grants.
-        if message.id in self.handling or self.bursts.group(message) is not None:
+        # Discord can deliver an event again, e.g. after a resume. Its first delivery answers, or
+        # explains, for every copy: while it or the burst holding it is still being handled, and
+        # for an hour after, in a bounded record the in-flight checks don't rely on.
+        now = time.monotonic()
+        while self.delivered and now-next(iter(self.delivered.values())) > REDELIVERY_SECONDS:
+            del self.delivered[next(iter(self.delivered))]
+        if (message.id in self.handling or self.bursts.group(message) is not None or
+                message.id in self.delivered):
             return
+        if len(self.delivered) >= MAX_DELIVERED:
+            del self.delivered[next(iter(self.delivered))]
+        self.delivered[message.id] = now
         self.handling[message.id] += 1
         try:
             await self.watch(message)
@@ -333,14 +343,14 @@ class Agent:
 
     async def watch(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
-        # A redelivered event is left to the delivery that watched it first.
+        # A copy that outlived the record of delivered events is left to the delivery watched first.
         if (message.guild is None or message.author.bot or getattr(message, 'webhook_id', None) or
                 message.id in self.watched or message.id in self.misses or message.id in self.replying or
                 not pinged(message, self.fri.user.id)):
             await self.receive(message)
             return
         self.watched[message.id] = self.misses[message.id] = None
-        if len(self.watched) > 1000:
+        if len(self.watched) > MAX_DELIVERED:
             del self.watched[next(iter(self.watched))]
         owned = False  # By a burst: its last message answers, or its drop explains, for this one.
         try:

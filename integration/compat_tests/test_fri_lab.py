@@ -77,7 +77,7 @@ def test_lab_harness_observes_only_selected_channel_and_uses_its_guild(monkeypat
         await agent.handle(message)
         assert len(agent.recent[789]) == 1
         agent.respond.assert_not_awaited()
-        message.content = 'fri what do you think?'
+        message.content, message.id = 'fri what do you think?', 101  # A new message; Fri ignores redeliveries.
         with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
             await agent.handle(message)
         agent.respond.assert_awaited_once()
@@ -96,7 +96,7 @@ def test_lab_harness_observes_only_selected_channel_and_uses_its_guild(monkeypat
         # Lab's Gene errors and owner-admin text cannot become FF work or expose reports.
         fri.api.reset_mock()
         message.author.id, message.author.bot = agent.gene_id, True
-        message.content = 'Track error: unavailable'
+        message.content, message.id = 'Track error: unavailable', 102
         await agent.handle(message)
         await agent.investigate(789, {'text': 'error'})
         message.author.id = fri.owner_id
