@@ -18,7 +18,13 @@ from .fri_actions import Actions
 from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
-from .fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
+from .fri_errors import (
+    UNREACHABLE,
+    AuthorErased,
+    ControllerRejected,
+    ControllerUnavailable,
+    GateClosed,
+)
 from .fri_images import CHANGED as IMAGES_CHANGED
 from .fri_images import unchanged as images_unchanged
 from .fri_memory import (
@@ -30,7 +36,7 @@ from .fri_memory import (
     profiled,
     server_wide,
 )
-from .fri_notices import ReplyInProgress, WaitingNotices, notice_text
+from .fri_notices import Busy, ReplyInProgress, WaitingNotices, notice_text
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
 from .fri_protocol import PROTOCOL, compatible
 from .fri_reports import ReportButton, report_component
@@ -179,7 +185,7 @@ class Fri(discord.Client):
         self.data = Path(os.getenv('FRI_DATA', '/data'))
         self.chat = Chat(Subscription(os.getenv('FRI_CHATGPT_AUTH', '/auth/session.json')))
         self.tree = FriTree(self)
-        self.busy = set()
+        self.busy = Busy()
         self.waiting_notices = WaitingNotices(self.busy)
         self.usage_lock = asyncio.Lock()
         self.chat_slots = asyncio.Semaphore(2)
@@ -227,9 +233,10 @@ class Fri(discord.Client):
         self.agent = Agent(self)
         await patiently(self, self.agent.start)
         self.add_view(HomeView(self))
+        from .fri_fixes import TellReporter
         from .fri_social import SocialButton
         from .fri_workspace import PostButton
-        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton)
+        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton, TellReporter)
 
         @self.tree.command(name='fri', description='Chat, request a feature or fix, and follow development.',
                            guild=discord.Object(id=self.guild_id))
@@ -265,7 +272,9 @@ class Fri(discord.Client):
             from .fri_social import component as social_component
             if social_component(interaction, getattr(self.user, 'id', None)):
                 allowed = True
+            from .fri_fixes import tell_component
             if (not allowed and not owner_dm_component(interaction, getattr(self.user, 'id', None), self.owner_id)
+                    and not tell_component(interaction, getattr(self.user, 'id', None), self.owner_id)
                     and not report_component(interaction, getattr(self.user, 'id', None), self.owner_id)
                     and not request_dm_component(interaction, getattr(self.user, 'id', None))):
                 return
@@ -335,6 +344,8 @@ class Fri(discord.Client):
     async def chat_once(self, text, context):
         async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
             fence = context.get('fence')
+            if fence and fence.get('gate'):
+                await fence['gate']()
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
@@ -379,7 +390,9 @@ class Fri(discord.Client):
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         return result
 
-    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None):
+    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None):
+        # `revision`: the author's privacy revision as their message came in, if known. Gene fences the
+        # reply against the one read below, so an erasure before that read must stop it here.
         if invitation and invitation.outside:
             return await self.invited_talk(invitation, text)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
@@ -423,6 +436,8 @@ class Fri(discord.Client):
         try:
             async with self.chat_slots:
                 context = attributed(await self.api('POST', '/chat/context', profiled(self, scope)))
+                if revision is not None and context['revision'] != revision:
+                    raise AuthorErased()
                 if self.profiles:
                     # From Discord's permissions: only a channel everyone could read when each message
                     # arrived, and still can, reaches the member's profile and their other conversations.
@@ -547,6 +562,13 @@ class Fri(discord.Client):
                                              'input': text, 'reply': '', 'model': context['model'],
                                              'effort': context['effort']},
                                     'actions': actions, 'shown': set()}
+                if self.agent and visibility == 'private' and source.kind == 'discord_message':
+                    async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
+                        if not await self.agent.member(user_id, fresh=True):
+                            raise GateClosed('not a member')
+                        if not self.agent.config['support_dms']:
+                            raise GateClosed('dms off')
+                    context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
                 result = await self.chat_once(text, context)
                 if invitation:
                     await invitation.require_current()

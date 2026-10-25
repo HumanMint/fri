@@ -9,7 +9,7 @@ import discord
 from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
-from .fri_errors import ControllerUnavailable
+from .fri_errors import AuthorErased, ControllerUnavailable
 from .fri_images import details
 from .fri_meme_media import sources
 from .privacy import clean
@@ -18,6 +18,18 @@ NEARBY_SECONDS = 6 * 3600  # "The memes above" in a slow channel can be hours ol
 REFERENCE_SECONDS = 7 * 86400
 MAX_MESSAGES = 12
 CHANGED = 'That mention or its context changed while I was replying. Ask again for a fresh reply.'
+# Said instead of a reply that can't go out, while the ping itself is still there to answer. Gates
+# that close access (permissions, thread state, a deleted or un-pinged message) stay quiet.
+CONTEXT_CHANGED = 'things changed while i was typing. ping me again and i’ll catch up.'
+NOTICES = {'stale event': 'took me too long on that one. ping me again if you still need me.',
+           'message changed': 'you edited that before i could answer. ping me again with the new version.',
+           'nearby message changed': CONTEXT_CHANGED, 'nearby privacy changed': CONTEXT_CHANGED,
+           'check failed: ControllerRejected': CONTEXT_CHANGED}
+GLITCH = 'that one glitched on my end. ping me again.'
+
+
+def notice_for(reason):
+    return NOTICES.get(reason, GLITCH if reason.startswith('check failed: ') else None)
 
 
 def fingerprint(message):
@@ -39,6 +51,8 @@ class Invitation:
         self.image = None  # The ping's own image post, or the one it replies to.
         self.images = []  # Otherwise, nearby posts with attachments, for look() to choose from.
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
+        self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
+        self.revision = None  # The author's privacy revision as Fri first read it for this ping.
 
     @classmethod
     async def create(cls, agent, message):
@@ -52,7 +66,8 @@ class Invitation:
             invitation = cls(agent, message)
             if await invitation.current(check_evidence=False):
                 return invitation
-            reason = invitation.refusal
+            await agent.withheld(message, [message], invitation.refusal, invitation)
+            return None
         agent.miss(message, reason)
         return None
 
@@ -60,10 +75,11 @@ class Invitation:
         self.refusal = reason
         return False
 
-    async def access(self):
-        """Fetch current overwrites and both members; cached channel access is insufficient."""
+    async def access(self, *, control=False):
+        """Fetch current overwrites and both members; cached channel access is insufficient. A privacy
+        `control` works with Fri paused."""
         event, guild = self.event, self.event.guild
-        if not self.agent.config['enabled']:
+        if not control and not self.agent.config['enabled']:
             return self.refuse('fri disabled')
         if guild.id != self.fri.guild_id and not self.agent.allowed(event.channel):
             return self.refuse('outside the main server')
@@ -94,11 +110,14 @@ class Invitation:
                 return self.refuse('missing permissions')
         return True
 
-    async def current(self, *, check_evidence=True):
+    async def current(self, *, check_evidence=True, control=False):
         try:
-            if not -5 <= time.time()-discord.utils.snowflake_time(self.event.id).timestamp() <= 300:
+            age = time.time()-discord.utils.snowflake_time(self.event.id).timestamp()
+            if age > 300:
                 return self.refuse('stale event')
-            if not await self.access():
+            if age < -5:
+                return self.refuse('clock skew')
+            if not await self.access(control=control):
                 return False
             current = await self.event.channel.fetch_message(self.event.id)
             if (current.id != self.event.id or current.author.bot or current.webhook_id or
@@ -122,12 +141,48 @@ class Invitation:
         if not await self.current():
             raise commands.UserFeedbackCheckFailure(CHANGED)
 
+    async def notice(self, reason, *, fenced=True):
+        """What to say instead of a reply that can't go out, or None to stay quiet.
+
+        Only while the ping still stands: Fri can still answer there, the message still pings Fri,
+        and, if `fenced`, its author hasn't erased since Fri first saw it. A privacy control isn't:
+        it always hears how it went, whatever it or another one changed. Never any content or context.
+        """
+        if not (text := notice_for(reason)):
+            return None
+        refusal, revision = self.refusal, self.revision
+        try:
+            if fenced and revision is None:  # Not read yet, e.g. already stale as it came in: compare from now.
+                try:
+                    revision = await self.agent.revision(self.event.author.id)
+                except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
+                    return None
+            if not await self.access():
+                return None
+            current = await self.event.channel.fetch_message(self.event.id)
+            if (current.id != self.event.id or current.author.id != self.event.author.id or current.author.bot or
+                    current.webhook_id or not explicit_mention(current, self.fri.user.id)):
+                return None
+            if reason == 'message changed' and current.edited_at is None:
+                text = GLITCH  # Not the member's edit, so don't say it was.
+            # Last, so an erasure during the checks above still counts.
+            if fenced and await self.agent.erasure(self.event.author.id, self.forgotten, revision):
+                return None
+            return text
+        except (discord.HTTPException, commands.UserFeedbackCheckFailure, ValueError, AttributeError, TypeError):
+            return None
+        finally:
+            self.refusal = refusal
+
     async def admit(self):
         await self.require_current()
         result = await self.fri.api('POST', '/chat/mentions/admit', {**self.scope,
             'source': self.source, 'content': self.event.content, 'bot_id': str(self.fri.user.id)})
         if result.get('allowed'):
+            if self.revision is not None and result['revision'] != self.revision:
+                raise AuthorErased()  # Gene fences the grant from here on, so stop at the gap before.
             self.grant = result['mention_grant']
+            self.revision = result['revision']
         return result
 
     def granted_scope(self):

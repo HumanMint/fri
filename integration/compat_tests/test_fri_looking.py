@@ -19,6 +19,7 @@ from compat_tests.test_fri_sass_eval import Scripted, grader  # noqa: F401
 from fri import feedback as commands
 from fri.fri_actions import Actions
 from fri.fri_chat import Chat, ChatResult
+from fri.fri_errors import GateClosed
 from fri.fri_eval import evaluate, sass_cases
 from fri.fri_images import MAX_IMAGES, look, media, require_current
 
@@ -172,8 +173,9 @@ def test_a_change_to_any_meme_fri_looked_at_withholds_the_reply(monkeypatch, tmp
                 await agent.handle(event)
             if change == 'none':
                 event.reply.assert_awaited_once()
-            else:
-                event.reply.assert_not_awaited()
+            else:  # Only the fixed notice goes out (#19), never the answer about the changed meme.
+                event.reply.assert_awaited_once()
+                assert event.reply.await_args.args[0].startswith('things changed while i was typing')
                 assert not any(path == '/chat/turn' for path, _ in calls)
         finally:
             await fri.close()
@@ -440,7 +442,7 @@ def test_a_channel_they_lose_mid_read_never_reaches_the_next_model_request(monke
             try:
                 result = await w.fri.talk(123, DM, 20, text, 'private', 'member 20', event=w.message(DM, text))
                 assert 'kev' not in result.reply.casefold()
-            except commands.UserFeedbackCheckFailure:
+            except (commands.UserFeedbackCheckFailure, GateClosed):  # Leaving the server closes the DM (#19).
                 pass
             assert sent == [[]]
         finally:
