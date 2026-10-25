@@ -8,6 +8,10 @@ UNREACHABLE = 'can’t reach my memory rn, so i’m sitting this one out. try ag
 class ControllerRejected(commands.UserFeedbackCheckFailure):
     """A controller 4xx response confirms this submission was rejected."""
 
+    def __init__(self, detail, status=None):
+        super().__init__(detail)
+        self.status = status
+
 
 class ControllerUnavailable(commands.UserFeedbackCheckFailure):
     """The controller didn't answer, or failed on its side (5xx); nothing confirms either way."""
