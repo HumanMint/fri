@@ -409,7 +409,7 @@ def test_read_history_cannot_be_persisted_as_a_clarification(monkeypatch, tmp_pa
         fri, agent, channels, _ = harness(monkeypatch, tmp_path)
         secret = 'Maple shared a private story about strawberry soda'
         async def history(**kwargs):
-            yield SimpleNamespace(author=SimpleNamespace(id=30, bot=False, display_name='Maple'),
+            yield SimpleNamespace(id=100, edited_at=None, author=SimpleNamespace(id=30, bot=False, display_name='Maple'),
                 webhook_id=None, content=secret, jump_url='https://discord.com/channels/123/1/100',
                 created_at=dt.datetime.now(dt.timezone.utc))
         channels[1].history = history

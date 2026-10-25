@@ -27,10 +27,10 @@ def world(monkeypatch, tmp_path):
     posts, channels = {}, {}
     def channel(cid, *, public=True, nsfw=False):
         def permissions_for(who):
-            return discord.Permissions(view_channel=public) if who is everyone else discord.Permissions(
+            return discord.Permissions(view_channel=public, read_message_history=public) if who is everyone else discord.Permissions(
                 view_channel=True, read_message_history=True)
         item = SimpleNamespace(id=cid, name=f'c{cid}', guild=guild, parent_id=None, nsfw=nsfw,
-                               is_nsfw=lambda: nsfw, permissions_for=permissions_for)
+                               is_nsfw=lambda: nsfw, permissions_for=permissions_for, overwrites={})
         async def fetch(mid):
             if mid not in posts or posts[mid].channel is not item:
                 raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
@@ -41,6 +41,13 @@ def world(monkeypatch, tmp_path):
     for cid, options in {1: {}, 2: {}, 3: {'public': False}, 456: {'nsfw': True}, 9: {}}.items():
         channel(cid, **options)
     fri.get_channel = lambda cid: channels.get(cid)
+    # A link is judged from the channel and roles as Discord has them now, not the cache.
+    async def fetch_channel(cid):
+        if cid not in channels:
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+        return channels[cid]
+    guild.fetch_channel = AsyncMock(side_effect=fetch_channel)
+    guild.fetch_roles = AsyncMock(return_value=[])
     def post(cid, text='kev cooked with this one', *, user=30, age=600, attachments=()):
         mid = discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)-dt.timedelta(seconds=age))
         while mid in posts:

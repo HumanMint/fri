@@ -20,12 +20,17 @@ New conversation and on-demand surrounding context still need normal chat admiss
 an outside mention always keeps its separate one-event social admission.
 
 Each invitation can use at most twelve preceding messages from the same channel in
-the last thirty minutes and a direct reference up to seven days old. A catch-up in a
-configured channel uses its own read instead (see "Catching up"). At most one
-image post is inspected, preferring the current attachments, then the reference,
-then a single nearby candidate. Multiple candidates need clarification. Existing
-limits remain two non-spoiler PNG/JPEG/WebP attachments, 4 MB each, twenty million
-pixels; external embeds, GIFs and videos are not inspected by this path. Captions
+the last six hours and a direct reference up to seven days old. A catch-up in a
+configured channel uses its own read instead (see "Catching up"). Up to four still
+images are inspected in one model call, the current attachments and the reference
+first, then the newest nearby posts' own attachments; Fri picks among several instead
+of asking which one. A speaker's own post keeps the two-image limit; a nearby gallery
+post can use the whole budget. Each image stays a non-spoiler PNG/JPEG/WebP, 4 MB,
+twenty million pixels; external embeds, GIFs and videos are not inspected by this path.
+A pasted message link or a replied-to post is opened only when the speaker and Fri can
+read it now (fetched overwrites and roles); from a server channel, only when it is this
+channel or one that keeps no role or member out. Every post a read or a link showed is
+found again unchanged before each later model request and before delivery. Captions
 and filenames are never visual evidence. Public research only exports an exact
 public question from the current request, never surrounding chat or image captions.
 
