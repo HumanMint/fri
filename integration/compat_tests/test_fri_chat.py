@@ -202,7 +202,7 @@ def test_model_input_carries_visible_text_raw_and_invisible_text_escaped():
         return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps({
             'summary': 'ok', 'notes': []})))+'\n\n')
     chat = Chat(SimpleNamespace(access_token=lambda: 'token'), httpx.MockTransport(handler))
-    said, hidden, escaped = 'it’s 한국 night 👀', 'ok\u200b\u202e\U000e0041', 'ok\\u200b\\u202e\\udb40\\udc41'
+    said, hidden, escaped = 'its 한국 night 👀', 'ok\u200b\u202e\U000e0041', 'ok\\u200b\\u202e\\udb40\\udc41'
     context = {**CONTEXT, 'turns': [{'input': said, 'reply': 'lol', 'response_kind': 'reply'},
                                     {'input': hidden, 'response_kind': 'react', 'reaction': '👀'}],
                'recent': [{'user_id': '1', 'name': 'Mïnt', 'text': hidden}]}

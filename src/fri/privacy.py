@@ -44,12 +44,11 @@ def clean(text: str, limit: int = 6000) -> str:
 # The only characters that reach the model raw: none looks like another, or like ASCII, alone or in a
 # row. Emoji are Emoji_Presentation in Unicode 14.0 (Python 3.11's version; Discord draws each as its own
 # image) without the regional indicators, since pairs of them make identical flags (🇫🇷 and Clipperton's
-# 🇨🇵), plus U+2764; then Hangul syllables, Hangul compatibility jamo (ㅋㅋ) without the blank filler,
-# and curly quotes. Other scripts and symbols have pixel-identical pairs (Latin A and Cyrillic А, the
-# Kelvin sign and K, combining marks), so a row of them could spell bits a person can't see; they stay
-# escaped.
+# 🇨🇵), plus U+2764; then Hangul syllables and the modern Hangul compatibility jamo (ㅋㅋ). Other scripts
+# and symbols have pixel-identical pairs (Latin A and Cyrillic А, the Kelvin sign and K, combining marks,
+# ’” and ”’), so a row of them could spell bits a person can't see; they stay escaped.
 RAW = re.compile(
-    '[\u2018\u2019\u201c\u201d\u3131-\u3163\u3165-\u318e\uac00-\ud7a3\u2764'
+    '[\u3131-\u3163\uac00-\ud7a3\u2764'
     '\u231a\u231b\u23e9-\u23ec\u23f0\u23f3\u25fd\u25fe\u2614\u2615\u2648-\u2653\u267f\u2693\u26a1'
     '\u26aa\u26ab\u26bd\u26be\u26c4\u26c5\u26ce\u26d4\u26ea\u26f2\u26f3\u26f5\u26fa\u26fd\u2705'
     '\u270a\u270b\u2728\u274c\u274e\u2753-\u2755\u2757\u2795-\u2797\u27b0\u27bf\u2b1b\u2b1c\u2b50'
@@ -68,7 +67,7 @@ NOT_PRINTABLE_ASCII = re.compile(r'[^\x20-\x7e]')
 
 
 def model_json(value):
-    """JSON for model input with emoji, Korean and curly quotes as written, so an emoji is one character
+    """JSON for model input with emoji and Korean as written, so an emoji is one character
     instead of a 12-character \\u escape. Everything else outside printable ASCII stays the escape
     json.dumps writes: other scripts and symbols (they have lookalikes), combining marks, variation
     selectors, controls, format and invisible characters, spaces and separators. json.dumps does the
