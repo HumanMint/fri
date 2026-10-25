@@ -216,13 +216,13 @@ class Fri(discord.Client):
         try:
             async with self.session.request(method, self.url + path, json=payload,
                     headers={'Authorization': 'Bearer ' + self.token, 'X-Fri-Contract': PROTOCOL}) as response:
-                foreign = False  # A non-JSON reply isn't the controller's: a proxy's page, or a wrong URL.
+                foreign = False  # A reply that isn't JSON or was cut off may not be the controller's: a proxy's page, say.
                 try:
                     data = await response.json()
-                except (ValueError, RecursionError, aiohttp.ContentTypeError) as exc:
+                except Exception as exc:  # Not JSON, or cut off or stalled partway: a refusal is still a refusal.
                     if response.status < 400:
                         raise
-                    data, foreign = None, isinstance(exc, aiohttp.ContentTypeError)  # A refusal keeps its status when its JSON can't be read.
+                    data, foreign = None, not isinstance(exc, (ValueError, RecursionError))  # A refusal keeps its status when its JSON can't be read.
                 detail = str(data.get('detail', 'Controller rejected this request')) if isinstance(data, dict) else (
                     'Controller rejected this request')
                 if 400 <= response.status < 500:

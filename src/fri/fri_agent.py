@@ -16,7 +16,7 @@ import discord
 from discord.ext import tasks
 
 from . import feedback as commands
-from .fri_addressing import addressed_text, explicit_mention, pinged
+from .fri_addressing import addressed_text, explicit_mention, pinged, visible_content
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
@@ -604,11 +604,14 @@ class Agent:
 
         async def outage():
             # The fixed notice carries no evidence, so only the Discord-side checks apply, not a controller read.
-            # A mention earlier in the burst keeps its gates too, though the reply answers a later message.
+            # A mention earlier in the burst keeps its gates too, though the reply answers a later message. Its
+            # text as it arrived decides, since an edit changes the cached copy; the gate then sees any edit.
             from .fri_mentions import Invitation
+            token = re.compile(r'(?<!\\)<@!?'+str(self.fri.user.id)+'>')
             gates = [invitation] if invitation else [
-                Invitation(self, event) for event in events[1:] if getattr(event, 'guild', None) and
-                event.guild.id == self.fri.guild_id and explicit_mention(event, self.fri.user.id)]
+                Invitation(self, event) for _, event, arrived in burst if event is not message and
+                getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
+                token.search(visible_content(arrived or ''))]
             for gate in gates:
                 if not await gate.current(check_evidence=False):
                     return missed(f'reply withheld: {gate.refusal}')

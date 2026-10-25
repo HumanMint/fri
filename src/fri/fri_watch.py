@@ -140,9 +140,10 @@ class Watch:
     async def observe(self):
         """Decides what the owner's DM should say; `deliver` makes Discord show it."""
         state = self.load()
+        start = time.time()  # Before the read, so its own latency can't hide a clock that moved back.
         kind, detail = await self.read()
         now = time.time()
-        if not 0 <= now-state['checked'] <= 3*INTERVAL:
+        if not (0 <= start-state['checked'] and now-state['checked'] <= 3*INTERVAL):
             state['bad'] = 0  # Fri itself was away, or the clock moved back: reads from before don't make a streak.
         state['checked'] = now
         alert = state['alert']

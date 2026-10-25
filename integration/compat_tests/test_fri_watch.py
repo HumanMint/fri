@@ -595,6 +595,27 @@ def test_a_clock_that_went_back_never_mutes_the_watch(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
+def test_a_clock_that_went_back_during_a_slow_read_still_starts_a_fresh_streak(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        dm = owner_dm(fri)
+        clock = SimpleNamespace(now=1000.0)
+        fri.watcher.load()
+        fri.watcher.state.update(bad=CHECKS-1, kind='unreachable', since=885, checked=1005)  # 5 s ahead.
+        async def slow(*args):
+            clock.now += 9
+            raise ControllerUnavailable(UNREACHABLE)
+        fri.api = slow
+        try:
+            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now)):
+                await fri.watcher.check()
+            assert fri.watcher.state['bad'] == 1 and not dm.sends
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_rejected_contract_still_stops_startup_at_once(monkeypatch, tmp_path):
     async def scenario():
         fri = configured(monkeypatch)
@@ -1121,22 +1142,25 @@ def test_a_dead_controller_at_the_last_recheck_answers_the_whole_burst(monkeypat
     assert not [r for r in caplog.records if r.getMessage().startswith('Mention ')]
 
 
-@pytest.mark.parametrize('nsfw', [False, True])
-def test_a_mention_that_opened_the_burst_keeps_its_gates_for_the_notice(monkeypatch, tmp_path, nsfw):
+@pytest.mark.parametrize('change', [None, 'nsfw', 'ping edited away', 'both'])
+def test_a_mention_that_opened_the_burst_keeps_its_gates_for_the_notice(monkeypatch, tmp_path, change):
     async def scenario():
         fri, agent, _, _, channel, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         first, second = make_message('<@99> can you help?'), make_message('one more thing')
         api = fri.api
         async def context_down(method, path, value=None):
-            if path == '/chat/context':
-                channel.nsfw = nsfw  # Changed while the burst's reply was underway.
+            if path == '/chat/context':  # Changed while the burst's reply was underway.
+                channel.nsfw = change in ('nsfw', 'both')
+                if change in ('ping edited away', 'both'):  # discord.py edits its cached copy in place.
+                    first.content, first.mentions = 'never mind', []
+                    first.edited_at = datetime.datetime.now(datetime.timezone.utc)
                 raise ControllerUnavailable(UNREACHABLE)
             return await api(method, path, value)
         fri.api = context_down
         try:
             await asyncio.gather(agent.handle(first), agent.handle(second))  # Real waits form the burst.
             replies = [call.args for event in (first, second) for call in event.reply.await_args_list]
-            if nsfw:
+            if change:
                 assert not replies and not {first.id, second.id} & set(agent.responded)
             else:
                 assert replies == [(UNREACHABLE,)] and {first.id, second.id} <= set(agent.responded)
@@ -1297,7 +1321,8 @@ def test_controller_transport_errors_are_typed_as_unavailable(monkeypatch):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('status,body', [(401, 'text'), (403, 'html'), (404, 'garbled'), (502, 'html')])
+@pytest.mark.parametrize('status,body', [(401, 'text'), (403, 'html'), (404, 'garbled'), (401, 'cut off'),
+                                         (403, 'stalled'), (502, 'html')])
 def test_a_refusal_that_isnt_json_is_still_a_refusal(monkeypatch, tmp_path, status, body):
     """A proxy's or a wrong URL's own error page: the status decides, never the body."""
     import aiohttp
@@ -1307,6 +1332,10 @@ def test_a_refusal_that_isnt_json_is_still_a_refusal(monkeypatch, tmp_path, stat
         async def json(self):
             if body == 'garbled':
                 raise json.JSONDecodeError('Expecting value', '<', 0)
+            if body == 'cut off':
+                raise aiohttp.ClientPayloadError('Response payload is not completed')
+            if body == 'stalled':
+                raise TimeoutError
             raise aiohttp.ContentTypeError(SimpleNamespace(real_url='http://controller/fri/contract'), (),
                                            message=f'unexpected mimetype: text/{body}')
         async def __aenter__(self):
