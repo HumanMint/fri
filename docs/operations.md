@@ -285,6 +285,81 @@ copy of `ops/compose.yml` here documents the runtime; the coordinator uses its o
 reviewed `Gene/ops/fri-compose.yml`. Fri's feature code cannot select service mounts.
 The Gene feature deployer still activates only Red and does not read Fri release pins.
 
+## Watching Gene and the controller
+
+Fri can't restart anything. It only notices and says so.
+
+- **Owner DM per outage.** Fri's own watch task reads `/controls/health` every 2 minutes, with
+  no model call, apart from the agent heartbeat and owner DM loop. It's a plain asyncio task
+  timed on the event loop's monotonic clock, not a `tasks.loop`, which times its sleeps by the
+  wall clock: a host clock set back an hour mid-pass would have stalled it for an hour. Once Fri
+  has read in this process, the spacing between reads and the bad-read streak also follow the
+  monotonic clock, so a stepped wall clock can't skip a read or break a streak. It doesn't wait
+  for the gateway: reads and the DM go over Discord's HTTP API. After 3 bad reads in a row it
+  DMs the owner once. A bad read is one of: Gene's heartbeat missing or at least 60 s old, Gene
+  not connected to Discord, Gene's command runner stopped, the controller unreachable (transport
+  error, 5xx, or no answer in 10 s), or the controller rejecting the read (4xx, such as a contract
+  mismatch). A stale command poll alone is a busy Gene, not an outage. Recovery edits the same DM
+  with the outage length. A new outage within 30 minutes of the last DM edits that DM again instead
+  of sending another. State lives in the private `fri-watch.json` in the data directory, so a
+  restart mid-outage neither repeats nor forgets the DM. Fri saves what the DM should say before
+  it touches Discord. Each pass waits up to 30 s for the delivery, then moves on, so a slow send
+  never delays the next read. No Discord call is ever cancelled, because discord.py can't recover
+  from a cancel inside its global rate-limit wait and every later Discord call would stall. A
+  delivery still running is left to finish (aiohttp's 5-minute request timeout still ends a hung
+  call), and no second one starts beside it. A send or edit that fails is retried on the next
+  pass, even after a restart. A send that may have landed is looked up in the DM before it's sent
+  again under the same nonce. Every DM from a minute before the attempt to a minute after that
+  send settled (or after Fri restarted, if it died mid-send) is checked, and a lookup that fails
+  proves nothing, so it's retried. A relapse keeps a DM whose delivery is still unknown rather than
+  starting a second one. The 30-minute relapse window starts when Discord made the DM (not when its reply reached Fri), and a
+  DM whose last edit hasn't landed still reads as down, so it carries the next outage too. An edit
+  whose reply is lost counts as not landed, so it's redone, even back to the text shown before. Only Fri or Discord can delete Fri's message in a DM. If it's gone
+  when Fri goes to edit it mid-outage, Fri sends it again. Once the outage is over, nothing is sent
+  late.
+- **Startup with the controller down.** Fri retries its startup controller reads (`/fri/contract`,
+  then `/agent/state`) every 10 s before it joins the gateway, instead of exiting. Discord's HTTP API already works then, so the same watch reads,
+  once per 2 minutes, still DM the owner. Reads stay about 2 minutes apart across that wait, the
+  loop's first pass and restarts, so a restart never shortens the 3-read debounce: the loop's
+  first pass waits until an interval after the last read, rather than skipping a read. Across a
+  restart only the saved wall time dates the last read, so a last read dated in the future, or a
+  clock that went back during the first read itself, starts a fresh streak instead of muting the
+  watch or counting toward an alert. Members see Fri offline until the controller answers, and
+  `fri health` waits too. A rejected or incompatible contract still stops Fri at once, and so does
+  a success that isn't JSON (a wrong URL or a proxy's page), since waiting won't fix it.
+- **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
+  command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
+  there, the member gets a fixed "gene isn't taking commands right now" at once, plus "owner
+  already knows" while a Gene outage DM is open, and nothing is queued. When Gene is polling but
+  Red has that one command disabled, the notice says Gene isn't offering it. A command Gene accepts and
+  then hangs on still waits out the controller's 115 s; that needs a controller change.
+- **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed
+  to Fri in a configured channel) whose controller read fails, before or while replying, gets one
+  fixed notice per channel per 5 minutes instead of silence. A mention Fri already admitted only
+  needs its Discord-side checks for this notice, since the notice carries no evidence. The notice
+  stands in for the whole burst, so every earlier message in it must also be as it arrived, and
+  each @mention among them still gets those checks, even when the reply answers a later message.
+  discord.py edits its cached copy in place, so only a fresh fetch shows an edit. A privacy
+  recheck that can't reach the controller leads to the notice, not silence, and so does the access
+  recheck before a reply drawn from recent Gene receipts (it used to say "my access changed
+  mid-check"). Rechecks after a tool ran keep their receipt reply. Every notice first
+  fetches the message as Discord has it now: it must still exist and never have been edited, since
+  discord.py updates its cached copy in place. Before a reply has started, a channel message must
+  also still be addressed, and an @mention must pass its channel and access checks with Fri
+  enabled. A posted notice counts as Fri's answer to a ping. A notice that
+  fails to post, for any reason, doesn't use up those 5 minutes, and they count from when Discord
+  took the notice, not from when Fri started sending it (a slow send under a rate limit would
+  otherwise leave a second notice due moments after the first appeared). Ambient chimes stay quiet, and so
+  does a message Fri already answered. Mentions outside configured channels keep their own gates
+  and stay silent. The same text replaces the old "workshop controller is
+  temporarily unavailable" wherever that error was shown, and a controller 5xx's detail goes to
+  the log only.
+- **`fri health`.** Owner DM only; in a server channel Fri says to DM. It works while the
+  controller is down and records no turn. It shows Fri's release, Discord connection, heartbeat
+  status and age, loop states, waiting usage receipts, live `/status` (Gene's deployed release, and
+  whether deploys are paused) and `/controls/health`
+  (4 s each, failures shown as "unreachable" or "rejected"), and the watch state.
+
 ## Existing installation migration
 
 1. Deploy a reviewed Gene controller supporting `/fri/contract` and `gene-fri/1`.
@@ -387,7 +462,10 @@ as needing a reconnect. Each refusal sends the owner one DM; a token that works 
 between, even briefly, makes the next refusal a new one.
 Network, rate-limit, provider and disk failures, including a malformed renewal
 response, ask members to retry. A renewal that can't be saved still keeps a rotated
-refresh token. A controller 4xx whose JSON body can't be read keeps its status.
+refresh token. A controller 4xx whose JSON body can't be read keeps its status. A 4xx that
+isn't JSON at all, such as a proxy's HTML or text page, or whose body is cut off or stalls (5 s), is
+still a refusal (startup stops, and the watch reports a rejection, not an outage), but with no
+status, so no receipt is set aside.
 
 ## New installations
 

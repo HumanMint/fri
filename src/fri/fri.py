@@ -18,7 +18,7 @@ from .fri_actions import Actions
 from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
-from .fri_errors import AuthorErased, ControllerRejected, ControllerUnavailable
+from .fri_errors import UNREACHABLE, AuthorErased, ControllerRejected, ControllerUnavailable
 from .fri_memory import (
     PROFILES,
     describe_memory,
@@ -52,6 +52,8 @@ FIRST_PROFILE = ('\n\n-# i kept a small preference from this, and it follows you
 FIRST_HERE = ('\n\n-# i kept a small preference from this, just for this chat. ask “what do you remember '
               'about me?” or say “forget me” any time.')
 MAX_PROVENANCE = 200
+ERROR_BODY = 5  # Seconds for a refusal's small body, well inside the watch's 10 s read.
+CONTRACT_RETRY = 10  # Seconds between contract reads while the controller is down at startup.
 HEARD_SECONDS = 1800  # Longer than any message waits for its reply; ambient attention looks back 15 minutes.
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
@@ -129,6 +131,24 @@ class FriTree(app_commands.CommandTree):
         await reply(self.client, interaction, 'That action did not complete. Please try again.')
 
 
+async def patiently(fri, read):
+    """A controller read Fri needs before joining the gateway, waited out while the controller is down.
+
+    Discord's HTTP API already works here, so the watch still tells the owner when the controller is
+    what's down. A rejected or incompatible controller, or a page that isn't the controller's, still
+    stops startup at once: a wrong URL or a proxy's page isn't an outage that waiting fixes."""
+    while True:
+        try:
+            return await read()
+        except ControllerUnavailable as exc:
+            if exc.answered:
+                raise
+            if fri.watcher.due():
+                LOG.warning('Controller unreachable at startup; waiting for it')
+                await fri.watcher.check()
+            await asyncio.sleep(CONTRACT_RETRY)
+
+
 class Fri(discord.Client):
     def __init__(self):
         intents = discord.Intents.none()
@@ -155,6 +175,9 @@ class Fri(discord.Client):
         self.session = None
         self.agent = None
         self.capabilities = frozenset()
+        from .fri_watch import Watch
+        self.watcher = Watch(self)
+        self.watching = None
         self.heard = {}  # Message id: (when Fri first saw it, whether everyone could read its channel then).
 
     @property
@@ -183,13 +206,13 @@ class Fri(discord.Client):
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        contract = await self.api('GET', '/fri/contract')
+        contract = await patiently(self, lambda: self.api('GET', '/fri/contract'))
         if not compatible(contract):
             raise RuntimeError('unsupported gene controller contract; fri did not start')
         self.capabilities = frozenset(contract['capabilities'])
         from .fri_agent import Agent
         self.agent = Agent(self)
-        await self.agent.start()
+        await patiently(self, self.agent.start)
         self.add_view(HomeView(self))
         from .fri_social import SocialButton
         from .fri_workspace import PostButton
@@ -206,6 +229,7 @@ class Fri(discord.Client):
         await self.tree.sync(guild=discord.Object(id=self.guild_id))
         self.health.start()
         self.owner_reviews.start()
+        self.watching = asyncio.create_task(self.keep_watch())
 
     def dispatch(self, event, /, *args, **kwargs):
         if event == 'interaction' and args:
@@ -241,21 +265,27 @@ class Fri(discord.Client):
         try:
             async with self.session.request(method, self.url + path, json=payload,
                     headers={'Authorization': 'Bearer ' + self.token, 'X-Fri-Contract': PROTOCOL}) as response:
+                foreign = False  # A reply that isn't JSON or was cut off may not be the controller's: a proxy's page, say.
                 try:
-                    data = await response.json()
-                except (ValueError, RecursionError):
+                    async with asyncio.timeout(ERROR_BODY if response.status >= 400 else None):
+                        data = await response.json()
+                except Exception as exc:  # Not JSON, or cut off or stalled partway: a refusal is still a refusal.
                     if response.status < 400:
+                        if isinstance(exc, aiohttp.ContentTypeError):  # Someone else's page, sent as a success.
+                            raise ControllerUnavailable(UNREACHABLE, answered=True) from None
                         raise
-                    data = None  # A refusal keeps its status when its JSON can't be read; a non-JSON reply isn't the controller's.
+                    data, foreign = None, not isinstance(exc, (ValueError, RecursionError))  # A refusal keeps its status when its JSON can't be read.
                 detail = str(data.get('detail', 'Controller rejected this request')) if isinstance(data, dict) else (
                     'Controller rejected this request')
                 if 400 <= response.status < 500:
-                    raise ControllerRejected(detail, response.status)
-                if response.status >= 400:
-                    raise commands.UserFeedbackCheckFailure(detail)
+                    # Still a refusal, so startup stops; one that isn't the controller's has no status to act on.
+                    raise ControllerRejected(detail, None if foreign else response.status)
+                if response.status >= 400:  # Its detail is a controller fault, for the log, not for members.
+                    LOG.warning('Controller %s %s failed: HTTP %s', method, path.split('?')[0], response.status)
+                    raise ControllerUnavailable(UNREACHABLE)
                 return data
         except (aiohttp.ClientError, TimeoutError):
-            raise ControllerUnavailable('The workshop controller is temporarily unavailable.') from None
+            raise ControllerUnavailable(UNREACHABLE) from None
 
     async def flush_usage(self):
         async with self.usage_lock:
@@ -567,7 +597,7 @@ class Fri(discord.Client):
                     except commands.UserFeedbackCheckFailure:
                         return ChatResult(reply=unrecorded(receipts), status='completed')
                     return result
-                if context.get('gene_receipts') and not await actions.valid():
+                if context.get('gene_receipts') and not await actions.valid(outage=True):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 result = self.stage_turn(scope, source, text, context, result, actions=actions)
                 # The save's privacy fence runs before delivery; the save itself waits for delivery.
@@ -860,6 +890,30 @@ class Fri(discord.Client):
     async def before_reviews(self):
         await self.wait_until_ready()
 
+    async def keep_watch(self):
+        # Its own task: a stuck heartbeat or owner DM can't hide an outage. Not a tasks.loop, which schedules
+        # by the wall clock: a clock set back an hour mid-pass would stall it an hour. asyncio sleeps on the
+        # event loop's monotonic clock.
+        from .fri_watch import INTERVAL
+        await self.before_watch()
+        clock = asyncio.get_running_loop()
+        while True:
+            started = clock.time()
+            try:
+                await self.watch()
+            except Exception as exc:  # A watchdog that stops on one odd error watches nothing.
+                LOG.warning('Gene watch pass failed: %s', type(exc).__name__)
+            await asyncio.sleep(max(0, started+INTERVAL-clock.time()))
+
+    async def watch(self):
+        # Reads stay an interval apart across startup's wait, the first pass and restarts; a pending DM
+        # still goes out on every pass.
+        await self.watcher.check(observe=self.watcher.due(slack=15))
+
+    async def before_watch(self):
+        # No wait for the gateway: the watch reads and DMs over HTTP, as it does during startup's wait.
+        await asyncio.sleep(self.watcher.wait())  # Not a pass early, which would skip its read and wait a whole one more.
+
     @tasks.loop(seconds=10)
     async def health(self):
         guild = self.get_guild(self.guild_id)
@@ -891,6 +945,8 @@ class Fri(discord.Client):
             self.agent.close()
         self.health.cancel()
         self.owner_reviews.cancel()
+        if self.watching:
+            self.watching.cancel()
         if self.sign_in_notice:
             self.sign_in_notice.cancel()
         await sessions(self).close_all()

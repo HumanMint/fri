@@ -132,6 +132,8 @@ class Invitation:
                     if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
                         return self.refuse('nearby message changed')
             return True
+        except ControllerUnavailable:
+            raise  # Nothing changed; the controller is down, and the caller's outage handling says so.
         except (discord.HTTPException, commands.UserFeedbackCheckFailure, ValueError, AttributeError, TypeError) as exc:
             return self.refuse('check failed: '+type(exc).__name__)
 
