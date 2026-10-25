@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import itertools
 import json
 import time
@@ -9,6 +10,7 @@ import pytest
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_actions import harness
+from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_runtime import configured, event
 from compat_tests.test_gene_controls import control_body, controls_api  # noqa: F401
 from fri.fri_agent import Agent
@@ -51,7 +53,8 @@ def owner_dm(fri):
             return dm.nonces[nonce]
         if dm.fail_send and not dm.landed:
             raise dm.fail_send
-        sent = SimpleNamespace(id=556+len(dm.messages), channel=dm, content=content, author=SimpleNamespace(id=99))
+        sent = SimpleNamespace(id=556+len(dm.messages), channel=dm, content=content, author=SimpleNamespace(id=99),
+                               created_at=datetime.datetime.now(datetime.timezone.utc))
         dm.messages[sent.id] = sent
         dm.sends.append(content)
         if nonce is not None:
@@ -59,8 +62,10 @@ def owner_dm(fri):
         if dm.fail_send:  # Discord took it; Fri never heard back.
             raise dm.fail_send
         return sent
-    async def history(limit=100):
-        for sent in list(reversed(dm.messages.values()))[:limit]:
+    async def history(limit=100, after=None, oldest_first=None):
+        found = sorted(dm.messages.values(), key=lambda sent: sent.created_at,
+                       reverse=not (after is not None if oldest_first is None else oldest_first))
+        for sent in [sent for sent in found if after is None or sent.created_at > after][:limit]:
             yield sent
     def message(mid):
         async def edit(*, content, **options):
@@ -345,6 +350,71 @@ def test_a_dm_that_landed_before_a_crash_is_found_again_not_resent(monkeypatch, 
     asyncio.run(scenario())
 
 
+def test_a_landed_dm_is_found_however_many_dms_follow_it(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        try:
+            for _ in range(CHECKS-1):
+                await fri.watcher.check()
+            dm.fail_send, dm.landed = Crash(), True
+            with pytest.raises(Crash):
+                await fri.watcher.check()
+            dm.fail_send = None
+            dm.nonces.clear()  # Restarted after Discord's nonce window.
+            later = datetime.datetime.now(datetime.timezone.utc)
+            for mid in range(1000, 1060):  # The owner kept talking while Fri was down.
+                dm.messages[mid] = SimpleNamespace(id=mid, author=SimpleNamespace(id=10), content='hello?',
+                                                   created_at=later+datetime.timedelta(seconds=mid-999))
+            fri.watcher = Watch(fri)
+            await fri.watcher.check()
+            assert len(dm.sends) == 1 and fri.watcher.state['alert']['message_id'] == '556'
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_fri_waits_out_a_controller_down_at_startup_and_still_tells_the_owner(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        dm = owner_dm(fri)
+        clock, reads = [time.time()], []
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
+        async def api(method, path, value=None):
+            reads.append(path)
+            if path == '/fri/contract':
+                clock[0] += 10  # Each startup retry, CONTRACT_RETRY apart.
+                if reads.count(path) > 40:
+                    return {}  # Back, but incompatible: setup stops right after the wait.
+            raise ControllerUnavailable(UNREACHABLE)
+        fri.api = api
+        try:
+            with patch('fri.fri.CONTRACT_RETRY', 0), pytest.raises(RuntimeError, match='unsupported'):
+                await fri.setup_hook()
+            assert reads.count('/controls/health') == CHECKS+1  # One read per watch interval, not per retry.
+            assert len(dm.sends) == 1 and 'haven’t reached gene’s controller' in dm.sends[0]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_rejected_contract_still_stops_startup_at_once(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerRejected('Unsupported Fri contract'))
+        try:
+            with pytest.raises(ControllerRejected):
+                await fri.setup_hook()
+            fri.api.assert_awaited_once()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_an_outage_over_before_its_dm_landed_sends_nothing_late(monkeypatch, tmp_path):
     async def scenario():
         fri = configured(monkeypatch)
@@ -582,6 +652,62 @@ def test_an_undelivered_outage_notice_leaves_the_channel_free():
         with pytest.raises(ControllerUnavailable):
             await agent.handle(second)
         second.reply.assert_awaited_once()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('failure', [TimeoutError(), ConnectionResetError(54, 'connection reset by peer')])
+def test_a_notice_lost_in_transport_leaves_the_channel_free(failure):
+    async def scenario():
+        agent = down_agent()
+        first = message()
+        first.reply.side_effect = failure
+        with pytest.raises(type(failure)):
+            await agent.handle(first)
+        second = message()
+        with pytest.raises(ControllerUnavailable):
+            await agent.handle(second)
+        second.reply.assert_awaited_once()
+    asyncio.run(scenario())
+
+
+def test_controller_dying_after_a_configured_mention_is_admitted_still_gets_the_notice(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, make_message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        api, failed = fri.api, []
+        async def cut_after_admission(method, path, value=None):
+            if failed or path == '/controls/recent':
+                failed.append(path)
+                raise ControllerUnavailable(UNREACHABLE)
+            return await api(method, path, value)
+        fri.api = cut_after_admission
+        event = make_message()
+        try:
+            await agent.handle(event)
+            assert failed and any(path == '/chat/mentions/admit' for path, _ in calls)
+            assert event.reply.await_count == 1 and event.reply.await_args.args == (UNREACHABLE,)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_controller_trouble_while_answering_an_outside_mention_stays_quiet(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=8)
+        api, failed = fri.api, []
+        async def one_failure(method, path, value=None):
+            if not failed and path == '/chat/context':
+                failed.append(path)
+                raise ControllerUnavailable(UNREACHABLE)
+            return await api(method, path, value)
+        fri.api = one_failure
+        event = make_message()
+        try:
+            await agent.handle(event)
+            assert failed
+            event.reply.assert_not_awaited()
+            assert not agent.unreachable_notices
+        finally:
+            await fri.close()
     asyncio.run(scenario())
 
 

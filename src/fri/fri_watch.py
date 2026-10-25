@@ -1,6 +1,7 @@
 """Fri keeps an eye on Gene and its controller: one owner DM per outage, plus an owner "fri health"."""
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
@@ -103,6 +104,10 @@ class Watch:
         alert = self.load()['alert']
         return bool(alert and alert.get('open') and alert.get('kind') in kinds and alert.get('message_id'))
 
+    def due(self):
+        """For Fri's startup wait, which has no loop of its own: a read per interval, as the loop would."""
+        return time.time()-self.load()['checked'] >= INTERVAL
+
     def refusal(self, offered=()):
         if offered:  # Gene is polling; this one command is disabled or unloaded in Red.
             return NOT_OFFERED
@@ -175,8 +180,10 @@ class Watch:
                 owner = self.fri.get_user(self.fri.owner_id) or await self.fri.fetch_user(self.fri.owner_id)
                 channel = owner.dm_channel or await owner.create_dm()
             if not alert.get('message_id') and alert.get('attempted'):
-                # The last send may have landed after all, before a timeout or a restart.
-                async for sent in channel.history(limit=50):
+                # The last send may have landed after all, before a timeout or a restart. It went out right
+                # after the attempt was saved, so it's among the first DMs since then, however many follow.
+                after = dt.datetime.fromtimestamp(alert['attempted_at']-60, dt.timezone.utc)
+                async for sent in channel.history(limit=50, after=after, oldest_first=True):
                     if sent.author.id == self.fri.user.id and sent.content == alert['attempted']:
                         alert.update(message_id=str(sent.id), channel_id=str(channel.id), shown=sent.content)
                         self.save()
@@ -187,7 +194,7 @@ class Watch:
                     alert['shown'] = text
                     self.save()
                     return
-                alert['attempted'] = text
+                alert.update(attempted=text, attempted_at=time.time())
                 self.save()
                 sent = await channel.send(text, nonce=alert['nonce'], allowed_mentions=NO_MENTIONS)
                 # A nonce Discord already saw returns that first message, maybe with older text; the next pass edits it.
@@ -199,8 +206,9 @@ class Watch:
                 await channel.get_partial_message(int(alert['message_id'])).edit(
                     content=text, allowed_mentions=NO_MENTIONS)
             except discord.NotFound:
-                if alert['open']:  # Deleted mid-outage: the owner still has to hear about this one.
-                    for key in ('message_id', 'channel_id', 'shown', 'attempted'):
+                # Only Fri or Discord can delete Fri's message in a DM. If it's gone mid-outage, send it again.
+                if alert['open']:
+                    for key in ('message_id', 'channel_id', 'shown', 'attempted', 'attempted_at'):
                         alert.pop(key, None)
                     alert['nonce'] = secrets.randbits(62)
                 else:

@@ -358,27 +358,30 @@ class Agent:
         """A message Fri would answer, read while the controller is down: say so instead of going silent.
 
         One notice per channel per five minutes, from either path; True once it's posted. `answering` is a
-        reply Fri had already started, past its gates."""
+        reply Fri had already started, so it was addressed."""
         if (message.author.bot or getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id or
                 message.id in self.responded):  # E.g. a preview card posted, then binding it failed.
             return False
-        # A DM only reaches a controller read after its member check; an outside ping keeps its own gates.
-        if message.guild and not answering and (not self.allowed(message.channel) or
-                                                await addressed_text(message, self.fri.user.id) is None):
+        # A DM only reaches a controller read after its member check. Outside configured channels a
+        # ping keeps its own gates and stays quiet.
+        if message.guild and (not self.allowed(message.channel) or
+                              not answering and await addressed_text(message, self.fri.user.id) is None):
             return False
         now = time.time()
         self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if now-v < 300}
         if message.channel.id in self.unreachable_notices:
             return False
         self.unreachable_notices[message.channel.id] = now
+        posted = False
         try:
             await message.reply(UNREACHABLE, allowed_mentions=NO_MENTIONS, mention_author=False)
-            return True
+            posted = True
         except discord.HTTPException:
-            if self.unreachable_notices.get(message.channel.id) == now:
-                del self.unreachable_notices[message.channel.id]  # Nobody saw it; the next message may try.
             LOG.info('Controller outage notice was not delivered')
-            return False
+        finally:  # Nobody saw it, whatever stopped it, so the next message may try.
+            if not posted and self.unreachable_notices.get(message.channel.id) == now:
+                del self.unreachable_notices[message.channel.id]
+        return posted
 
     async def watch(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
@@ -572,7 +575,8 @@ class Agent:
                 await self.fri.waiting_notices.send(message)
             return
         except ControllerUnavailable:
-            if invitation and not await invitation.current():
+            # The fixed notice carries no evidence, so only the Discord-side checks apply, not a controller read.
+            if invitation and not await invitation.current(check_evidence=False):
                 return missed(f'reply withheld: {invitation.refusal}')
             if not ambient and await self.unreachable(message, answering=True):
                 self.answered(events)

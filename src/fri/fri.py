@@ -38,6 +38,7 @@ NO_MENTIONS = discord.AllowedMentions.none()
 FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
                 'or say “forget me” any time.')
 MAX_PROVENANCE = 200
+CONTRACT_RETRY = 10  # Seconds between contract reads while the controller is down at startup.
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
 UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
@@ -136,7 +137,18 @@ class Fri(discord.Client):
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        if not compatible(await self.api('GET', '/fri/contract')):
+        while True:
+            try:
+                contract = await self.api('GET', '/fri/contract')
+                break
+            except ControllerUnavailable:
+                # Fri waits for its controller before joining the gateway. Discord's HTTP API already
+                # works here, so the watch still tells the owner when the controller is what's down.
+                if self.watcher.due():
+                    LOG.warning('Controller unreachable at startup; waiting for it')
+                    await self.watcher.check()
+                await asyncio.sleep(CONTRACT_RETRY)
+        if not compatible(contract):
             raise RuntimeError('unsupported gene controller contract; fri did not start')
         from .fri_agent import Agent
         self.agent = Agent(self)

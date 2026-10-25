@@ -178,8 +178,14 @@ Fri can't restart anything. It only notices and says so.
   restart mid-outage neither repeats nor forgets the DM. Fri saves what the DM should say before
   it touches Discord, with 30 s for each pass, so a stuck send never delays the next read. A send
   or edit that fails or times out is retried on the next pass, even after a restart. A send that
-  may have landed is looked up in the DM before it's sent again, under the same nonce. A DM the
-  owner deleted mid-outage is sent again; once the outage is over, nothing is sent late.
+  may have landed is looked up in the DM, among the first messages after that attempt, before it's
+  sent again under the same nonce. Only Fri or Discord can delete Fri's message in a DM. If it's gone
+  when Fri goes to edit it mid-outage, Fri sends it again. Once the outage is over, nothing is sent
+  late.
+- **Startup with the controller down.** Fri waits for `/fri/contract` (every 10 s) before it joins
+  the gateway, instead of exiting. Discord's HTTP API already works then, so the same watch reads,
+  once per 2 minutes, still DM the owner. Members see Fri offline until the controller answers, and
+  `fri health` waits too. A rejected or incompatible contract still stops Fri at once.
 - **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
   command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
   there, the member gets a fixed "gene isn't taking commands right now" at once, plus "owner
@@ -188,9 +194,11 @@ Fri can't restart anything. It only notices and says so.
   then hangs on still waits out the controller's 115 s; that needs a controller change.
 - **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed
   to Fri in a configured channel) whose controller read fails, before or while replying, gets one
-  fixed notice per channel per 5 minutes instead of silence. A notice that fails to post doesn't
-  use up those 5 minutes. Ambient chimes stay quiet. Mentions outside configured channels keep
-  their own gates and stay silent. The same text replaces the old "workshop controller is
+  fixed notice per channel per 5 minutes instead of silence. A mention Fri already admitted only
+  needs its Discord-side checks for this notice, since the notice carries no evidence. A notice that
+  fails to post, for any reason, doesn't use up those 5 minutes. Ambient chimes stay quiet, and so
+  does a message Fri already answered. Mentions outside configured channels keep their own gates
+  and stay silent. The same text replaces the old "workshop controller is
   temporarily unavailable" wherever that error was shown, and a controller 5xx's detail goes to
   the log only.
 - **`fri health`.** Owner DM only; in a server channel Fri says to DM. It works while the
