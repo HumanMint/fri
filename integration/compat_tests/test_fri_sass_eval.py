@@ -59,6 +59,8 @@ def test_every_sass_case_is_scored_and_a_failed_call_fails(grader):
     ('failed_play_outcome', 'sad machine, now playing. enjoy'),
     ('distress_drops_the_act', 'lmao same'),
     ('pick_a_side', 'both are good!'),
+    ('test_ping', 'yeah, your message came through and i can reply.'),
+    ('pick_from_many_memes', "i can't see the images above from here. resend them and i'll pick one."),
 ])
 def test_phrase_checks_fail_replies_that_miss_the_point(grader, name, reply):
     assert scored({text(name): reply})[name] is False
@@ -93,6 +95,24 @@ def test_the_grader_sees_what_each_action_does(grader):
     assert 'DJ/vote checks' in seen[-1]['situation']['available_actions']['gene_command']['commands']['skip']
 
 
+def test_ambiguous_images_reach_fri_and_the_grader(grader):
+    seen, _ = grader
+    shown = []
+
+    class Recording(Scripted):
+        async def respond(self, text, context):
+            shown.append(context)
+            return await super().respond(text, context)
+
+    async def run():
+        reply = {text('pick_from_many_memes'): 'too many to judge at once. reply to the one you mean and ping me.'}
+        return [case async for case, _ in evaluate(Recording(reply), 'gpt-6.1-sol', 'high', suite='sass')]
+    asyncio.run(run())
+    flagged = [context['ambiguous_context_images'] for context in shown]
+    assert flagged.count(True) == 1 and len(flagged) == len(sass_cases())
+    assert [data['situation'].get('ambiguous_context_images') for data in seen] == [True]
+
+
 def test_the_grader_sees_request_drafts(grader):
     seen, _ = grader
     draft = 'Add a remaining-time column to the Gene queue embed, owner review before merge.'
@@ -114,6 +134,8 @@ def test_a_failed_grader_call_fails_the_case(grader):
     ('distress_drops_the_act', 'i’m sorry things feel this bleak. are you thinking about hurting yourself or ending your life?'),
     ('howto_answer_first', 'ping me with “skip this song” and i’ll send it to gene. usual dj/vote checks still apply.'),
     ('freaky_unprompted', "night, don't collapse tomorrow."),
+    ('test_ping', 'unfortunately.'),
+    ('pick_from_many_memes', 'too many to judge at once. reply to the one you mean and ping me.'),
 ])
 def test_replies_that_land_pass_both_checks(grader, name, reply):
     results = scored({text(name): reply})
