@@ -35,6 +35,8 @@ def requested(text):
         # "find the meme kev posted": a post someone made, asked for by what it carries.
         r'|\b(find|search|look\s+up|dig\s+up|pull\s+up)\b.*\b(memes?|pics?|pictures?|images?|photos?|screenshots?|gifs?|'
         r'videos?|clips?|links?|files?)\b.*\b(posted|sent|shared|dropped|uploaded|linked)\b'
+        # The verb ends the clause, as in recall; "a shared drive" uses it as an adjective.
+        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn|in\s+[#<])))'
         # "what was that song kev mentioned": a thing someone said, named before the verb. The word
         # before the verb is who said it, so "the most commonly recommended laptop" or "the difference
         # between shared and dedicated" stay general questions.
@@ -56,6 +58,12 @@ def valid_action(action):
             and action['has'] in HAS
             and bool(re.fullmatch(r'(?:[a-f0-9]{32})?', action['cursor']))
             and all(clean(action[k], 80) == action[k] for k in ('query', 'author')))
+
+
+def attachment_ids(message):
+    attachments = getattr(message, 'attachments', None)
+    return tuple(getattr(a, 'id', None) or str(a.url).split('?')[0] for a in attachments) \
+        if isinstance(attachments, (list, tuple)) else ()
 
 
 def bounds(after, before, now):
@@ -242,7 +250,9 @@ class HistorySearch:
                     or message.content != row['content'] or not (message.content.strip() or carries)):
                 continue
             a.observe(scope, message.author.id, profile['revision'])
-            self.evidence[(channel_id, message.id)] = (message.author.id, message.content)
+            # What it carries counts too: an image removed since is an edit, and the attachments change.
+            self.evidence[(channel_id, message.id)] = (message.author.id, message.content,
+                                                       getattr(message, 'edited_at', None), attachment_ids(message))
             messages.append({'id': str(message.id), 'user_id': str(message.author.id),
                 'author': clean(message.author.display_name, 80), 'at': message.created_at.isoformat(),
                 'text': clean(message.content, 600), 'source': message.jump_url,
@@ -271,7 +281,7 @@ class HistorySearch:
             return await self._valid(channels)
 
     async def _valid(self, channels):
-        for (channel_id, message_id), (user, content) in self.evidence.items():
+        for (channel_id, message_id), (user, content, edited, attachments) in self.evidence.items():
             if channel_id not in channels:
                 return False
             channel = channels[channel_id]
@@ -279,6 +289,7 @@ class HistorySearch:
             if not permissions.view_channel or not permissions.read_message_history:
                 return False
             message = await channel.fetch_message(message_id)
-            if (message.author.id != user or message.content != content or message.author.bot or message.webhook_id):
+            if (message.author.id != user or message.content != content or message.author.bot or message.webhook_id or
+                    getattr(message, 'edited_at', None) != edited or attachment_ids(message) != attachments):
                 return False
         return True
