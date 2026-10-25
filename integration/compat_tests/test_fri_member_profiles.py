@@ -21,7 +21,7 @@ from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_runtime import configured
-from fri.fri import FIRST_HERE, FIRST_MEMORY, FIRST_PROFILE, NO_MENTIONS
+from fri.fri import FIRST_HERE, FIRST_MEMORY, FIRST_PROFILE, NO_MENTIONS, Fri
 from fri.fri_agent import Agent
 from fri.fri_chat import Chat, ChatResult
 from fri.fri_errors import ControllerRejected
@@ -100,15 +100,23 @@ def world(monkeypatch, tmp_path):
                     author=SimpleNamespace(id=user, display_name=f'member {user}', bot=False), webhook_id=None,
                     mentions=[], reference=None, attachments=[], embeds=[], edited_at=None)
 
-    async def say(cid, text, reply='bold of you', notes=(), user=20, age=0):
+    async def say(cid, text, reply='bold of you', notes=(), user=20, age=0, event=None):
         fri.chat_once.return_value = ChatResult(status='completed', reply=reply, notes=list(notes))
-        event = message(cid, text, user, age)
+        event = event or message(cid, text, user, age)
         result = await fri.talk(123, cid, user, text, 'private' if cid == DM else 'public', f'member {user}', event=event)
         sent = SimpleNamespace(id=event.id+1, content=result.reply, edit=AsyncMock(), reply=AsyncMock())
         saved = await fri.record_turn(result, sent) if result.turn else None
         return result, saved, sent
     return SimpleNamespace(fri=fri, store=store, channels=channels, readable=readable, calls=calls, say=say,
-                           client=client)
+                           client=client, message=message)
+
+
+def model(w, respond):
+    """Fri's own model call, with the model itself replaced."""
+    async def call(text, context):
+        return await Fri.chat_once(w.fri, text, context)
+    w.fri.chat = SimpleNamespace(respond=respond)
+    w.fri.chat_once = AsyncMock(side_effect=call)
 
 
 def model_context(w):
@@ -295,6 +303,65 @@ def test_a_channel_opened_mid_reply_keeps_what_was_said_while_closed(monkeypatch
             assert saved['memory_scope'] == 'conversation'
             await w.say(GAMING, 'fri recommend me something')
             assert 'private jazz' not in json.dumps(model_context(w), default=str)
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_what_fri_heard_on_arrival_outlasts_busy_channels(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            w.readable[GENERAL] = False
+            waiting = w.message(GENERAL, 'fri I like private jazz')
+            w.fri.hear(waiting)  # Arrives while #general is closed...
+            for _ in range(3000):
+                w.fri.hear(w.message(GAMING, 'chatter', user=40))
+            w.readable[GENERAL] = True  # ...and is answered after it opens, behind a lot of chatter.
+            _, saved, _ = await w.say(GENERAL, waiting.content, 'noted', note('I like private jazz', 'music'),
+                                      event=waiting)
+            assert saved['memory_scope'] == 'conversation'
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_channel_closed_while_fri_gathers_context_drops_out_of_elsewhere(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri compare these two lenses for me')
+            seen = []
+
+            async def respond(text, context):
+                seen.append([row['input'] for row in context['elsewhere']])
+                return ChatResult(status='completed', reply='sure')
+            model(w, respond)
+            gather = w.fri.resolve_references
+
+            async def close(scope, context):
+                w.readable[GENERAL] = False  # Closed after elsewhere was read, before the model call.
+                return await gather(scope, context)
+            w.fri.resolve_references = close
+            await w.say(GAMING, 'fri recommend me something')
+            assert seen == [[]]
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_channel_closed_while_fri_replies_keeps_the_note_there(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            async def respond(text, context):
+                w.readable[GENERAL] = False  # Closed while the model writes.
+                return ChatResult(status='completed', reply='noted', notes=note('I like jazz', 'music'))
+            model(w, respond)
+            _, saved, _ = await w.say(GENERAL, 'fri I like jazz')
+            assert saved['memory_scope'] == 'conversation' and turns(w)[-1]['audience'] == 'conversation'
+            await w.say(GAMING, 'fri recommend me something')
+            assert 'jazz' not in json.dumps(model_context(w), default=str)
         finally:
             await w.fri.close()
     run(scenario)

@@ -202,7 +202,8 @@ edit, anywhere in the server: no note, archive observation or channel summary co
 messages, however it's phrased. A message sent before the edit but answered after it gets its reply
 and keeps nothing: Fri's short-lived channel chatter and reply echoes skip it too. Whether a message
 counts as said in front of everyone is decided when Fri first sees it, so a channel opened while Fri
-replies can't widen it. "Forget me" is unchanged and erases everything. At
+replies can't widen it; a channel closed meanwhile narrows it: its excerpts drop out right before each
+model call, and the turn is saved as staying in its channel. "Forget me" is unchanged and erases everything. At
 startup Fri logs how many configured channels are readable by everyone. If that's none, profiles
 never fill, and the server's channel permissions are the thing to look at.
 

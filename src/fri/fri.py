@@ -52,6 +52,7 @@ FIRST_PROFILE = ('\n\n-# i kept a small preference from this, and it follows you
 FIRST_HERE = ('\n\n-# i kept a small preference from this, just for this chat. ask “what do you remember '
               'about me?” or say “forget me” any time.')
 MAX_PROVENANCE = 200
+HEARD_SECONDS = 1800  # Longer than any message waits for its reply; ambient attention looks back 15 minutes.
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
 UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
@@ -150,7 +151,7 @@ class Fri(discord.Client):
         self.session = None
         self.agent = None
         self.capabilities = frozenset()
-        self.heard = {}  # Message id: whether everyone could read its channel when Fri first saw it.
+        self.heard = {}  # Message id: (when Fri first saw it, whether everyone could read its channel then).
 
     @property
     def profiles(self):
@@ -160,12 +161,15 @@ class Fri(discord.Client):
         """Whether everyone could read this message where it was sent, decided once, when Fri first sees it.
 
         A channel opened while Fri waits or writes its reply can't widen what was said while it was closed.
+        Decisions outlast any wait for a reply; a message first seen later than that counts as restricted.
         """
+        now = time.monotonic()
+        while self.heard and now-next(iter(self.heard.values()))[0] > HEARD_SECONDS:
+            del self.heard[next(iter(self.heard))]
         if message.id not in self.heard:
-            if len(self.heard) >= 1000:
-                del self.heard[next(iter(self.heard))]
-            self.heard[message.id] = server_wide(message.channel)
-        return self.heard[message.id]
+            age = time.time()-discord.utils.snowflake_time(message.id).timestamp()
+            self.heard[message.id] = (now, age < HEARD_SECONDS and server_wide(message.channel))
+        return self.heard[message.id][1]
 
     def first_memory(self, saved):
         """Where the first kept note will show, once the controller keeps member profiles."""
@@ -282,6 +286,9 @@ class Fri(discord.Client):
         LOG.warning('Usage receipt set aside in usage/rejected: %s', cause)
 
     async def chat_once(self, text, context):
+        if context.get('elsewhere'):  # A channel closed while Fri gathered context: what was said there stays there.
+            context['elsewhere'] = [row for row in context['elsewhere'] if server_wide(
+                self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
         result = await self.chat.respond(text, context)
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
@@ -638,6 +645,9 @@ class Fri(discord.Client):
             delivered = getattr(sent, 'content', None)
             if payload.get('verbatim') and isinstance(delivered, str) and delivered != payload['reply']:
                 payload['reply'] = clean(delivered, 3500)  # E.g. an attachment fallback replaced the answer.
+        if payload.get('audience') == 'server' and not server_wide(
+                self.get_channel(int(payload['conversation_id'].split(':', 1)[1]))):
+            payload = {**payload, 'audience': 'conversation'}  # Closed while Fri replied: it stays where it was said.
         try:
             saved = await self.api('POST', '/chat/turn', payload)
         except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError) as exc:
