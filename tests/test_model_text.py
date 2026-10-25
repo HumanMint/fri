@@ -1,3 +1,4 @@
+import hashlib
 import json
 import time
 import unicodedata
@@ -70,10 +71,19 @@ def test_a_row_of_lookalikes_cannot_carry_hidden_bits(pair):
     assert len(raw) <= 1
 
 
-def test_every_raw_character_is_assigned_and_visible():
-    raw = [chr(cp) for cp in range(0x80, 0x110000) if RAW.match(chr(cp))]
-    assert {unicodedata.category(char) for char in raw} <= {'Lo', 'So', 'Sk', 'Sm'}
-    assert '\u3164' not in raw and '\ufe0f' not in raw and len(raw) == 51 + 11172 + 1 + 1185 - 26
+# sha256 of the comma-joined uppercase hex code points with Emoji_Presentation in Unicode 14.0's
+# emoji-data.txt (file sha256 c2076a1b5743c5ab2f6ee8ce82ffe866a4cc3b74c91aa2c3e02f5d080da22e53),
+# minus the regional indicators U+1F1E6-U+1F1FF: 1,159 code points.
+EMOJI = '934d5277c0da21b8716b9a6f4d46ea39babe8f0f133e3bd5d30d495817c710e1'
+
+
+def test_the_raw_list_is_exactly_the_pinned_policy():
+    raw = {cp for cp in range(0x80, 0x110000) if RAW.match(chr(cp))}
+    korean = {*range(0x3131, 0x3164), *range(0xac00, 0xd7a4), 0x2764}  # Modern jamo, syllables and ❤.
+    emoji = sorted(raw - korean)
+    assert korean <= raw and len(emoji) == 1159
+    assert hashlib.sha256(','.join(f'{cp:X}' for cp in emoji).encode()).hexdigest() == EMOJI
+    assert {unicodedata.category(chr(cp)) for cp in raw} <= {'Lo', 'So', 'Sk', 'Sm'}
 
 
 @pytest.mark.parametrize('value,expected', [
