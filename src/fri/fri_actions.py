@@ -333,6 +333,9 @@ class Actions:
             overview = await self.fri.api('POST', '/agent/learning/overview', self.agent.identity(self.user))
             self.overview = self.scoped_overview(overview, channels)
             self.sources.update(self.overview['history_channels'])
+            # A retained report can come from a channel that is no longer a learning channel.
+            self.sources.update(row['channel_id'] for key in ('reports', 'summaries', 'historical_notes')
+                                for row in self.overview[key] if row.get('channel_id'))
             return {'kind': kind, 'completion': receipt, 'evidence': self.overview}
         if kind != 'read_recent':
             return {'blocked': 'That action is not available.'}
@@ -341,10 +344,10 @@ class Actions:
         if channel_id not in channels:
             return {'blocked': 'That channel is outside this conversation’s readable scope.'}
         catch_up = action.get('window') == 'since_my_last_message'
+        self.sources.add(channel_id)
         if self.invitation and not catch_up:
             return await self.invited_context(channel_id)
         channel = channels[channel_id]
-        self.sources.add(channel_id)
         scope = getattr(channel, 'parent_id', None) or channel.id
         after = time.time()-min(7, self.agent.config['history_days'])*86400
         # A catch-up's window hangs off the request, so a slow model call can't move where they left.

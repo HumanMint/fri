@@ -12,6 +12,7 @@ import discord
 import httpx
 import pytest
 
+from compat_tests.test_fri_actions import harness
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_sass_eval import Scripted, grader  # noqa: F401
@@ -395,7 +396,7 @@ def test_the_controls_suite_expects_a_read_before_judging_memes():
     assert asyncio.run(run('resend them and i’ll pick'))['memes_above_reads_first'] is False
 
 
-@pytest.mark.parametrize('lost', ['access', 'membership'])
+@pytest.mark.parametrize('lost', ['access', 'membership', 'poster_opts_out_during_the_access_check'])
 def test_a_channel_they_lose_mid_read_never_reaches_the_next_model_request(monkeypatch, tmp_path, lost):
     """Access is rechecked before each model request, not only before delivery: by then the images
     and text a read turned up would already have gone to the provider."""
@@ -416,8 +417,13 @@ def test_a_channel_they_lose_mid_read_never_reaches_the_next_model_request(monke
             if lost == 'access':
                 general.permissions_for = lambda who: (discord.Permissions.none() if getattr(who, 'id', None) == 20
                                                        else discord.Permissions.all())
-            else:
+            elif lost == 'membership':
                 general.guild.fetch_member.side_effect = discord.NotFound(SimpleNamespace(status=404, reason=''), 'left')
+            else:  # The access check passes, but the poster opts out while it waits on Discord.
+                async def fetched(user):
+                    w.store.personal_control('30', 'disable')
+                    return SimpleNamespace(id=user, bot=False)
+                general.guild.fetch_member.side_effect = fetched
             return 'data:image/png;base64,meme.png'
         monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(side_effect=load))
         sent = []
@@ -439,4 +445,70 @@ def test_a_channel_they_lose_mid_read_never_reaches_the_next_model_request(monke
             assert sent == [[]]
         finally:
             await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_each_model_request_checks_access_first_and_privacy_last(monkeypatch, tmp_path):
+    """Nothing waits between the privacy check and the request. Gene receipts count as sources too."""
+    from compat_tests.test_fri_member_profiles import model, world
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        order = []
+        async def respond(text, context):
+            order.append('request')
+            return ChatResult(status='completed', reply='ok')
+        model(w, respond)
+        async def channels(fresh=False):
+            order.append('access')
+            return readable
+        async def api(method, path, payload=None):
+            order.append(path)
+            return {}
+        w.fri.api = api
+        w.fri.flush_usage = AsyncMock()
+        # A Gene receipt from #1 on an ordinary turn: no read, so no private evidence.
+        actions = SimpleNamespace(sources={'1'}, private_evidence=False, channels=channels)
+        context = {'model': 'm', 'effort': 'high', 'fence': {'turn': {'user_id': '20'}, 'actions': actions,
+                                                              'shown': set()}}
+        monkeypatch.setattr('fri.fri.turn_provenance', lambda *_: [])
+        try:
+            readable = {'1': object()}
+            await w.fri.chat_once('hi', dict(context))
+            assert order == ['access', '/chat/turn/check', 'request']
+            order.clear()
+            readable = {}
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await w.fri.chat_once('hi', dict(context))
+            assert order == ['access']
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_mention_read_and_retained_reports_record_where_they_came_from(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channel, _, post = read_harness(monkeypatch, tmp_path)
+        post('nearby', age=60)
+        event = Mock(spec=discord.Message, id=discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)),
+                     channel=channel, attachments=[], embeds=[], content='<@99> thoughts?')
+        actions = Actions(agent, 20, channel.id, True)
+        actions.event, actions.turn_context, actions.message = event, {}, event.content
+        actions.invitation = SimpleNamespace(outside=False, require_current=AsyncMock(), collect=AsyncMock(),
+            context=dict, look=AsyncMock(return_value={}), image=None, rows=[])
+        try:
+            await actions.execute({'kind': 'read_recent', 'channel_id': str(channel.id), 'window': 'recent'})
+            assert actions.sources == {str(channel.id)}
+        finally:
+            await fri.close()
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        # A report kept from #2, which is no longer a learning channel.
+        fri.api = AsyncMock(return_value={'history_channels': [], 'summaries': [],
+                                          'reports': [{'id': 'r', 'channel_id': '2', 'body': 'memes'}]})
+        owner = Actions(agent, 10, 999, False)
+        try:
+            await owner.execute({'kind': 'learning_overview', 'channel_id': ''})
+            assert owner.sources == {'2'}
+        finally:
+            await fri.close()
     asyncio.run(scenario())
