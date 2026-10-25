@@ -59,7 +59,7 @@ def test_wait_notice_is_deleted_only_after_completion(monkeypatch, tmp_path, out
         try:
             await started.wait()
             await agent.respond(followup, 'fri?')
-            assert followup.reply.await_args.args == ('i’m still replying to you. give me a moment.',)
+            assert followup.reply.await_args.args == ('hold on, still typing your last one.',)
             assert followup.reply.await_args.kwargs['delete_after'] == 300
             notice.delete.assert_not_awaited()
             finish.set()
