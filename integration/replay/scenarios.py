@@ -126,10 +126,11 @@ KEYWORDS = Scenario(
      Say(OWNER, 'fri lol the token usage today is crazy', label='casual'),
      Say(BO, 'fri what do you remember about me?', label='memory'),
      Say(OWNER, 'fri have you been learning anything', label='learning'),
-     Say(OWNER, 'fri make your tone a bit drier', label='tone')],
-    {'conversation': [reply('wallet in shambles'), reply('a bit, mostly game chatter')],
-     'internal': [{'explanation': 'drier voice', 'changes': [
-         {'key': 'voice_notes', 'json_value': json.dumps('drier, fewer jokes')}]}]},
+     Say(OWNER, 'fri make your tone a bit drier', label='tone'),
+     Say(OWNER, "fri you'd be a terrible model lol", label='banter')],
+    {'conversation': [reply('wallet in shambles'), reply('a bit, mostly game chatter'), reply('and yet here you are')],
+     'internal': [{'answer': 'settings_change'}, {'explanation': 'drier voice', 'changes': [
+         {'key': 'voice_notes', 'json_value': json.dumps('drier, fewer jokes')}]}, {'answer': 'other'}]},
     [Check('explicit usage request is answered locally',
            lambda r: route(r, 'usage')['kind'] == 'local-usage-report' and route(r, 'usage')['model_calls'] == 0),
      Check('casual mention of usage reaches the model', lambda r: route(r, 'casual')['kind'] == 'model'),
@@ -139,7 +140,11 @@ KEYWORDS = Scenario(
            lambda r: route(r, 'learning')['kind'] == 'model'),
      Check('tone change becomes an owner settings preview',
            lambda r: route(r, 'tone')['kind'] == 'owner-control'
-           and any(d.view for d in r.step('tone').deliveries))])
+           and any(d.view for d in r.step('tone').deliveries)
+           and [m['model'] for m in r.step('tone').model] == ['gpt-6-luna', 'gpt-6.1-sol']),
+     Check('owner banter with a settings word costs one cheap check, not the Sol settings call',
+           lambda r: route(r, 'banter')['kind'] == 'model'
+           and [m['model'] for m in r.step('banter').model if m['kind'] == 'internal'] == ['gpt-6-luna'])])
 
 ERASURE = Scenario(
     'derived_content_removed_on_erasure',
