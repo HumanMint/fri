@@ -9,3 +9,7 @@ class ControllerRejected(commands.UserFeedbackCheckFailure):
 
 class ControllerUnavailable(commands.UserFeedbackCheckFailure):
     """The controller couldn't be reached, so nothing is known about the request's outcome."""
+
+
+class AuthorErased(Exception):
+    """The author erased after their message came in, so nothing more answers it."""

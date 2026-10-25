@@ -18,7 +18,7 @@ from .fri_actions import Actions
 from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
-from .fri_errors import ControllerRejected, ControllerUnavailable
+from .fri_errors import AuthorErased, ControllerRejected, ControllerUnavailable
 from .fri_memory import describe_memory, memory_intent
 from .fri_notices import Busy, ReplyInProgress, WaitingNotices, notice_text
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
@@ -226,7 +226,9 @@ class Fri(discord.Client):
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         return result
 
-    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None):
+    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None):
+        # `revision`: the author's privacy revision as their message came in, if known. Gene fences the
+        # reply against the one read below, so an erasure before that read must stop it here.
         if invitation and invitation.outside:
             return await self.invited_talk(invitation, text)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
@@ -264,6 +266,8 @@ class Fri(discord.Client):
         try:
             async with self.chat_slots:
                 context = attributed(await self.api('POST', '/chat/context', scope))
+                if revision is not None and context['revision'] != revision:
+                    raise AuthorErased()
                 conversation = {}
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence

@@ -555,8 +555,8 @@ def test_a_slow_check_cannot_let_a_later_message_go_first(monkeypatch, tmp_path)
                 while 456 not in profiles:
                     await pause(0.01)
                 tasks.append(asyncio.create_task(agent.handle(third)))
-                while not any(row[0] == third.id for row in answered):
-                    await pause(0.01)  # The third's waiting notice.
+                while profiles.count(1) < 3:
+                    await pause(0.01)  # The third came in too.
                 finish.set()
                 await pause(0.05)
                 slow.set()
@@ -953,6 +953,149 @@ def test_a_controller_that_goes_down_while_a_ping_waits_says_so(monkeypatch, tmp
             texts = [item.args[0] for item in event.reply.await_args_list]
             assert texts == ([GLITCH] if when == 'before notice' else [str(ReplyInProgress()), GLITCH])
             assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: controller unavailable']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('queued', [False, True])
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_an_erasure_during_the_typing_call_stops_the_reply(monkeypatch, tmp_path, caplog, channel_id, queued):
+    # Before Fri reads the context its reply is fenced against, queued or not.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message('<@99> remember the private marker?')
+        event.reply.return_value = SimpleNamespace(delete=AsyncMock())
+        @asynccontextmanager
+        async def typing():
+            if not typing.erased:
+                typing.erased = True
+                store.clear_chats('20')
+            yield
+        typing.erased = False
+        channel.typing = typing
+        if queued:
+            fri.busy.add(20)
+            asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            assert all(item.args[0] == str(ReplyInProgress()) for item in event.reply.await_args_list)
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['erase', 'unping', 'access'])
+def test_the_waiting_notice_checks_run_once_it_can_post(monkeypatch, tmp_path, caplog, change):
+    # Another notice to the same member holds the way; the ping changes meanwhile.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        fri.busy.add(20)
+        send, sending = fri.waiting_notices.send, asyncio.Event()
+        async def queued(item, eligible=None):
+            sending.set()
+            return await send(item, eligible)
+        fri.waiting_notices.send = queued
+        lock = fri.waiting_notices.locks[20]
+        await lock.acquire()
+        try:
+            task = asyncio.create_task(agent.handle(event))
+            await sending.wait()
+            await asyncio.sleep(0.01)
+            if change == 'erase':
+                store.personal_control('20', 'disable')
+            elif change == 'unping':
+                edited = copy.copy(event)
+                edited.content, edited.mentions = 'you there?', []
+                rows[event.id] = edited
+            else:
+                channel.permissions_for = lambda _: discord.Permissions.none()
+            lock.release()
+            await asyncio.wait_for(task, 5)
+            event.reply.assert_not_awaited()
+            fri.chat_once.assert_not_awaited()
+            assert len(mention_lines(caplog)) == 1 and ' not answered: ' in mention_lines(caplog)[0]
+        finally:
+            if lock.locked():
+                lock.release()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_no_dm_low_battery_after_an_erasure_during_the_membership_check(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, _, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        since = (agent.forgotten.get(20, 0), await agent.revision(20))
+        async def member(*_, **__):
+            store.clear_chats('20')
+            return SimpleNamespace(id=20)
+        agent.member = member
+        event = SimpleNamespace(id=1, guild=None, author=SimpleNamespace(id=20), add_reaction=AsyncMock())
+        try:
+            assert await agent.recharging(event, True, since) is False
+            event.add_reaction.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_forget_me_ping_hears_about_an_outage(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> forget me')
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+        try:
+            await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(GLITCH,)]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('failure', ['outage', 'deadline'])
+def test_a_ping_that_waited_for_a_save_still_gets_its_checks(monkeypatch, tmp_path, caplog, failure):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.2 if failure == 'deadline' else 0)
+        saved = agent.recording[(1, 20)] = asyncio.Event()  # An earlier reply is still being saved.
+        asyncio.get_running_loop().call_later(0.35, saved.set)
+        if failure == 'outage':
+            agent.revision = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            expected = GLITCH if failure == 'outage' else NOTICES['stale event']
+            assert [item.args for item in event.reply.await_args_list] == [(expected,)]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: ' +
+                                             ('controller unavailable' if failure == 'outage' else 'earlier reply still running')]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_outside_the_queue_keeps_its_controller_error(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, _, _, _ = environment(monkeypatch, tmp_path)
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+        mid = discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc))
+        event = SimpleNamespace(id=mid, guild=None, author=SimpleNamespace(id=20, display_name='member', bot=False),
+                                channel=SimpleNamespace(id=5), reply=AsyncMock())
+        try:
+            await agent.take_turn(event, 'hey', True)
+            assert [item.args for item in event.reply.await_args_list] == [('the workshop controller is temporarily unavailable.',)]
+            fri.chat_once.assert_not_awaited()
         finally:
             await fri.close()
     asyncio.run(scenario())

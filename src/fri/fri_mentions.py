@@ -9,7 +9,7 @@ import discord
 from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
-from .fri_errors import ControllerUnavailable
+from .fri_errors import AuthorErased, ControllerUnavailable
 from .fri_meme_media import sources
 from .privacy import clean
 
@@ -181,9 +181,10 @@ class Invitation:
         result = await self.fri.api('POST', '/chat/mentions/admit', {**self.scope,
             'source': self.source, 'content': self.event.content, 'bot_id': str(self.fri.user.id)})
         if result.get('allowed'):
+            if self.revision is not None and result['revision'] != self.revision:
+                raise AuthorErased()  # Gene fences the grant from here on, so stop at the gap before.
             self.grant = result['mention_grant']
-            if self.revision is None:
-                self.revision = result['revision']
+            self.revision = result['revision']
         return result
 
     def granted_scope(self):
