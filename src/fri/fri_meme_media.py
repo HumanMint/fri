@@ -22,11 +22,9 @@ def gif_previews(message):
         if isinstance(embeds, (list, tuple)) else []
 
 
-def stills(message):
-    """Whether a post's images include a GIF, so the model knows it saw one frame."""
-    attachments = getattr(message, 'attachments', None)
-    return bool(gif_previews(message)) or (isinstance(attachments, (list, tuple)) and
-                                           any(a.content_type == 'image/gif' for a in attachments))
+class Still(str):
+    """A data URL holding an animation's first frame, so the model can be told it saw one frame."""
+    first_frame = True
 
 
 def sources(message, most=2, *, gifs=False):
@@ -101,7 +99,7 @@ async def load_image(url, channel, *, transport=None, gifs=False):
     animated = ((mime == 'image/png' and b'acTL' in body) or (mime == 'image/webp' and b'ANIM' in body) or
                 mime == 'image/gif')
     if gifs and animated and (body.startswith((b'GIF87a', b'GIF89a')) or mime != 'image/gif'):
-        return 'data:image/png;base64,'+base64.b64encode(first_frame(body)).decode()
+        return Still('data:image/png;base64,'+base64.b64encode(first_frame(body)).decode())
     if len(body) > MAX_BYTES:
         raise ValueError('Image exceeds the byte limit')
     valid = ((mime == 'image/png' and body.startswith(b'\x89PNG\r\n\x1a\n') and b'acTL' not in body) or
@@ -124,6 +122,10 @@ def first_frame(body):
         frame.thumbnail((STILL_SIDE, STILL_SIDE))
         out = io.BytesIO()
         frame.save(out, 'PNG')
+    except ValueError:
+        raise
     except (OSError, UnidentifiedImageError, Image.DecompressionBombError, EOFError, SyntaxError) as exc:
+        raise ValueError('Not a readable animated image') from exc
+    except Exception as exc:  # A malformed file can trip anything inside Pillow's decoders (IndexError, ...).
         raise ValueError('Not a readable animated image') from exc
     return out.getvalue()

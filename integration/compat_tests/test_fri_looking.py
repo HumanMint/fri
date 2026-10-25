@@ -22,6 +22,7 @@ from fri.fri_chat import Chat, ChatResult
 from fri.fri_errors import GateClosed
 from fri.fri_eval import evaluate, sass_cases
 from fri.fri_images import MAX_IMAGES, look, media, require_current
+from fri.fri_meme_media import Still
 
 ASK = '<@99> whats ur favorite meme out of the memes above'
 
@@ -36,7 +37,8 @@ def loads(monkeypatch, fail=()):
     async def load(url, channel, **_):
         if url.rsplit('/', 1)[1] in fail:
             raise httpx.ConnectError('cdn down')
-        return 'data:image/png;base64,'+url.rsplit('/', 1)[1]
+        image = 'data:image/png;base64,'+url.rsplit('/', 1)[1]
+        return Still(image) if url.endswith('.gif') else image  # An animation comes back as its first frame.
     loader = AsyncMock(side_effect=load)
     monkeypatch.setattr('fri.fri_images.load_image', loader)
     return loader
