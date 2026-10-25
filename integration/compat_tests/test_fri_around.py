@@ -29,9 +29,17 @@ def around(monkeypatch, tmp_path):
         item.name, item.parent = f'thread-{tid}', parent  # Mock(name=, parent=) mean something else.
         item.is_private = lambda: kind == discord.ChannelType.private_thread
         item.is_nsfw = lambda: False
+        async def history(**_):
+            return
+            yield
+        item.history = history
         parent.threads.append(item)
         channels[tid] = item
         return item
+    # A fresh access check refetches the channels a turn read from, and the server's roles.
+    guild = channels[1].guild
+    guild.fetch_roles = AsyncMock(return_value=[])
+    guild.fetch_channel = AsyncMock(side_effect=lambda cid: channels[cid])
     for posted in posts.values():
         posted.jump_url = f'https://discord.com/channels/123/{posted.channel.id}/{posted.id}'
         posted.created_at = discord.utils.snowflake_time(posted.id)
@@ -101,6 +109,27 @@ def test_reading_another_public_channel_from_here_is_fenced_like_this_one(monkey
             channels[2].permissions_for = channels[3].permissions_for
             assert not await actions.valid()
             assert (await actions.execute({'kind': 'read_recent', 'channel_id': '2', 'window': 'recent'}))['blocked']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_revoke_the_cache_has_not_seen_still_fences_another_channel_read(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, _, post, thread = around(monkeypatch, tmp_path)
+        busy = thread(channels[2], 2001)
+        post(2, 'movie night friday?', age=300)
+        actions = Actions(agent, 20, 1, True)
+        actions.event = SimpleNamespace(id=1, channel=channels[1])
+        try:
+            await actions.execute({'kind': 'read_recent', 'channel_id': '2001', 'window': 'recent'})
+            assert actions.sources == {'2001'} and await actions.valid()
+            # Discord already took #2 away from the speaker; the cached channel still lets them read it.
+            fetched = SimpleNamespace(**{**vars(channels[2]), 'permissions_for': lambda who: discord.Permissions()})
+            channels[1].guild.fetch_channel = AsyncMock(side_effect=lambda cid: fetched if cid == 2 else channels[cid])
+            assert busy.permissions_for(channels[1].guild.me).view_channel
+            assert '2001' not in await actions.channels(fresh=True, around=True)
+            assert not await actions.valid()
         finally:
             await fri.close()
     asyncio.run(scenario())
