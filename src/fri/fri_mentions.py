@@ -16,6 +16,14 @@ NEARBY_SECONDS = 30 * 60
 REFERENCE_SECONDS = 7 * 86400
 MAX_MESSAGES = 12
 CHANGED = 'That mention or its context changed while I was replying. Ask again for a fresh reply.'
+# Said instead of a reply that can't go out, while the ping itself is still there to answer. Gates
+# that close access (permissions, thread state, a deleted or un-pinged message) stay quiet.
+CONTEXT_CHANGED = 'things changed while i was typing. ping me again and i’ll catch up.'
+NOTICES = {'stale event': 'took me too long on that one. ping me again if you still need me.',
+           'message changed': 'you edited that before i could answer. ping me again with the new version.',
+           'nearby message changed': CONTEXT_CHANGED, 'nearby privacy changed': CONTEXT_CHANGED,
+           'check failed: ControllerRejected': CONTEXT_CHANGED}
+GLITCH = 'that one glitched on my end. ping me again.'
 
 
 def fingerprint(message):
@@ -37,6 +45,7 @@ class Invitation:
         self.image = None
         self.ambiguous_images = False
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
+        self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
 
     @classmethod
     async def create(cls, agent, message):
@@ -50,7 +59,8 @@ class Invitation:
             invitation = cls(agent, message)
             if await invitation.current(check_evidence=False):
                 return invitation
-            reason = invitation.refusal
+            await agent.withheld(message, [message], invitation.refusal, invitation)
+            return None
         agent.miss(message, reason)
         return None
 
@@ -94,8 +104,11 @@ class Invitation:
 
     async def current(self, *, check_evidence=True):
         try:
-            if not -5 <= time.time()-discord.utils.snowflake_time(self.event.id).timestamp() <= 300:
+            age = time.time()-discord.utils.snowflake_time(self.event.id).timestamp()
+            if age > 300:
                 return self.refuse('stale event')
+            if age < -5:
+                return self.refuse('clock skew')
             if not await self.access():
                 return False
             current = await self.event.channel.fetch_message(self.event.id)
@@ -117,6 +130,31 @@ class Invitation:
     async def require_current(self):
         if not await self.current():
             raise commands.UserFeedbackCheckFailure(CHANGED)
+
+    async def notice(self, reason):
+        """What to say instead of a reply that can't go out, or None to stay quiet.
+
+        Only while the ping still stands: Fri can still answer there, the message still pings Fri,
+        and its author hasn't asked Fri to forget them since. Never any content or context.
+        """
+        text = NOTICES.get(reason, GLITCH if reason.startswith('check failed: ') else None)
+        if not text or self.agent.forgotten.get(self.event.author.id, 0) != self.forgotten:
+            return None
+        refusal = self.refusal
+        try:
+            if not await self.access():
+                return None
+            current = await self.event.channel.fetch_message(self.event.id)
+            if (current.id != self.event.id or current.author.id != self.event.author.id or current.author.bot or
+                    current.webhook_id or not explicit_mention(current, self.fri.user.id)):
+                return None
+            if reason == 'message changed' and current.edited_at is None:
+                return GLITCH  # Not the member's edit, so don't say it was.
+            return text
+        except (discord.HTTPException, commands.UserFeedbackCheckFailure, ValueError, AttributeError, TypeError):
+            return None
+        finally:
+            self.refusal = refusal
 
     async def admit(self):
         await self.require_current()

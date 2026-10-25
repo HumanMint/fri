@@ -23,6 +23,23 @@ class ReplyInProgress(commands.UserFeedbackCheckFailure):
         super().__init__('hold on, still typing your last one.')
 
 
+class Busy(set):
+    """Members with a reply running. A message that arrives meanwhile can wait for it to finish."""
+
+    def __init__(self):
+        super().__init__()
+        self.idle = {}  # member: set once their running reply finishes.
+
+    def discard(self, user):
+        super().discard(user)
+        if user in self.idle:
+            self.idle.pop(user).set()
+
+    async def finished(self, user):
+        while user in self:
+            await self.idle.setdefault(user, asyncio.Event()).wait()
+
+
 class WaitingNotices:
     def __init__(self, busy):
         self.busy = busy

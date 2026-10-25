@@ -23,10 +23,11 @@ from compat_tests.test_fri_continuity import arm, origin
 from compat_tests.test_fri_runtime import configured
 from fri.fri_actions import Actions
 from fri.fri_addressing import explicit_mention
-from fri.fri_agent import Agent
+from fri.fri_agent import QUEUE_SECONDS, Agent
 from fri.fri_chat import Chat, ChatResult
 from fri.fri_errors import ControllerRejected
-from fri.fri_mentions import Invitation
+from fri.fri_mentions import CONTEXT_CHANGED, NOTICES, Invitation
+from fri.fri_notices import ReplyInProgress
 
 
 def environment(monkeypatch, tmp_path, *, channel_id=8):
@@ -205,13 +206,17 @@ def test_invalid_invitation_fails_before_model(monkeypatch, tmp_path, caplog, fa
             await agent.handle(event)
             assert not calls
             fri.chat_once.assert_not_awaited()
-            event.reply.assert_not_awaited()
             # A member's dropped mention says why in the log, by message ID only. Bots and webhooks aren't members.
             reason = {'old': 'stale event', 'bot': None, 'webhook': None,
                       'foreign_guild': 'outside the main server', 'foreign_source': 'message changed',
                       'permission': 'missing permissions', 'disabled': 'fri disabled'}[failure]
             logged = [line for line in caplog.messages if line.startswith('Mention ')]
-            assert logged == ([f'Mention {channel.id}/{event.id} not answered: {reason}'] if reason else [])
+            if failure == 'old':  # A ping that's still there hears why, never what it said.
+                assert event.reply.await_args.args == (NOTICES['stale event'],)
+                assert logged == [f'Mention {channel.id}/{event.id} not answered, told why: stale event']
+            else:  # Another author's message, or access Fri no longer has, gets nothing.
+                event.reply.assert_not_awaited()
+                assert logged == ([f'Mention {channel.id}/{event.id} not answered: {reason}'] if reason else [])
             assert not any('what do you think' in line for line in caplog.messages)
         finally:
             await fri.close()
@@ -291,12 +296,16 @@ def test_an_erasure_during_the_burst_wait_names_the_mention(monkeypatch, tmp_pat
     asyncio.run(scenario())
 
 
-def test_a_cooldown_burst_names_the_mention_it_answers_for(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize('reactions', [True, False])
+def test_a_cooldown_burst_shows_a_low_battery_for_the_mention_it_answers_for(monkeypatch, tmp_path, caplog, reactions):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
-        fri, agent, _, controller, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri, agent, _, controller, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         for _ in range(30):  # Spend the allowance; its one cooldown notice has already shown.
             controller.admit('20', 'public')
+        if not reactions:
+            channel.permissions_for = lambda _: discord.Permissions(view_channel=True, send_messages=True,
+                                                                   read_message_history=True)
         first, second = message('<@99> how is it going?', age=1), message('you around?')
         try:
             task = asyncio.create_task(agent.handle(first))
@@ -305,30 +314,131 @@ def test_a_cooldown_burst_names_the_mention_it_answers_for(monkeypatch, tmp_path
             await agent.handle(second)  # Answers for both, without the mention's invitation.
             await task
             first.reply.assert_not_awaited()
-            second.reply.assert_not_awaited()
-            assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: social cooldown']
+            second.reply.assert_not_awaited()  # Its one text notice already showed.
+            first.add_reaction.assert_not_awaited()
+            if reactions:  # A low battery on the newest message, instead of silence.
+                second.add_reaction.assert_awaited_once_with('🪫')
+                assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered, told why: social cooldown']
+            else:
+                second.add_reaction.assert_not_awaited()
+                assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: social cooldown']
         finally:
             await fri.close()
     asyncio.run(scenario())
 
 
-def test_a_mention_behind_a_finishing_reply_says_why(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize('when', ['before', 'during'])
+def test_a_mention_behind_a_running_reply_is_answered_after_it(monkeypatch, tmp_path, caplog, when):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        notice = SimpleNamespace(delete=AsyncMock())
+        replies = []
+        async def reply(text, **kwargs):
+            replies.append(text)
+            if text == str(ReplyInProgress()):
+                fri.busy.discard(20)  # The earlier reply finishes after this mention starts waiting.
+                return notice
+            return SimpleNamespace(id=event.id+1, content=text)
+        event.reply.side_effect = reply
+        if when == 'before':
+            fri.busy.add(20)  # An earlier reply to the same member (here, its panel) is still running.
+        else:  # The panel reply starts after this mention's turn began, right before it talks.
+            talk, raced = fri.talk, []
+            async def racing(*args, **kwargs):
+                if not raced:
+                    raced.append(True)
+                    fri.busy.add(20)
+                    asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+                    raise ReplyInProgress()
+                return await talk(*args, **kwargs)
+            fri.talk = racing
+        try:
+            await agent.handle(event)
+            answer = 'that meme is doing a lot of work'
+            assert replies == ([str(ReplyInProgress()), answer] if when == 'before' else [answer])
+            assert any(path == '/chat/turn' for path, _ in calls)
+            if when == 'before':
+                notice.delete.assert_awaited_once()  # The waiting notice goes once the answer lands.
+            assert not mention_lines(caplog)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_message_waiting_behind_a_stuck_reply_hears_why(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
-        event = message('<@99> you there?')
-        fri.busy.add(20)  # An earlier reply to the same member is still running...
-        original, checks = Invitation.current, []
-        async def current(self, **kwargs):
-            checks.append(await original(self, **kwargs))
-            if len(checks) == 2:
-                fri.busy.discard(20)  # ...and finishes while this mention is rechecked.
-            return checks[-1]
-        monkeypatch.setattr(Invitation, 'current', current)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.2)
+        event.reply.return_value = SimpleNamespace(delete=AsyncMock())
+        fri.busy.add(20)  # An earlier reply that doesn't finish in time.
         try:
             await agent.handle(event)
-            event.reply.assert_not_awaited()
-            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: earlier reply still running']
+            fri.chat_once.assert_not_awaited()
+            assert [item.args for item in event.reply.await_args_list] == [
+                (str(ReplyInProgress()),), (NOTICES['stale event'],)]
+            assert mention_lines(caplog) == [
+                f'Mention 8/{event.id} not answered, told why: earlier reply still running']
+            assert not agent.turns[20].locked()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_messages_that_come_in_mid_reply_are_answered_in_order(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second, third = (message(f'fri question {n}') for n in (1, 2, 3))
+        started, finish, answered = asyncio.Event(), asyncio.Event(), []
+        async def answer(text, context):
+            if not started.is_set():
+                started.set()
+                await finish.wait()
+            return ChatResult(status='completed', reply='answer to '+text)
+        fri.chat_once.side_effect = answer
+        for item in (first, second, third):
+            item.reply.side_effect = lambda text, item=item, **_: (answered.append((item.id, text)) or
+                                                                  SimpleNamespace(id=item.id+1, content=text,
+                                                                                  delete=AsyncMock()))
+        pause = asyncio.sleep  # The burst debounce is skipped below; this test's own waits aren't.
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                await started.wait()
+                for item in (second, third):
+                    tasks.append(asyncio.create_task(agent.handle(item)))
+                    while not any(row[0] == item.id for row in answered):
+                        await pause(0.01)  # Its waiting notice.
+                finish.set()
+                await asyncio.gather(*tasks)
+            texts = [(mid, text) for mid, text in answered if text.startswith('answer to')]
+            assert texts == [(first.id, 'answer to fri question 1'), (second.id, 'answer to fri question 2'),
+                             (third.id, 'answer to fri question 3')]
+        finally:
+            finish.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_message_waiting_its_turn_is_dropped_if_its_author_erases(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        async def reply(text, **kwargs):
+            store.personal_control('20', 'disable')  # Erased through Gene or Red while it waits.
+            fri.busy.discard(20)
+            return SimpleNamespace(delete=AsyncMock())
+        event.reply.side_effect = reply
+        fri.busy.add(20)
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert [item.args for item in event.reply.await_args_list] == [(str(ReplyInProgress()),)]
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+            assert not agent.turns[20].locked()
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -580,12 +690,17 @@ def test_revocation_during_answer_never_sends_or_saves_context(monkeypatch, tmp_
         fri.chat_once.side_effect = answer
         try:
             await agent.handle(event)
-            event.reply.assert_not_awaited()
             assert not any(path == '/chat/turn' for path, _ in calls)
             reason = {'privacy': 'check failed: ControllerRejected', 'source_edit': 'nearby message changed',
                       'permission': 'missing permissions', 'settings': 'check failed: ControllerRejected'}[change]
-            assert [line for line in caplog.messages if line.startswith('Mention ')] == [
-                f'Mention {channel.id}/{event.id} not answered: reply withheld: {reason}']
+            if change == 'permission':  # Fri can't answer there any more, so it doesn't.
+                event.reply.assert_not_awaited()
+                assert mention_lines(caplog) == [
+                    f'Mention {channel.id}/{event.id} not answered: reply withheld: {reason}']
+            else:  # A fixed notice, never the reply or what it drew on.
+                assert [item.args for item in event.reply.await_args_list] == [(CONTEXT_CHANGED,)]
+                assert mention_lines(caplog) == [
+                    f'Mention {channel.id}/{event.id} not answered, told why: reply withheld: {reason}']
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -609,10 +724,11 @@ def test_outside_invitation_preserves_cooldown_and_blocks_all_nonweb_actions(mon
                 await agent.handle(item)
             assert fri.chat_once.await_count < 20
             assert any(e.reply.await_args and 'recharge' in e.reply.await_args.args[0] for e in events)
-            later = message()  # The notice shows once; the rest of the cooldown is quiet, but logged.
+            later = message()  # The notice shows once; later pings in the cooldown get a low battery.
             await agent.handle(later)
             later.reply.assert_not_awaited()
-            assert f'Mention 8/{later.id} not answered: social cooldown' in caplog.messages
+            later.add_reaction.assert_awaited_once_with('🪫')
+            assert f'Mention 8/{later.id} not answered, told why: social cooldown' in caplog.messages
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -786,8 +902,9 @@ def test_on_demand_meme_read_checks_sources_before_reply_and_prevents_persistenc
                 event.reply.assert_awaited_once()
                 assert event.reply.await_args.kwargs['view'] is None
                 assert 'another member caption' not in str(store.chat_context('123', 'public:1', '20'))
-            else:
-                event.reply.assert_not_awaited()
+            else:  # Never the reply; a fixed notice only while Fri can still answer there.
+                assert [item.args for item in event.reply.await_args_list] == (
+                    [] if change == 'permission' else [(CONTEXT_CHANGED,)])
                 assert not any(path == '/chat/turn' for path, _ in calls)
         finally:
             await fri.close()

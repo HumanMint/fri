@@ -20,7 +20,7 @@ from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
 from .fri_errors import ControllerRejected
 from .fri_memory import describe_memory, memory_intent
-from .fri_notices import ReplyInProgress, WaitingNotices, notice_text
+from .fri_notices import Busy, ReplyInProgress, WaitingNotices, notice_text
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
 from .fri_protocol import PROTOCOL, compatible
 from .fri_reports import ReportButton, report_component
@@ -125,7 +125,7 @@ class Fri(discord.Client):
         self.data = Path(os.getenv('FRI_DATA', '/data'))
         self.chat = Chat(Subscription(os.getenv('FRI_CHATGPT_AUTH', '/auth/session.json')))
         self.tree = FriTree(self)
-        self.busy = set()
+        self.busy = Busy()
         self.waiting_notices = WaitingNotices(self.busy)
         self.usage_lock = asyncio.Lock()
         self.chat_slots = asyncio.Semaphore(2)

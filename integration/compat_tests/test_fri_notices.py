@@ -1,6 +1,7 @@
 """Temporary notices follow actual reply delivery, without changing member text."""
 
 import asyncio
+import datetime as dt
 import itertools
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -48,30 +49,42 @@ def test_wait_notice_is_deleted_only_after_completion(monkeypatch, tmp_path, out
                     social_preview={'id': 'social'} if outcome == 'social' else None)
             finally:
                 fri.busy.discard(10)
+        deliveries = []
         async def delivered(*args, **kwargs):
-            notice.delete.assert_not_awaited()
+            deliveries.append(args)
+            if len(deliveries) == 1:  # The first reply lands before the waiting notice goes.
+                notice.delete.assert_not_awaited()
         first.reply.side_effect = delivered
         agent.acknowledge = AsyncMock(side_effect=delivered)
         for path in ('fri.fri_workspace.show_preview', 'fri.fri_social.show_preview'):
             monkeypatch.setattr(path, AsyncMock(side_effect=delivered))
         fri.talk = talk
+        followup.id = discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc))  # A fresh message.
         task = asyncio.create_task(agent.respond(first, 'dog or rat'))
+        waiting = None
         try:
             await started.wait()
-            await agent.respond(followup, 'fri?')
+            waiting = asyncio.create_task(agent.respond(followup, 'fri?'))
+            while not followup.reply.await_count:
+                await asyncio.sleep(0)
             assert followup.reply.await_args.args == ('hold on, still typing your last one.',)
             assert followup.reply.await_args.kwargs['delete_after'] == 300
             notice.delete.assert_not_awaited()
             finish.set()
             await task
+            await waiting  # It waited its turn rather than being dropped.
             notice.delete.assert_awaited_once()
             other.reply.return_value.delete.assert_not_awaited()
             if outcome == 'reply':
                 assert first.reply.await_args.args == ('Looks like a dog.',)  # Model text is unchanged.
+                assert followup.reply.await_args.args == ('Looks like a dog.',)
             if outcome == 'error':
                 assert first.reply.await_args.args == ('the image could not be loaded.',)
+                assert followup.reply.await_args.args == ('the image could not be loaded.',)
         finally:
             finish.set()
+            if waiting:
+                await waiting
             await fri.close()
     asyncio.run(scenario())
 
