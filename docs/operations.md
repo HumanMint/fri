@@ -66,19 +66,23 @@ They do not prove Discord delivery or live model interpretation of a particular 
 ## Catching up
 
 "fri what did i miss", or any ask to be caught up, has the model call `read_recent` with
-`window=since_my_last_message`. Fri reads that channel back from the request, up to 100 messages
-or 12 hours, and stops at the speaker's last message there. Their own messages from the last five
-minutes ("back", "yo") and ones only bots answered count as them coming back, not where they left.
-The receipt says where the read stopped (`your_last_message`, `message_limit` or `time_limit`) and
-when the speaker last spoke, so Fri can say a recap only covers the latest stretch. Rows carry the
-author, minute and text cut to 300 characters, without jump links.
+`window=since_my_last_message`. Fri reads that channel back from the request (the message, or the
+panel interaction), up to 100 messages or 12 hours, and stops at the speaker's last message there.
+Their own messages from the last five minutes ("back", "yo") and ones only bots answered count as
+them coming back, not where they left. Rows carry the author, minute and text cut to 300
+characters, without jump links, and stop once the serialized rows would pass 20,000 characters, so
+emoji-heavy chat keeps the newest stretch instead of growing the prompt. The receipt says where the
+read stopped (`your_last_message`, `size_limit`, `message_limit` or `time_limit`) and when the
+speaker last spoke, so Fri can say a recap only covers the latest stretch.
 
 It is the same tool, scope and fences as any `read_recent`: one channel the member can read (the
 current one in public, an approved one from a DM), no bots, webhooks, empty messages or members with
 memory off, each author's privacy revision rechecked before delivery, the history-days and
 dedicated-channel start floors, no images, no extra model call, only the conversation allowance,
-and a neutral breadcrumb in saved history. A configured-channel mention that asks to catch up gets
-this read rather than the twelve-message nearby context. Outside invitations don't offer it.
+and a neutral breadcrumb in saved history. Before the reply goes out Fri reads the same window
+again, and withholds the reply if any message it showed was edited or deleted meanwhile. A
+configured-channel mention that asks to catch up gets this read, and that recheck, rather than the
+twelve-message nearby context. Outside invitations don't offer it.
 `python -m fri.fri_eval --suite controls` includes catch-up cases: choosing the window, a short
 attributed recap, an empty read and a partial one.
 

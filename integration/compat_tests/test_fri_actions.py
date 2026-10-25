@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import discord
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -15,7 +16,7 @@ from compat_tests.test_fri_agent import finish, record
 from compat_tests.test_fri_agent import setup_agent as setup_agent
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_runtime import configured, event
-from fri.fri_actions import Actions
+from fri.fri_actions import CATCH_UP_CHARS, Actions
 from fri.fri_agent import Agent
 from fri.fri_chat import SCHEMA, Chat, ChatResult
 
@@ -156,19 +157,39 @@ def test_recent_fri_chat_excludes_old_startup_archive(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
+def snowflake(age):
+    return discord.utils.time_snowflake(dt.datetime.fromtimestamp(time.time()-age, dt.timezone.utc))
+
+
+def chat_message(user, text, age):
+    mid = snowflake(age)
+    return SimpleNamespace(id=mid, author=SimpleNamespace(id=user, bot=user == 99, display_name=f'member {user}'),
+        webhook_id=None, content=text, edited_at=None, jump_url=f'https://discord.com/channels/123/1/{mid}',
+        created_at=discord.utils.snowflake_time(mid))
+
+
 def catch_up_channel(channels, reads, rows):
-    """Channel 1 holds rows of (user, text, age in seconds); bot and empty rows look like Discord's."""
-    now = time.time()
-    messages = [SimpleNamespace(author=SimpleNamespace(id=user, bot=user == 99, display_name=f'member {user}'),
-        webhook_id=None, content=text, jump_url=f'https://discord.com/channels/123/1/{age}',
-        created_at=dt.datetime.fromtimestamp(now-age, dt.timezone.utc)) for user, text, age in rows]
+    """Channel 1 holds rows of (user, text, age in seconds), read back like Discord's history API.
+
+    Bot and empty rows look like Discord's. Edit or remove the returned messages to change the channel.
+    """
+    messages = [chat_message(*row) for row in rows]
     async def history(**kwargs):
         reads.append(kwargs)
-        newest = sorted((m for m in messages if m.created_at > kwargs['after']), key=lambda m: m.created_at, reverse=True)
+        before = getattr(kwargs.get('before'), 'id', None)
+        newest = sorted((m for m in messages if m.created_at > kwargs['after'] and (before is None or m.id < before)),
+                        key=lambda m: m.id, reverse=True)
         for message in newest[:kwargs['limit']]:
             yield message
     channels[1].history = history
     return messages
+
+
+def request(age=0, kind='message'):
+    """The member's request, stamped with a real snowflake so history's before= bound applies."""
+    item = event(channel=1, kind=kind, content='fri what did i miss')
+    item.id = snowflake(age)
+    return item
 
 
 CATCH_UP = {'kind': 'read_recent', 'channel_id': '1', 'window': 'since_my_last_message'}
@@ -187,14 +208,14 @@ def test_catch_up_reads_what_others_said_since_the_speaker_left(monkeypatch, tmp
         actions = Actions(agent, 10, 1, True)
         offered = (await actions.available())['read_recent']
         assert 'since_my_last_message' in offered['windows']
-        actions.event = event(channel=1, content='fri what did i miss')
+        actions.event = request()
         receipt = await actions.execute(CATCH_UP)
         assert [row['text'] for row in receipt['messages']] == ['bo blamed lag', 'ash found a modpack', 'wb']
         assert all(set(row) == {'user_id', 'name', 'at', 'text'} for row in receipt['messages'])
         assert receipt['stopped_at'] == 'your_last_message' and receipt['window'] == 'since_my_last_message'
         assert receipt['your_last_message_at'] == messages[7].created_at.isoformat(timespec='minutes')
         assert receipt['scanned'] == 8 and not receipt['images_inspected']
-        assert reads[0]['limit'] == 100 and reads[0]['before'] is actions.event
+        assert reads[0]['limit'] == 100 and reads[0]['before'].id == actions.event.id
         assert abs(time.time()-reads[0]['after'].timestamp()-12*3600) < 5
         assert set(actions.revisions) == {(1, 20)} and await actions.valid()
         agent.profile.side_effect = lambda channel, user: {'enabled': True, 'revision': int(user == 20)}
@@ -232,6 +253,7 @@ def test_catch_up_without_a_departure_says_where_it_stopped(monkeypatch, tmp_pat
 def test_catch_up_keeps_the_dedicated_channel_start_floor(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, channels, reads = harness(monkeypatch, tmp_path)
+        catch_up_channel(channels, reads, [(20, 'since fri started', 600)])
         channels[3].history = channels[1].history
         await Actions(agent, 10, 999, False).execute({**CATCH_UP, 'channel_id': '3'})
         assert abs(reads[0]['after'].timestamp()-agent.state['started']) < .001
@@ -242,7 +264,7 @@ def test_catch_up_keeps_the_dedicated_channel_start_floor(monkeypatch, tmp_path)
 def test_configured_mention_catch_up_reads_the_channel_not_nearby_context(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, channels, reads = harness(monkeypatch, tmp_path)
-        catch_up_channel(channels, reads, [(20, 'ash found a modpack', 600), (10, 'gn', 3600)])
+        messages = catch_up_channel(channels, reads, [(20, 'ash found a modpack', 600), (10, 'gn', 3600)])
         actions = Actions(agent, 10, 1, True)
         actions.invitation = SimpleNamespace(outside=False, require_current=AsyncMock(),
                                              current=AsyncMock(return_value=True))
@@ -258,6 +280,63 @@ def test_configured_mention_catch_up_reads_the_channel_not_nearby_context(monkey
         assert actions.private_evidence and await actions.valid()
         actions.invitation.current.return_value = False
         assert not await actions.valid()
+        # The invitation still checks out, but the message the catch-up read was deleted.
+        actions.invitation.current.return_value = True
+        del messages[0]
+        assert not await actions.valid()
+        await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change,still_valid', [
+    ('edit', False), ('delete', False),
+    ('edit_unread', True),  # The speaker's own message where the read stopped was never shown.
+    ('newer', True),  # Messages after the request never enter the read or its recheck.
+])
+def test_catch_up_withholds_the_reply_when_a_message_it_read_changes(monkeypatch, tmp_path, change, still_valid):
+    async def scenario():
+        fri, agent, channels, reads = harness(monkeypatch, tmp_path)
+        messages = catch_up_channel(channels, reads, [(20, 'wb', 600), (30, 'bo blamed lag', 900), (10, 'gn', 3600)])
+        actions = Actions(agent, 10, 1, True)
+        actions.event = request(age=300)
+        assert len((await actions.execute(CATCH_UP))['messages']) == 2
+        assert await actions.valid()
+        if change == 'edit':
+            messages[1].content, messages[1].edited_at = 'nvm', dt.datetime.now(dt.timezone.utc)
+        elif change == 'delete':
+            del messages[0]
+        elif change == 'edit_unread':
+            messages[2].content, messages[2].edited_at = 'gn!!', dt.datetime.now(dt.timezone.utc)
+        else:
+            messages.append(chat_message(20, 'later', 10))
+        assert await actions.valid() is still_valid
+        assert all(read['before'].id == actions.event.id for read in reads)
+        await fri.close()
+    asyncio.run(scenario())
+
+
+def test_panel_catch_up_stops_at_the_request(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, reads = harness(monkeypatch, tmp_path)
+        catch_up_channel(channels, reads, [(20, 'after the request', 30), (20, 'before the request', 120)])
+        actions = Actions(agent, 10, 999, False)
+        actions.event = request(age=60, kind='interaction')
+        receipt = await actions.execute(CATCH_UP)
+        assert [row['text'] for row in receipt['messages']] == ['before the request']
+        assert reads[0]['before'].id == actions.event.id
+        await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['x' * 300, '😀' * 300], ids=['ascii', 'emoji'])
+def test_catch_up_keeps_the_newest_rows_within_a_size_budget(monkeypatch, tmp_path, text):
+    async def scenario():
+        fri, agent, channels, reads = harness(monkeypatch, tmp_path)
+        catch_up_channel(channels, reads, [(20, f'{i} {text}', 60+i) for i in range(100)])
+        receipt = await Actions(agent, 10, 1, True).execute(CATCH_UP)
+        rows = receipt['messages']
+        assert receipt['stopped_at'] == 'size_limit' and 0 < len(rows) < 100
+        assert rows[-1]['text'].startswith('0 ') and sum(len(json.dumps(row)) for row in rows) <= CATCH_UP_CHARS
         await fri.close()
     asyncio.run(scenario())
 

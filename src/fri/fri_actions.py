@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+import json
 import time
 
 import discord
@@ -20,6 +21,7 @@ from .privacy import clean
 from .web_policy import public_query
 
 CATCH_UP_MESSAGES, CATCH_UP_SECONDS = 100, 12 * 3600
+CATCH_UP_CHARS = 20000  # Serialized rows, so emoji-heavy chat can't blow up the prompt.
 RETURN_SECONDS = 5 * 60  # The speaker's own recent messages ("yo", "back") are part of coming back.
 CATCH_UP = ('Only when the speaker asks what they missed: other members\' text in that channel since '
             'the speaker\'s last message there, up to 100 messages or 12 hours. No images.')
@@ -45,6 +47,7 @@ class Actions:
         self.media_allowed = False
         self.invitation = None
         self.turn_context = None
+        self.caught_up = None
         from .fri_image_share import ImageShare
         self.image_share = ImageShare(self)
         self.history = HistorySearch(self)
@@ -347,12 +350,12 @@ class Actions:
         options = {'limit': 20, 'after': dt.datetime.fromtimestamp(after, dt.timezone.utc), 'oldest_first': False}
         if catch_up:
             options['limit'] = CATCH_UP_MESSAGES
-            if isinstance(self.event, discord.Message):
-                options['before'] = self.event
+            if isinstance(getattr(self.event, 'id', None), int):  # A message or a panel interaction.
+                options['before'] = discord.Object(id=self.event.id)
         # A catch-up stops at the speaker's last message before anyone else spoke. Messages
         # they sent just now, or that only bots answered, are them coming back, not leaving.
-        returned, others, left = time.time()-RETURN_SECONDS, False, None
-        records, scanned, profiles = [], 0, {}
+        returned, others, left, full = time.time()-RETURN_SECONDS, False, None, False
+        records, scanned, profiles, shown, size = [], 0, {}, {}, 0
         async for message in channel.history(**options):
             scanned += 1
             if message.author.bot or message.webhook_id:
@@ -371,23 +374,39 @@ class Actions:
             profile = profiles[user]
             if not profile['enabled']:
                 continue
-            self.observe(scope, user, profile['revision'])
             if catch_up:  # Up to 100 rows, so drop the links and keep each line short.
-                records.append({'user_id': user, 'name': clean(message.author.display_name, 60),
-                                'at': message.created_at.isoformat(timespec='minutes'),
-                                'text': clean(message.content, 300)})
+                row = {'user_id': user, 'name': clean(message.author.display_name, 60),
+                       'at': message.created_at.isoformat(timespec='minutes'), 'text': clean(message.content, 300)}
+                size += len(json.dumps(row))
+                if size > CATCH_UP_CHARS:
+                    full = True
+                    break
+                self.observe(scope, user, profile['revision'])
+                shown[message.id] = (user, message.content, message.edited_at)
+                records.append(row)
                 continue
+            self.observe(scope, user, profile['revision'])
             records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
                             'at': message.created_at.isoformat(), 'text': clean(message.content, 500)})
         result = {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
                   'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': after,
                   'images_inspected': False, 'personal_notes_saved': 0}
         if catch_up:
+            self.caught_up = {'channel': channel, 'options': options, 'shown': shown}
             result.update(window='since_my_last_message',
                 your_last_message_at=left.created_at.isoformat(timespec='minutes') if left else None,
-                stopped_at='your_last_message' if left else
+                stopped_at='your_last_message' if left else 'size_limit' if full else
                     'message_limit' if scanned >= CATCH_UP_MESSAGES else 'time_limit')
         return result
+
+    async def caught_up_unchanged(self):
+        """Every message a catch-up showed must still exist unedited, like an invitation's sources."""
+        if not self.caught_up:
+            return True
+        read, shown = self.caught_up, self.caught_up['shown']
+        latest = {message.id: (message.author.id, message.content, message.edited_at)
+                  async for message in read['channel'].history(**read['options']) if message.id in shown}
+        return latest == shown
 
     async def invited_context(self, channel_id):
         """An explicit configured-channel read introduces ephemeral evidence only now."""
@@ -550,6 +569,8 @@ class Actions:
             if not channels or not self.sources <= set(channels):
                 return False
             if not await self.history.valid(channels):
+                return False
+            if not await self.caught_up_unchanged():
                 return False
             for (scope, user), revision in self.revisions.items():
                 profile = await self.agent.profile(scope, user)
