@@ -139,17 +139,18 @@ class Invitation:
         if not await self.current():
             raise commands.UserFeedbackCheckFailure(CHANGED)
 
-    async def notice(self, reason):
+    async def notice(self, reason, *, fenced=True):
         """What to say instead of a reply that can't go out, or None to stay quiet.
 
         Only while the ping still stands: Fri can still answer there, the message still pings Fri,
-        and its author hasn't erased since Fri first saw it. Never any content or context.
+        and, if `fenced`, its author hasn't erased since Fri first saw it. A privacy control isn't:
+        it always hears how it went, whatever it or another one changed. Never any content or context.
         """
         if not (text := notice_for(reason)):
             return None
         refusal, revision = self.refusal, self.revision
         try:
-            if revision is None:  # Not read yet, e.g. already stale as it came in: compare from now.
+            if fenced and revision is None:  # Not read yet, e.g. already stale as it came in: compare from now.
                 try:
                     revision = await self.agent.revision(self.event.author.id)
                 except ControllerUnavailable:
@@ -167,7 +168,7 @@ class Invitation:
                 text = GLITCH  # Not the member's edit, so don't say it was.
             # Last, so an erasure during the checks above still counts. An outage can't be checked
             # against itself, so only a known erasure silences the notice saying so.
-            erased = await self.agent.erasure(self.event.author.id, self.forgotten, revision)
+            erased = fenced and await self.agent.erasure(self.event.author.id, self.forgotten, revision)
             if erased and not (reason in OUTAGES and erased == 'check failed: ControllerUnavailable'):
                 return None
             return text

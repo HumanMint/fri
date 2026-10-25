@@ -1608,6 +1608,85 @@ def test_no_reaction_after_an_erasure_during_its_last_check(monkeypatch, tmp_pat
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('change', ['none', 'access', 'unpinged', 'deleted'])
+def test_a_queued_burst_pings_outage_line_needs_the_ping_to_still_stand(monkeypatch, tmp_path, caplog, change):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        ping, after = message('<@99> help'), message('fri more details')
+        after.reply.return_value = SimpleNamespace(id=after.id+1, content='hold on', delete=AsyncMock())
+        fri.busy.add(20)  # A reply to them that's still going, so the burst waits its turn.
+        released, debounce, grouped = gated_debounce()
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in (ping, after):
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                while not after.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                if change == 'access':  # Still sees and sends there, but can't read the history.
+                    channel.permissions_for = lambda _: discord.Permissions(view_channel=True, send_messages=True)
+                elif change == 'unpinged':
+                    edited = copy.copy(ping)
+                    edited.content, edited.mentions = 'help', []
+                    rows[ping.id] = edited
+                elif change == 'deleted':
+                    def gone(mid):
+                        if mid == ping.id:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                        return rows[mid]
+                    channel.fetch_message.side_effect = gone
+                agent.revision = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+                fri.busy.discard(20)
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_not_awaited()
+            ping.reply.assert_not_awaited()
+            texts = [item.args[0] for item in after.reply.await_args_list]
+            if change == 'none':
+                assert texts == [str(ReplyInProgress()), GLITCH]
+                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered, told why: controller unavailable']
+            else:
+                assert texts == [str(ReplyInProgress())]
+                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: controller unavailable']
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text,meanwhile', [('<@99> forget me', 'committed'), ('<@99> remember me again', 'committed'),
+                                            ('<@99> forget me', 'another control')])
+def test_a_privacy_control_ping_hears_about_an_outage_whatever_changed(monkeypatch, tmp_path, caplog, text, meanwhile):
+    # Gene carried it out but the answer never came back, or another control came in meanwhile.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        if 'remember' in text:
+            store.personal_control('20', 'disable')
+        event = message(text)
+        api = fri.api
+        async def lost(method, path, payload=None):
+            if path == '/chat/memory/control':
+                if meanwhile == 'committed':
+                    await api(method, path, payload)
+                else:
+                    agent.forget(20)
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await api(method, path, payload)
+        fri.api = lost
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert [item.args[0] for item in event.reply.await_args_list] == [GLITCH]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_stale_ping_redelivered_after_its_record_expires_is_told_once(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():

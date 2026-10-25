@@ -435,10 +435,11 @@ class Agent:
                 del self.misses[event.id]
                 LOG.info('Mention %s/%s not answered, told why: %s', event.channel.id, event.id, reason)
 
-    async def withheld(self, message, events, reason, invitation=None, *, logged=None):
-        """Say why a reply can't go out while the message still stands to be answered; else log why."""
+    async def withheld(self, message, events, reason, invitation=None, *, logged=None, fenced=True):
+        """Say why a reply can't go out while the message still stands to be answered; else log why.
+        `fenced`: a ping's notice also needs its author not to have erased since (see notice)."""
         from .fri_mentions import notice_for
-        text = await invitation.notice(reason) if invitation else notice_for(reason)
+        text = await invitation.notice(reason, fenced=fenced) if invitation else notice_for(reason)
         if text:
             try:
                 await message.reply(text, mention_author=False, allowed_mentions=NO_MENTIONS)
@@ -469,11 +470,12 @@ class Agent:
             return 'author privacy changed'
         return failed
 
-    async def dropped(self, message, events, reason, invitation=None):
+    async def dropped(self, message, events, reason, invitation=None, since=None):
         """Drop a message whose author may have erased: quietly, unless all that's known is that the
-        controller can't be reached to check, which is worth saying."""
+        controller can't be reached to check, which is worth saying (to a ping only while it stands)."""
         if reason == 'check failed: ControllerUnavailable':
-            return await self.withheld(message, events, 'controller unavailable', invitation)
+            ping = invitation or (since and self.ping_among(events, since))
+            return await self.withheld(message, events, 'controller unavailable', ping)
         return self.missed(events, reason)
 
     async def recharging(self, message, dm, since=None):
@@ -539,7 +541,7 @@ class Agent:
                     if refusal:
                         return await self.withheld(message, events, refusal, invitation, logged=f'reply withheld: {refusal}')
                     if erasure:
-                        return await self.dropped(message, events, erasure, invitation)
+                        return await self.dropped(message, events, erasure, invitation, since)
                 try:
                     async with asyncio.timeout(until-time.time()):
                         while not self.turns.ready(user, message.id):
@@ -549,9 +551,9 @@ class Agent:
                 recheck = True
             if recheck:
                 if reason := await self.erasure(user, *since):
-                    return await self.dropped(message, events, reason, invitation)
+                    return await self.dropped(message, events, reason, invitation, since)
                 if time.time() >= until:
-                    return await self.withheld(message, events, 'stale event', invitation,
+                    return await self.withheld(message, events, 'stale event', invitation or self.ping_among(events, since),
                                                logged='earlier reply still running')
                 recheck = False
                 if not self.turns.ready(user, message.id):
@@ -713,7 +715,7 @@ class Agent:
                 pass
             # Erased meanwhile, here or through the panel, Gene or Red: drop it, as forget() drops a burst.
             if reason := await self.erasure(message.author.id, forgotten, observed):
-                return await self.dropped(message, [message], reason, invitation)
+                return await self.dropped(message, [message], reason, invitation, (forgotten, observed))
         active = (self.active.get((channel, message.author.id), 0) > time.time() or
                   self.bursts.has(channel, message.author.id))
         if not active and directed is None and not dm and not message.author.bot:
@@ -829,8 +831,8 @@ class Agent:
             for event in events:
                 self.miss(event, reason)
 
-        def withhold():
-            return self.withheld(message, events, invitation.refusal, invitation,
+        def withhold():  # A privacy control's notice isn't fenced by the change it made, or another's.
+            return self.withheld(message, events, invitation.refusal, invitation, fenced=since is not None,
                                  logged=f'reply withheld: {invitation.refusal}')
 
         try:
@@ -858,13 +860,13 @@ class Agent:
                 # A ping gets a fixed line, not the controller's text, even when a later message's reply
                 # answers it. Its notice checks the ping still stands, and erasure last.
                 reason = 'controller unavailable' if isinstance(exc, ControllerUnavailable) else 'check failed: ControllerRejected'
-                return await self.withheld(message, events, reason, ping)
+                return await self.withheld(message, events, reason, ping, fenced=since is not None)
             if since:  # Said only if they haven't erased since, checked last.
                 erased = await self.erasure(message.author.id, *since)
                 if erased == 'check failed: ControllerUnavailable' and isinstance(exc, ControllerUnavailable):
                     erased = None  # The same outage, which is what this says.
                 if erased:
-                    return await self.dropped(message, events, erased, invitation)
+                    return await self.dropped(message, events, erased, invitation, since)
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
@@ -878,7 +880,7 @@ class Agent:
             reason = (await self.erasure(message.author.id, *since) if invitation else
                       'author privacy changed' if self.forgotten.get(message.author.id, 0) != since[0] else None)
             if reason:
-                return await self.dropped(message, events, reason, invitation)
+                return await self.dropped(message, events, reason, invitation, since)
         if result.response_kind in ('react', 'quiet'):
             if (result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(
                     message, result.reaction, (lambda: self.erasure(message.author.id, *since)) if since else None)):
