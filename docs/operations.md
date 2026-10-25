@@ -387,8 +387,9 @@ Fri can't restart anything. It only notices and says so.
   be on with proactive posts on, the member still in the server, and the report still there and
   still theirs, in a configured channel Fri can post in and not an archived thread, or in their DM
   while support DMs are on. A thread Fri had to fetch is read again after the report, since no
-  archive update reaches an uncached copy. Fri then checks the live release itself (an older
-  controller doesn't) and claims the controller's mark, which refuses an erased report, a rollback
+  archive update reaches an uncached copy, and the member is checked last of all. Fri then checks
+  the live release itself, and that no other release is going out (an older controller checks
+  neither), and claims the controller's mark, which refuses an erased report, a rollback
   since the repair, any newer release now live, or another release still going out. It checks the
   config and channel once more with nothing awaited before the send. Controller data of the wrong
   shape, or a thread whose channel was deleted, gets the owner a plain "didn't send it" and frees

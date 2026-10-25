@@ -671,3 +671,58 @@ def test_a_claim_without_a_lease_sends_nothing(world):
     world.fri.api.side_effect = leaseless
     text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
     assert not sent and not world.sent and text == 'didn’t send it. tap again later.'
+
+
+def test_a_finish_answer_fri_cant_read_still_gets_the_owner_an_answer(world):
+    _, job_id, _ = reported(world)
+    api = world.fri.api.side_effect
+
+    async def garbled(method, path, body=None):
+        result = await api(method, path, body)
+        if path.endswith('/finish'):
+            raise json.JSONDecodeError('Expecting value', '{"ok":', 6)  # What aiohttp's json() raises on a cut-off body.
+        return result
+
+    world.fri.api.side_effect = garbled
+    event = owner_tap(world.fri, job_id)
+    asyncio.run(TellReporter(job_id).callback(event))
+    assert len(world.sent) == 1 and event.followup.send.await_args.args[0].startswith('told them: ')
+
+
+@pytest.mark.parametrize('dm', [False, True])
+def test_a_member_who_leaves_while_discord_reads_gets_no_reply(world, dm):
+    report, job_id, _ = reported(world)
+    gone = []
+    if dm:
+        dm_channel = Mock(spec=discord.DMChannel, id=777, recipient=SimpleNamespace(id=MEMBER))
+        with world.store.connection() as db:
+            db.execute('UPDATE jobs SET source_url=? WHERE id=?', (f'https://discord.com/channels/@me/777/{report.id}', job_id))
+        world.fri.fetch_channel = AsyncMock(return_value=dm_channel)
+        room = dm_channel
+    else:
+        room = world.room
+
+    async def fetch(id):
+        gone.append(True)  # They leave while Discord answers.
+        return report
+
+    room.fetch_message = AsyncMock(side_effect=fetch)
+    world.agent.member = AsyncMock(side_effect=lambda *a, **k: None if gone else SimpleNamespace(id=MEMBER))
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'not in the server' in text
+
+
+def test_fri_waits_out_another_release_going_out_even_if_the_controller_would_claim(world):
+    """Gene #40 claims during a deploy; Fri reads /status and doesn't ask it to."""
+    _, job_id, _ = reported(world)
+    job = world.store.request('123', '30', 'message-later', 'https://discord.com/channels/123/456/1', 'Add a vote command')
+    world.store.review_decision(job['id'], 'intake', request_reference(world.store.get(job['id'])), 'approve', 'owner')
+    built = world.store.claim()
+    world.store.finish_build(built['id'], built['lease'], {'sha': 'c'*40, 'base_sha': built['base_sha'],
+                             'branch': 'codex/vote', 'tests_passed': True, 'summary': 'Vote'})
+    if world.store.get(built['id'])['state'] == 'review':
+        world.store.approve(built['id'], 'c'*40, 'owner')
+    assert world.store.claim_deploy()['id'] == built['id']  # Going out, not recorded yet.
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'going out' in text
+    assert not [c for c in world.fri.api.await_args_list if c.args[1].endswith('/requester-notice')]

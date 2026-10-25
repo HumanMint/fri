@@ -292,8 +292,6 @@ async def report(fri, job):
         raise Unreachable('there’s no member report on record to reply to')
     postable(fri, None)
     try:
-        if not await fri.agent.member(int(user), fresh=True):
-            raise Unreachable('they’re not in the server anymore')
         if match['guild'] == '@me':
             channel = await fri.fetch_channel(int(match['channel']))
             if not isinstance(channel, discord.DMChannel) or not channel.recipient or str(channel.recipient.id) != user:
@@ -308,6 +306,9 @@ async def report(fri, job):
         if match['guild'] != '@me' and cached is None and isinstance(channel, discord.Thread):
             # A fetched thread isn't in the cache, so no archive update reaches it: read it again last.
             channel = await fri.fetch_channel(channel.id)
+        # Last of the Discord reads: no members intent tells Fri someone left while the others ran.
+        if not await fri.agent.member(int(user), fresh=True):
+            raise Unreachable('they’re not in the server anymore')
     except discord.NotFound:
         raise Unreachable('their report is gone') from None
     except discord.HTTPException:
@@ -329,8 +330,11 @@ async def tell(fri, job_id, actor):
         job = await fri.api('GET', '/requests/'+job_id)
         channel, message = await report(fri, job)
         # The controller checks this too; an older one (gene #40) doesn't, so Fri reads the live release itself.
-        if (await fri.api('GET', '/status')).get('active_sha') != job['approved_sha']:
+        status = await fri.api('GET', '/status')
+        if status.get('active_sha') != job['approved_sha']:
             raise Unreachable('a newer release is live now, so "fixed" might not hold')
+        if (status.get('jobs') or {}).get('deploying'):
+            raise Unreachable('another release is going out right now. tap again once it lands')
         postable(fri, channel)
         claimed = await fri.api('POST', f'/requests/{job_id}/requester-notice', scope)
     except Unreachable as exc:
@@ -368,7 +372,7 @@ async def tell(fri, job_id, actor):
     try:
         await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
                       {**scope, 'lease': lease, 'state': state, 'message_id': message_id})
-    except commands.UserFeedbackCheckFailure:
+    except (commands.UserFeedbackCheckFailure, *TAP_FAILURES):  # An answer Fri can't read is still unconfirmed.
         LOG.warning('Requester notice outcome for %s not recorded; it stays unretried', job_id)
     return text, state == 'sent'
 
