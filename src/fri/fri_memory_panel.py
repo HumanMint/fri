@@ -7,7 +7,7 @@ import discord
 
 from . import feedback as commands
 from .fri_context import discord_source
-from .fri_memory import note_place
+from .fri_memory import note_place, profiled
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
@@ -49,7 +49,7 @@ async def allowed(cog, interaction, scope, *, message=True):
 
 
 async def show(cog, interaction, scope=None, *, state=None, selected=None, notice=''):
-    scope = scope or scope_for(cog, interaction)
+    scope = profiled(cog, scope or scope_for(cog, interaction))
     if not await allowed(cog, interaction, scope, message=False):
         return
     state = state or await cog.api('POST', '/chat/memory/notes', scope)

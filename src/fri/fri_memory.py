@@ -76,6 +76,11 @@ def memory_intent(text):
     return None
 
 
+def profiled(fri, scope):
+    """Ask for the member's profile when the controller keeps them; otherwise the request is unchanged."""
+    return {**scope, 'profiles': True} if getattr(fri, 'profiles', False) else scope
+
+
 def note_place(get_channel, scope, conversation, *, public=False):
     """Where a note shows, from the member's side. A public listing holds only the profile and here."""
     if scope == 'server':

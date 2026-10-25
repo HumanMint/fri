@@ -25,6 +25,7 @@ from .fri_memory import (
     describe_profile,
     memory_intent,
     note_place,
+    profiled,
     server_wide,
 )
 from .fri_notices import ReplyInProgress, WaitingNotices, notice_text
@@ -92,7 +93,6 @@ def turn_provenance(context, speaker, actions=None):
     inherited = [item for turn in context.get('turns', []) for item in turn.get('provenance', [])]
     inherited += (context.get('pending') or {}).get('provenance', [])
     inherited += context.get('summary_provenance', []) + context.get('reference_provenance', [])
-    inherited += [item for row in context.get('elsewhere', []) for item in row.get('provenance', [])]
     for item in inherited:
         add(item['user_id'], item['revision'])
     for row in context.get('recent', []):
@@ -259,7 +259,7 @@ class Fri(discord.Client):
         # Privacy controls must work while inference is busy or the subscription is down.
         intent = memory_intent(text)
         if intent == 'show' and self.profiles:
-            profile = (await self.api('POST', '/chat/context', scope))['personal_memory']
+            profile = (await self.api('POST', '/chat/context', profiled(self, scope)))['personal_memory']
             return ChatResult(reply=await self.memory_overview(scope, profile, visibility == 'private'),
                               status='completed', memory_scope=scope)
         if intent == 'show':
@@ -289,7 +289,7 @@ class Fri(discord.Client):
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
-                context = attributed(await self.api('POST', '/chat/context', scope))
+                context = attributed(await self.api('POST', '/chat/context', profiled(self, scope)))
                 if self.profiles:
                     # Decided now, from Discord's permissions: only an everyone-readable channel reaches the
                     # member's profile and their other conversations. Private conversations never do.
@@ -525,7 +525,7 @@ class Fri(discord.Client):
         return result
 
     def elsewhere(self, rows, guild_id):
-        """The member's exchanges from other channels that everyone in this server can still read."""
+        """What the member said lately in other channels that everyone in this server can still read."""
         kept = []
         for row in rows:
             kind, _, channel_id = str(row.get('conversation_id', '')).partition(':')
@@ -540,7 +540,7 @@ class Fri(discord.Client):
         """Everything for the member's own eyes in private; in public, only what that channel can see."""
         escape = discord.utils.escape_markdown
         if private:
-            state = await self.api('POST', '/chat/memory/notes', scope)
+            state = await self.api('POST', '/chat/memory/notes', profiled(self, scope))
             enabled, rows = state['enabled'], state['entries']
         else:
             enabled, rows = profile['enabled'], profile['notes']
@@ -594,8 +594,13 @@ class Fri(discord.Client):
             LOG.warning('Delivered turn was not recorded')  # Includes privacy changes mid-reply.
             return None
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
+            notice = self.first_memory(saved)
+            content = (sent.content or '')+notice
             try:
-                await sent.edit(content=(sent.content or '')+self.first_memory(saved))
+                if len(content.encode('utf-16-le'))//2 <= 2000:
+                    await sent.edit(content=content)
+                else:  # No room left in a long reply: say it on its own rather than lose it.
+                    await sent.reply(notice.strip(), allowed_mentions=NO_MENTIONS)
             except discord.HTTPException:
                 LOG.info('First-memory notice was not added')
         return saved

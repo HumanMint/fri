@@ -19,7 +19,7 @@ from gene.fri_agent_store import AgentStore
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_runtime import configured
-from fri.fri import FIRST_HERE, FIRST_MEMORY, FIRST_PROFILE
+from fri.fri import FIRST_HERE, FIRST_MEMORY, FIRST_PROFILE, NO_MENTIONS
 from fri.fri_agent import Agent
 from fri.fri_chat import Chat, ChatResult
 from fri.fri_errors import ControllerRejected
@@ -102,7 +102,7 @@ def world(monkeypatch, tmp_path):
         fri.chat_once.return_value = ChatResult(status='completed', reply=reply, notes=list(notes))
         event = message(cid, text, user)
         result = await fri.talk(123, cid, user, text, 'private' if cid == DM else 'public', f'member {user}', event=event)
-        sent = SimpleNamespace(id=event.id+1, content=result.reply, edit=AsyncMock())
+        sent = SimpleNamespace(id=event.id+1, content=result.reply, edit=AsyncMock(), reply=AsyncMock())
         saved = await fri.record_turn(result, sent) if result.turn else None
         return result, saved, sent
     return SimpleNamespace(fri=fri, store=store, channels=channels, readable=readable, calls=calls, say=say,
@@ -137,7 +137,7 @@ def test_a_preference_said_in_general_follows_the_member_to_gaming_and_dms(monke
                 await w.say(where, 'fri what should i play tonight')
                 notes = model_context(w)['personal_memory']['notes']
                 assert notes == [{'category': 'games', 'evidence': 'I like Minecraft', 'scope': 'server'}]
-            # The earlier exchange in #general shows up elsewhere, labelled and clipped for the model.
+            # What they said in #general shows up elsewhere, labelled and clipped for the model.
             elsewhere = model_context(w)['elsewhere']
             assert [row['channel'] for row in elsewhere][-2:] == ['#gaming', '#thread-70']
             await w.say(GAMING, 'fri thoughts?')
@@ -145,7 +145,8 @@ def test_a_preference_said_in_general_follows_the_member_to_gaming_and_dms(monke
             # Newest last; the DM exchange in between never shows up here.
             assert [(row['channel'], row['input']) for row in rows] == [
                 ('#general', 'fri I like Minecraft'), ('#thread-70', 'fri what should i play tonight')]
-            assert rows[-1]['minutes_ago'] == 0 and rows[-1]['reply'] == 'bold of you'
+            assert rows[-1]['minutes_ago'] == 0 and 'reply' not in rows[-1]  # Only their own words travel.
+            assert all(body.get('profiles') for path, body in w.calls if path == '/chat/context')
         finally:
             await w.fri.close()
     run(scenario)
@@ -188,7 +189,7 @@ def test_a_channel_that_becomes_restricted_stops_feeding_elsewhere(monkeypatch, 
     run(scenario)
 
 
-def test_replies_built_on_elsewhere_inherit_its_provenance(monkeypatch, tmp_path):
+def test_elsewhere_carries_only_the_members_words_and_goes_with_its_sources(monkeypatch, tmp_path):
     async def scenario():
         w = world(monkeypatch, tmp_path)
         source = {'kind': 'discord_message', 'id': str(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc))),
@@ -197,11 +198,45 @@ def test_replies_built_on_elsewhere_inherit_its_provenance(monkeypatch, tmp_path
                           source=source, provenance=[{'user_id': '30', 'revision': 0}], audience='server')
         try:
             await w.say(GENERAL, 'fri where was that again')
-            assert {'user_id': '30', 'revision': 0} in turns(w)[-1]['provenance']
-            w.store.personal_control('30', 'disable')  # Ash's privacy change reaches both replies.
+            assert [row['input'] for row in model_context(w)['elsewhere']] == ['what did ash say']
+            assert 'denver' not in json.dumps(model_context(w), default=str)
+            # Ash's words never reached this turn, so it doesn't depend on them.
+            assert {'user_id': '30', 'revision': 0} not in turns(w)[-1]['provenance']
+            w.store.personal_control('30', 'disable')  # The exchange built on ash still goes.
             await w.say(GENERAL, 'fri and now?')
             assert model_context(w)['elsewhere'] == []
-            assert [t['input'] for t in w.store.chat_context('123', 'public:1', '20')['turns']] == ['fri and now?']
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_reply_drawing_on_a_note_from_a_restricted_time_stays_in_its_channel(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            w.readable[GENERAL] = False
+            await w.say(GENERAL, 'fri I like private jazz', 'noted', note('I like private jazz', 'music'))
+            w.readable[GENERAL] = True  # Opened to everyone later; Fri's reply there uses the note.
+            await w.say(GENERAL, 'fri what music do i like', 'you like private jazz')
+            assert turns(w)[-1]['audience'] == 'server'
+            await w.say(GAMING, 'fri recommend me something')
+            context = model_context(w)
+            assert [row['input'] for row in context['elsewhere']] == ['fri what music do i like']
+            assert 'private jazz' not in json.dumps(context, default=str)
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_first_profile_notice_that_does_not_fit_is_sent_on_its_own(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            long = 'y'*1900
+            _, saved, sent = await w.say(GENERAL, 'fri I like Minecraft', long, note('I like Minecraft'))
+            assert saved['first_memory'] and len(long+FIRST_PROFILE) > 2000
+            sent.edit.assert_not_awaited()
+            sent.reply.assert_awaited_once_with(FIRST_PROFILE.strip(), allowed_mentions=NO_MENTIONS)
         finally:
             await w.fri.close()
     run(scenario)
@@ -227,6 +262,8 @@ def test_memory_overview_lists_everything_in_dms_and_only_whats_visible_in_publi
             await w.say(GAMING, 'forget me')
             dm, _, _ = await w.say(DM, 'what do you remember about me')
             assert dm.reply.startswith('memory’s off')
+            listed = [body for path, body in w.calls if path == '/chat/memory/notes']
+            assert listed and all(body.get('profiles') for body in listed)
             assert w.store.chat_context('123', 'public:1', '20')['elsewhere'] == []
         finally:
             await w.fri.close()
@@ -236,6 +273,7 @@ def test_memory_overview_lists_everything_in_dms_and_only_whats_visible_in_publi
 def test_an_older_controller_or_fri_keeps_todays_per_conversation_memory(monkeypatch, tmp_path):
     async def scenario():
         w = world(monkeypatch, tmp_path)
+        await w.say(GAMING, 'fri I like Terraria', 'ok', note('I like Terraria'))  # A profile note, before.
         w.fri.capabilities = w.fri.capabilities - {'member-profiles'}
         try:
             _, saved, sent = await w.say(GENERAL, 'fri I like Minecraft', 'ok', note('I like Minecraft'))
@@ -243,9 +281,11 @@ def test_an_older_controller_or_fri_keeps_todays_per_conversation_memory(monkeyp
             assert saved['memory_scope'] == 'conversation'
             sent.edit.assert_awaited_once_with(content='ok'+FIRST_MEMORY)  # The notice the older controller allows.
             await w.say(GAMING, 'fri hi')
+            # Without asking for profiles, only this conversation's notes come back, as before.
             assert model_context(w)['personal_memory']['notes'] == [] and model_context(w)['elsewhere'] == []
             overview, _, _ = await w.say(GENERAL, 'what do you remember about me')
-            assert overview.reply.startswith('Memory is on.')
+            assert overview.reply.startswith('Memory is on.') and 'Terraria' not in overview.reply
+            assert not any('profiles' in body for path, body in w.calls[-3:] if path == '/chat/context')
         finally:
             await w.fri.close()
     run(scenario)
@@ -315,9 +355,8 @@ def test_the_model_sees_elsewhere_rows_clipped_without_ids():
         return httpx.Response(200, text='data: '+json.dumps(response_event())+'\n\n')
     chat = Chat(SimpleNamespace(access_token=lambda: 'test'), httpx.MockTransport(handler))
     rows = [{'conversation_id': 'public:2', 'channel': '#gaming', 'minutes_ago': 40, 'input': 'a'*500,
-             'reply': 'b'*500, 'at': time.time(), 'provenance': [{'user_id': '30', 'revision': 0}]}]
+             'at': time.time()}]
     asyncio.run(chat.respond('hey', {**CONTEXT, 'elsewhere': rows}))
-    assert seen[0]['with_you_elsewhere_untrusted'] == [
-        {'channel': '#gaming', 'minutes_ago': 40, 'message': 'a'*300, 'reply': 'b'*400}]
+    assert seen[0]['with_you_elsewhere_untrusted'] == [{'channel': '#gaming', 'minutes_ago': 40, 'message': 'a'*300}]
     asyncio.run(chat.respond('hey', CONTEXT))
     assert seen[1]['with_you_elsewhere_untrusted'] == []
