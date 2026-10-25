@@ -16,6 +16,7 @@ from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
 from .fri_images import details, image_context, look, media
+from .fri_memes import reacted
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
 from .gene_controls import COMMANDS, arguments, grounded, music_control_intent, own_words, requested
@@ -448,6 +449,7 @@ class Actions:
         # they sent just before asking, or that only bots answered, are them coming back, not leaving.
         returned, others, left, full = asked-RETURN_SECONDS, False, None, False
         records, scanned, profiles, shown, size, posts, newest = [], 0, {}, {}, 0, [], 0
+        notes = {} if catch_up else self.agent.ensure_memes().notes()  # Memes Fri reacted to lately.
         async for message in (channel.pins(limit=PINS) if pins else channel.history(**options)):
             scanned, newest = scanned+1, max(newest, message.id)
             if message.author.bot or message.webhook_id or (floor and message.created_at.timestamp() < floor):
@@ -483,7 +485,8 @@ class Actions:
             self.observe(scope, user, profile['revision'])
             shown[message.id] = (user, message.content, message.edited_at)
             records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
-                            'at': message.created_at.isoformat(), 'text': clean(message.content, 500), **details(message)})
+                            'at': message.created_at.isoformat(), 'text': clean(message.content, 500), **details(message),
+                            **reacted(notes, message, profile)})
             if carries:
                 posts.append(message)
         result = {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),

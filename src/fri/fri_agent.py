@@ -248,6 +248,7 @@ class Agent:
         if erased:
             self.erased[user] = self.erased.get(user, 0)+1
         self.bursts.forget(user)
+        self.ensure_memes().forget(user)  # What Fri saw in their memes goes with the rest.
         for key in list(self.pending):
             if key[1] == user:
                 del self.pending[key]
@@ -1051,10 +1052,13 @@ class Agent:
             await self.presence.check()
 
     async def check_memes(self):
+        await self.ensure_memes().check()
+
+    def ensure_memes(self):
         from .fri_memes import Memes
         if self.memes is None:
             self.memes = Memes(self)
-        await self.memes.check()
+        return self.memes
 
     async def stage(self, name, step, *switches, when=None):
         """One heartbeat stage. A failure is logged by class and recorded, and never skips later stages."""

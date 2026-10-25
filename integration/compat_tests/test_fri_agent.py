@@ -432,9 +432,9 @@ def test_attention_yields_when_the_direct_path_takes_its_pick_meanwhile():
     asyncio.run(scenario())
 
 
-def test_external_privacy_change_removes_buffer_before_attention_or_context():
+def test_external_privacy_change_removes_buffer_before_attention_or_context(tmp_path):
     async def scenario():
-        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456,
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, data=tmp_path,
                               get_channel=lambda _: SimpleNamespace(id=456))
         agent = Agent(fri)
         agent.profile = AsyncMock(return_value={'enabled': False, 'revision': 1})

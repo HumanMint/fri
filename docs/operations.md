@@ -280,6 +280,11 @@ Calls whose result can't change what members see are skipped before inference.
   is skipped, since the normal path can't answer then.
 - Meme checks are unchanged: an inspection still runs while the reaction budget is closed, because
   the budget can reopen (or the owner can raise it) before the model answers.
+- When a meme check reacts, its entry in `meme-attention.json` also keeps the emoji, the post's author
+  ID, their privacy revision, the post's edit time and up to 200 characters of what the model saw
+  (never the caption). Entries expire after three days with the rest of the meme state. A read or a
+  mention's nearby rows show it as `fri_reacted` on that post only while the author's revision and the
+  edit time still match, and forgetting a member drops it from every entry of theirs.
 
 ## Deployment boundary
 
