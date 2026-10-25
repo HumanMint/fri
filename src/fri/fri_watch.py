@@ -106,6 +106,11 @@ class Watch:
         alert = self.load()['alert']
         return bool(alert and alert.get('open') and alert.get('kind') in kinds and alert.get('message_id'))
 
+    def wait(self):
+        """Seconds until the next read is due, so the loop's first pass lands an interval after the last read."""
+        since = time.time()-self.load()['checked']
+        return 0 if since < 0 else max(0, INTERVAL-since)
+
     def due(self, slack=0):
         """Whether a read is due, an interval after the last one. `slack` covers a read's own latency."""
         since = time.time()-self.load()['checked']

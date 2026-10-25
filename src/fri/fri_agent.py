@@ -694,14 +694,23 @@ class Agent:
 
         async def outage():
             # The fixed notice carries no evidence, so only the Discord-side checks apply, not a controller read.
-            # A mention earlier in the burst keeps its gates too, though the reply answers a later message. Its
-            # text as it arrived decides, since an edit changes the cached copy; the gate then sees any edit.
+            # It stands in for the whole burst: every earlier message must still be as it arrived (only a fetch
+            # shows an edit, since discord.py edits its cached copy in place), and each mention keeps its gates.
             from .fri_mentions import Invitation
             token = re.compile(r'(?<!\\)<@!?'+str(self.fri.user.id)+'>')
-            gates = [invitation] if invitation else [
-                Invitation(self, event) for _, event, arrived in burst if event is not message and
-                getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
-                token.search(visible_content(arrived or ''))]
+            gates = [invitation] if invitation else []
+            for _, event, arrived in burst:
+                if event is message:
+                    continue
+                try:
+                    current = await event.channel.fetch_message(event.id)
+                except discord.HTTPException:
+                    return missed('reply withheld: message changed')
+                if getattr(current, 'edited_at', None) is not None or current.content != arrived:
+                    return missed('reply withheld: message changed')
+                if (getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
+                        token.search(visible_content(arrived or ''))):
+                    gates.append(Invitation(self, event))
             for gate in gates:
                 if not await gate.current(check_evidence=False):
                     return missed(f'reply withheld: {gate.refusal}')

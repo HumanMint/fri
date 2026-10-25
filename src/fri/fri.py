@@ -40,6 +40,7 @@ SIGN_IN_NOTICE = ('heads up: my chatgpt sign-in stopped working, so every reply 
 FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
                 'or say “forget me” any time.')
 MAX_PROVENANCE = 200
+ERROR_BODY = 5  # Seconds for a refusal's small body, well inside the watch's 10 s read.
 CONTRACT_RETRY = 10  # Seconds between contract reads while the controller is down at startup.
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
@@ -221,7 +222,8 @@ class Fri(discord.Client):
                     headers={'Authorization': 'Bearer ' + self.token, 'X-Fri-Contract': PROTOCOL}) as response:
                 foreign = False  # A reply that isn't JSON or was cut off may not be the controller's: a proxy's page, say.
                 try:
-                    data = await response.json()
+                    async with asyncio.timeout(ERROR_BODY if response.status >= 400 else None):
+                        data = await response.json()
                 except Exception as exc:  # Not JSON, or cut off or stalled partway: a refusal is still a refusal.
                     if response.status < 400:
                         if isinstance(exc, aiohttp.ContentTypeError):  # Someone else's page, sent as a success.
@@ -763,6 +765,7 @@ class Fri(discord.Client):
     @watch.before_loop
     async def before_watch(self):
         await self.wait_until_ready()
+        await asyncio.sleep(self.watcher.wait())  # Not a pass early, which would skip its read and wait a whole one more.
 
     @tasks.loop(seconds=10)
     async def health(self):

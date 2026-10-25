@@ -275,7 +275,8 @@ Fri can't restart anything. It only notices and says so.
 - **Startup with the controller down.** Fri retries its startup controller reads (`/fri/contract`,
   then `/agent/state`) every 10 s before it joins the gateway, instead of exiting. Discord's HTTP API already works then, so the same watch reads,
   once per 2 minutes, still DM the owner. Reads stay about 2 minutes apart across that wait, the
-  loop's first pass and restarts, so a restart never shortens the 3-read debounce. A last read
+  loop's first pass and restarts, so a restart never shortens the 3-read debounce: the loop's
+  first pass waits until an interval after the last read, rather than skipping a read. A last read
   dated in the future (the host clock went back) starts a fresh streak instead of muting the watch. Members see Fri offline until the controller answers, and
   `fri health` waits too. A rejected or incompatible contract still stops Fri at once, and so does
   a success that isn't JSON (a wrong URL or a proxy's page), since waiting won't fix it.
@@ -288,9 +289,10 @@ Fri can't restart anything. It only notices and says so.
 - **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed
   to Fri in a configured channel) whose controller read fails, before or while replying, gets one
   fixed notice per channel per 5 minutes instead of silence. A mention Fri already admitted only
-  needs its Discord-side checks for this notice, since the notice carries no evidence. An @mention
-  earlier in a burst still gets those checks when the reply answers a later, unmentioned message,
-  judged by its text as it arrived, so editing the ping away withholds the notice. A privacy
+  needs its Discord-side checks for this notice, since the notice carries no evidence. The notice
+  stands in for the whole burst, so every earlier message in it must also be as it arrived, and
+  each @mention among them still gets those checks, even when the reply answers a later message.
+  discord.py edits its cached copy in place, so only a fresh fetch shows an edit. A privacy
   recheck that can't reach the controller leads to the notice, not silence. Every notice first
   fetches the message as Discord has it now: it must still exist and never have been edited, since
   discord.py updates its cached copy in place. Before a reply has started, a channel message must
@@ -400,7 +402,7 @@ between, even briefly, makes the next refusal a new one.
 Network, rate-limit, provider and disk failures, including a malformed renewal
 response, ask members to retry. A renewal that can't be saved still keeps a rotated
 refresh token. A controller 4xx whose JSON body can't be read keeps its status. A 4xx that
-isn't JSON at all, such as a proxy's HTML or text page, or whose body is cut off or stalls, is
+isn't JSON at all, such as a proxy's HTML or text page, or whose body is cut off or stalls (5 s), is
 still a refusal (startup stops, and the watch reports a rejection, not an outage), but with no
 status, so no receipt is set aside.
 

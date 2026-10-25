@@ -1177,17 +1177,24 @@ def test_a_dead_controller_at_the_last_recheck_answers_the_whole_burst(monkeypat
     assert not [r for r in caplog.records if r.getMessage().startswith('Mention ')]
 
 
-@pytest.mark.parametrize('change', [None, 'nsfw', 'ping edited away', 'both'])
-def test_a_mention_that_opened_the_burst_keeps_its_gates_for_the_notice(monkeypatch, tmp_path, change):
+@pytest.mark.parametrize('change,pinged_again', [
+    (None, False), ('nsfw', False), ('ping edited away', False), ('both', False), ('edited, ping kept', False),
+    (None, True), ('ping edited away', True), ('edited, ping kept', True)])
+def test_a_mention_that_opened_the_burst_keeps_its_gates_for_the_notice(monkeypatch, tmp_path, change,
+                                                                         pinged_again):
     async def scenario():
         fri, agent, _, _, channel, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
-        first, second = make_message('<@99> can you help?'), make_message('one more thing')
+        first = make_message('<@99> can you help?')
+        second = make_message('<@99> one more thing' if pinged_again else 'one more thing')
         api = fri.api
         async def context_down(method, path, value=None):
             if path == '/chat/context':  # Changed while the burst's reply was underway.
                 channel.nsfw = change in ('nsfw', 'both')
                 if change in ('ping edited away', 'both'):  # discord.py edits its cached copy in place.
                     first.content, first.mentions = 'never mind', []
+                if change == 'edited, ping kept':
+                    first.content = '<@99> never mind the first question'
+                if change and change != 'nsfw':
                     first.edited_at = datetime.datetime.now(datetime.timezone.utc)
                 raise ControllerUnavailable(UNREACHABLE)
             return await api(method, path, value)
@@ -1341,6 +1348,44 @@ def test_health_report_stays_out_of_channels_and_other_members(monkeypatch, tmp_
         assert not await agent.owner_control(lab, 'fri health')
         fri.api.assert_not_awaited()
         await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_refusal_whose_body_stalls_reads_as_a_rejection_inside_the_watch_deadline(monkeypatch, tmp_path):
+    class Response:
+        status = 403
+        async def json(self):
+            await asyncio.sleep(60)  # Headers arrived; the body never finishes.
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *exc):
+            return False
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.session = SimpleNamespace(request=lambda *a, **k: Response())
+        try:
+            with patch('fri.fri_watch.READ', 0.5), patch('fri.fri.ERROR_BODY', 0.05):
+                assert await fri.watcher.read() == ('rejected', {})
+        finally:
+            fri.session = None
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('since,expected', [(100, 20), (0, 120), (500, 0), (-5, 0)])
+def test_the_loop_s_first_pass_lands_an_interval_after_the_last_read(monkeypatch, tmp_path, since, expected):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.wait_until_ready = AsyncMock()
+        fri.watcher.load()['checked'] = time.time()-since  # A read in startup's wait, or before a restart.
+        try:
+            with patch('fri.fri.asyncio.sleep', new=AsyncMock()) as sleep:
+                await fri.before_watch()
+            assert sleep.await_args.args[0] == pytest.approx(expected, abs=1)
+        finally:
+            await fri.close()
     asyncio.run(scenario())
 
 
