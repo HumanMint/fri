@@ -532,8 +532,9 @@ def test_reads_stay_an_interval_apart_from_startup_into_the_gateway_loop(monkeyp
             return GOOD  # Gene came back between the reads.
         fri.api = api
         fri.tree.sync = AsyncMock()
-        for loop in (fri.health, fri.owner_reviews, fri.watch):
+        for loop in (fri.health, fri.owner_reviews):
             monkeypatch.setattr(loop, 'start', lambda *args: None)
+        monkeypatch.setattr(fri, 'keep_watch', AsyncMock())
         try:
             with patch('fri.fri.CONTRACT_RETRY', 0), patch('fri.fri_agent.Agent.start', AsyncMock()):
                 await fri.setup_hook()
@@ -567,8 +568,9 @@ def test_startup_waits_out_every_controller_read_it_needs(monkeypatch, tmp_path)
             raise ControllerUnavailable(UNREACHABLE)
         fri.api = api
         fri.tree.sync = AsyncMock()
-        for loop in (fri.health, fri.owner_reviews, fri.watch):
+        for loop in (fri.health, fri.owner_reviews):
             monkeypatch.setattr(loop, 'start', lambda *args: None)
+        monkeypatch.setattr(fri, 'keep_watch', AsyncMock())
         try:
             with patch('fri.fri.CONTRACT_RETRY', 0), patch('fri.fri_agent.Agent.heartbeat'):
                 await fri.setup_hook()
@@ -612,6 +614,82 @@ def test_a_clock_that_went_back_during_a_slow_read_still_starts_a_fresh_streak(m
             with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now)):
                 await fri.watcher.check()
             assert fri.watcher.state['bad'] == 1 and not dm.sends
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_clock_that_went_back_mid_read_still_starts_a_fresh_streak(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        dm = owner_dm(fri)
+        clock = SimpleNamespace(now=1120.0)  # An interval after the last read.
+        fri.watcher.load()
+        fri.watcher.state.update(bad=CHECKS-1, kind='unreachable', since=880, checked=1000)
+        async def corrected(*args):
+            clock.now = 900.0  # The host clock is set back while the read is underway.
+            raise ControllerUnavailable(UNREACHABLE)
+        fri.api = corrected
+        try:
+            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now)):
+                await fri.watcher.check()
+            assert fri.watcher.state['bad'] == 1 and fri.watcher.state['alert'] is None and not dm.sends
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('jump', [-3600, 3600])
+def test_a_clock_change_mid_pass_never_stalls_or_rushes_the_watch(monkeypatch, tmp_path, jump):
+    class Stop(Exception):
+        pass
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.wait_until_ready = AsyncMock()
+        clock = SimpleNamespace(now=time.time())
+        reads, sleeps = [], []
+        async def api(method, path, value=None):
+            reads.append(path)
+            clock.now += jump  # The host clock is corrected while a read is underway.
+            return GOOD
+        async def sleep(delay):
+            sleeps.append(delay)
+            clock.now += delay
+            if len(sleeps) == 4:
+                raise Stop
+        fri.api = api
+        try:
+            with patch('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now)), \
+                    patch('fri.fri.asyncio.sleep', sleep), pytest.raises(Stop):
+                await fri.keep_watch()
+            # The first pass reads at once (no last read); each later pass is an interval after the one before.
+            assert sleeps[0] == 0 and sleeps[1:] == [pytest.approx(120, abs=1)]*3 and len(reads) == 3
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_watch_pass_that_fails_never_ends_the_watch(monkeypatch, tmp_path):
+    class Stop(Exception):
+        pass
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.wait_until_ready = AsyncMock()
+        passes = []
+        async def odd():
+            passes.append(1)
+            raise TypeError('an odd one')
+        async def sleep(delay):
+            if len(passes) == 2:
+                raise Stop
+        fri.watch = odd
+        try:
+            with patch('fri.fri.asyncio.sleep', sleep), pytest.raises(Stop):
+                await fri.keep_watch()
+            assert len(passes) == 2
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -1386,6 +1464,24 @@ def test_owner_health_report_works_in_dm_with_the_controller_down_and_records_no
             assert dm.reply.await_args.kwargs['suppress_embeds'] is True
             called = [call.args[1] for call in fri.api.await_args_list]
             assert sorted(called) == ['/controls/health', '/status']  # No turn, context or usage write.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('state', ['running', 'failed'])
+def test_the_health_report_shows_the_watch_task_as_it_is(monkeypatch, tmp_path, state):
+    async def scenario():
+        fri, _, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        fri.get_guild = lambda _: None
+        async def broken():
+            raise TypeError
+        fri.watching = asyncio.create_task(asyncio.Event().wait() if state == 'running' else broken())
+        await asyncio.sleep(0)
+        try:
+            loops = next(line for line in (await fri.watcher.report()).splitlines() if line.startswith('- loops:'))
+            assert loops.endswith('watch running' if state == 'running' else 'watch stopped (failed)')
         finally:
             await fri.close()
     asyncio.run(scenario())

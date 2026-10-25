@@ -17,7 +17,7 @@ from .private_files import private_json
 LOG = logging.getLogger('fri.watch')
 STARTED = time.time()  # A send from an earlier run of Fri can't have landed after this one started.
 NO_MENTIONS = discord.AllowedMentions.none()
-INTERVAL = 120  # Fri.watch runs every two minutes.
+INTERVAL = 120  # Fri.keep_watch passes every two minutes.
 CHECKS = 3  # Consecutive bad reads before the owner hears about it, so restarts and deploys stay quiet.
 STALE = 60  # Gene's runtime reports every 10 s; a minute without one is several missed beats.
 RELAPSE = 1800  # A new outage this soon after the last DM edits that DM instead of sending another.
@@ -148,8 +148,8 @@ class Watch:
         start = time.time()  # Before the read, so its own latency can't hide a clock that moved back.
         kind, detail = await self.read()
         now = time.time()
-        if not (0 <= start-state['checked'] and now-state['checked'] <= 3*INTERVAL):
-            state['bad'] = 0  # Fri itself was away, or the clock moved back: reads from before don't make a streak.
+        if not (0 <= start-state['checked'] <= now-state['checked'] <= 3*INTERVAL):
+            state['bad'] = 0  # Fri was away, or the clock moved back before or during this read: no streak.
         state['checked'] = now
         alert = state['alert']
         if kind == 'ok':
@@ -286,10 +286,14 @@ class Watch:
             me += f', heartbeat {agent.heartbeat_status} ({beat})'
         lines.append(me)
         loops = {'heartbeat': agent.heartbeat if agent else None, 'owner dms': fri.owner_reviews,
-                 'health file': fri.health, 'watch': fri.watch}
-        lines.append('- loops: '+', '.join(f"{name} {'running' if loop.is_running() else 'stopped'}"
-                                            + (' (failed)' if loop.failed() else '')
-                                            for name, loop in loops.items() if loop))
+                 'health file': fri.health}
+        loops = {name: (loop.is_running(), loop.failed()) for name, loop in loops.items() if loop}
+        task = fri.watching  # A plain task, not a tasks.loop.
+        loops['watch'] = (bool(task and not task.done()),
+                          bool(task and task.done() and not task.cancelled() and task.exception()))
+        lines.append('- loops: '+', '.join(f"{name} {'running' if running else 'stopped'}"
+                                            + (' (failed)' if failed else '')
+                                            for name, (running, failed) in loops.items()))
         try:
             waiting = sum(1 for _ in (fri.data / 'usage').glob('*.json'))
         except OSError:

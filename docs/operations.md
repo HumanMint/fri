@@ -250,8 +250,10 @@ The Gene feature deployer still activates only Red and does not read Fri release
 
 Fri can't restart anything. It only notices and says so.
 
-- **Owner DM per outage.** Fri's own `watch` loop reads `/controls/health` every 2 minutes, with
-  no model call, apart from the agent heartbeat and owner DM loop. After 3 bad reads in a row it
+- **Owner DM per outage.** Fri's own watch task reads `/controls/health` every 2 minutes, with
+  no model call, apart from the agent heartbeat and owner DM loop. It's a plain asyncio task
+  timed on the event loop's monotonic clock, not a `tasks.loop`, which times its sleeps by the
+  wall clock: a host clock set back an hour mid-pass would have stalled it for an hour. After 3 bad reads in a row it
   DMs the owner once. A bad read is one of: Gene's heartbeat missing or at least 60 s old, Gene
   not connected to Discord, Gene's command runner stopped, the controller unreachable (transport
   error, 5xx, or no answer in 10 s), or the controller rejecting the read (4xx, such as a contract
@@ -278,7 +280,8 @@ Fri can't restart anything. It only notices and says so.
   once per 2 minutes, still DM the owner. Reads stay about 2 minutes apart across that wait, the
   loop's first pass and restarts, so a restart never shortens the 3-read debounce: the loop's
   first pass waits until an interval after the last read, rather than skipping a read. A last read
-  dated in the future (the host clock went back) starts a fresh streak instead of muting the watch. Members see Fri offline until the controller answers, and
+  dated in the future, or a clock that went back during the read itself, starts a fresh streak
+  instead of muting the watch or counting toward an alert. Members see Fri offline until the controller answers, and
   `fri health` waits too. A rejected or incompatible contract still stops Fri at once, and so does
   a success that isn't JSON (a wrong URL or a proxy's page), since waiting won't fix it.
 - **Quick controls.** Before charging the operations allowance, a quick control checks Gene's

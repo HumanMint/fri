@@ -158,6 +158,7 @@ class Fri(discord.Client):
         self.capabilities = frozenset()
         from .fri_watch import Watch
         self.watcher = Watch(self)
+        self.watching = None
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
@@ -184,7 +185,7 @@ class Fri(discord.Client):
         await self.tree.sync(guild=discord.Object(id=self.guild_id))
         self.health.start()
         self.owner_reviews.start()
-        self.watch.start()
+        self.watching = asyncio.create_task(self.keep_watch())
 
     def dispatch(self, event, /, *args, **kwargs):
         if event == 'interaction' and args:
@@ -756,13 +757,26 @@ class Fri(discord.Client):
     async def before_reviews(self):
         await self.wait_until_ready()
 
-    @tasks.loop(seconds=120)
+    async def keep_watch(self):
+        # Its own task: a stuck heartbeat or owner DM can't hide an outage. Not a tasks.loop, which schedules
+        # by the wall clock: a clock set back an hour mid-pass would stall it an hour. asyncio sleeps on the
+        # event loop's monotonic clock.
+        from .fri_watch import INTERVAL
+        await self.before_watch()
+        clock = asyncio.get_running_loop()
+        while True:
+            started = clock.time()
+            try:
+                await self.watch()
+            except Exception as exc:  # A watchdog that stops on one odd error watches nothing.
+                LOG.warning('Gene watch pass failed: %s', type(exc).__name__)
+            await asyncio.sleep(max(0, started+INTERVAL-clock.time()))
+
     async def watch(self):
-        # Its own loop: a stuck heartbeat or owner DM can't hide an outage. Reads stay an interval apart
-        # across startup's wait, this loop's first pass and restarts; a pending DM still goes out.
+        # Reads stay an interval apart across startup's wait, the first pass and restarts; a pending DM
+        # still goes out on every pass.
         await self.watcher.check(observe=self.watcher.due(slack=15))
 
-    @watch.before_loop
     async def before_watch(self):
         await self.wait_until_ready()
         await asyncio.sleep(self.watcher.wait())  # Not a pass early, which would skip its read and wait a whole one more.
@@ -798,7 +812,8 @@ class Fri(discord.Client):
             self.agent.close()
         self.health.cancel()
         self.owner_reviews.cancel()
-        self.watch.cancel()
+        if self.watching:
+            self.watching.cancel()
         if self.sign_in_notice:
             self.sign_in_notice.cancel()
         await sessions(self).close_all()
