@@ -41,17 +41,19 @@ def clean(text: str, limit: int = 6000) -> str:
     return redact(text.strip())[:limit]
 
 
-# The only characters that reach the model raw: none looks like another, or like ASCII. Emoji are
-# Emoji_Presentation in Unicode 14.0 (Python 3.11's version; Discord draws each as its own image), plus
-# U+2764, then Hangul syllables, Hangul compatibility jamo (ㅋㅋ) without the blank filler, and curly
-# quotes. Other scripts and symbols have pixel-identical pairs (Latin A and Cyrillic А, the Kelvin sign
-# and K, combining marks), so a row of them could spell bits a person can't see; they stay escaped.
+# The only characters that reach the model raw: none looks like another, or like ASCII, alone or in a
+# row. Emoji are Emoji_Presentation in Unicode 14.0 (Python 3.11's version; Discord draws each as its own
+# image) without the regional indicators, since pairs of them make identical flags (🇫🇷 and Clipperton's
+# 🇨🇵), plus U+2764; then Hangul syllables, Hangul compatibility jamo (ㅋㅋ) without the blank filler,
+# and curly quotes. Other scripts and symbols have pixel-identical pairs (Latin A and Cyrillic А, the
+# Kelvin sign and K, combining marks), so a row of them could spell bits a person can't see; they stay
+# escaped.
 RAW = re.compile(
     '[\u2018\u2019\u201c\u201d\u3131-\u3163\u3165-\u318e\uac00-\ud7a3\u2764'
     '\u231a\u231b\u23e9-\u23ec\u23f0\u23f3\u25fd\u25fe\u2614\u2615\u2648-\u2653\u267f\u2693\u26a1'
     '\u26aa\u26ab\u26bd\u26be\u26c4\u26c5\u26ce\u26d4\u26ea\u26f2\u26f3\u26f5\u26fa\u26fd\u2705'
     '\u270a\u270b\u2728\u274c\u274e\u2753-\u2755\u2757\u2795-\u2797\u27b0\u27bf\u2b1b\u2b1c\u2b50'
-    '\u2b55\U0001f004\U0001f0cf\U0001f18e\U0001f191-\U0001f19a\U0001f1e6-\U0001f1ff\U0001f201'
+    '\u2b55\U0001f004\U0001f0cf\U0001f18e\U0001f191-\U0001f19a\U0001f201'
     '\U0001f21a\U0001f22f\U0001f232-\U0001f236\U0001f238-\U0001f23a\U0001f250\U0001f251'
     '\U0001f300-\U0001f320\U0001f32d-\U0001f335\U0001f337-\U0001f37c\U0001f37e-\U0001f393'
     '\U0001f3a0-\U0001f3ca\U0001f3cf-\U0001f3d3\U0001f3e0-\U0001f3f0\U0001f3f4\U0001f3f8-\U0001f43e'

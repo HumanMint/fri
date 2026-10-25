@@ -157,8 +157,9 @@ advertises it, so the controller must be released first.
   research) goes through `privacy.model_json`. Emoji, Korean and curly quotes arrive as written, so
   an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead
   of six. Only a pinned allowlist is raw (`privacy.RAW`): Emoji_Presentation emoji from Unicode 14.0
-  plus ❤, Hangul syllables, Hangul compatibility jamo such as ㅋ (not the blank filler), and curly
-  quotes. None of them looks like another or like ASCII, so a row of lookalikes can't spell bits a
+  except the regional indicators (🇫🇷 and Clipperton's 🇨🇵 are the same flag), plus ❤, Hangul
+  syllables, Hangul compatibility jamo such as ㅋ (not the blank filler), and curly quotes. None of
+  them looks like another or like ASCII, alone or in a row, so a row of lookalikes can't spell bits a
   person reading the log won't see. Everything else stays escaped exactly as before: other scripts
   and symbols (Latin A and Cyrillic А, the Kelvin sign and K, and look-alike combining marks render
   identically), combining marks, every variation selector (even an emoji's own U+FE0F: 👍 and 👍️
@@ -168,7 +169,7 @@ advertises it, so the controller must be released first.
   compare against the old escaping, run `python -m fri.fri_eval --suite model-text` with and without
   `--baseline` (same cases and settings, model-graded: boundaries, attribution, tone, Korean and
   Korean chat shorthand, and hidden carriers (thumbs, doubled shaddas, overlay order, Kelvin signs,
-  Cyrillic A)). The baseline escapes all of Fri's own model input, internal tasks such as image
+  Cyrillic A, French-looking flags)). The baseline escapes all of Fri's own model input, internal tasks such as image
   selection included; the graders pin `privacy.model_json`, so they read both runs the same way. A
   case whose reply fails, or whose grade fails, fails the run.
 
