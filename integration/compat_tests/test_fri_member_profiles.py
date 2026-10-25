@@ -21,12 +21,14 @@ from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_runtime import configured
+from fri import feedback as commands
 from fri.fri import FIRST_HERE, FIRST_MEMORY, FIRST_PROFILE, NO_MENTIONS, Fri
 from fri.fri_agent import Agent
 from fri.fri_chat import Chat, ChatResult
 from fri.fri_errors import ControllerRejected
 from fri.fri_memory import describe_profile, note_place, profiled, server_wide
 from fri.fri_memory_panel import SHOWN, EditMemory, MemoryView, show
+from fri.subscription import SubscriptionError
 
 GENERAL, GAMING, STAFF, SPICY, DM, THREAD, SECRET = 1, 2, 5, 6, 900, 70, 71
 
@@ -383,6 +385,27 @@ def test_a_channel_closed_while_fri_signs_in_drops_out_of_elsewhere(monkeypatch,
             w.fri.chat_once = AsyncMock(side_effect=call)
             await w.say(GAMING, 'fri recommend me something')
             assert sent and sent[-1]['with_you_elsewhere_untrusted'] == []
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_sign_in_failure_on_a_cross_channel_turn_is_reported(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like mellow jazz')
+
+            def access_token():
+                raise SubscriptionError('Reconnect the subscription.')
+            w.fri.chat = Chat(SimpleNamespace(access_token=access_token), httpx.MockTransport(
+                lambda request: pytest.fail('nothing is sent without signing in')))
+
+            async def call(text, context):
+                return await Fri.chat_once(w.fri, text, context)
+            w.fri.chat_once = AsyncMock(side_effect=call)
+            with pytest.raises(commands.UserFeedbackCheckFailure, match='Reconnect the subscription'):
+                await w.say(GAMING, 'fri recommend me something')
         finally:
             await w.fri.close()
     run(scenario)

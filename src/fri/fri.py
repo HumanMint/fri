@@ -39,7 +39,7 @@ from .fri_usage import describe_usage, usage_requested
 from .panels import defer_panel
 from .privacy import clean
 from .reviews import owner_dm_component
-from .subscription import Subscription, private_json
+from .subscription import Subscription, SubscriptionError, private_json
 
 LOG = logging.getLogger('fri')
 NO_MENTIONS = discord.AllowedMentions.none()
@@ -286,13 +286,15 @@ class Fri(discord.Client):
         LOG.warning('Usage receipt set aside in usage/rejected: %s', cause)
 
     async def chat_once(self, text, context):
-        signed_in = {}
+        result, signed_in = None, {}
         if context.get('elsewhere'):  # A channel closed while Fri gathered context: what was said there stays there.
-            # Signed in first, so nothing waits between this last look and the request it shapes.
-            signed_in['headers'] = await self.chat.headers()
+            try:  # Signed in first, so nothing waits between this last look and the request it shapes.
+                signed_in['headers'] = await self.chat.headers()
+            except SubscriptionError as exc:  # Reported as a sign-in failure during the reply would be.
+                result = ChatResult(status='failed', error=str(exc))
             context['elsewhere'] = [row for row in context['elsewhere'] if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
-        result = await self.chat.respond(text, context, **signed_in)
+        result = result or await self.chat.respond(text, context, **signed_in)
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
             'attempt_id': attempt, 'model': context['model'], 'effort': context['effort'],
