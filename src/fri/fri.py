@@ -332,7 +332,7 @@ class Fri(discord.Client):
                 # receipts, a learning report) never reaches the request either. Delivery checks it again.
                 # First, so nothing waits between the privacy check below and the request.
                 actions = fence['actions']
-                if actions and actions.sources and not actions.sources <= set(await actions.channels(fresh=True)):
+                if actions and actions.sources and not actions.sources <= set(await actions.channels(fresh=True, around=True)):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
                     context, fence['turn']['user_id'], fence['actions'])})

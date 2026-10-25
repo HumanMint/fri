@@ -24,6 +24,7 @@ from .web_policy import public_query
 CATCH_UP_MESSAGES, CATCH_UP_SECONDS = 100, 12 * 3600
 CATCH_UP_CHARS = 20000  # Serialized rows, so emoji-heavy chat can't blow up the prompt.
 RETURN_SECONDS = 5 * 60  # The speaker's own recent messages ("yo", "back") are part of coming back.
+MAX_THREADS = 6  # Active public threads a read can pick from, most recently active first.
 CATCH_UP = ('Only when the speaker asks what they missed: other members\' text in that channel since '
             'the speaker\'s last message there, up to 100 messages or 12 hours. No images.')
 
@@ -107,24 +108,47 @@ class Actions:
         return (original.author.id == self.user and not original.webhook_id and
                 clean(original.content, 4000) == self.pending['request_text'])
 
-    async def channels(self, fresh=False):
+    async def channels(self, fresh=False, around=False):
+        """What this member can read through Fri: in public, this channel.
+
+        around, for read_recent, adds active public threads, and in public the other channels Fri
+        reads that everyone here could read anyway. This channel's own threads and, in a thread, its
+        parent and siblings have this channel's audience."""
+        from .fri_memory import PUBLIC_THREADS, server_wide
+
         member = await self.agent.member(self.user, fresh=fresh, guild_id=self.guild)
         if not member or not self.agent.config['enabled']:
             return {}
-        ids = [str(self.channel)] if self.public else list(dict.fromkeys(
-            self.agent.state['history_channels'] + self.agent.state['channels'] + [str(self.fri.workshop_id)]))
+        listed = self.agent.state['history_channels'] + self.agent.state['channels']
+        ids = [str(self.channel)] if self.public else list(dict.fromkeys(listed + [str(self.fri.workshop_id)]))
+        home = self.fri.get_channel(int(self.channel)) if self.public and str(self.channel).isdigit() else None
+        home = str(getattr(home, 'parent_id', None) or self.channel)
+        if around and self.public:
+            ids = list(dict.fromkeys(ids + [home] + listed))
         result = {}
-        for channel_id in ids[:10]:
-            if not channel_id.isdigit():
-                continue
-            channel = self.fri.get_channel(int(channel_id))
+        def readable(channel):
             if (not channel or getattr(getattr(channel, 'guild', None), 'id', None) != self.guild or
-                    (not self.agent.allowed(channel) and str(channel.id) not in self.agent.state['history_channels']) or getattr(channel, 'nsfw', False) or
+                    (not self.agent.allowed(channel) and not {str(channel.id), str(getattr(channel, 'parent_id', None))}
+                     & set(self.agent.state['history_channels'])) or getattr(channel, 'nsfw', False) or
                     (isinstance(channel, discord.Thread) and (channel.is_private() or getattr(channel.parent, 'nsfw', True)))):
-                continue
+                return False
+            if (around and self.public and str(channel.id) != str(self.channel) and
+                    str(getattr(channel, 'parent_id', None) or channel.id) != home and not server_wide(channel)):
+                return False
             permissions = channel.permissions_for(member)
-            if permissions.view_channel and permissions.read_message_history:
+            return permissions.view_channel and permissions.read_message_history
+        for channel_id in ids[:10]:
+            if channel_id.isdigit() and readable(channel := self.fri.get_channel(int(channel_id))):
                 result[str(channel.id)] = channel
+        if around:
+            threads = []
+            for channel in list(result.values()):
+                found = getattr(channel, 'threads', None)  # Discord's cache of active threads.
+                if not isinstance(channel, discord.Thread) and isinstance(found, list):
+                    threads += [thread for thread in found if isinstance(thread, discord.Thread) and
+                                thread.type in PUBLIC_THREADS and not thread.archived and str(thread.id) not in result]
+            threads.sort(key=lambda thread: thread.last_message_id or thread.id, reverse=True)
+            result.update((str(thread.id), thread) for thread in threads[:MAX_THREADS] if readable(thread))
         return result
 
     async def available(self):
@@ -143,18 +167,23 @@ class Actions:
         channels = await self.channels()
         if not channels:
             return {}
-        actions = {'read_recent': {'channels': [{'channel_id': k, 'name': clean(v.name, 60)}
-                                                for k, v in channels.items()],
+        def listed(key, channel):
+            row = {'channel_id': key, 'name': clean(channel.name, 60)}
+            if isinstance(channel, discord.Thread) and channel.parent:
+                row['thread_in'] = clean(channel.parent.name, 60)
+            return row
+        actions = {'read_recent': {'channels': [listed(k, v) for k, v in (await self.channels(around=True)).items()],
                     'default_channel_id': next(iter(channels)), 'limit': 20, 'max_age_days': 7,
                     'description': 'Read one small recent batch when asked: text, what each post carries '
                     '(image, gif, video, file), and a look at up to four of the newest still images. '
-                    'No saved personal notes.',
+                    'Another listed channel or thread when they ask about it. No saved personal notes.',
                     'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
         if self.invitation:
             actions['read_recent'].update(limit=12, max_age_days=6/24,
                 description='Read up to twelve preceding same-channel messages from the last six hours '
                 'when this mention needs nearby conversation, memes or images. Looks at the image the ping '
                 'replies to or carries, else up to four of the newest nearby still images, each with its author. '
+                'Another listed channel or thread, when they ask about it, reads its latest twenty from the last week. '
                 'This read disables persistent writes and external image selection for this turn; '
                 'complete current requests need no read.')
         if isinstance(self.event, discord.Message) and history_requested(self.message):
@@ -238,8 +267,8 @@ class Actions:
                 return {'blocked': 'The conversation evidence changed. Send a fresh request.'}
         from .fri_images import require_current
         await require_current(self.image_context, self.event)
-        channels = await self.channels(fresh=True)
         kind = action.get('kind')
+        channels = await self.channels(fresh=True, around=kind == 'read_recent')
         if not channels:
             return {'blocked': 'No approved channels are currently readable.'}
         if self.history.pages and kind not in READ_ONLY_AFTER_HISTORY:
@@ -345,7 +374,7 @@ class Actions:
             return {'blocked': 'That channel is outside this conversation’s readable scope.'}
         catch_up = action.get('window') == 'since_my_last_message'
         self.sources.add(channel_id)
-        if self.invitation and not catch_up:
+        if self.invitation and not catch_up and channel_id == str(self.channel):
             return await self.invited_context(channel_id)
         channel = channels[channel_id]
         scope = getattr(channel, 'parent_id', None) or channel.id
@@ -590,7 +619,8 @@ class Actions:
             if not await unchanged(self.image_context, self.event):
                 return False
             channels = await self.channels(fresh=True)
-            if not channels or not self.sources <= set(channels):
+            if not channels or not (self.sources <= set(channels) or
+                                    self.sources <= set(await self.channels(fresh=True, around=True))):
                 return False
             if not await self.history.valid(channels):
                 return False

@@ -459,7 +459,7 @@ def test_each_model_request_checks_access_first_and_privacy_last(monkeypatch, tm
             order.append('request')
             return ChatResult(status='completed', reply='ok')
         model(w, respond)
-        async def channels(fresh=False):
+        async def channels(fresh=False, around=False):
             order.append('access')
             return readable
         async def api(method, path, payload=None):
