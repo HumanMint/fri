@@ -115,11 +115,14 @@ async def patiently(fri, read):
     """A controller read Fri needs before joining the gateway, waited out while the controller is down.
 
     Discord's HTTP API already works here, so the watch still tells the owner when the controller is
-    what's down. A rejected or incompatible controller still stops startup at once."""
+    what's down. A rejected or incompatible controller, or a page that isn't the controller's, still
+    stops startup at once: a wrong URL or a proxy's page isn't an outage that waiting fixes."""
     while True:
         try:
             return await read()
-        except ControllerUnavailable:
+        except ControllerUnavailable as exc:
+            if exc.answered:
+                raise
             if fri.watcher.due():
                 LOG.warning('Controller unreachable at startup; waiting for it')
                 await fri.watcher.check()
@@ -221,6 +224,8 @@ class Fri(discord.Client):
                     data = await response.json()
                 except Exception as exc:  # Not JSON, or cut off or stalled partway: a refusal is still a refusal.
                     if response.status < 400:
+                        if isinstance(exc, aiohttp.ContentTypeError):  # Someone else's page, sent as a success.
+                            raise ControllerUnavailable(UNREACHABLE, answered=True) from None
                         raise
                     data, foreign = None, not isinstance(exc, (ValueError, RecursionError))  # A refusal keeps its status when its JSON can't be read.
                 detail = str(data.get('detail', 'Controller rejected this request')) if isinstance(data, dict) else (

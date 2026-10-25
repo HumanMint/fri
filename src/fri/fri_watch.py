@@ -234,8 +234,10 @@ class Watch:
                     self.save()
                     raise
                 # A nonce Discord already saw returns that first message, maybe with older text; the next pass edits it.
+                # `sent` is when Discord made the DM, not when its reply arrived: the relapse window counts from then.
+                made = getattr(sent, 'created_at', None)
                 alert.update(message_id=str(sent.id), channel_id=str(channel.id), shown=getattr(sent, 'content', text),
-                             sent=time.time())
+                             sent=made.timestamp() if made else time.time())
                 self.save()
                 LOG.warning('Owner told about a Gene outage: %s', alert['kind'])
                 return

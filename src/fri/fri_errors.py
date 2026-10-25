@@ -15,3 +15,7 @@ class ControllerRejected(commands.UserFeedbackCheckFailure):
 
 class ControllerUnavailable(commands.UserFeedbackCheckFailure):
     """The controller didn't answer, or failed on its side (5xx); nothing confirms either way."""
+
+    def __init__(self, detail, answered=False):
+        super().__init__(detail)
+        self.answered = answered  # Something answered as the controller never would: a proxy's page, a wrong URL.

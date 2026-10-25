@@ -18,7 +18,7 @@ from compat_tests.test_gene_controls import control_body, controls_api  # noqa: 
 from fri.fri import patiently
 from fri.fri_agent import Agent
 from fri.fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
-from fri.fri_watch import CHECKS, NOT_OFFERED, NOT_TAKING, Watch, health_requested
+from fri.fri_watch import CHECKS, NOT_OFFERED, NOT_TAKING, RELAPSE, Watch, health_requested
 
 
 def beat(controls, age=0, **changes):
@@ -57,8 +57,9 @@ def owner_dm(fri):
             return dm.nonces[nonce]
         if dm.fail_send and not dm.landed:
             raise dm.fail_send
+        made = sys.modules['fri.fri_watch'].time.time()  # Discord's clock, which agrees with Fri's, faked or not.
         sent = SimpleNamespace(id=556+len(dm.messages), channel=dm, content=content, author=SimpleNamespace(id=99),
-                               created_at=datetime.datetime.now(datetime.timezone.utc))
+                               created_at=datetime.datetime.fromtimestamp(made, datetime.timezone.utc))
         dm.messages[sent.id] = sent
         dm.sends.append(content)
         if nonce is not None:
@@ -721,6 +722,40 @@ def test_the_relapse_window_starts_when_the_dm_actually_went_out(monkeypatch, tm
     asyncio.run(scenario())
 
 
+def test_the_relapse_window_counts_from_when_discord_made_the_dm_not_its_late_reply(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        clock = SimpleNamespace(now=1_000_000.0)
+        monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock.now))
+        quick = dm.send
+        async def late(content, **options):
+            sent = await quick(content, **options)
+            clock.now += 300  # Discord posted it at once; its reply reached Fri five minutes later.
+            return sent
+        dm.send = late
+        async def checks(count, step=120):
+            for _ in range(count):
+                clock.now += step
+                await fri.watcher.check()
+        try:
+            await checks(CHECKS)
+            made = dm.messages[556].created_at.timestamp()
+            assert fri.watcher.state['alert']['sent'] == made
+            dm.send = quick
+            fri.api = AsyncMock(return_value=GOOD)
+            await checks(1)
+            fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+            clock.now = made+RELAPSE-200
+            await checks(CHECKS)  # Confirmed 40 s past half an hour after the DM, though 260 s inside its reply.
+            assert len(dm.sends) == 2
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_dm_still_missing_its_recovery_note_carries_the_next_outage(monkeypatch, tmp_path):
     async def scenario():
         fri = configured(monkeypatch)
@@ -1322,7 +1357,7 @@ def test_controller_transport_errors_are_typed_as_unavailable(monkeypatch):
 
 
 @pytest.mark.parametrize('status,body', [(401, 'text'), (403, 'html'), (404, 'garbled'), (401, 'cut off'),
-                                         (403, 'stalled'), (502, 'html')])
+                                         (403, 'stalled'), (502, 'html'), (200, 'html')])
 def test_a_refusal_that_isnt_json_is_still_a_refusal(monkeypatch, tmp_path, status, body):
     """A proxy's or a wrong URL's own error page: the status decides, never the body."""
     import aiohttp
@@ -1351,12 +1386,17 @@ def test_a_refusal_that_isnt_json_is_still_a_refusal(monkeypatch, tmp_path, stat
             return Response()
         request.request = start
         try:
-            if status < 500:
+            if 400 <= status < 500:
                 with pytest.raises(ControllerRejected) as caught:  # Startup stops at once, as on any rejection.
                     await asyncio.wait_for(patiently(fri, lambda: fri.api('GET', '/fri/contract')), 5)
                 # A page that isn't the controller's has no status to act on, such as setting a usage receipt aside.
                 assert caught.value.status == (status if body == 'garbled' else None) and request.calls == 1
                 assert await fri.watcher.read() == ('rejected', {})
+            elif status == 200:  # Not the controller at all, so startup stops instead of waiting it out.
+                with pytest.raises(ControllerUnavailable) as caught:
+                    await asyncio.wait_for(patiently(fri, lambda: fri.api('GET', '/fri/contract')), 5)
+                assert caught.value.answered and request.calls == 1
+                assert await fri.watcher.read() == ('unreachable', {})
             else:
                 assert await fri.watcher.read() == ('unreachable', {})
         finally:

@@ -240,7 +240,7 @@ Fri can't restart anything. It only notices and says so.
   again under the same nonce. Every DM from a minute before the attempt to a minute after that
   send settled (or after Fri restarted, if it died mid-send) is checked, and a lookup that fails
   proves nothing, so it's retried. A relapse keeps a DM whose delivery is still unknown rather than
-  starting a second one. The 30-minute relapse window starts when a DM actually went out, and a
+  starting a second one. The 30-minute relapse window starts when Discord made the DM (not when its reply reached Fri), and a
   DM whose last edit hasn't landed still reads as down, so it carries the next outage too. Only Fri or Discord can delete Fri's message in a DM. If it's gone
   when Fri goes to edit it mid-outage, Fri sends it again. Once the outage is over, nothing is sent
   late.
@@ -249,7 +249,8 @@ Fri can't restart anything. It only notices and says so.
   once per 2 minutes, still DM the owner. Reads stay about 2 minutes apart across that wait, the
   loop's first pass and restarts, so a restart never shortens the 3-read debounce. A last read
   dated in the future (the host clock went back) starts a fresh streak instead of muting the watch. Members see Fri offline until the controller answers, and
-  `fri health` waits too. A rejected or incompatible contract still stops Fri at once.
+  `fri health` waits too. A rejected or incompatible contract still stops Fri at once, and so does
+  a success that isn't JSON (a wrong URL or a proxy's page), since waiting won't fix it.
 - **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
   command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
   there, the member gets a fixed "gene isn't taking commands right now" at once, plus "owner
