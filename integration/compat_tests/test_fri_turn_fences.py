@@ -873,8 +873,8 @@ def test_messages_queued_behind_a_delivery_still_get_answered(monkeypatch, tmp_p
         # Sent 6.1 seconds apart, both while Fri's earlier reply was still being delivered.
         first, second = message('fri first follow-up', age=6.2), message('fri second follow-up', age=0.1)
         add = agent.bursts.add
-        def arrive(event, arrived=None):  # The second arrived over five seconds later: a separate burst.
-            return add(event, arrived+6.1 if event is second else arrived)
+        def arrive(event, arrived=None, since=None):  # The second arrived over five seconds later: a separate burst.
+            return add(event, arrived+6.1 if event is second else arrived, since)
         agent.bursts.add = arrive
         tasks = [asyncio.create_task(agent.handle(initial))]
         try:

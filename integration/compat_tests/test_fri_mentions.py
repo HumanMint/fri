@@ -178,8 +178,8 @@ def test_ping_after_another_members_meme_gets_text_without_ambient_expansion(mon
                 assert set(context['actions']) == {'web_search'}
                 assert not agent.recent and not agent.active and not agent.bursts.rows
                 assert not any(path.startswith(('/controls', '/workspace', '/social')) for path, _ in calls)
-                # Read once, only for the privacy revision the ping came in under.
-                assert sum(path == '/agent/context' for path, _ in calls) == 1
+                # Only for the privacy revision the ping came in under, then to check it before sending.
+                assert sum(path == '/agent/context' for path, _ in calls) == 2
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -907,7 +907,7 @@ def test_no_low_battery_after_an_erasure_during_admission(monkeypatch, tmp_path,
                 await agent.handle(event)
             event.add_reaction.assert_not_awaited()
             event.reply.assert_not_awaited()
-            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: social cooldown']
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -1097,6 +1097,112 @@ def test_a_dm_outside_the_queue_keeps_its_controller_error(monkeypatch, tmp_path
             assert [item.args for item in event.reply.await_args_list] == [('the workshop controller is temporarily unavailable.',)]
             fri.chat_once.assert_not_awaited()
         finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['fri still there?', '<@99> still there?'])
+def test_a_stale_cached_row_does_not_drop_a_message_sent_after_the_erasure(monkeypatch, tmp_path, caplog, text):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        earlier = message('fri remember the private marker', age=30)
+        earlier.reply.return_value = SimpleNamespace(id=earlier.id+1, content='got it')
+        event = message(text)
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='still here')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='still here')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(earlier)
+                assert agent.recent[1]  # Cached under the revision before the erasure...
+                store.clear_chats('20')  # ...which they then clear through Gene, not Fri.
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [('still here',)]
+            assert 'private marker' not in str(fri.chat_once.await_args.args[1])
+            assert not mention_lines(caplog)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel_id,erasure', [(1, 'local'), (8, 'local'), (8, 'gene')])
+def test_an_erasure_during_a_pings_last_checks_stops_the_reply(monkeypatch, tmp_path, caplog, channel_id, erasure):
+    # The last Discord read after the controller's checks: the ping in a configured channel, where
+    # Gene's grant fence catches its own erasures, and a nearby message outside one.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        nearby = message('another member nearby', user=30, age=60)
+        event = message()
+        last, seen = event if channel_id == 1 else nearby, []
+        def fetch(mid):
+            if mid == last.id and fri.chat_once.await_count:
+                seen.append(mid)
+                if len(seen) == 2:  # Fri's own last look, after talk's.
+                    agent.forget(20) if erasure == 'local' else store.clear_chats('20')
+            return rows[mid]
+        channel.fetch_message.side_effect = fetch
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert len(seen) >= 2
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_erased_during_its_debounce_is_not_answered(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+        event = message('remember the private marker?')
+        event.guild = None
+        async def debounce(_):
+            store.clear_chats('20')  # Through Gene, while Fri waits to see if more is coming.
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_burst_does_not_carry_messages_from_before_an_erasure(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('<@99> remember the private marker'), message('fri anyway, hi')
+        second.reply.return_value = SimpleNamespace(id=second.id+1, content='hi')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='hi')
+        debounced, real_sleep = asyncio.Event(), asyncio.sleep
+        async def debounce(_):
+            await debounced.wait()
+        async def grouped(event):
+            while agent.bursts.group(event) is None:
+                await real_sleep(0.01)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                await asyncio.wait_for(grouped(first), 5)
+                store.clear_chats('20')  # Through Gene, between the two.
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                await asyncio.wait_for(grouped(second), 5)
+                debounced.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_awaited_once()
+            assert 'private marker' not in str(fri.chat_once.await_args)
+            assert [item.args for item in second.reply.await_args_list] == [('hi',)]
+            first.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: author privacy changed']
+        finally:
+            debounced.set()
             await fri.close()
     asyncio.run(scenario())
 

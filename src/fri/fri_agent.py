@@ -220,17 +220,24 @@ class Agent:
             if profile['enabled'] and profile['revision'] == row.get('revision', 0):
                 accepted.append(row)
             else:
-                self.forget(int(user))
+                self.uncache(int(user))
         if stale:  # Drop invalidated Fri replies from the raw cache too, not just from this context.
             self.recent[channel] = deque((r for r in self.recent[channel] if r['id'] not in stale), maxlen=30)
         return accepted
 
     def forget(self, user):
+        """The member erased through Fri: their messages still waiting for a reply drop too."""
         self.forgotten[user] = self.forgotten.get(user, 0)+1
         self.bursts.forget(user)
         for key in list(self.pending):
             if key[1] == user:
                 del self.pending[key]
+        self.uncache(user)
+
+    def uncache(self, user):
+        """Drop a member's cached rows, Fri's replies drawing on them, and Fri's attention to them.
+        Unlike forget(), not counted as an erasure: a stale row can predate the messages now waiting,
+        and their own revision fences those."""
         for key, rows in self.recent.items():
             self.recent[key] = deque((r for r in rows if r['user_id'] != str(user) and str(user) not in
                                       {p['user_id'] for p in r.get('provenance', [])}), maxlen=30)
@@ -600,6 +607,11 @@ class Agent:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})
             return
+        elif not privacy:  # A DM's too, as it comes in, so an erasure during any wait below counts.
+            try:
+                observed = await self.revision(message.author.id)
+            except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
+                return await self.unreadable(message, [message], exc, invitation, forgotten)
         if message.id in self.replying:
             return  # A redelivered event: its reply is already being delivered or recorded.
         recording = self.recording.get((channel, message.author.id))
@@ -607,11 +619,6 @@ class Agent:
         if waited:
             # Fri's reply was delivered but isn't saved yet, so a question it asked isn't pending
             # yet either. This message may be the answer: decide only after the save.
-            if observed is None:  # A DM's.
-                try:
-                    observed = await self.revision(message.author.id)
-                except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
-                    return await self.unreadable(message, [message], exc, invitation, forgotten)
             try:
                 await asyncio.wait_for(recording.wait(), 30)
             except TimeoutError:
@@ -635,7 +642,7 @@ class Agent:
         # Short bursts share context and produce one response to the newest message.
         key = (channel, message.author.id)
         try:
-            self.bursts.add(message, arrived)
+            self.bursts.add(message, arrived, None if privacy else (forgotten, observed))
         except ValueError as exc:
             self.pending.pop(key, None)
             await message.reply(notice_text(str(exc)), allowed_mentions=NO_MENTIONS, mention_author=False)
@@ -750,13 +757,16 @@ class Agent:
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        if since and self.forgotten.get(message.author.id, 0) != since[0]:
-            return missed('author privacy changed')  # Gene's fence covers the rest once they erase there.
         if invitation:
             if not await invitation.current():
                 return await withhold()
             from .fri_mentions import force_text
             result = force_text(result)
+        if since:  # Last before sending. Talk ended on Gene's fence, but a ping's reads above came after it.
+            reason = (await self.erased(message.author.id, *since) if invitation else
+                      'author privacy changed' if self.forgotten.get(message.author.id, 0) != since[0] else None)
+            if reason:
+                return await self.dropped(message, events, reason, invitation)
         if result.response_kind in ('react', 'quiet'):
             if result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(message, result.reaction):
                 self.answered(events)
