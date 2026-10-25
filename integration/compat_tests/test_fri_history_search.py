@@ -73,6 +73,9 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'find recommended movies', 'look up recommended games',
                  'what are the recommended settings for this game?',
                  'what is the recommended way to learn Python?', 'whats the most posted meme format',
+                 'what is the most commonly recommended gaming laptop?',
+                 'which is the most widely recommended Python tutorial?',
+                 'what is the difference between shared and dedicated hosting?',
                  'what was that'):
         assert not requested(text)
     assert valid_action(query())
