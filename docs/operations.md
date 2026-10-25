@@ -308,8 +308,9 @@ error code, never the response or tokens. Only a refused grant (HTTP 400/401), a
 renewal without the plan scope, or a missing or incomplete saved sign-in is reported
 as needing a reconnect. Each refusal sends the owner one DM; a token that works in
 between, even briefly, makes the next refusal a new one.
-Network, rate-limit and provider failures, including a malformed renewal response,
-ask members to retry.
+Network, rate-limit, provider and disk failures, including a malformed renewal
+response, ask members to retry. A renewal that can't be saved still keeps a rotated
+refresh token. A controller 4xx whose JSON body can't be read keeps its status.
 
 ## New installations
 

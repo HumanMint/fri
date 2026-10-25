@@ -153,27 +153,31 @@ class Subscription:
 
     def access_token(self):
         observation = self.observation()
-        if not self.path.exists():
-            self.settle(observation, True)
-            raise SubscriptionError('Fri needs a ChatGPT subscription sign-in. Ask the owner to connect them.')
-        with self.path.with_suffix('.lock').open('a') as lock:
-            os.chmod(lock.name, 0o600)
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            observation = self.observation()
-            try:
-                token = self.locked_token()
-            except SubscriptionUnavailable:
-                raise
-            except SubscriptionError:
+        try:
+            if not self.path.exists():
                 self.settle(observation, True)
-                raise
-            self.settle(observation, False)
-            return token
+                raise SubscriptionError('Fri needs a ChatGPT subscription sign-in. Ask the owner to connect them.')
+            with self.path.with_suffix('.lock').open('a') as lock:
+                os.chmod(lock.name, 0o600)
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                observation = self.observation()
+                try:
+                    token = self.locked_token()
+                except SubscriptionUnavailable:
+                    raise
+                except SubscriptionError:
+                    self.settle(observation, True)
+                    raise
+                self.settle(observation, False)
+                return token
+        except OSError as exc:  # A reconnect can't fix the disk, and the saved token may be fine.
+            LOG.warning('ChatGPT sign-in unavailable: %s', type(exc).__name__)
+            raise SubscriptionUnavailable('Fri couldn’t read their ChatGPT sign-in. Try again in a minute.') from None
 
     def locked_token(self):
         try:
             saved = json.loads(self.path.read_text())
-        except (OSError, ValueError, RecursionError):  # Unreadable, gone since the check, or nested too deep.
+        except (FileNotFoundError, ValueError, RecursionError):  # Gone since the check, or not JSON we can read.
             saved = None
         expires_at = saved.get('expires_at') if isinstance(saved, dict) else None
         if not isinstance(saved, dict) or not usable(saved.get('access_token')) or not moment(expires_at):
@@ -196,11 +200,15 @@ class Subscription:
             tokens = response.json()
             renewed = token_record(tokens, saved, client_id=saved['client_id'],
                                    host_id=saved['ext_agent_host_id'])
+            private_json(self.path, renewed)
         except (httpx.HTTPError, SubscriptionError, KeyError, ValueError, TypeError, AttributeError,
-                RecursionError) as exc:
+                RecursionError, OSError) as exc:
             rotated = tokens.get('refresh_token') if isinstance(tokens, dict) else None
             if usable(rotated) and rotated != saved['refresh_token']:
-                private_json(self.path, {**saved, 'refresh_token': rotated})  # The old one may be spent already.
+                try:
+                    private_json(self.path, {**saved, 'refresh_token': rotated})  # The old one may be spent already.
+                except (OSError, ValueError, RecursionError) as failed:
+                    LOG.warning('ChatGPT sign-in renewal: rotated refresh token not saved: %s', type(failed).__name__)
             # A malformed success is the provider's fault, not the grant's; only a refusal needs the owner.
             withdrawn = plan_withdrawn(tokens)
             refused = withdrawn or refusal(exc)
@@ -209,5 +217,4 @@ class Subscription:
             if refused:
                 raise SubscriptionError('Fri could not renew their ChatGPT connection. Reconnect the subscription.') from None
             raise SubscriptionUnavailable('Fri couldn’t reach ChatGPT to renew their sign-in. Try again in a minute.') from None
-        private_json(self.path, renewed)
         return renewed['access_token']

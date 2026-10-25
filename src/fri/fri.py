@@ -197,11 +197,18 @@ class Fri(discord.Client):
         try:
             async with self.session.request(method, self.url + path, json=payload,
                     headers={'Authorization': 'Bearer ' + self.token, 'X-Fri-Contract': PROTOCOL}) as response:
-                data = await response.json()
+                try:
+                    data = await response.json()
+                except (ValueError, RecursionError):
+                    if response.status < 400:
+                        raise
+                    data = None  # A refusal keeps its status when its JSON can't be read; a non-JSON reply isn't the controller's.
+                detail = str(data.get('detail', 'Controller rejected this request')) if isinstance(data, dict) else (
+                    'Controller rejected this request')
                 if 400 <= response.status < 500:
-                    raise ControllerRejected(str(data.get('detail', 'Controller rejected this request')), response.status)
+                    raise ControllerRejected(detail, response.status)
                 if response.status >= 400:
-                    raise commands.UserFeedbackCheckFailure(str(data.get('detail', 'Controller rejected this request')))
+                    raise commands.UserFeedbackCheckFailure(detail)
                 return data
         except (aiohttp.ClientError, TimeoutError):
             raise commands.UserFeedbackCheckFailure('The workshop controller is temporarily unavailable.') from None

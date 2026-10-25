@@ -1,3 +1,4 @@
+import errno
 import json
 import threading
 import time
@@ -180,6 +181,43 @@ def test_rotated_refresh_token_is_kept_even_when_the_rest_of_the_renewal_is_unus
     assert json.loads(path.read_text()) == {**saved, 'refresh_token': 'rotated'}  # Still expired, so the next call renews.
 
 
+@pytest.mark.parametrize('error', [OSError(errno.ENOSPC, 'private'), RecursionError()], ids=['disk full', 'too deep to save'])
+def test_a_renewal_that_cannot_be_saved_still_keeps_its_rotated_refresh_token(tmp_path, caplog, monkeypatch, error):
+    path = tmp_path / 'session.json'
+    saved = expired(path)
+    renewed = httpx.Response(200, json={'access_token': 'private-a', 'refresh_token': 'rotated',
+                                        'token_type': 'Bearer', 'expires_in': 3600})
+    import fri.subscription as subscription
+    writes = []
+
+    def full_once(target, data):
+        writes.append(data)
+        if len(writes) == 1:
+            raise error
+        private_json(target, data)
+    monkeypatch.setattr(subscription, 'private_json', full_once)
+    session = Subscription(path, httpx.MockTransport(lambda _: renewed))
+    with pytest.raises(SubscriptionUnavailable):
+        session.access_token()
+    assert json.loads(path.read_text()) == {**saved, 'refresh_token': 'rotated'} and not session.rejected
+    assert f'renewal failed: {type(error).__name__}' in caplog.text and 'private' not in caplog.text
+
+
+def test_a_failed_save_of_the_rotation_itself_is_still_not_raw(tmp_path, caplog, monkeypatch):
+    path = tmp_path / 'session.json'
+    saved = expired(path)
+    rotated = httpx.Response(200, json={'access_token': 'private-a', 'refresh_token': 'rotated',
+                                        'token_type': 'Bearer', 'expires_in': None})
+
+    def full(*_):
+        raise OSError(errno.ENOSPC, 'private')
+    monkeypatch.setattr('fri.subscription.private_json', full)
+    with pytest.raises(SubscriptionUnavailable):
+        Subscription(path, httpx.MockTransport(lambda _: rotated)).access_token()
+    assert json.loads(path.read_text()) == saved
+    assert 'rotated refresh token not saved: OSError' in caplog.text and 'private' not in caplog.text
+
+
 def test_renewal_without_a_refresh_token_keeps_the_saved_one(tmp_path):
     path = tmp_path / 'session.json'
     expired(path)
@@ -203,19 +241,40 @@ class Unreadable:
         return getattr(self.path, name)
 
 
-@pytest.mark.parametrize('error', [PermissionError(13, 'private'), FileNotFoundError(2, 'private')],
-                         ids=['permission denied', 'gone after the check'])
-def test_an_unreadable_saved_sign_in_is_a_refusal(tmp_path, caplog, error):
+def test_a_saved_sign_in_gone_after_the_check_is_a_refusal(tmp_path, caplog):
     path = tmp_path / 'session.json'
     expired(path, expires_at=time.time() + 3600)
     session = Subscription(path)
-    session.path = Unreadable(path, error)
+    session.path = Unreadable(path, FileNotFoundError(2, 'private'))
     with pytest.raises(SubscriptionError, match='Reconnect') as exc:
         session.access_token()
     assert not isinstance(exc.value, SubscriptionUnavailable) and session.rejected
     assert 'saved sign-in is unreadable' in caplog.text and 'private' not in caplog.text
     session.path = path
     assert session.access_token() == 'old' and not session.rejected
+
+
+@pytest.mark.parametrize('error', [OSError(errno.EIO, 'private'), PermissionError(13, 'private')],
+                         ids=['disk error', 'permission denied'])
+@pytest.mark.parametrize('where', ['read', 'lock'])
+def test_a_file_error_is_not_a_refusal(tmp_path, caplog, monkeypatch, error, where):
+    # A reconnect wouldn't fix the disk, and the token on it may be fine: members retry, the log has the cause.
+    path = tmp_path / 'session.json'
+    expired(path, expires_at=time.time() + 3600)
+    session = Subscription(path)
+    if where == 'read':
+        session.path = Unreadable(path, error)
+    else:
+        def flock(*_):
+            raise error
+        monkeypatch.setattr('fri.subscription.fcntl.flock', flock)
+    with pytest.raises(SubscriptionUnavailable) as exc:
+        session.access_token()
+    assert 'reconnect' not in str(exc.value).lower() and not session.rejected and session.refusals == 0
+    assert f'sign-in unavailable: {type(error).__name__}' in caplog.text and 'private' not in caplog.text
+    monkeypatch.undo()
+    session.path = path
+    assert session.access_token() == 'old'
 
 
 class Paused:

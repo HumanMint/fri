@@ -6,10 +6,12 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import aiohttp
 import pytest
 
 from compat_tests.test_api import actor, headers
 from compat_tests.test_split_contract import Session
+from fri import feedback as commands
 from fri.fri import SIGN_IN_NOTICE, Fri
 from fri.fri_agent import Agent
 from fri.fri_agent_settings import DEFAULTS
@@ -278,6 +280,56 @@ def test_refused_usage_receipts_are_set_aside_and_later_ones_still_deliver(clien
     assert (usage/'rejected').stat().st_mode & 0o777 == 0o700
     totals = client.post('/chat/usage', json=actor(), headers=headers('fri')).json()
     assert {row['model']: row['attempts'] for row in totals} == {'gpt-6-luna': 1, 'gpt-6.1-sol': 1}
+
+
+class Unreadable:
+    """A controller (or something in front of it) answering every request with an unreadable body."""
+
+    def __init__(self, status, error):
+        self.status, self.error, self.calls = status, error, 0
+
+    def request(self, method, url, **_):
+        self.calls += 1
+        reply = self
+
+        class Reply:
+            status = reply.status
+
+            async def json(self):
+                raise reply.error
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+        return Reply()
+
+
+# RecursionError is what json.loads raises on a body nested about 1,000 deep.
+@pytest.mark.parametrize('error', [RecursionError(), ValueError('not json')], ids=['deeply nested', 'not json'])
+def test_an_invalid_receipt_refusal_with_an_unreadable_body_is_still_set_aside(tmp_path, error):
+    usage = tmp_path/'usage'
+    receipt(usage/('1'*32+'.json'), 'gpt-6-luna')
+    receipt(usage/('2'*32+'.json'), 'gpt-6-luna')
+    fri = usage_runtime(None, tmp_path)
+    fri.session = Unreadable(422, error)
+    asyncio.run(Fri.flush_usage(fri))
+    assert fri.session.calls == 2 and len(list((usage/'rejected').glob('*.json'))) == 2
+
+
+@pytest.mark.parametrize('status, error', [(401, RecursionError()), (422, aiohttp.ContentTypeError(None, (), status=422))],
+                         ids=['refused client', 'not the controller'])
+def test_other_unreadable_refusals_keep_every_receipt_queued(tmp_path, status, error):
+    # A non-JSON reply didn't come from the controller (a proxy, say), so it says nothing about the receipt.
+    usage = tmp_path/'usage'
+    receipt(usage/('1'*32+'.json'), 'gpt-6-luna')
+    receipt(usage/('2'*32+'.json'), 'gpt-6-luna')
+    fri = usage_runtime(None, tmp_path)
+    fri.session = Unreadable(status, error)
+    with pytest.raises(commands.UserFeedbackCheckFailure):
+        asyncio.run(Fri.flush_usage(fri))
+    assert fri.session.calls == 1 and len(list(usage.glob('*.json'))) == 2 and not (usage/'rejected').exists()
 
 
 def test_client_level_refusals_keep_every_receipt_queued(client, tmp_path):
