@@ -373,11 +373,12 @@ class Fri(discord.Client):
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         return result
 
-    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, typing=None):
+    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, typing=None, last_look=None):
         # `revision`: the author's privacy revision as their message came in, if known. Gene fences the
         # reply against the one read below, so an erasure before that read must stop it here.
         # `typing(stage)`: told once a model turn is 'admitted' (no closing, control or cooldown) and
-        # before an 'action' runs, so the caller shows typing only when words are coming.
+        # before an 'action' runs, so the caller shows typing only when words are coming. `last_look(result)`:
+        # the caller's own last Discord read, run before the turn's last privacy checks so they cover it.
         typing = typing or noop
         if invitation and invitation.outside:
             return await self.invited_talk(invitation, text, typing)
@@ -496,6 +497,11 @@ class Fri(discord.Client):
                                   f'back in about {minutes} mins') if admission.get('notice') else ''
                         return ChatResult(reply=notice, status='cooldown')
                 await typing('admitted')
+                if conversation and (conversation.get('message_burst') or conversation.get('reply_target')):
+                    # Read before typing could start: an edit or delete meanwhile mustn't reach the model.
+                    from .fri_conversation import unchanged
+                    if not await unchanged(self.agent, event, conversation):
+                        raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
                 if invitation:
                     if invitation.grant and event.reference and event.reference.message_id:
                         await invitation.collect(include_recent=False)
@@ -629,6 +635,8 @@ class Fri(discord.Client):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
                     elif not private:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored)
+                    if last_look:
+                        await last_look(result)
                     try:  # The save's privacy fence, applied before anything is shown.
                         await self.api('POST', '/chat/turn/check', result.turn)
                         self.still_open(context)
@@ -638,6 +646,8 @@ class Fri(discord.Client):
                 if context.get('gene_receipts') and not await actions.valid(outage=True):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 result = self.stage_turn(scope, source, text, context, result, actions=actions)
+                if last_look:
+                    await last_look(result)
                 # The save's privacy fence runs before delivery; the save itself waits for delivery.
                 await self.api('POST', '/chat/turn/check', result.turn)
                 self.still_open(context)

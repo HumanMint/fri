@@ -1188,6 +1188,10 @@ class Agent:
                                 logged=f'reply withheld: {invitation.refusal}')
             return True
 
+        async def room(result):  # An ambient reply's last look, before talk's last privacy checks.
+            if result.response_kind not in ('react', 'quiet') and await self.moved_on(message):
+                raise GateClosed('room moved on')  # Nothing posted or saved: as if it had stayed quiet.
+
         try:
             if ambient and not self.ambient_ready(message.channel.id, message.author.id):
                 return
@@ -1195,7 +1199,7 @@ class Agent:
                 result = await self.fri.talk(self.fri.guild_id if dm else message.guild.id, message.channel.id, message.author.id,
                     text, 'private' if dm else 'public', message.author.display_name, event=message,
                     burst=burst, inspect_images=not ambient, typing=typing, **({'invitation': invitation} if invitation else {}),
-                    **({'revision': since[1]} if since else {}))
+                    **({'revision': since[1]} if since else {}), **({'last_look': room} if ambient else {}))
         except AuthorErased:
             return missed('author privacy changed')
         except GateClosed as exc:
@@ -1209,6 +1213,8 @@ class Agent:
         except ControllerUnavailable:
             return await outage()
         except commands.UserFeedbackCheckFailure as exc:
+            if ambient:  # Nobody asked: an unprompted reply that can't go out just stays quiet.
+                return missed('reply withheld: '+type(exc).__name__)
             if invitation and await refused():
                 return
             if isinstance(exc, ControllerRejected) and (
@@ -1229,8 +1235,6 @@ class Agent:
                 return
             from .fri_mentions import force_text
             result = force_text(result)
-        if ambient and result.response_kind not in ('react', 'quiet') and await self.moved_on(message):
-            return missed('room moved on')  # Nothing posted or saved: as if it had stayed quiet.
         if since:  # Last before sending. Talk ended on Gene's fence, but a ping's reads above came after it.
             reason = (await self.erasure(message.author.id, *since) if invitation else
                       'author privacy changed' if self.forgotten.get(message.author.id, 0) != since[0] else None)
