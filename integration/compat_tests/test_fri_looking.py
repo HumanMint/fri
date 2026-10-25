@@ -512,3 +512,28 @@ def test_a_mention_read_and_retained_reports_record_where_they_came_from(monkeyp
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_gallery_post_is_looked_at_whole_within_the_budget(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channel, rows, post = read_harness(monkeypatch, tmp_path)
+        post('', attachments=[picture(1, f'big{n}.png') for n in range(5)], age=60)  # Over the budget alone.
+        gallery = post('three for the price of one', attachments=[picture(1, f'g{n}.png') for n in range(3)], age=120)
+        loads(monkeypatch)
+        actions = Actions(agent, 20, 999, False)
+        actions.turn_context, actions.media_allowed = {}, True
+        actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
+        try:
+            receipt = await actions.execute({'kind': 'read_recent', 'channel_id': '1', 'window': 'recent'})
+            assert receipt['images_inspected'] == 1 and receipt['images_not_inspected'] == 1
+            assert actions.turn_context['images'] == [f'data:image/png;base64,g{n}.png' for n in range(3)]
+            assert actions.turn_context['inspected_images'] == [
+                {'images': [1, 2, 3], 'source': actions.turn_context['inspected_images'][0]['source']}]
+            assert await actions.valid()
+            trimmed = copy.copy(gallery)
+            trimmed.attachments = gallery.attachments[:2]
+            rows[gallery.id] = trimmed
+            assert not await actions.valid()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

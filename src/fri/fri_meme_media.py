@@ -11,10 +11,12 @@ MAX_BYTES = 4 * 1024 * 1024
 MIMES = {'image/png', 'image/jpeg', 'image/webp'}
 
 
-def sources(message):
-    """None means incomplete/unsupported media; don't judge a video from its thumbnail."""
+def sources(message, most=2):
+    """None means incomplete/unsupported media; don't judge a video from its thumbnail.
+
+    most: how many images one post may carry; a look around takes a whole gallery post."""
     attachments = message.attachments
-    if len(attachments) > 2 or any(a.is_spoiler() for a in attachments) or '||' in message.content:
+    if len(attachments) > most or any(a.is_spoiler() for a in attachments) or '||' in message.content:
         return None
     result = []
     for a in attachments:
@@ -30,7 +32,7 @@ def sources(message):
             if not proxy:
                 return None
             result.append(str(proxy))
-    if len(result) > 2 or (not result and re.search(r'https?://', message.content)):
+    if len(result) > most or (not result and re.search(r'https?://', message.content)):
         return None
     return result
 

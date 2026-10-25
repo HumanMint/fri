@@ -86,7 +86,7 @@ async def look(context, posts, *, invitation=None):
         if post.id in seen:
             continue
         seen.add(post.id)
-        urls = sources(post)
+        urls = sources(post, MAX_IMAGES)
         if not urls or urls != [str(a.url) for a in post.attachments] or len(urls) > budget:
             skipped += 1
             continue
@@ -212,7 +212,7 @@ async def looked_unchanged(context):
             current = await post.channel.fetch_message(post.id)
             if (current.id != post.id or current.author.id != post.author.id or getattr(current.author, 'bot', False) or
                     current.webhook_id or current.channel.id != post.channel.id or current.content != post.content or
-                    current.edited_at != post.edited_at or sources(current) != read['sources']):
+                    current.edited_at != post.edited_at or sources(current, MAX_IMAGES) != read['sources']):
                 return False
         return True
     except discord.HTTPException:
