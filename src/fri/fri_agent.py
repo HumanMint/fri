@@ -16,11 +16,11 @@ import discord
 from discord.ext import tasks
 
 from . import feedback as commands
-from .fri_addressing import addressed_text, explicit_mention, pinged
+from .fri_addressing import addressed_text, explicit_mention, pinged, visible_content
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SETTINGS_GATE, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
-from .fri_errors import ControllerRejected
+from .fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
 from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
@@ -112,6 +112,8 @@ class Agent:
         self.heartbeat_started = self.heartbeat_finished = 0
         self.heartbeat_status = 'starting'
         self.stages = {}
+        self.unreachable_notices = {}  # channel: when Discord took Fri's notice (monotonic), or None in flight.
+        self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
 
     @property
     def config(self):
@@ -301,6 +303,11 @@ class Agent:
             return False
         if message.guild and message.guild.id != self.fri.guild_id:
             return False  # Lab is for conversation; administrative output stays in FF/owner DMs.
+        from .fri_watch import health_requested
+        if health_requested(text):  # Before any controller read: it has to work while the controller doesn't.
+            report = await self.fri.watcher.report() if not message.guild else 'dm me for that one.'
+            await message.reply(report, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+            return True
         if usage_requested(text):
             return False  # Keep reports in the normal attributed conversation and privacy flow.
         lower = text.lower()
@@ -409,6 +416,9 @@ class Agent:
     def answered(self, events):
         for event in events:
             self.misses.pop(event.id, None)
+            self.responded[event.id] = None
+        while len(self.responded) > MAX_DELIVERED:
+            del self.responded[next(iter(self.responded))]
 
     def settle(self, event, reason=None):
         if event.id in self.misses:  # IDs and a gate or exception name only, never content or names.
@@ -434,20 +444,80 @@ class Agent:
         finally:
             self.handling -= Counter([message.id])
 
+    async def unreachable(self, message, *, answering=False):
+        """A message Fri would answer, read while the controller is down: say so instead of going silent.
+
+        One notice per channel per five minutes, from either path; True once it's posted. `answering` is a
+        reply Fri had already started, so it was addressed."""
+        if (message.author.bot or getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id or
+                message.id in self.responded):  # E.g. a preview card posted, then binding it failed.
+            return False
+        # A DM only reaches a controller read after its member check. Outside configured channels a
+        # ping keeps its own gates and stays quiet.
+        if message.guild and not self.allowed(message.channel) or not await self.still_addressed(message, answering):
+            return False
+        now = time.monotonic()
+        self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if v is None or now-v < 300}
+        if message.channel.id in self.unreachable_notices:
+            return False
+        self.unreachable_notices[message.channel.id] = None  # The five minutes start once members can see it.
+        posted = False
+        try:
+            await message.reply(UNREACHABLE, allowed_mentions=NO_MENTIONS, mention_author=False)
+            posted = True
+        except discord.HTTPException:
+            LOG.info('Controller outage notice was not delivered')
+        finally:  # Nobody saw it, whatever stopped it, so the next message may try.
+            if posted:
+                self.unreachable_notices[message.channel.id] = time.monotonic()
+            else:
+                del self.unreachable_notices[message.channel.id]
+        return posted
+
+    async def still_addressed(self, message, answering=False):
+        """The message as Discord has it now: still there, never edited, and, before a reply, still addressed.
+
+        discord.py updates its cached copy in place on an edit, so only a fresh fetch can show one."""
+        if message.guild and not answering:
+            if explicit_mention(message, self.fri.user.id):
+                # The checks its invitation passed: channel, access, Fri enabled, still a mention.
+                from .fri_mentions import Invitation
+                if (message.guild.id != self.fri.guild_id or
+                        not await Invitation(self, message).current(check_evidence=False)):
+                    return False
+            elif not self.config['enabled']:
+                return False
+        try:
+            current = await message.channel.fetch_message(message.id)
+        except discord.HTTPException:
+            return False
+        if getattr(current, 'edited_at', None) is not None or current.content != message.content:
+            return False  # Edited since it was sent, maybe to take it back.
+        return answering or message.guild is None or await addressed_text(current, self.fri.user.id) is not None
+
+    async def listen(self, message):
+        """`receive`, plus the outage notice when a controller read fails before any reply has started."""
+        try:
+            return await self.receive(message)
+        except ControllerUnavailable:
+            if await self.unreachable(message):
+                self.answered([message])  # Before the ping's miss settles, so it isn't logged as unanswered.
+            raise  # on_message still logs it.
+
     async def watch(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
         # A copy that outlived the record of delivered events is left to the delivery watched first.
         if (message.guild is None or message.author.bot or getattr(message, 'webhook_id', None) or
                 message.id in self.watched or message.id in self.misses or message.id in self.replying or
                 not pinged(message, self.fri.user.id)):
-            await self.receive(message)
+            await self.listen(message)
             return
         self.watched[message.id] = self.misses[message.id] = None
         if len(self.watched) > MAX_DELIVERED:
             del self.watched[next(iter(self.watched))]
         owned = False  # By a burst: its last message answers, or its drop explains, for this one.
         try:
-            owned = await self.receive(message) is DEFERRED
+            owned = await self.listen(message) is DEFERRED
         except BaseException as exc:
             owned = self.bursts.group(message) is not None
             if not owned:
@@ -626,6 +696,44 @@ class Agent:
             for event in events:
                 self.miss(event, reason)
 
+        async def outage():
+            # The fixed notice carries no evidence, so only the Discord-side checks apply, not a controller read.
+            # It stands in for the whole burst: every earlier message must still be as it arrived (only a fetch
+            # shows an edit, since discord.py edits its cached copy in place), and each mention keeps its gates.
+            from .fri_mentions import Invitation
+            token = re.compile(r'(?<!\\)<@!?'+str(self.fri.user.id)+'>')
+            gates = [invitation] if invitation else []
+            for _, event, arrived in burst:
+                if event is message:
+                    continue
+                try:
+                    current = await event.channel.fetch_message(event.id)
+                except discord.HTTPException:
+                    return missed('reply withheld: message changed')
+                if getattr(current, 'edited_at', None) is not None or current.content != arrived:
+                    return missed('reply withheld: message changed')
+                if (getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
+                        token.search(visible_content(arrived or ''))):
+                    gates.append(Invitation(self, event))
+            for gate in gates:
+                if not await gate.current(check_evidence=False):
+                    return missed(f'reply withheld: {gate.refusal}')
+            if not ambient and await self.unreachable(message, answering=True):
+                self.answered(events)
+            else:
+                missed('controller unreachable')
+            await self.fri.waiting_notices.clear(message.author.id)
+
+        async def withheld():
+            """The invitation's recheck before Fri answers; a dead controller there is an outage, not a change."""
+            try:
+                if await invitation.current():
+                    return False
+                missed(f'reply withheld: {invitation.refusal}')
+            except ControllerUnavailable:
+                await outage()
+            return True
+
         try:
             async with message.channel.typing():
                 # Entering Discord's typing context itself awaits an HTTP request.
@@ -635,22 +743,24 @@ class Agent:
                     text, 'private' if dm else 'public', message.author.display_name, event=message,
                     burst=burst, inspect_images=not ambient, **({'invitation': invitation} if invitation else {}))
         except ReplyInProgress:
-            if invitation and not await invitation.current():
-                return missed(f'reply withheld: {invitation.refusal}')
+            if invitation and await withheld():
+                return
             missed('earlier reply still running')  # Its waiting notice is deleted once that reply lands.
             if not ambient:
                 await self.fri.waiting_notices.send(message)
             return
+        except ControllerUnavailable:
+            return await outage()
         except commands.UserFeedbackCheckFailure as exc:
-            if invitation and not await invitation.current():
-                return missed(f'reply withheld: {invitation.refusal}')
+            if invitation and await withheld():
+                return
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if invitation:
-            if not await invitation.current():
-                return missed(f'reply withheld: {invitation.refusal}')
+            if await withheld():
+                return
             from .fri_mentions import force_text
             result = force_text(result)
         if result.response_kind in ('react', 'quiet'):

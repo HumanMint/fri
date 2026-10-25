@@ -9,6 +9,7 @@ import discord
 from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
+from .fri_errors import ControllerUnavailable
 from .fri_meme_media import sources
 from .privacy import clean
 
@@ -111,6 +112,8 @@ class Invitation:
                     if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
                         return self.refuse('nearby message changed')
             return True
+        except ControllerUnavailable:
+            raise  # Nothing changed; the controller is down, and the caller's outage handling says so.
         except (discord.HTTPException, commands.UserFeedbackCheckFailure, ValueError, AttributeError, TypeError) as exc:
             return self.refuse('check failed: '+type(exc).__name__)
 

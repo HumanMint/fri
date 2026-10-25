@@ -11,7 +11,7 @@ from . import feedback as commands
 from .fri_agent_model import ATTENTION, DIAGNOSIS
 from .fri_context import discord_source
 from .fri_conversation import PERSISTENT_MODEL_WRITES
-from .fri_errors import ControllerRejected
+from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
 from .fri_pending import Clarification, completion, research_query
@@ -554,8 +554,11 @@ class Actions:
                     result['proposed_request'] = ''
         return result
 
-    async def valid(self):
-        """Fail closed if access or source privacy changed while the model was answering."""
+    async def valid(self, *, outage=False):
+        """Fail closed if access or source privacy changed while the model was answering.
+
+        With outage, a controller that can't be reached raises instead, so a caller with no receipt to
+        keep gives the fixed outage notice rather than an access error."""
         try:
             if self.invitation:
                 if not await self.invitation.current():
@@ -588,6 +591,10 @@ class Actions:
                     if any(row not in latest[key] for row in self.overview[key]):
                         return False
             return True
+        except ControllerUnavailable:
+            if outage:
+                raise
+            return False
         except (commands.UserFeedbackCheckFailure, discord.HTTPException, TimeoutError):
             return False
 
