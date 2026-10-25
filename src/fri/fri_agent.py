@@ -20,7 +20,13 @@ from .fri_addressing import addressed_text, explicit_mention, pinged, visible_co
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SETTINGS_GATE, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
-from .fri_errors import UNREACHABLE, AuthorErased, ControllerRejected, ControllerUnavailable
+from .fri_errors import (
+    UNREACHABLE,
+    AuthorErased,
+    ControllerRejected,
+    ControllerUnavailable,
+    GateClosed,
+)
 from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
@@ -1012,6 +1018,8 @@ class Agent:
                     **({'revision': since[1]} if since else {}))
         except AuthorErased:
             return missed('author privacy changed')
+        except GateClosed as exc:
+            return missed(str(exc))
         except ReplyInProgress:
             if invitation and await refused():
                 return

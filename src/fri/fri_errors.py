@@ -23,3 +23,8 @@ class ControllerUnavailable(commands.UserFeedbackCheckFailure):
 
 class AuthorErased(Exception):
     """The author erased after their message came in, so nothing more answers it."""
+
+
+class GateClosed(Exception):
+    """A gate the message passed coming in closed before the model saw it, e.g. its DM author left.
+    The reason is a gate name for the log, never content."""

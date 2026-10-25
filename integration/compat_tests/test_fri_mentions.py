@@ -2066,6 +2066,39 @@ def test_a_queued_bursts_outage_line_needs_its_earlier_message_unchanged(monkeyp
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('change', ['stays', 'left', 'dms off'])
+def test_a_dm_whose_author_leaves_while_fri_reads_its_context_is_not_answered(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = {'member': SimpleNamespace(id=20)}
+        agent.member = AsyncMock(side_effect=lambda *_, **__: present['member'])
+        event = message('what is ash working on?')
+        event.guild = None
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        api = fri.api
+        async def reading(method, path, payload=None):
+            if path == '/chat/context':  # Inside the reply, after every arrival check passed.
+                if change == 'left':
+                    present['member'] = None
+                elif change == 'dms off':
+                    agent.config['support_dms'] = False
+            return await api(method, path, payload)
+        fri.api = reading
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            if change == 'stays':
+                fri.chat_once.assert_awaited_once()
+                assert [item.args[0] for item in event.reply.await_args_list] == ['an answer']
+            else:
+                fri.chat_once.assert_not_awaited()
+                event.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('member', [True, False])
 def test_a_dm_low_battery_needs_a_current_member(monkeypatch, tmp_path, member):
     async def scenario():

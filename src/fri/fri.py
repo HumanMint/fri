@@ -18,7 +18,13 @@ from .fri_actions import Actions
 from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
-from .fri_errors import UNREACHABLE, AuthorErased, ControllerRejected, ControllerUnavailable
+from .fri_errors import (
+    UNREACHABLE,
+    AuthorErased,
+    ControllerRejected,
+    ControllerUnavailable,
+    GateClosed,
+)
 from .fri_memory import (
     PROFILES,
     describe_memory,
@@ -515,6 +521,13 @@ class Fri(discord.Client):
                                              'input': text, 'reply': '', 'model': context['model'],
                                              'effort': context['effort']},
                                     'actions': actions, 'shown': set()}
+                if self.agent and visibility == 'private' and source.kind == 'discord_message':
+                    # A DM's own gates, last before the model and after every read above: its author is
+                    # still a member, as Discord has it now, and DMs are still on.
+                    if not await self.agent.member(user_id, fresh=True):
+                        raise GateClosed('not a member')
+                    if not self.agent.config['support_dms']:
+                        raise GateClosed('dms off')
                 result = await self.chat_once(text, context)
                 if invitation:
                     await invitation.require_current()
