@@ -46,9 +46,9 @@ def test_a_pins_read_shows_pinned_posts_of_any_age_from_members_who_allow_it(mon
         try:
             receipt = await actions.execute({'kind': 'read_recent', 'channel_id': '1', 'window': 'pins'})
             assert receipt['window'] == 'pins' and calls == [PINS]
-            # Oldest pinned first, like any read; bots and members who opted out stay out.
+            # Newest pinned first, as the window says; bots and members who opted out stay out.
             assert [row['text'] for row in receipt['messages']] == [
-                'server ip is play.example.net', 'rules: no spoilers outside #spoilers']
+                'rules: no spoilers outside #spoilers', 'server ip is play.example.net']
             assert all(row['pinned'] is True for row in receipt['messages'])
             assert actions.sources == {'1'} and await actions.valid()
         finally:
