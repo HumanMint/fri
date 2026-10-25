@@ -333,14 +333,14 @@ def test_controller_outage_gets_one_fixed_notice_per_channel_instead_of_silence(
 
 @pytest.mark.parametrize('changes', [
     {'content': 'anyone up for ranked'},  # Not addressed to Fri.
-    {'channel': SimpleNamespace(id=999)},  # Not a configured channel.
+    {'channel': 999},  # Not a configured channel.
 ])
 def test_controller_outage_notice_needs_a_message_fri_would_answer(changes):
     async def scenario():
         agent = down_agent()
         quiet = message(**changes)
         if 'channel' in changes:  # Only an outside invitation's own reads could fail there.
-            agent._handle = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+            agent.receive = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
         with pytest.raises(ControllerUnavailable):
             await agent.handle(quiet)
         quiet.reply.assert_not_awaited()
