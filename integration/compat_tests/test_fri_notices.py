@@ -20,8 +20,10 @@ IDS = itertools.count(100000000000000001)
 def event(user=10):
     channel = SimpleNamespace(id=456, typing=Mock(return_value=AsyncMock()), permissions_for=lambda _: discord.Permissions.all())
     guild = SimpleNamespace(id=123, fetch_channel=AsyncMock(return_value=channel), fetch_roles=AsyncMock(return_value=[]))
-    return SimpleNamespace(id=next(IDS), author=SimpleNamespace(id=user, display_name='Member'), guild=guild,
-        channel=channel, reply=AsyncMock(return_value=SimpleNamespace(delete=AsyncMock())))
+    message = SimpleNamespace(id=next(IDS), author=SimpleNamespace(id=user, display_name='Member'), guild=guild,
+        channel=channel, content='', edited_at=None, reply=AsyncMock(return_value=SimpleNamespace(delete=AsyncMock())))
+    channel.fetch_message = AsyncMock(return_value=message)  # Discord's copy: unedited, unless a test changes it.
+    return message
 
 
 @pytest.mark.parametrize('outcome', ['reply', 'error', 'quiet', 'react', 'post', 'social'])
