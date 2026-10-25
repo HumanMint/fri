@@ -117,7 +117,8 @@ def test_history_notes_require_attributed_self_disclosure_and_survive_restart(se
     assert finish(agent, claim, rows, notes)['saved'] == 1
     store = Store(settings.db)
     profile = store.chat_context('guild', 'public:1', 'person')['personal_memory']
-    assert profile['notes'] == [{'category': 'music', 'evidence': 'I love trance'}]
+    assert profile['notes'] == [{'category': 'music', 'evidence': 'I love trance', 'scope': 'here',
+                                 'provenance': []}]  # Not the profile.
     assert not store.chat_context('guild', 'private:1', 'person')['personal_memory']['notes']
     assert not store.chat_context('guild', 'public:2', 'person')['personal_memory']['notes']
     assert not store.memories('guild')
@@ -224,7 +225,7 @@ def test_fri_chat_archive_never_enters_startup_learning(monkeypatch):
 
 def test_followups_work_without_name_but_dont_follow_someone_elses_reply():
     async def scenario():
-        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456,
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, hear=lambda message: False,
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
         agent = Agent(fri)
         agent.state['config']['enabled'] = True
@@ -358,6 +359,7 @@ def test_attention_skips_messages_the_direct_path_is_answering():
     async def scenario():
         channel = SimpleNamespace(id=456)
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel,
+                              hear=lambda message: False,
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
         agent = Agent(fri)
         agent.state['config']['enabled'] = True
@@ -386,6 +388,7 @@ def test_attention_skips_followups_in_an_active_window():
     async def scenario():
         channel = SimpleNamespace(id=456)
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel,
+                              hear=lambda message: False,
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
         agent = Agent(fri)
         agent.state['config']['enabled'] = True
@@ -408,6 +411,7 @@ def test_attention_yields_when_the_direct_path_takes_its_pick_meanwhile():
     async def scenario():
         channel = SimpleNamespace(id=456, fetch_message=AsyncMock())
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel,
+                              hear=lambda message: False,
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}), busy=set())
         agent = Agent(fri)
         agent.state['config'].update(enabled=True, proactive=True)

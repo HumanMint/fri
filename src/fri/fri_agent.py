@@ -21,7 +21,7 @@ from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SETTINGS_GATE, SUMM
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
 from .fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
-from .fri_memory import memory_intent
+from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
 from .fri_reports import report_message
@@ -529,6 +529,8 @@ class Agent:
 
     async def receive(self, message):
         arrived = time.monotonic()  # Bursts group by arrival, even if this waits for an earlier reply.
+        if message.guild is not None:
+            self.fri.hear(message)  # Who could read it, as it arrives.
         forgotten = self.forgotten.get(message.author.id, 0)
         erasures = self.erased.get(message.author.id, 0)  # The owner settings fence ignores cache resets.
         if getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:
@@ -584,7 +586,7 @@ class Agent:
         if not dm and not message.author.bot:
             profile = await self.profile(parent, message.author.id)
             observed = profile.get('revision', 0)
-            if profile['enabled'] and not privacy:
+            if profile['enabled'] and not privacy and not before_removal(message.id, profile):
                 if directed is not None or channel == self.dedicated:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
@@ -813,8 +815,10 @@ class Agent:
                 return
             self.answered(events)
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
-            await self.fri.record_turn(result, sent)
-            if echo and message.guild and self.allowed(message.channel):
+            saved = await self.fri.record_turn(result, sent)
+            # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory,
+            # or a save that failed, whose reply may carry exactly what the controller would have refused.
+            if echo and saved is not None and saved.get('kept', True) and message.guild and self.allowed(message.channel):
                 text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']  # As shown.
                 self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
                     'name': 'Fri', 'text': clean(text, 500), 'at': time.time(), 'gene_error': False,

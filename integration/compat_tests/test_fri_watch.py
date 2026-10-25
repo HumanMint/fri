@@ -1063,7 +1063,7 @@ def message(content='fri you there?', channel=456, guild=123, user=11, **changes
 
 def down_agent():
     fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, user=SimpleNamespace(id=99),
-                          api=AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE)))
+                          hear=lambda message: False, api=AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE)))
     agent = Agent(fri)
     agent.state['config']['enabled'] = True
     agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
