@@ -101,13 +101,15 @@ class Typing:
         self.channel, self.addressed, self.stack, self.started = channel, addressed, AsyncExitStack(), False
 
     async def __call__(self, stage):
+        """True when this call started it: the caller waited on Discord, so it rechecks what it read before."""
         if self.started or not (self.addressed or stage == 'action'):
-            return
+            return False
         self.started = True
         try:
             await self.stack.enter_async_context(self.channel.typing())
         except discord.HTTPException:
             LOG.info('Typing indicator was not shown')
+        return True
 
     async def __aenter__(self):
         return self

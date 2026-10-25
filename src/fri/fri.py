@@ -507,8 +507,8 @@ class Fri(discord.Client):
                         await last_look(result)
                         await sources_unchanged()
 
-                await typing('admitted')
-                await sources_unchanged()  # Read before typing could start: an edit or delete meanwhile mustn't reach the model.
+                if await typing('admitted'):
+                    await sources_unchanged()  # Read before typing started: an edit or delete meanwhile mustn't reach the model.
                 if invitation:
                     if invitation.grant and event.reference and event.reference.message_id:
                         await invitation.collect(include_recent=False)
@@ -580,7 +580,10 @@ class Fri(discord.Client):
                 if result.action:
                     if not actions or result.action['kind'] not in context['actions']:
                         raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
-                    await typing('action')
+                    if await typing('action'):  # Checked before typing started: again, before the tool sees anything.
+                        await self.api('POST', '/chat/turn/check', {**context['fence']['turn'], 'provenance': turn_provenance(
+                            context, user_id, actions)})
+                        await sources_unchanged()
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
                     result.shown = context['fence'].get('messages', set())  # A summary of the steps may still draw on them.

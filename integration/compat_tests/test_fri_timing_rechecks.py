@@ -1,6 +1,7 @@
 """Timing changes keep the checks that came after the waits they moved (from #33's Codex reviews): an
 ambient reply's history read happens before its last privacy and source checks, a reply target edited or
-deleted while typing starts never reaches the model, and a history read that times out stays quiet."""
+deleted while typing starts never reaches the model, and a history read that times out stays quiet, and
+nothing withdrawn while typing starts before a tool reaches the tool or the next model call."""
 import asyncio
 import copy
 import datetime as dt
@@ -224,5 +225,96 @@ def test_cancel_eight_second_summons_releases_all_state(monkeypatch, tmp_path, c
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_erasure_while_unaddressed_action_starts(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        trigger = message('what is the current weather in lima')
+        query = trigger.content
+        asked, searched, erased = [], [], []
+        @asynccontextmanager
+        async def typing():
+            store.clear_chats('20')
+            agent.forget(20)
+            erased.append(True)
+            await asyncio.sleep(0)
+            yield
+        channel.typing = typing
+        async def model(text, context, ready):
+            await ready()
+            asked.append(text)
+            return ChatResult(status='completed', action={'kind': 'web_search', 'query': query})
+        async def lookup(chat, text, *args, **kwargs):
+            assert erased
+            searched.append(text)
+            return {}, {}, 'failed'
+        monkeypatch.setattr('fri.fri_actions.lookup', lookup)
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()
+        fri.chat = SimpleNamespace(respond=model)
+        fri.chat_once = lambda text, context: Fri.chat_once(fri, text, context)
+        try:
+            await agent.respond(trigger, trigger.content)
+            assert erased
+            assert not searched, f'erased query reached researcher: {searched}; main calls: {asked}'
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['edit', 'delete'])
+def test_reference_retracted_while_unaddressed_action_starts(monkeypatch, tmp_path, change):
+    async def scenario():
+        import discord
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        target = message('my private marker is blue', user=21, age=3600)
+        trigger = message('what is the current weather in lima')
+        trigger.reference = SimpleNamespace(message_id=target.id, channel_id=1, resolved=target)
+        sent_after_retraction = []
+        retracted, calls = [], []
+        @asynccontextmanager
+        async def typing():
+            if change == 'edit':
+                replacement = copy.copy(target)
+                replacement.content = 'i took that back'
+                replacement.edited_at = dt.datetime.now(dt.timezone.utc)
+                rows[target.id] = replacement
+                await fri.on_raw_message_edit(SimpleNamespace(channel_id=1, message=replacement))
+            else:
+                del rows[target.id]
+                def fetch(mid):
+                    if mid == target.id:
+                        raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                    return rows[mid]
+                channel.fetch_message.side_effect = fetch
+                await fri.on_raw_message_delete(SimpleNamespace(channel_id=1, message_id=target.id))
+            retracted.append(True)
+            await asyncio.sleep(0)
+            yield
+        channel.typing = typing
+        async def history(**kwargs):
+            return
+            yield
+        channel.history = history
+        async def model(text, context, ready):
+            await ready()
+            calls.append(context.get('reply_target', []))
+            if retracted:
+                sent_after_retraction.extend(row['text'] for row in context.get('reply_target', []))
+            if len(calls) == 1:
+                return ChatResult(status='completed', action={'kind': 'web_search', 'query': trigger.content})
+            return ChatResult(status='completed', reply='the marker is blue')
+        monkeypatch.setattr('fri.fri_actions.lookup', AsyncMock(return_value=({}, {}, 'failed')))
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()
+        fri.chat = SimpleNamespace(respond=model)
+        fri.chat_once = lambda text, context: Fri.chat_once(fri, text, context)
+        try:
+            await agent.respond(trigger, trigger.content, ambient=True)
+            assert retracted
+            assert not any('private marker' in text for text in sent_after_retraction), (
+                f'retracted text reached a subsequent model request: {sent_after_retraction}')
+        finally:
             await fri.close()
     asyncio.run(scenario())
