@@ -1,6 +1,7 @@
 """Fri reads another channel or a thread when someone asks about it, within what this audience could read."""
 
 import asyncio
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -210,3 +211,62 @@ def test_a_mention_can_read_another_channel_without_its_nearby_rules(monkeypatch
 
 def test_the_instructions_send_fri_to_read_the_channel_they_name():
     assert 'another channel or a thread' in INSTRUCTIONS and 'thread_in' in INSTRUCTIONS
+
+
+@pytest.mark.parametrize('where', ['public', 'dm'])
+def test_a_configured_forum_is_never_read_as_a_channel(monkeypatch, tmp_path, where):
+    from compat_tests.test_fri_links_fences import real_server
+    from compat_tests.test_fri_member_profiles import world
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        guild, _, channels = real_server(w, monkeypatch, [])
+        channels[2] = discord.ForumChannel(state=w.fri._connection, guild=guild, data={
+            'id': '2', 'name': 'games-forum', 'type': 15, 'position': 0, 'permission_overwrites': []})
+        guild._channels.update(channels)
+        actions = Actions(w.fri.agent, 20, 1 if where == 'public' else 999, where == 'public')
+        try:
+            listed = [row['channel_id'] for row in (await actions.available())['read_recent']['channels']]
+            assert '2' not in listed and '1' in listed
+            receipt = await actions.execute({'kind': 'read_recent', 'channel_id': '2', 'window': 'recent'})
+            assert 'blocked' in receipt and '2' not in actions.sources
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_thread_already_read_stays_valid_when_busier_threads_pass_it(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, _, post, thread = around(monkeypatch, tmp_path)
+        others = [thread(channels[2], 1100+n) for n in range(MAX_THREADS)]
+        read = thread(channels[2], 2001, active=50)
+        actions = Actions(agent, 20, 1, True)
+        actions.event = SimpleNamespace(id=1, channel=channels[1])
+        try:
+            await actions.execute({'kind': 'read_recent', 'channel_id': '2001', 'window': 'recent'})
+            assert await actions.valid()
+            for other in others:  # Six other threads get newer posts; nothing about the read changed.
+                other.last_message_id = read.last_message_id+100
+            assert '2001' not in await Actions(agent, 20, 1, True).channels(around=True)
+            assert await actions.valid()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_thread_discord_archived_after_the_read_drops_it(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, _, post, thread = around(monkeypatch, tmp_path)
+        read = thread(channels[2], 2001)
+        actions = Actions(agent, 20, 1, True)
+        actions.event = SimpleNamespace(id=1, channel=channels[1])
+        try:
+            await actions.execute({'kind': 'read_recent', 'channel_id': '2001', 'window': 'recent'})
+            assert await actions.valid()
+            archived = copy.copy(read)
+            archived.archived = True  # The cached thread still says it's active.
+            channels[1].guild.fetch_channel = AsyncMock(side_effect=lambda cid: archived if cid == 2001 else channels[cid])
+            assert not await actions.valid()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

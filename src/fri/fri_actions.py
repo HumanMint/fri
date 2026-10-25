@@ -30,6 +30,11 @@ CATCH_UP = ('Only when the speaker asks what they missed: other members\' text i
             'the speaker\'s last message there, up to 100 messages or 12 hours. No images.')
 
 
+def posts_in(channel):
+    """A channel with posts of its own to read: a forum or a category only holds threads or channels."""
+    return callable(getattr(channel, 'history', None))
+
+
 class Actions:
     def __init__(self, agent, user, channel, public):
         self.agent, self.fri = agent, agent.fri
@@ -152,7 +157,9 @@ class Actions:
                     threads += [thread for thread in found if isinstance(thread, discord.Thread) and
                                 thread.type in PUBLIC_THREADS and not thread.archived and str(thread.id) not in result]
             threads.sort(key=lambda thread: thread.last_message_id or thread.id, reverse=True)
-            result.update((str(thread.id), thread) for thread in threads[:MAX_THREADS] if readable(thread))
+            # A thread this turn already read stays listed when busier ones push it past the cap.
+            kept = threads[:MAX_THREADS] + [thread for thread in threads[MAX_THREADS:] if str(thread.id) in self.sources]
+            result.update((str(thread.id), thread) for thread in kept if readable(thread))
         if fresh and self.sources & result.keys():
             result = await self.recheck(result, member, elsewhere)
         return result
@@ -170,6 +177,9 @@ class Actions:
             fresh_guild._roles = {role.id: role for role in await guild.fetch_roles()}
             for channel_id in read:
                 channel = await guild.fetch_channel(int(channel_id))
+                if isinstance(channel, discord.Thread) and channel.archived is True:  # Reads take active threads.
+                    del channels[channel_id]
+                    continue
                 parent = await guild.fetch_channel(channel.parent_id) if isinstance(channel, discord.Thread) else channel
                 parent = copy.copy(parent)
                 parent.guild = fresh_guild
@@ -202,13 +212,16 @@ class Actions:
             if isinstance(channel, discord.Thread) and channel.parent:
                 row['thread_in'] = clean(channel.parent.name, 60)
             return row
-        actions = {'read_recent': {'channels': [listed(k, v) for k, v in (await self.channels(around=True)).items()],
-                    'default_channel_id': next(iter(channels)), 'limit': 20, 'max_age_days': 7,
+        # A forum holds threads, not posts: its threads are listed, the forum itself isn't read.
+        readable = {k: v for k, v in (await self.channels(around=True)).items() if posts_in(v)}
+        default = next((k for k, v in channels.items() if posts_in(v)), None)
+        actions = {} if default is None else {'read_recent': {'channels': [listed(k, v) for k, v in readable.items()],
+                    'default_channel_id': default, 'limit': 20, 'max_age_days': 7,
                     'description': 'Read one small recent batch when asked: text, what each post carries '
                     '(image, gif, video, file), and a look at up to four of the newest still images. '
                     'Another listed channel or thread when they ask about it. No saved personal notes.',
                     'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
-        if self.invitation:
+        if self.invitation and 'read_recent' in actions:
             actions['read_recent'].update(limit=12, max_age_days=6/24,
                 description='Read up to twelve preceding same-channel messages from the last six hours '
                 'when this mention needs nearby conversation, memes or images. Looks at the image the ping '
@@ -402,6 +415,8 @@ class Actions:
         channel_id = action.get('channel_id') or next(iter(channels))
         if channel_id not in channels:
             return {'blocked': 'That channel is outside this conversation’s readable scope.'}
+        if not posts_in(channels[channel_id]):
+            return {'blocked': 'That forum holds threads, not posts. Read one of its listed threads.'}
         catch_up = action.get('window') == 'since_my_last_message'
         self.sources.add(channel_id)
         if self.invitation and not catch_up and channel_id == str(self.channel):
