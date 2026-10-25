@@ -2078,7 +2078,7 @@ def test_no_outage_notice_for_a_message_whose_author_erased_during_its_arrival_r
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('change', ['none', 'edited', 'deleted'])
+@pytest.mark.parametrize('change', ['none', 'edited', 'deleted', 'erased'])
 def test_a_queued_bursts_outage_line_needs_its_earlier_message_unchanged(monkeypatch, tmp_path, caplog, change):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
@@ -2107,6 +2107,12 @@ def test_a_queued_bursts_outage_line_needs_its_earlier_message_unchanged(monkeyp
                             raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
                         return rows[mid]
                     channel.fetch_message.side_effect = gone
+                elif change == 'erased':
+                    def erasing(mid):  # Their "forget me" lands while the notice checks the burst.
+                        if mid == before.id:
+                            agent.forget(20, erased=True)
+                        return rows[mid]
+                    channel.fetch_message.side_effect = erasing
                 agent.revision = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
                 fri.busy.discard(20)
                 await asyncio.wait_for(asyncio.gather(*tasks), 5)
@@ -2118,15 +2124,17 @@ def test_a_queued_bursts_outage_line_needs_its_earlier_message_unchanged(monkeyp
                 assert mention_lines(caplog) == []
             else:
                 assert texts == [str(ReplyInProgress())]
-                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: reply withheld: message changed']
+                reason = 'author privacy changed' if change == 'erased' else 'reply withheld: message changed'
+                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: {reason}']
         finally:
             released.set()
             await fri.close()
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('when', ['context', 'sign-in'])
 @pytest.mark.parametrize('change', ['stays', 'left', 'dms off'])
-def test_a_dm_whose_author_leaves_while_fri_reads_its_context_is_not_answered(monkeypatch, tmp_path, change):
+def test_a_dm_whose_author_leaves_before_the_model_runs_is_not_answered(monkeypatch, tmp_path, change, when):
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
         agent.config['support_dms'] = True

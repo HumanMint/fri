@@ -521,8 +521,11 @@ class Agent:
         for gate in gates:
             if not await gate.current(check_evidence=False):
                 return self.missed(events, f'reply withheld: {gate.refusal}')
-        if not ambient and await self.unreachable(message, answering=True):
+        standing = (lambda: self.forgotten.get(message.author.id, 0) == since[0]) if since else None
+        if not ambient and await self.unreachable(message, answering=True, standing=standing):
             self.answered(events)
+        elif standing and not standing():
+            self.missed(events, 'author privacy changed')
         else:
             self.missed(events, 'controller unreachable')
         await self.fri.waiting_notices.clear(message.author.id)
@@ -709,17 +712,20 @@ class Agent:
             self.handling -= Counter([message.id])
             self.turns.leave(message.author.id, message.id)
 
-    async def unreachable(self, message, *, answering=False):
+    async def unreachable(self, message, *, answering=False, standing=None):
         """A message Fri would answer, read while the controller is down: say so instead of going silent.
 
         One notice per channel per five minutes, from either path; True once it's posted. `answering` is a
-        reply Fri had already started, so it was addressed."""
+        reply Fri had already started, so it was addressed. `standing`, if given, is checked last before
+        posting, e.g. that its author hasn't erased since."""
         if (message.author.bot or getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id or
                 message.id in self.responded):  # E.g. a preview card posted, then binding it failed.
             return False
         # A DM only reaches a controller read after its member check. Outside configured channels a
         # ping keeps its own gates and stays quiet.
         if message.guild and not self.allowed(message.channel) or not await self.still_addressed(message, answering):
+            return False
+        if standing and not standing():
             return False
         now = time.monotonic()
         self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if v is None or now-v < 300}
