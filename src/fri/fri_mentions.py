@@ -76,10 +76,11 @@ class Invitation:
         self.refusal = reason
         return False
 
-    async def access(self):
-        """Fetch current overwrites and both members; cached channel access is insufficient."""
+    async def access(self, *, control=False):
+        """Fetch current overwrites and both members; cached channel access is insufficient. A privacy
+        `control` works with Fri paused."""
         event, guild = self.event, self.event.guild
-        if not self.agent.config['enabled']:
+        if not control and not self.agent.config['enabled']:
             return self.refuse('fri disabled')
         if guild.id != self.fri.guild_id and not self.agent.allowed(event.channel):
             return self.refuse('outside the main server')
@@ -110,14 +111,14 @@ class Invitation:
                 return self.refuse('missing permissions')
         return True
 
-    async def current(self, *, check_evidence=True):
+    async def current(self, *, check_evidence=True, control=False):
         try:
             age = time.time()-discord.utils.snowflake_time(self.event.id).timestamp()
             if age > 300:
                 return self.refuse('stale event')
             if age < -5:
                 return self.refuse('clock skew')
-            if not await self.access():
+            if not await self.access(control=control):
                 return False
             current = await self.event.channel.fetch_message(self.event.id)
             if (current.id != self.event.id or current.author.bot or current.webhook_id or

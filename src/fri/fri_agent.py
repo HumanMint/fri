@@ -539,6 +539,10 @@ class Agent:
             async with self.controls[user] if privacy else nullcontext():
                 if privacy and (reason := await self.excluded(message, dm, invitation, privacy)):
                     return self.missed(events, reason)  # E.g. they left while another control ran.
+                if privacy and invitation and not await invitation.current(check_evidence=False, control=True):
+                    # The ping as it stands now, before the control changes anything: e.g. edited to take it back.
+                    return await self.withheld(message, events, invitation.refusal, invitation, fenced=False,
+                                               logged=f'reply withheld: {invitation.refusal}')
                 if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since) is not BUSY:
                     return
             recheck = True

@@ -1853,6 +1853,97 @@ def test_dms_turned_off_during_a_queued_dms_membership_lookup_stop_it(monkeypatc
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('change', ['stays', 'unpinged', 'left', 'access lost'])
+def test_a_privacy_control_ping_taken_back_while_it_waits_changes_nothing(monkeypatch, tmp_path, caplog, change):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('<@99> what do you remember about me?'), message('<@99> forget me')
+        for event in (first, second):
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='done', edit=AsyncMock())
+        talk, released, talked = fri.talk, asyncio.Event(), []
+        async def stalled(*args, **kwargs):
+            talked.append(kwargs.get('event'))
+            if len(talked) == 1:  # The first is still being answered when the second comes in.
+                await released.wait()
+            return await talk(*args, **kwargs)
+        fri.talk = stalled
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                while not talked:
+                    await real_sleep(0.01)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                while not agent.controls[20]._waiters:  # Waiting for the first to finish.
+                    await real_sleep(0.01)
+                if change == 'unpinged':  # Taken back before Fri got to it.
+                    edited = copy.copy(second)
+                    edited.content, edited.mentions = 'keep my memory', []
+                    edited.edited_at = dt.datetime.now(dt.timezone.utc)
+                    rows[second.id] = edited
+                elif change == 'left':
+                    def fetch_member(user):
+                        if user == 20:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'unknown member')
+                        return SimpleNamespace(id=user, bot=user == 99)
+                    channel.guild.fetch_member.side_effect = fetch_member
+                elif change == 'access lost':  # Fri still sees the channel; they no longer do.
+                    channel.permissions_for = lambda who: (discord.Permissions.all() if who.id == 99 else
+                                                           discord.Permissions.none())
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            controls = [payload['action'] for path, payload in calls if path == '/chat/memory/control']
+            if change == 'stays':
+                assert controls == ['disable']
+                assert second.reply.await_args.args[0].startswith('done. i erased')
+            else:
+                assert controls == []
+                second.reply.assert_not_awaited()
+                reason = {'unpinged': 'message changed', 'left': 'check failed: NotFound',
+                          'access lost': 'missing permissions'}[change]
+                withheld = [second] if change == 'unpinged' else [first, second]  # Losing access stops both.
+                assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: reply withheld: {reason}'
+                                                 for event in withheld]
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_privacy_control_ping_that_waited_still_runs_with_fri_paused(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, controller, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('<@99> what do you remember about me?'), message('<@99> forget me')
+        for event in (first, second):
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='done', edit=AsyncMock())
+        talk, released, talked = fri.talk, asyncio.Event(), []
+        async def stalled(*args, **kwargs):
+            talked.append(kwargs.get('event'))
+            if len(talked) == 1:
+                await released.wait()
+            return await talk(*args, **kwargs)
+        fri.talk = stalled
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                while not talked:
+                    await real_sleep(0.01)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                while not agent.controls[20]._waiters:
+                    await real_sleep(0.01)
+                controller.update({'enabled': False}, controller.state()['version'], '10')  # The owner pauses Fri.
+                agent.state = controller.state()
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert [payload['action'] for path, payload in calls if path == '/chat/memory/control'] == ['disable']
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('member', [True, False])
 def test_a_dm_low_battery_needs_a_current_member(monkeypatch, tmp_path, member):
     async def scenario():
