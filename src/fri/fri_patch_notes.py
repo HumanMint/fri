@@ -79,6 +79,7 @@ def recorded(part):
     attempted = part.get('attempted_at', 0)
     return (isinstance(part, dict) and set(part) <= {'attempted_at', 'message_id', 'channel_id'} and
             isinstance(attempted, (int, float)) and not isinstance(attempted, bool) and
+            0 <= attempted <= time.time() + 86400 and  # A real past attempt: no NaN, no far future.
             all(isinstance(part.get(key, '0'), str) and part.get(key, '0').isdigit() for key in ('message_id', 'channel_id')))
 
 

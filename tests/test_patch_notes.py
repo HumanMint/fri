@@ -167,7 +167,10 @@ def test_a_damaged_record_or_a_concurrent_send_is_refused(dm, tmp_path):
     '{"versions": {"0.4.0": {}}}', '{"versions": {"0.4.0": null}}', '{"versions": {"0.4.0": 7}}',
     '{"versions": {"0.4.0": {"sha256": "x", "parts": [{}]}}}', '{"versions": "x"}', '{"versions": {',
     '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"message_id": 5}]}}}',
-    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": []}}}', b'\xff'])
+    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": []}}}', b'\xff',
+    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": 1e100}]}}}',
+    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": NaN}]}}}',
+    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": -1}]}}}'])
 def test_a_damaged_entry_is_refused_with_exit_2_before_login(monkeypatch, capsys, tmp_path, dm, record):
     """Truncated JSON, a malformed entry or part, or a null one (which would resend), anywhere in the record."""
     path = tmp_path / 'patch-notes.json'
