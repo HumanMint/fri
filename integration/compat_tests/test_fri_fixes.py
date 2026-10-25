@@ -3,7 +3,6 @@
 import asyncio
 import datetime as dt
 import json
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -127,7 +126,7 @@ def test_a_filed_gene_error_gets_eyes_and_one_line_once_its_fix_ships(world):
     assert line['reply_to'] == error.id and line['target_id'] == '456'
     assert line['body'] == 'that one should be fixed now, gene’s on `bbbbbbb`. you’re welcome'
     asyncio.run(check(world.agent))
-    assert len(world.sent) == 1 and json.loads((world.fri.data/'gene-fixes.json').read_text()) == {}
+    assert len(world.sent) == 1 and json.loads((world.fri.data/'gene-fixes.json').read_text())[job_id]['done']
 
 
 def test_a_busy_room_waits_for_a_lull(world):
@@ -153,10 +152,10 @@ def test_nothing_but_a_live_fix_is_announced(world, ending):
         deploying = world.store.claim_deploy()
         assert deploying['id'] == rollback['id']
         world.store.finish_deploy(deploying['id'], deploying['lease'], True, 'Rolled back.')
-    if ending == 'expired':
+    if ending == 'expired':  # Gene's error is over three days old by now.
         path = world.fri.data/'gene-fixes.json'
         entries = json.loads(path.read_text())
-        entries[job_id]['filed'] = time.time()-3*86400-1
+        entries[job_id]['message_id'] = str(snowflake(3*86400+1))
         path.write_text(json.dumps(entries))
     if ending == 'deleted':
         del world.found[error.id]
@@ -188,15 +187,92 @@ def test_a_line_discord_did_not_confirm_is_never_repeated(world, monkeypatch):
     assert len(attempts) == 1
 
 
-def test_a_refiled_error_whose_job_ended_starts_no_watch(world, tmp_path):
+def test_a_refiled_error_whose_job_ended_or_an_old_error_starts_no_watch(world, tmp_path):
     agent = world.agent
-    asyncio.run(follow(agent, 456, '1', {'id': 'a'*12, 'state': 'deployed'}))
-    asyncio.run(follow(agent, 456, '1', {'id': 'nope'}))
+    asyncio.run(follow(agent, 456, str(snowflake(5)), {'id': 'a'*12, 'state': 'deployed'}))
+    asyncio.run(follow(agent, 456, str(snowflake(5)), {'id': 'nope'}))
+    asyncio.run(follow(agent, 456, str(snowflake(3*86400+1)), {'id': 'b'*12, 'state': 'queued'}))
+    asyncio.run(follow(agent, 456, 'nope', {'id': 'b'*12, 'state': 'queued'}))
     assert not (world.fri.data/'gene-fixes.json').exists()
-    asyncio.run(follow(agent, 456, '5', {'id': 'b'*12, 'state': 'queued'}))
-    first = json.loads((world.fri.data/'gene-fixes.json').read_text())['b'*12]['filed']
-    asyncio.run(follow(agent, 456, '5', {'id': 'b'*12, 'state': 'queued'}))
-    assert json.loads((world.fri.data/'gene-fixes.json').read_text())['b'*12]['filed'] == first
+
+
+def test_refiling_an_error_through_the_other_path_gets_no_second_line(world):
+    error, job_id = filed(world)
+    # The same error filed again as a repair, before and after the first job's line: a second job each time.
+    asyncio.run(follow(world.agent, 456, str(error.id), {'id': 'e'*12, 'state': 'queued'}))
+    ship(world.store, job_id)
+    asyncio.run(check(world.agent))
+    asyncio.run(follow(world.agent, 456, str(error.id), {'id': 'f'*12, 'state': 'queued'}))
+    asyncio.run(check(world.agent))
+    assert len(world.sent) == 1 and error.add_reaction.await_count == 1
+    assert list(json.loads((world.fri.data/'gene-fixes.json').read_text())) == [job_id]
+
+
+def test_a_filing_during_a_pass_is_kept(world):
+    error, job_id = filed(world)
+    other = message(GENE)
+    world.found[other.id] = other
+    fetch = world.room.fetch_message.side_effect
+
+    async def meanwhile(id):
+        await follow(world.agent, 456, str(other.id), {'id': 'e'*12, 'state': 'queued'})
+        return fetch(id)
+
+    ship(world.store, job_id)
+    world.room.fetch_message = AsyncMock(side_effect=meanwhile)
+    asyncio.run(check(world.agent))
+    assert len(world.sent) == 1 and set(json.loads((world.fri.data/'gene-fixes.json').read_text())) == {job_id, 'e'*12}
+
+
+def test_a_stalled_discord_read_holds_up_one_heartbeat_stage_and_is_never_cancelled(world, monkeypatch):
+    error, job_id = filed(world)
+    ship(world.store, job_id)
+    monkeypatch.setattr(fri_fixes, 'PASS', 0.05)
+
+    async def scenario():
+        release, reads = asyncio.Event(), []
+
+        async def rate_limited(id):  # discord.py's global rate-limit wait, which must never be cancelled.
+            reads.append(id)
+            await release.wait()
+            return error
+
+        world.room.fetch_message = AsyncMock(side_effect=rate_limited)
+        with pytest.raises(TimeoutError):
+            await check(world.agent)
+        task = fri_fixes.RUNNING[world.agent]
+        with pytest.raises(TimeoutError):
+            await check(world.agent)  # The next heartbeat waits on the same pass instead of starting another.
+        assert fri_fixes.RUNNING[world.agent] is task and not task.done() and len(reads) == 1 and not world.sent
+        release.set()
+        await check(world.agent)
+        assert task.done() and not task.cancelled() and len(reads) == 1 and len(world.sent) == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['rolled_back', 'proactive_off', 'not_allowed', 'archived'])
+def test_a_change_while_discord_answers_still_stops_the_line(world, change):
+    error, job_id = filed(world)
+    ship(world.store, job_id)
+
+    def meanwhile(id):
+        if change == 'rolled_back':
+            world.store.rollback('123', 'owner')
+            deploying = world.store.claim_deploy()
+            world.store.finish_deploy(deploying['id'], deploying['lease'], True, 'Rolled back.')
+        if change == 'proactive_off':
+            world.agent.state['config']['proactive'] = False
+        if change == 'not_allowed':
+            world.agent.state['channels'] = []
+            world.fri.workshop_id = 1
+        if change == 'archived':
+            world.room.archived = True
+        return error
+
+    world.room.fetch_message = AsyncMock(side_effect=meanwhile)
+    asyncio.run(check(world.agent))
+    assert not world.sent
+    assert (job_id in json.loads((world.fri.data/'gene-fixes.json').read_text())) == (change != 'rolled_back')
 
 
 def test_only_genes_own_error_gets_the_eyes(world):
@@ -274,7 +350,7 @@ def test_a_refused_reply_can_be_tapped_again_but_an_unconfirmed_one_cannot(world
     assert ('may already' in text) != again
 
 
-@pytest.mark.parametrize('change', ['deleted', 'edited_author', 'not_allowed', 'bot_reporter'])
+@pytest.mark.parametrize('change', ['deleted', 'edited_author', 'not_allowed', 'archived', 'bot_reporter'])
 def test_nothing_posts_when_the_report_is_not_reachable_now(world, change):
     report, job_id, notice = reported(world)
     if change == 'deleted':
@@ -284,6 +360,8 @@ def test_nothing_posts_when_the_report_is_not_reachable_now(world, change):
     if change == 'not_allowed':
         world.agent.state['channels'] = []
         world.fri.workshop_id = 1
+    if change == 'archived':  # A reply would reopen their thread.
+        world.room.archived = True
     if change == 'bot_reporter':
         world.agent.gene_id = MEMBER
         assert not offers_tell(world.fri, notice)

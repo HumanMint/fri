@@ -1,15 +1,18 @@
 """Closing the loop when Gene gets fixed.
 
-A Gene error Fri files gets a 👀, and its job is watched for three days. Once that fix ships, Fri says
-one dry line under the error, when the room is quiet. Only deployed counts: a failure, a rejection, a
-withdrawal or a hand-off to the owner is never announced. The owner's DM for a shipped repair that a
-member reported gets a Tell reporter button, which replies to that report once.
+A Gene error Fri files gets a 👀, and its job is watched for three days after the error. Once that fix
+ships, Fri says one dry line under the error, when the room is quiet, and never a second one for it.
+Only deployed counts: a failure, a rejection, a withdrawal or a hand-off to the owner is never
+announced. The owner's DM for a shipped repair that a member reported gets a Tell reporter button,
+which replies to that report once.
 """
 
+import asyncio
 import json
 import logging
 import re
 import time
+import weakref
 
 import discord
 import httpx
@@ -22,13 +25,16 @@ from .private_files import private_json
 LOG = logging.getLogger('fri.fixes')
 NO_MENTIONS = discord.AllowedMentions.none()
 FILE = 'gene-fixes.json'
-WATCHING = 3*86400  # After this a "fixed" line reads as necro-posting, so the watch just ends.
+WATCHING = 3*86400  # After this a "fixed" line under Gene's error reads as necro-posting, so the watch just ends.
 QUIET = 60  # Someone spoke this recently: wait for a lull instead of talking over them.
+PASS = 10  # How long a heartbeat waits on a pass over the watch list before moving on. It never cancels it.
+RUNNING = weakref.WeakKeyDictionary()  # Each agent's pass, so a slow one is waited on again instead of doubled.
 SETTLED = frozenset({'deployed', 'rejected', 'failed', 'needs_attention'})
 CAPABILITY = 'requester-notices'
 JOB = re.compile(r'[a-f0-9]{12}')
 TELL_ID = re.compile(r'^fri:tell:(?P<job_id>[a-f0-9]{12})$')
 SOURCE = re.compile(r'https://discord\.com/channels/(?P<guild>[0-9]{1,25}|@me)/(?P<channel>[0-9]{1,25})/(?P<message>[0-9]{1,25})')
+MALFORMED = (KeyError, TypeError, ValueError, OverflowError)
 
 
 def fixed_line(sha):
@@ -50,13 +56,37 @@ def watched(fri):
     return entries if isinstance(entries, dict) else {}
 
 
+def expired(entry):
+    """Timed from Gene's error itself, so refiling an old error never restarts the three days."""
+    return time.time()-discord.utils.snowflake_time(int(entry['message_id'])).timestamp() > WATCHING
+
+
+def save(fri, job_id, entry):
+    """Read again just before each write: a filing may have added to the list while a pass awaited."""
+    entries = watched(fri)
+    if entry is None:
+        entries.pop(job_id, None)
+    else:
+        entries[job_id] = entry
+    private_json(fri.data/FILE, entries)
+
+
 async def follow(agent, channel_id, message_id, job):
     """A Gene error Fri just filed: watch its job and put a 👀 on the error. Never raises."""
     job_id = str((job or {}).get('id', ''))
-    if not JOB.fullmatch(job_id) or job.get('state') in SETTLED:
-        return  # A refiled error whose job already ended has nothing left to announce.
+    entry = {'channel_id': str(channel_id), 'message_id': str(message_id)}
+    try:
+        if not JOB.fullmatch(job_id) or job.get('state') in SETTLED or expired(entry):
+            return  # A refiled error whose job already ended has nothing left to announce.
+    except MALFORMED:
+        return
     entries = watched(agent.fri)
-    entries.setdefault(job_id, {'channel_id': str(channel_id), 'message_id': str(message_id), 'filed': time.time()})
+    # One watch per error, kept until its three days end: filing it again through the other path (a repair,
+    # then a request) opens a second job, and that one must not get a second line.
+    if job_id in entries or any(isinstance(other, dict) and str(other.get('message_id')) == entry['message_id']
+                                for other in entries.values()):
+        return
+    entries[job_id] = entry
     try:
         private_json(agent.fri.data/FILE, entries)
     except OSError as exc:
@@ -86,13 +116,22 @@ def can_send(channel):
             (permissions.send_messages_in_threads if isinstance(channel, discord.Thread) else permissions.send_messages))
 
 
+def room(agent, entry):
+    """Where the line goes, while Fri may post there: not a channel it left or an archived thread it'd reopen."""
+    channel = agent.fri.get_channel(int(entry['channel_id']))
+    if (channel is None or getattr(channel, 'guild', None) is None or getattr(channel, 'archived', False) or
+            not agent.allowed(channel) or not can_send(channel)):
+        return None
+    return channel
+
+
 async def due(agent, job_id, entry):
     """'keep', 'drop', or the channel, Gene's message and the live release to post under it."""
     fri = agent.fri
-    if time.time()-float(entry['filed']) > WATCHING:
+    if expired(entry):
         return 'drop'
-    if not agent.config['proactive']:
-        return 'keep'  # No reads while the owner has proactive posts off; the three days still run.
+    if not agent.config['proactive'] or room(agent, entry) is None:
+        return 'keep'  # No reads while Fri couldn't post anyway; the three days still run.
     try:
         job = await fri.api('GET', '/requests/'+job_id)
     except ControllerRejected as exc:
@@ -100,14 +139,10 @@ async def due(agent, job_id, entry):
     if job.get('state') != 'deployed':
         return 'drop' if job.get('state') in SETTLED else 'keep'
     sha = str(job.get('approved_sha') or '')
-    if not sha or (await fri.api('GET', '/status')).get('active_sha') != sha:
-        return 'drop'  # A rollback or a newer release came first, so "fixed" might not hold.
-    channel = fri.get_channel(int(entry['channel_id']))
-    if (channel is None or getattr(channel, 'guild', None) is None or getattr(channel, 'archived', False) or
-            not agent.allowed(channel) or not can_send(channel)):
-        return 'keep'  # Not reopening an archived thread, or posting somewhere Fri no longer talks.
-    last = channel.last_message_id
-    if last and time.time()-discord.utils.snowflake_time(last).timestamp() < QUIET:
+    if not sha:
+        return 'drop'
+    channel = room(agent, entry)
+    if channel is None:
         return 'keep'
     try:
         message = await channel.fetch_message(int(entry['message_id']))
@@ -117,26 +152,61 @@ async def due(agent, job_id, entry):
         return 'keep'
     if message.author.id != agent.gene_id:
         return 'drop'
+    # The release is read last and every gate after it needs no await, so a rollback, an archive, a
+    # config change or proactive posts going off while Discord answered still stops the line.
+    if (await fri.api('GET', '/status')).get('active_sha') != sha:
+        return 'drop'  # A rollback or a newer release came first, so "fixed" might not hold.
+    channel = room(agent, entry)
+    if not agent.config['proactive'] or channel is None:
+        return 'keep'
+    last = channel.last_message_id
+    if last and time.time()-discord.utils.snowflake_time(last).timestamp() < QUIET:
+        return 'keep'
     return channel, message, sha
 
 
 async def check(agent):
-    """Heartbeat stage: each watched job is read until it settles, and a shipped fix is announced once."""
+    """Heartbeat stage: waits up to PASS on a pass over the watch list, and fails the stage if it's still going.
+
+    A Discord read is never cancelled: discord.py can't recover from a cancel inside its global rate-limit
+    wait, and every later Discord call would stall. A pass still running is left to finish, and the next
+    heartbeat waits on it again instead of starting another."""
+    task = RUNNING.get(agent)
+    if task is None or task.done():
+        task = RUNNING[agent] = asyncio.create_task(sweep(agent))
+        task.add_done_callback(ended)
+    done, _ = await asyncio.wait({task}, timeout=PASS)
+    if not done:
+        raise TimeoutError('Gene fix pass still running')
+    task.result()
+
+
+def ended(task):
+    """A pass that fails after its heartbeat moved on is still logged, not left unretrieved."""
+    if not task.cancelled() and task.exception() is not None:
+        LOG.info('Gene fix pass ended: %s', type(task.exception()).__name__)
+
+
+async def sweep(agent):
+    """One pass: each watched job is read until it settles, and a shipped fix is announced once."""
     from .fri_workspace import send_once
-    path = agent.fri.data/FILE
-    entries = watched(agent.fri)
-    for job_id, entry in list(entries.items()):
+    for job_id, entry in watched(agent.fri).items():
         try:
-            outcome = 'drop' if not JOB.fullmatch(job_id) else await due(agent, job_id, entry)
-        except (KeyError, TypeError, ValueError):
+            if not JOB.fullmatch(job_id) or not isinstance(entry, dict):
+                outcome = 'drop'
+            elif entry.get('done'):
+                outcome = 'drop' if expired(entry) else 'keep'  # Kept only so a refile isn't watched again.
+            else:
+                outcome = await due(agent, job_id, entry)
+        except MALFORMED:
             outcome = 'drop'  # A malformed entry would fail every heartbeat.
         if outcome == 'keep':
             continue
-        del entries[job_id]
-        private_json(path, entries)  # Off the list before the send: an unconfirmed post is never repeated.
         if outcome == 'drop':
+            save(agent.fri, job_id, None)
             continue
         channel, message, sha = outcome
+        save(agent.fri, job_id, {**entry, 'done': True})  # Before the send: an unconfirmed post is never repeated.
         try:
             await send_once(agent.fri, {'id': job_id, 'target_id': str(channel.id), 'body': fixed_line(sha)},
                             reply_to=message.id)
@@ -192,6 +262,8 @@ async def report(fri, job):
             if (int(match['guild']) != fri.guild_id or getattr(channel, 'guild', None) is None or
                     not fri.agent.allowed(channel) or not can_send(channel)):
                 raise Unreachable('i can’t post where they reported it anymore')
+            if getattr(channel, 'archived', False):
+                raise Unreachable('their thread’s archived, and i’m not reopening it for this')
         message = await channel.fetch_message(int(match['message']))
     except discord.NotFound:
         raise Unreachable('their report is gone') from None
