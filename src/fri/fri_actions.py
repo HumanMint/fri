@@ -474,6 +474,8 @@ class Actions:
                        'at': message.created_at.isoformat(timespec='minutes'), 'text': clean(message.content, 300)}
                 if carries:
                     row['attachments'] = carries
+                if getattr(message, 'pinned', None) is True:
+                    row['pinned'] = True
                 size += len(json.dumps(row))
                 if size > CATCH_UP_CHARS:
                     full = True
