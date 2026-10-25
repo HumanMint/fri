@@ -263,12 +263,23 @@ class Agent:
         Gene's error posts stay until they expire, so a quick delete can't hide one from the repair
         investigation."""
         ids, now = {int(i) for i in ids}, time.monotonic()
-        while self.unsent and (len(self.unsent) >= MAX_DELIVERED or
-                               now-next(iter(self.unsent.values())) > REDELIVERY_SECONDS):
-            del self.unsent[next(iter(self.unsent))]
+        def handled(i):
+            return self.handling[i] or i in self.replying
         # Raw events arrive from every channel Fri can see. Kept: what Fri is handling, and what attention
         # may pick from a channel it watches.
-        self.unsent.update((i, now) for i in ids if channel in self.recent or self.handling[i] or i in self.replying)
+        marks = [i for i in ids if channel in self.recent or handled(i)]
+        # Bounded, oldest first, but never a message still being handled: its fences must keep seeing it gone.
+        spare, expired = len(self.unsent)+len(marks)-MAX_DELIVERED, []
+        for i, at in self.unsent.items():
+            if handled(i):
+                continue
+            if spare <= 0 and now-at <= REDELIVERY_SECONDS:
+                break  # The rest are newer.
+            expired.append(i)
+            spare -= 1
+        for i in expired:
+            del self.unsent[i]
+        self.unsent.update((i, now) for i in marks)
         rows = self.recent.get(channel)  # Never index: that would add a channel for attention to scan.
         if rows:
             gone = {str(i) for i in ids}
