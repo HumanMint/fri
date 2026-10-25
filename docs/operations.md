@@ -59,6 +59,20 @@ being handled. Separately, it remembers each event ID for an hour from its first
 delivery answers or explains for every copy. A ping is logged at most once while it is among the last
 10,000 pings watched.
 
+A message to Fri waits 1.5 s for the rest of a burst before Fri answers. A message that is only
+Fri's name or a hello ("fri", "yo fri", "fri?", a bare ping) waits up to 8 s instead, because the
+question usually comes next, and in a channel that next message gets in without "fri". If it comes
+within the 5 s burst span, one reply answers both. If it comes later, it is answered on its own with
+the bare line in Fri's view, and a bare ping is logged as `rest came separately`. A reply to another
+message, or one with an image or sticker, doesn't wait.
+
+Fri shows typing only once words are coming: for a message addressed to it (its name, a ping, a
+reply to Fri, a DM), once the turn is admitted, so never before a cooldown, a privacy or music
+control, or the local closing reaction; for anything else (a follow-up without "fri", ambient
+attention), only once an action starts. A refused typing request never stops the reply. An ambient
+reply is dropped, unsaid and unsaved (`room moved on`), if anyone other than the member it answers
+spoke in the channel while Fri composed, or the channel can't be read to check.
+
 Fri's live view of a configured channel is its last 15 minutes (at most 30 messages). A deleted
 message leaves it, and so does a reply of Fri's that someone deletes. Gene's error posts stay until
 they expire, so a quick delete can't hide one from the repair investigation. A deleted message

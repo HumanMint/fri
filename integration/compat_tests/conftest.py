@@ -14,6 +14,13 @@ gene_test_config = TemporaryDirectory(prefix='gene-test-config-')
 os.environ['XDG_CONFIG_HOME'] = gene_test_config.name
 
 
+@pytest.fixture(autouse=True)
+def bare_greeting_debounce(monkeypatch):
+    # A bare "fri" waits up to 8 s for the rest (test_fri_summons.py). Elsewhere it keeps the usual
+    # 1.5 s debounce, so tests that send one don't each wait out the longer window.
+    monkeypatch.setattr('fri.fri_agent.REST_SECONDS', 1.5)
+
+
 @pytest.fixture
 def store(tmp_path):
     result = Store(tmp_path / 'gene.sqlite3')

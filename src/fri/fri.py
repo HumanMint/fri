@@ -71,6 +71,10 @@ CLOSED = 'a channel i was pulling from just went private while i was replying, s
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
 
 
+async def noop(stage):
+    pass
+
+
 def private_read(receipts):
     """Includes a diagnosis nested in an uncertain Gene command receipt."""
     return any(r.get('kind') in PRIVATE_READS or r.get('diagnostic') or (r.get('gene_result') or {}).get('diagnostic')
@@ -367,11 +371,14 @@ class Fri(discord.Client):
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         return result
 
-    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None):
+    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, typing=None):
         # `revision`: the author's privacy revision as their message came in, if known. Gene fences the
         # reply against the one read below, so an erasure before that read must stop it here.
+        # `typing(stage)`: told once a model turn is 'admitted' (no closing, control or cooldown) and
+        # before an 'action' runs, so the caller shows typing only when words are coming.
+        typing = typing or noop
         if invitation and invitation.outside:
-            return await self.invited_talk(invitation, text)
+            return await self.invited_talk(invitation, text, typing)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
         heard = [self.hear(item) for item in (event, *(row[1] for row in burst))
                  if getattr(item, 'guild', None) is not None]  # Before anything here waits.
@@ -486,6 +493,7 @@ class Fri(discord.Client):
                         notice = (f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
                                   f'back in about {minutes} mins') if admission.get('notice') else ''
                         return ChatResult(reply=notice, status='cooldown')
+                await typing('admitted')
                 if invitation:
                     if invitation.grant and event.reference and event.reference.message_id:
                         await invitation.collect(include_recent=False)
@@ -557,6 +565,7 @@ class Fri(discord.Client):
                 if result.action:
                     if not actions or result.action['kind'] not in context['actions']:
                         raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
+                    await typing('action')
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
                     result.shown = context['fence'].get('messages', set())  # A summary of the steps may still draw on them.
@@ -760,7 +769,7 @@ class Fri(discord.Client):
         return ChatResult(reply=(f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
                                 f'back in about {minutes} mins') if admission.get('notice') else '', status='cooldown')
 
-    async def invited_talk(self, invitation, text):
+    async def invited_talk(self, invitation, text, typing=None):
         """Outside the ambient scope, one ping has only conversation and public research."""
         from .fri_context import addressed_content
         from .fri_images import attach, require_current
@@ -779,6 +788,7 @@ class Fri(discord.Client):
                 admission = await invitation.admit()
                 if not admission['allowed']:
                     return self.mention_cooldown(admission)
+                await (typing or noop)('admitted')
                 scope = invitation.granted_scope()
                 context = attributed(await self.api('POST', '/chat/context', scope))
                 await invitation.collect()
@@ -801,6 +811,7 @@ class Fri(discord.Client):
                 if result.action:
                     if result.action['kind'] not in context['actions']:
                         raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
+                    await (typing or noop)('action')
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
                     receipt = research or receipts[-1]
