@@ -267,3 +267,27 @@ def test_turning_dms_off_during_the_last_checks_stops_the_request(monkeypatch, t
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+def test_leaving_the_server_during_the_access_recheck_stops_the_image_request(monkeypatch, tmp_path):
+    """A DM's membership gate runs after the Discord waits of the image and access rechecks."""
+    async def scenario():
+        w, _, _, sent = image_world(monkeypatch, tmp_path)
+        general = w.channels[GENERAL]
+        fetching, left = general.guild.fetch_channel, False
+
+        async def fetch_then_leave(cid):
+            nonlocal left
+            result = await fetching(cid)
+            left = True  # They leave while Fri refetches the channel it read.
+            general.guild.fetch_member.side_effect = discord.NotFound(SimpleNamespace(status=404, reason='left'), 'left')
+            return result
+        general.guild.fetch_channel = fetch_then_leave
+        try:
+            text = 'fri pick the best meme in general'
+            with pytest.raises(GateClosed):
+                await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert left and len(sent) == 1  # The read went out; the request carrying the meme didn't.
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
