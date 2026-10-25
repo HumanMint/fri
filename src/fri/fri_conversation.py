@@ -164,11 +164,11 @@ class Bursts:
     def unsend(self, channel, ids):
         """Deleted messages leave their burst, and its newest message answers for the rest. A burst
         whose newest message went is dropped whole: the rest were waiting on what was taken back.
-        A privacy control is carried out even if its message is deleted."""
+        So is a privacy control's: deleting it may be taking it back, and an erasure can't be undone."""
         for key in [key for key in self.rows if key[0] == channel]:
             groups = []
             for rows in self.rows[key]:
-                gone = [] if rows.alone else [row[1] for row in rows if row[1].id in ids]
+                gone = [row[1] for row in rows if row[1].id in ids]
                 if gone and rows[-1][1].id in ids:
                     self.dropped([row[1] for row in rows], 'message deleted')
                     continue

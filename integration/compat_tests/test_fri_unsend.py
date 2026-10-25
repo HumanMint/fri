@@ -145,7 +145,8 @@ def test_a_ping_deleted_during_the_debounce_costs_nothing_and_says_why(monkeypat
 
 
 @pytest.mark.parametrize('waited', [False, True])
-def test_a_deleted_forget_me_is_still_carried_out(monkeypatch, tmp_path, waited):
+def test_a_deleted_forget_me_is_not_carried_out(monkeypatch, tmp_path, waited):
+    # Deleting it may be taking it back, and an erasure can't be undone: as its recheck before running.
     async def scenario():
         fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
         gate, real_sleep = gated_debounce(monkeypatch)
@@ -164,7 +165,8 @@ def test_a_deleted_forget_me_is_still_carried_out(monkeypatch, tmp_path, waited)
         gate.set()
         try:
             await asyncio.wait_for(task, 5)
-            assert not store.chat_context('123', 'public:1', '20')['personal_memory']['enabled']
+            assert store.chat_context('123', 'public:1', '20')['personal_memory']['enabled']
+            control.reply.assert_not_awaited()
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
