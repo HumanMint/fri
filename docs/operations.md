@@ -316,7 +316,9 @@ Fri can't restart anything. It only notices and says so.
   DM whose last edit hasn't landed still reads as down, so it carries the next outage too. An edit
   whose reply is lost counts as not landed, so it's redone, even back to the text shown before. Only Fri or Discord can delete Fri's message in a DM. If it's gone
   when Fri goes to edit it mid-outage, Fri sends it again. Once the outage is over, nothing is sent
-  late.
+  late. If what the DM should say changed while Discord was taking it (Gene recovered while a slow
+  send was underway, say), the same delivery edits it to the new text at once instead of leaving
+  it for the next pass.
 - **Startup with the controller down.** Fri retries its startup controller reads (`/fri/contract`,
   then `/agent/state`) every 10 s before it joins the gateway, instead of exiting. Discord's HTTP API already works then, so the same watch reads,
   once per 2 minutes, still DM the owner. Reads stay about 2 minutes apart across that wait, the
@@ -330,7 +332,8 @@ Fri can't restart anything. It only notices and says so.
 - **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
   command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
   there, the member gets a fixed "gene isn't taking commands right now" at once, plus "owner
-  already knows" while a Gene outage DM is open, and nothing is queued. When Gene is polling but
+  already knows" while the owner's DM shows an open Gene outage (not while a relapse's edit is
+  still pending on a DM that says Gene is back), and nothing is queued. When Gene is polling but
   Red has that one command disabled, the notice says Gene isn't offering it. A command Gene accepts and
   then hangs on still waits out the controller's 115 s; that needs a controller change.
 - **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed

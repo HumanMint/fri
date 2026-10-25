@@ -104,8 +104,10 @@ class Watch:
         return self.state
 
     def alerted(self, kinds=GENE):
+        """Whether the owner's DM shows this outage now: one whose edit hasn't landed may still say recovered."""
         alert = self.load()['alert']
-        return bool(alert and alert.get('open') and alert.get('kind') in kinds and alert.get('message_id'))
+        return bool(alert and alert.get('open') and alert.get('kind') in kinds and alert.get('message_id')
+                    and alert.get('shown') == alert['text'])
 
     def since(self):
         """Seconds since the last read. Once this process has read, by the monotonic clock, so a stepped
@@ -215,6 +217,12 @@ class Watch:
         for task in done:
             task.result()  # Re-raises only what ends Fri's process; `push` logs its own failures.
 
+    async def catch_up(self, alert):
+        """A pass may have changed the text while Discord took the last one (say, Gene recovered while a
+        slow send was underway): show the new text now, not a pass later."""
+        if alert is self.load()['alert'] and alert.get('shown') != alert['text']:
+            await self.push(alert)
+
     async def push(self, alert):
         try:
             channel = self.fri.get_channel(int(alert['channel_id'])) if alert.get('channel_id') else None
@@ -259,7 +267,7 @@ class Watch:
                              sent=made.timestamp() if made else time.time())
                 self.save()
                 LOG.warning('Owner told about a Gene outage: %s', alert['kind'])
-                return
+                return await self.catch_up(alert)
             # Unknown until Discord confirms: an edit whose reply is lost may have landed, so until one is
             # confirmed the next pass edits again, even back to the text the DM showed before.
             alert['shown'] = None
@@ -280,6 +288,7 @@ class Watch:
                 return
             alert['shown'] = text
             self.save()
+            await self.catch_up(alert)
         except Exception as exc:  # It runs on its own, so nobody else would hear; the next pass tries again.
             LOG.warning('Gene watch deliver failed: %s', type(exc).__name__)
 
