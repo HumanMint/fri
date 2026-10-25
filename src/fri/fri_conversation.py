@@ -99,7 +99,8 @@ class Bursts:
 
     def add(self, message, arrived=None, since=None, alone=False):
         """`since`: the author's erasure baseline as it came in. `alone`: a privacy control, which
-        neither joins nor takes in other messages, so it's carried out and they're still answered."""
+        neither joins nor takes in other messages, so it's carried out and they're still answered.
+        False if the message came in before an erasure the open burst came in after, so it's dropped."""
         key, now = (message.channel.id, message.author.id), time.monotonic()
         arrived = now if arrived is None else arrived
         groups, abandoned = [], []
@@ -109,6 +110,11 @@ class Bursts:
         joins = groups and arrived-groups[-1][0][0] <= BURST_SECONDS and not (alone or groups[-1].alone)
         if joins and since != groups[-1].since:
             # They erased in between, so nothing answers what came before, as forget() drops it.
+            # Messages can finish coming in out of order, so that may be this one.
+            if None not in (since, groups[-1].since) and all(a <= b for a, b in zip(since, groups[-1].since)):
+                self.rows[key] = groups
+                self.dropped([message], 'author privacy changed')
+                return False
             self.dropped([row[1] for row in groups.pop()], 'author privacy changed')
             joins = False
         if not joins:
@@ -122,6 +128,7 @@ class Bursts:
                 del self.rows[key]
             self.dropped([row[1] for row in rows[:-1]], 'burst too long')  # The newest gets the notice.
             raise ValueError('Send at most five messages and 4000 characters together, then give me a moment.')
+        return True
 
     def group(self, message):
         return next((rows for rows in self.rows.get((message.channel.id, message.author.id), [])

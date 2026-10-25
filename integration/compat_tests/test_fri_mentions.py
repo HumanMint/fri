@@ -1440,9 +1440,9 @@ def test_a_reply_error_says_nothing_after_an_erasure_and_a_fixed_line_for_a_ping
             fri.chat_once.assert_awaited_once()
             assert all(not event.reply.await_count for event in events[:-1])
             texts = [item.args[0] for item in last.reply.await_args_list]
-            if failure == 'erased':
+            if failure == 'erased':  # Gene's fence rejected the save, and its notice stayed quiet.
                 assert texts == []
-                lines = [f'Mention 1/{events[0].id} not answered: author privacy changed'] if burst else []
+                lines = [f'Mention 1/{events[0].id} not answered: check failed: ControllerRejected'] if burst else []
             elif burst:
                 assert texts == [GLITCH]
                 lines = [f'Mention 1/{events[0].id} not answered, told why: controller unavailable']
@@ -1471,6 +1471,137 @@ def test_a_dm_reply_error_says_nothing_after_an_erasure(monkeypatch, tmp_path):
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
             fri.chat_once.assert_awaited_once()
+            event.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_ping_whose_arrival_read_finishes_late_does_not_drop_a_newer_burst(monkeypatch, tmp_path, caplog):
+    # The older ping came in before a Gene erasure, the newer after, but the older one's read lands last.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        older, newer = message('<@99> first question'), message('<@99> second question')
+        newer.reply.return_value = SimpleNamespace(id=newer.id+1, content='answered')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='answered')
+        profile, read, finish = agent.profile, asyncio.Event(), asyncio.Event()
+        async def slow(channel, user):
+            result = await profile(channel, user)
+            if not read.is_set():  # The older ping's, read before the erasure and held up after it.
+                read.set()
+                await finish.wait()
+            return result
+        agent.profile = slow
+        released, debounce, grouped = gated_debounce()
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = [asyncio.create_task(agent.handle(older))]
+                await asyncio.wait_for(read.wait(), 5)
+                store.clear_chats('20')
+                tasks.append(asyncio.create_task(agent.handle(newer)))
+                await asyncio.wait_for(grouped(agent, newer), 5)
+                finish.set()
+                await real_sleep(0.1)  # The older one's read lands, then it comes to the bursts.
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert [item.args[0] for item in newer.reply.await_args_list] == ['answered']
+            older.reply.assert_not_awaited()
+            assert 'first question' not in str(fri.chat_once.await_args_list)
+            assert mention_lines(caplog) == [f'Mention 1/{older.id} not answered: author privacy changed']
+        finally:
+            finish.set()
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['access', 'unpinged', 'deleted'])
+def test_a_burst_pings_fixed_line_needs_the_ping_to_still_stand(monkeypatch, tmp_path, caplog, change):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        ping, after = message('<@99> help'), message('fri more details')
+        api = fri.api
+        async def down(method, path, payload=None):
+            if path == '/chat/turn/check':
+                if change == 'access':  # Still sees and sends there, but can't read the history.
+                    channel.permissions_for = lambda _: discord.Permissions(view_channel=True, send_messages=True)
+                elif change == 'unpinged':
+                    edited = copy.copy(ping)
+                    edited.content, edited.mentions = 'help', []
+                    rows[ping.id] = edited
+                else:
+                    def gone(mid):
+                        if mid == ping.id:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                        return rows[mid]
+                    channel.fetch_message.side_effect = gone
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await api(method, path, payload)
+        fri.api = down
+        released, debounce, grouped = gated_debounce()
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in (ping, after):
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_awaited_once()
+            ping.reply.assert_not_awaited()
+            after.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: controller unavailable']
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text,path', [('<@99> forget me', '/chat/memory/control'),
+                                       ('<@99> show my memory', '/chat/context')])
+def test_a_privacy_control_ping_hears_the_glitch_line_when_the_controller_is_down(monkeypatch, tmp_path, caplog, text, path):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message(text)
+        api = fri.api
+        async def down(method, called, payload=None):
+            if called == path:
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await api(method, called, payload)
+        fri.api = down
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert [item.args[0] for item in event.reply.await_args_list] == [GLITCH]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erasure', ['local', 'gene'])
+def test_no_reaction_after_an_erasure_during_its_last_check(monkeypatch, tmp_path, erasure):
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('fri lol')
+        event.reactions = []
+        fri.chat_once.return_value = ChatResult(status='completed', response_kind='react', reaction='😂')
+        def fetch(mid):
+            if agent.reaction_lock.locked() and not fetch.erased:  # Reacting's own look at the message.
+                fetch.erased = True
+                agent.forget(20) if erasure == 'local' else store.clear_chats('20')
+            return rows[mid]
+        fetch.erased = False
+        channel.fetch_message.side_effect = fetch
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert fetch.erased
+            event.add_reaction.assert_not_awaited()
             event.reply.assert_not_awaited()
         finally:
             await fri.close()

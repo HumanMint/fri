@@ -731,7 +731,8 @@ class Agent:
         key = (channel, message.author.id)
         self.answer_directly(message)
         try:
-            self.bursts.add(message, arrived, None if privacy else (forgotten, observed), alone=bool(privacy))
+            if not self.bursts.add(message, arrived, None if privacy else (forgotten, observed), alone=bool(privacy)):
+                return DEFERRED  # Dropped, and said why, as from before an erasure.
         except ValueError as exc:
             self.pending.pop(key, None)
             await message.reply(notice_text(str(exc)), allowed_mentions=NO_MENTIONS, mention_author=False)
@@ -785,6 +786,16 @@ class Agent:
         if invitation:
             invitation.revision = profile.get('revision', 0)
         return profile
+
+    def ping_among(self, events, since):
+        """A ping among a burst's messages, to check it still stands, since `since`, before a notice."""
+        from .fri_mentions import Invitation
+        for event in reversed(events):
+            if event.guild and event.guild.id == self.fri.guild_id and explicit_mention(event, self.fri.user.id):
+                ping = Invitation(self, event)
+                ping.forgotten, ping.revision = since
+                return ping
+        return None
 
     def answer_directly(self, message):
         now = time.time()
@@ -842,20 +853,18 @@ class Agent:
         except commands.UserFeedbackCheckFailure as exc:
             if invitation and not await invitation.current():
                 return await withhold()
-            if since:  # Said only if they haven't erased since, checked last.
-                # A ping gets a fixed line, not the controller's text, even when a later message's reply answers it.
-                fixed = isinstance(exc, (ControllerRejected, ControllerUnavailable)) and bool(
-                    invitation or any(event.guild and explicit_mention(event, self.fri.user.id) for event in events))
+            if isinstance(exc, (ControllerRejected, ControllerUnavailable)) and (
+                    ping := invitation or (since and self.ping_among(events, since))):
+                # A ping gets a fixed line, not the controller's text, even when a later message's reply
+                # answers it. Its notice checks the ping still stands, and erasure last.
                 reason = 'controller unavailable' if isinstance(exc, ControllerUnavailable) else 'check failed: ControllerRejected'
-                if fixed and invitation:  # Its notice checks erasure itself.
-                    return await self.withheld(message, events, reason, invitation)
+                return await self.withheld(message, events, reason, ping)
+            if since:  # Said only if they haven't erased since, checked last.
                 erased = await self.erasure(message.author.id, *since)
                 if erased == 'check failed: ControllerUnavailable' and isinstance(exc, ControllerUnavailable):
                     erased = None  # The same outage, which is what this says.
                 if erased:
                     return await self.dropped(message, events, erased, invitation)
-                if fixed:
-                    return await self.withheld(message, events, reason)
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
@@ -871,7 +880,8 @@ class Agent:
             if reason:
                 return await self.dropped(message, events, reason, invitation)
         if result.response_kind in ('react', 'quiet'):
-            if result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(message, result.reaction):
+            if (result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(
+                    message, result.reaction, (lambda: self.erasure(message.author.id, *since)) if since else None)):
                 self.answered(events)
             else:
                 missed('reaction withheld' if result.response_kind == 'react' else 'chose quiet')
@@ -939,8 +949,9 @@ class Agent:
                 del self.recording[key]
         await self.fri.waiting_notices.clear(message.author.id)
 
-    async def acknowledge(self, message, emoji):
-        """Only react to the triggering message, once, within the existing write scope. True once added."""
+    async def acknowledge(self, message, emoji, erased=None):
+        """Only react to the triggering message, once, within the existing write scope. True once added.
+        `erased`: whether its author erased since, checked last."""
         if emoji not in REACTIONS or not self.config['enabled']:
             return
         async with self.reaction_lock:
@@ -968,6 +979,8 @@ class Agent:
                 current = await channel.fetch_message(message.id)
                 if (current.author.id != user.id or current.author.bot or current.webhook_id or
                         current.content != message.content or any(r.me for r in current.reactions)):
+                    return
+                if erased and await erased():
                     return
                 # Reserve before sending: an ambiguous HTTP failure must not cause retries.
                 self.acknowledged[message.id] = now
