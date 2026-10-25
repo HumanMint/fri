@@ -25,14 +25,20 @@ import discord
 
 from .private_files import private_json
 
-LIMIT = 2000  # Discord's message length.
+LIMIT = 2000  # Discord's message length, in UTF-16 units.
 MAX_PARTS = 4
+EARLIEST = 1767225600  # 2026-01-01 UTC. No real attempt is older; an older attempt time is damage.
 VERSION = re.compile(r'(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})')
 NO_MENTIONS = discord.AllowedMentions.none()
 
 
 class NotesRefused(Exception):
     """Notes that shouldn't reach the owner as given."""
+
+
+def length(text):
+    """Discord's count, not Python's: UTF-16 units, so most emoji count 2."""
+    return len(text.encode('utf-16-le')) // 2
 
 
 def parts(text):
@@ -43,10 +49,10 @@ def parts(text):
     chunks = ['']
     for paragraph in re.split(r'\n\s*\n', text):
         paragraph = paragraph.strip('\n')
-        if len(paragraph) > LIMIT:
+        if length(paragraph) > LIMIT:
             raise NotesRefused(f'a paragraph is over {LIMIT} characters')
         joined = f'{chunks[-1]}\n\n{paragraph}' if chunks[-1] else paragraph
-        if len(joined) <= LIMIT:
+        if length(joined) <= LIMIT:
             chunks[-1] = joined
         else:
             chunks.append(paragraph)
@@ -76,10 +82,10 @@ def locked(directory):
 
 def recorded(part):
     """One part as send() writes it: when it was attempted, and the message Discord confirmed."""
-    attempted = part.get('attempted_at', 0)
+    attempted = part.get('attempted_at', EARLIEST)
     return (isinstance(part, dict) and set(part) <= {'attempted_at', 'message_id', 'channel_id'} and
             isinstance(attempted, (int, float)) and not isinstance(attempted, bool) and
-            0 <= attempted <= time.time() + 86400 and  # A real past attempt: no NaN, no far future.
+            EARLIEST <= attempted <= time.time() + 86400 and  # A real past attempt: no NaN, no 0, no far future.
             all(isinstance(part.get(key, '0'), str) and part.get(key, '0').isdigit() for key in ('message_id', 'channel_id')))
 
 
@@ -101,12 +107,14 @@ def load(path):
     return state
 
 
-async def landed(dm, me, chunk, attempted_at):
+async def landed(dm, me, chunk, attempted_at, taken):
     """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
-    Clocks get a minute either side; only Fri's own messages with exactly this text count."""
+    Every message since a minute before the attempt is read (clocks drift). Only Fri's own messages
+    with exactly this text count, and never one the record already gives a part: Discord keeps no
+    nonce in history, so that is what tells identical parts and releases apart."""
     after = dt.datetime.fromtimestamp(attempted_at - 60, dt.timezone.utc)
-    async for message in dm.history(limit=50, after=after, oldest_first=True):
-        if message.author.id == me and message.content == chunk:
+    async for message in dm.history(limit=None, after=after, oldest_first=True):
+        if message.author.id == me and message.content == chunk and str(message.id) not in taken:
             return message
     return None
 
@@ -134,7 +142,8 @@ async def send(version, text, *, token, owner_id, data, out=print):
                 if part.get('message_id'):
                     out(f'part {index}/{len(chunks)}: already sent')
                     continue
-                message = part.get('attempted_at') and await landed(dm, client.user.id, chunk, part['attempted_at'])
+                taken = {p['message_id'] for e in state['versions'].values() for p in e['parts'] if 'message_id' in p}
+                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, part['attempted_at'], taken)
                 if not message:
                     part['attempted_at'] = time.time()
                     private_json(path, state)
@@ -142,7 +151,7 @@ async def send(version, text, *, token, owner_id, data, out=print):
                                             allowed_mentions=NO_MENTIONS, suppress_embeds=True)
                 part.update(message_id=str(message.id), channel_id=str(dm.id))
                 private_json(path, state)
-                out(f'part {index}/{len(chunks)}: sent as message {message.id} ({len(chunk)} chars)')
+                out(f'part {index}/{len(chunks)}: sent as message {message.id} ({length(chunk)} chars)')
         finally:
             await client.close()
 
@@ -155,11 +164,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not VERSION.fullmatch(args.version):
         parser.error('version must look like 0.4.0')
-    text = sys.stdin.buffer.read().decode('utf-8')
     try:
+        try:
+            text = sys.stdin.buffer.read().decode('utf-8')
+        except UnicodeDecodeError:
+            raise NotesRefused('the notes are not UTF-8') from None
         if args.command == 'preview':
             for index, chunk in enumerate(parts(text), 1):
-                print(f'--- part {index} ({len(chunk)} chars)\n{chunk}')
+                print(f'--- part {index} ({length(chunk)} chars)\n{chunk}')
             return 0
         asyncio.run(send(args.version, text, token=os.environ['DISCORD_TOKEN'],
                          owner_id=int(os.environ['GENE_OWNER_ID']),

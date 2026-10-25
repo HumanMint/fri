@@ -24,7 +24,7 @@ class FakeDM:
         self.sends.append({'content': content, 'nonce': nonce, 'mentions': allowed_mentions,
                            'suppress_embeds': suppress_embeds})
         index = len(self.sends)
-        if index in self.refused:
+        if index in self.refused or len(content.encode('utf-16-le')) > 4000:
             raise RuntimeError('discord refused')
         message = types.SimpleNamespace(id=1000+index, content=content, author=types.SimpleNamespace(id=BOT))
         self.messages.append(message)
@@ -87,14 +87,27 @@ def test_parts_packs_whole_paragraphs_into_discord_sized_messages():
     assert notes.parts('**fri 0.4.0**\r\nline\r\n\r\n- next') == ['**fri 0.4.0**\nline\n\n- next']
 
 
+def test_parts_count_length_the_way_discord_does():
+    """Discord counts UTF-16 units, so an emoji is 2: two paragraphs that fit as Python text don't fit one message."""
+    text = paragraph(1000, 'a') + '\n\n' + '\U0001f3ae' * 600
+    assert notes.parts(text) == [paragraph(1000, 'a'), '\U0001f3ae' * 600]
+    assert notes.parts('\U0001f3ae' * 1000) == ['\U0001f3ae' * 1000]
+
+
 @pytest.mark.parametrize('text, reason', [
     ('  \n\n ', 'empty'),
     (paragraph(2001), 'over 2000'),
+    ('\U0001f3ae' * 1001, 'over 2000'),
     ('\n\n'.join(paragraph(1500, t) for t in 'abcde'), 'at most 4'),
-])
+], ids=['empty', 'long', 'emoji', 'five-parts'])
 def test_parts_refuses_notes_it_cant_send_whole(text, reason):
     with pytest.raises(notes.NotesRefused, match=reason):
         notes.parts(text)
+
+
+def test_emoji_heavy_notes_are_sent_in_parts_discord_accepts(dm, tmp_path):
+    run(paragraph(1000, 'a') + '\n\n' + '\U0001f3ae' * 600, tmp_path)
+    assert [s['content'] for s in dm.sends] == [paragraph(1000, 'a'), '\U0001f3ae' * 600]
 
 
 def test_send_dms_the_owner_once_without_mentions_or_embeds(dm, tmp_path):
@@ -152,6 +165,37 @@ def test_an_identical_part_from_an_earlier_release_is_not_mistaken_for_this_one(
     assert len(dm.messages) == 2
 
 
+def test_recovery_looks_past_the_first_page_of_history(dm, tmp_path):
+    text = paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b')
+    dm.lost.add(2)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    owner = types.SimpleNamespace(id=OWNER)
+    dm.messages[1:1] = [types.SimpleNamespace(id=500+i, content='hm', author=owner) for i in range(150)]
+    run(text, tmp_path)
+    assert len(dm.sends) == 2
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())['versions']['0.4.0']
+    assert [p['message_id'] for p in record['parts']] == ['1001', '1002']
+
+
+@pytest.mark.parametrize('earlier', [None, paragraph(1500, 'a') + '\n\n' + paragraph(1500, 's')],
+                         ids=['own-first-part', 'earlier-release'])
+def test_a_part_never_delivered_is_not_confirmed_by_another_parts_message(dm, tmp_path, earlier):
+    """Identical text is no proof: a part refused before Discord took it is sent on the rerun."""
+    if earlier:
+        run(earlier, tmp_path, version='0.3.9')
+    before = len(dm.messages)
+    text = paragraph(1500, 's') + '\n\n' + paragraph(1500, 's')
+    dm.refused.add(len(dm.sends) + 2)
+    with pytest.raises(RuntimeError, match='refused'):
+        run(text, tmp_path)
+    run(text, tmp_path)
+    mine = dm.messages[before:]
+    assert [m.content for m in mine] == [paragraph(1500, 's')] * 2
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())['versions']['0.4.0']
+    assert [p['message_id'] for p in record['parts']] == [str(m.id) for m in mine]
+
+
 def test_a_damaged_record_or_a_concurrent_send_is_refused(dm, tmp_path):
     (tmp_path / 'patch-notes.json').write_text('[]')
     with pytest.raises(notes.NotesRefused, match='not a patch-notes record'):
@@ -170,7 +214,9 @@ def test_a_damaged_record_or_a_concurrent_send_is_refused(dm, tmp_path):
     '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": []}}}', b'\xff',
     '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": 1e100}]}}}',
     '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": NaN}]}}}',
-    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": -1}]}}}'])
+    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": -1}]}}}',
+    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": 0}]}}}',
+    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"attempted_at": 1e-9}]}}}'])
 def test_a_damaged_entry_is_refused_with_exit_2_before_login(monkeypatch, capsys, tmp_path, dm, record):
     """Truncated JSON, a malformed entry or part, or a null one (which would resend), anywhere in the record."""
     path = tmp_path / 'patch-notes.json'
@@ -202,6 +248,9 @@ def test_cli_reports_a_refusal_with_exit_code_2(monkeypatch, capsys, tmp_path, d
     monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'  ')))
     assert notes.main(['send', '0.4.0']) == 2
     assert 'refused: the notes are empty' in capsys.readouterr().err
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'\xff\xfe notes')))
+    assert notes.main(['preview', '0.4.0']) == 2
+    assert 'refused: the notes are not UTF-8' in capsys.readouterr().err
     monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'**fri 0.4.0**')))
     assert notes.main(['send', '0.4.0']) == 0
     assert dm.sends[0]['content'] == '**fri 0.4.0**'

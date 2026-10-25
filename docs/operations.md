@@ -455,11 +455,14 @@ docker exec -i fri-runtime-1 python -m fri.fri_patch_notes preview 0.4.0 < notes
 
 The recipient is always `GENE_OWNER_ID`; there is no way to name anyone else. It logs in over
 REST only, so the running Fri's gateway session is untouched, and sends with mentions and link
-embeds off. Notes are split at blank lines into at most four messages of 2000 characters.
+embeds off. Notes are split at blank lines into at most four messages of 2000 characters,
+counted the way Discord counts them (UTF-16 units, so most emoji count 2).
 `/data/patch-notes.json` records each version's confirmed parts, so a rerun finishes a partial
 send and never repeats a part: a part whose send was attempted but never confirmed is looked for
-in the DM first, and every part carries a fixed nonce. The same version with different notes is
-refused (exit 2); send a correction as a new version. Members see nothing.
+in the DM first (Fri's own messages since the attempt with exactly that text, skipping any the
+record already gives another part), and every part carries a fixed nonce. The same version with
+different notes, or a damaged record, is refused (exit 2); send a correction as a new version.
+Members see nothing.
 
 ## Background work and health
 
