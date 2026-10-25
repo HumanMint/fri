@@ -26,7 +26,7 @@ from fri.fri_actions import Actions
 from fri.fri_addressing import explicit_mention
 from fri.fri_agent import QUEUE_SECONDS, Agent
 from fri.fri_chat import Chat, ChatResult
-from fri.fri_errors import ControllerRejected
+from fri.fri_errors import ControllerRejected, ControllerUnavailable
 from fri.fri_mentions import CONTEXT_CHANGED, GLITCH, NOTICES, Invitation
 from fri.fri_notices import ReplyInProgress
 
@@ -177,7 +177,9 @@ def test_ping_after_another_members_meme_gets_text_without_ambient_expansion(mon
             if not configured_channel:
                 assert set(context['actions']) == {'web_search'}
                 assert not agent.recent and not agent.active and not agent.bursts.rows
-                assert not any(path.startswith(('/controls', '/workspace', '/social', '/agent/context')) for path, _ in calls)
+                assert not any(path.startswith(('/controls', '/workspace', '/social')) for path, _ in calls)
+                # Read once, only for the privacy revision the ping came in under.
+                assert sum(path == '/agent/context' for path, _ in calls) == 1
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -465,8 +467,8 @@ def test_a_reply_that_starts_mid_turn_keeps_the_deadline_and_erasure_checks(monk
             await agent.handle(event)
             fri.chat_once.assert_not_awaited()
             texts = [item.args[0] for item in event.reply.await_args_list]
-            if erase:
-                assert texts == [str(ReplyInProgress())]
+            if erase:  # Not even the waiting notice, once they erased.
+                assert texts == []
                 assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
             else:
                 assert texts == [str(ReplyInProgress()), NOTICES['stale event']]
@@ -614,6 +616,181 @@ def test_a_controller_outage_entering_the_queue_still_says_so(monkeypatch, tmp_p
         try:
             await agent.handle(event)
             assert [item.args for item in event.reply.await_args_list] == [(GLITCH,)]
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: controller unavailable']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erasure', ['disable', 'clear'])
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_an_erasure_during_a_first_attempt_that_found_them_busy_drops_the_retry(
+        monkeypatch, tmp_path, caplog, channel_id, erasure):
+    # Gene erases once, while a panel reply that started first keeps this attempt waiting.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message('<@99> remember the private marker?')
+        talk = fri.talk
+        async def racing(*args, **kwargs):
+            if not racing.raced:
+                racing.raced = True
+                fri.busy.add(20)
+                store.personal_control('20', 'disable') if erasure == 'disable' else store.clear_chats('20')
+                asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+                raise ReplyInProgress()
+            return await talk(*args, **kwargs)
+        racing.raced = False
+        fri.talk = racing
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            assert 'private marker' not in json.dumps(store.chat_context('123', f'public:{channel_id}', '20'))
+            assert all(item.args[0] == str(ReplyInProgress()) for item in event.reply.await_args_list)
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+            assert 20 not in agent.turns.holders
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_reply_that_ends_during_the_busy_recheck_still_rechecks_erasure(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        talk = fri.talk
+        async def racing(*args, **kwargs):
+            if not racing.raced:
+                racing.raced = True
+                fri.busy.add(20)
+                agent.forget(20)  # E.g. their "forget me" in another channel.
+                asyncio.get_running_loop().call_soon(fri.busy.discard, 20)  # Within the invitation recheck.
+                raise ReplyInProgress()
+            return await talk(*args, **kwargs)
+        racing.raced = False
+        fri.talk = racing
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erasure', ['local', 'gene'])
+def test_an_erasure_during_the_waiting_notice_checks_sends_no_notice(monkeypatch, tmp_path, caplog, erasure):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        fri.busy.add(20)
+        current = Invitation.current
+        async def checking(self, **kwargs):
+            result = await current(self, **kwargs)
+            if kwargs.get('check_evidence', True):  # The waiting notice's own check, not the first one.
+                agent.forget(20) if erasure == 'local' else store.personal_control('20', 'disable')
+            return result
+        monkeypatch.setattr(Invitation, 'current', checking)
+        try:
+            await agent.handle(event)
+            event.reply.assert_not_awaited()
+            fri.chat_once.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('arrived', [False, True])
+def test_an_erasure_during_a_notices_own_checks_silences_it(monkeypatch, tmp_path, caplog, arrived):
+    # Already stale as it came in, so no baseline was read yet, or one that went stale while waiting.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, channel, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.3 if arrived else 301)
+        if arrived:
+            fri.busy.add(20)  # A reply that never ends in time.
+            event.reply.return_value = SimpleNamespace(delete=AsyncMock())
+        fetch = channel.guild.fetch_roles
+        async def roles():
+            if fetch.await_count == (2 if arrived else 0):  # The notice's own access check.
+                store.personal_control('20', 'disable')
+            return await fetch()
+        channel.guild.fetch_roles = roles
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert all(item.args[0] == str(ReplyInProgress()) for item in event.reply.await_args_list)
+            assert len(mention_lines(caplog)) == 1 and ' not answered: ' in mention_lines(caplog)[0]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_controller_outage_as_a_configured_ping_comes_in_says_so(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you there?')
+        agent.profile = AsyncMock(side_effect=UserFeedbackCheckFailure('The workshop controller is temporarily unavailable.'))
+        try:
+            await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(GLITCH,)]
+            fri.chat_once.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: controller unavailable']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_slow_check_cannot_carry_a_waiting_message_past_its_deadline(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.2)
+        fri.busy.add(20)
+        profile = agent.profile
+        async def slow(channel, user):
+            if slow.calls == 1:  # The check before the waiting notice; the earlier reply ends meanwhile.
+                await asyncio.sleep(0.35)
+                fri.busy.discard(20)
+            slow.calls += 1
+            return await profile(channel, user)
+        slow.calls = 0
+        agent.profile = slow
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert [item.args for item in event.reply.await_args_list] == [(NOTICES['stale event'],)]
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: earlier reply still running']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('down', ['admit', 'everything'])
+def test_a_controller_outage_at_admission_uses_the_glitch_line(monkeypatch, tmp_path, caplog, down):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        api = fri.api
+        async def outage(method, path, payload=None):
+            if path == '/chat/mentions/admit' or (down == 'everything' and outage.admitting):
+                outage.admitting = True
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await api(method, path, payload)
+        outage.admitting = False
+        fri.api = outage
+        try:
+            await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(GLITCH,)]
+            fri.chat_once.assert_not_awaited()
             assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: controller unavailable']
         finally:
             await fri.close()

@@ -18,7 +18,7 @@ from .fri_actions import Actions
 from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
-from .fri_errors import ControllerRejected
+from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_memory import describe_memory, memory_intent
 from .fri_notices import Busy, ReplyInProgress, WaitingNotices, notice_text
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
@@ -200,7 +200,7 @@ class Fri(discord.Client):
                     raise commands.UserFeedbackCheckFailure(str(data.get('detail', 'Controller rejected this request')))
                 return data
         except (aiohttp.ClientError, TimeoutError):
-            raise commands.UserFeedbackCheckFailure('The workshop controller is temporarily unavailable.') from None
+            raise ControllerUnavailable('The workshop controller is temporarily unavailable.') from None
 
     async def flush_usage(self):
         async with self.usage_lock:

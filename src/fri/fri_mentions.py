@@ -25,6 +25,7 @@ NOTICES = {'stale event': 'took me too long on that one. ping me again if you st
            'check failed: ControllerRejected': CONTEXT_CHANGED}
 GLITCH = 'that one glitched on my end. ping me again.'
 NOTICES['controller unavailable'] = GLITCH
+OUTAGES = ('controller unavailable', 'check failed: ControllerUnavailable')
 
 
 def notice_for(reason):
@@ -51,7 +52,7 @@ class Invitation:
         self.ambiguous_images = False
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
-        self.revision = None  # The author's privacy revision once admitted.
+        self.revision = None  # The author's privacy revision as Fri first read it for this ping.
 
     @classmethod
     async def create(cls, agent, message):
@@ -141,13 +142,18 @@ class Invitation:
         """What to say instead of a reply that can't go out, or None to stay quiet.
 
         Only while the ping still stands: Fri can still answer there, the message still pings Fri,
-        and its author hasn't erased since it was admitted. Never any content or context.
+        and its author hasn't erased since Fri first saw it. Never any content or context.
         """
-        text = notice_for(reason)
-        if not text or await self.agent.erased(self.event.author.id, self.forgotten, self.revision):
+        if not (text := notice_for(reason)):
             return None
-        refusal = self.refusal
+        refusal, revision = self.refusal, self.revision
         try:
+            if revision is None:  # Not read yet, e.g. already stale as it came in: compare from now.
+                try:
+                    revision = await self.agent.revision(self.event.author.id)
+                except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
+                    if reason not in OUTAGES:
+                        return None
             if not await self.access():
                 return None
             current = await self.event.channel.fetch_message(self.event.id)
@@ -155,7 +161,12 @@ class Invitation:
                     current.webhook_id or not explicit_mention(current, self.fri.user.id)):
                 return None
             if reason == 'message changed' and current.edited_at is None:
-                return GLITCH  # Not the member's edit, so don't say it was.
+                text = GLITCH  # Not the member's edit, so don't say it was.
+            # Last, so an erasure during the checks above still counts. An outage can't be checked
+            # against itself, so only a known erasure silences the notice saying so.
+            erased = await self.agent.erased(self.event.author.id, self.forgotten, revision)
+            if erased and not (reason in OUTAGES and erased == 'check failed: ControllerUnavailable'):
+                return None
             return text
         except (discord.HTTPException, commands.UserFeedbackCheckFailure, ValueError, AttributeError, TypeError):
             return None
@@ -167,7 +178,9 @@ class Invitation:
         result = await self.fri.api('POST', '/chat/mentions/admit', {**self.scope,
             'source': self.source, 'content': self.event.content, 'bot_id': str(self.fri.user.id)})
         if result.get('allowed'):
-            self.grant, self.revision = result['mention_grant'], result['revision']
+            self.grant = result['mention_grant']
+            if self.revision is None:
+                self.revision = result['revision']
         return result
 
     def granted_scope(self):
