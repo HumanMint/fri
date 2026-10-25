@@ -14,6 +14,11 @@ posting or learning permission, and never adds a channel to an ambient allowlist
 The controller applies the existing member allowance. Disabled mode and in-progress
 reply notices keep their existing behavior. The runtime rechecks the current event,
 member roles, channel/thread permissions, source contents and privacy before output.
+Each recheck sends its Discord reads together (the channel, roles, both members, the
+ping and its nearby messages; a thread's parent after its channel), judges them in the
+order a one-by-one check would, and reads the grant's privacy from the controller after
+them. After the model answers, a ping is rechecked before each tool acts, before the model
+hears the turn again, and once right before sending; that last check also covers its image.
 In configured channels, local privacy/usage utilities, exact controls and accepted
 operational follow-ups retain their existing admission before any social allowance.
 New conversation and on-demand surrounding context still need normal chat admission;

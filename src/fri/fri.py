@@ -531,14 +531,15 @@ class Fri(discord.Client):
                             raise GateClosed('dms off')
                     context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
                 result = await self.chat_once(text, context)
-                if invitation:
-                    await invitation.require_current()
+                # A ping's last check before sending (Agent.reply_once) covers it and its image, and a tool
+                # checks it again before acting, so nothing here repeats that.
                 if conversation and (conversation.get('message_burst') or conversation.get('reply_target')):
                     from .fri_conversation import unchanged
                     if not await unchanged(self.agent, event, conversation):
                         raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
                 from .fri_images import require_current as require_current_images
-                await require_current_images(context, event)
+                if not invitation:
+                    await require_current_images(context, event)
                 if guild_id != self.guild_id:
                     result.draft = None
                 if actions and actions.private_evidence:
@@ -550,12 +551,11 @@ class Fri(discord.Client):
                     result, receipts, research = await run(self, actions, text, context, result)
                     if actions.private_evidence:
                         result.draft, result.notes = None, []
-                    if invitation:
-                        await invitation.require_current()
                     if context.get('force_text_reply'):
                         from .fri_mentions import force_text
                         result = force_text(result)
-                    await require_current_images(context, event)
+                    if not invitation:  # A ping's is its last check before sending.
+                        await require_current_images(context, event)
                     receipt = receipts[-1]
                     action_kind = receipt['kind']
                     from .fri_outcomes import unrecorded
@@ -563,7 +563,7 @@ class Fri(discord.Client):
                         current = await self.api('POST', '/chat/context', scope)
                     except (commands.UserFeedbackCheckFailure, TimeoutError):
                         return ChatResult(reply=unrecorded(receipts, reason='I couldn’t recheck conversation access to show the details.'), status='completed')
-                    if current['revision'] != context['revision'] or not await actions.valid():
+                    if current['revision'] != context['revision'] or not await actions.valid(sending=True):
                         return ChatResult(reply=unrecorded(receipts, reason='Access or memory changed before I could safely show the details.'), status='completed')
                     result.notes = []
                     diagnosis = (receipt if action_kind == 'gene_diagnose'
@@ -612,7 +612,7 @@ class Fri(discord.Client):
                     except commands.UserFeedbackCheckFailure:
                         return ChatResult(reply=unrecorded(receipts), status='completed')
                     return result
-                if context.get('gene_receipts') and not await actions.valid(outage=True):
+                if context.get('gene_receipts') and not await actions.valid(outage=True, sending=True):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 result = self.stage_turn(scope, source, text, context, result, actions=actions)
                 # The save's privacy fence runs before delivery; the save itself waits for delivery.
@@ -751,7 +751,7 @@ class Fri(discord.Client):
     async def invited_talk(self, invitation, text):
         """Outside the ambient scope, one ping has only conversation and public research."""
         from .fri_context import addressed_content
-        from .fri_images import attach, require_current
+        from .fri_images import attach
         from .fri_mentions import force_text
         event, user = invitation.event, invitation.event.author.id
         expected = addressed_content(event.content, self.user.id) or 'hey'
@@ -798,8 +798,7 @@ class Fri(discord.Client):
                             include_sources=receipts[-1]['kind'] == 'web_sources' or links_requested(text))
                 result = force_text(result)
                 result.draft, result.notes = None, []
-                await invitation.require_current()
-                await require_current(context, event)
+                # Its last check before sending (Agent.reply_once) covers it and its image.
                 # The controller stores only a neutral placeholder for outside invitations.
                 result.turn = {**scope, 'revision': context['revision'],
                     'input': text, 'reply': result.reply, 'source': invitation.source,

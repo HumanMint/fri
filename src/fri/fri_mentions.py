@@ -1,5 +1,6 @@
 """One live ping invites bounded evidence, never ambient collection or new tools."""
 
+import asyncio
 import copy
 import datetime as dt
 import time
@@ -31,6 +32,18 @@ def notice_for(reason):
     return NOTICES.get(reason, GLITCH if reason.startswith('check failed: ') else None)
 
 
+async def together(*reads):
+    """Send Discord reads at once: each comes back as its result or the exception it raised, to be
+    judged in the order a one-by-one check would have read them (see settled)."""
+    return await asyncio.gather(*reads, return_exceptions=True)
+
+
+def settled(result):
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
 def fingerprint(message):
     return (source_identity(discord_source(message)), message.content, message.edited_at,
             tuple((str(a.url), a.content_type, a.size, a.width, a.height, a.is_spoiler())
@@ -50,6 +63,7 @@ class Invitation:
         self.image = None
         self.ambiguous_images = False
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
+        self.fetched = {}  # Message ID: Discord's copy as the last passing check read it.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
         self.revision = None  # The author's privacy revision as Fri first read it for this ping.
 
@@ -74,40 +88,46 @@ class Invitation:
         self.refusal = reason
         return False
 
-    async def access(self, *, control=False):
+    async def access(self, *, control=False, messages=()):
         """Fetch current overwrites and both members; cached channel access is insufficient. A privacy
-        `control` works with Fri paused."""
+        `control` works with Fri paused. Returns whether access holds, and the `messages` by ID as Discord
+        has them now, read alongside: each a message, or the exception its fetch raised."""
         event, guild = self.event, self.event.guild
         if not control and not self.agent.config['enabled']:
-            return self.refuse('fri disabled')
+            return self.refuse('fri disabled'), {}
         if guild.id != self.fri.guild_id and not self.agent.allowed(event.channel):
-            return self.refuse('outside the main server')
-        channel = await guild.fetch_channel(event.channel.id)
+            return self.refuse('outside the main server'), {}
+        # None of these depends on another, so they go out together.
+        channel, roles, author, fri, *fetched = await together(
+            guild.fetch_channel(event.channel.id), guild.fetch_roles(), guild.fetch_member(event.author.id),
+            guild.fetch_member(self.fri.user.id), *(event.channel.fetch_message(mid) for mid in messages))
+        fetched = dict(zip(messages, fetched))
+        channel = settled(channel)
         if channel.id != event.channel.id or channel.guild.id != guild.id:
-            return self.refuse('channel changed')
+            return self.refuse('channel changed'), fetched
         thread = isinstance(channel, discord.Thread)
         if thread:
             if channel.is_private() or channel.archived or channel.locked:
-                return self.refuse('private, archived or locked thread')
+                return self.refuse('private, archived or locked thread'), fetched
             parent = await guild.fetch_channel(channel.parent_id)
         else:
             parent = channel
         if getattr(parent, 'nsfw', False):
-            return self.refuse('nsfw channel')
+            return self.refuse('nsfw channel'), fetched
         # Current role permissions matter as well as fresh channel overwrites.
         fresh_guild = copy.copy(guild)
-        fresh_guild._roles = {role.id: role for role in await guild.fetch_roles()}
+        fresh_guild._roles = {role.id: role for role in settled(roles)}
         parent = copy.copy(parent)
         parent.guild = fresh_guild
-        for user in (event.author.id, self.fri.user.id):
-            member = await guild.fetch_member(user)
+        for user, member in ((event.author.id, author), (self.fri.user.id, fri)):
+            member = settled(member)
             if member.id != user or (user == event.author.id and member.bot):
-                return self.refuse('member changed')
+                return self.refuse('member changed'), fetched
             permissions = parent.permissions_for(member)
             if not (permissions.view_channel and permissions.read_message_history and
                     (permissions.send_messages_in_threads if thread else permissions.send_messages)):
-                return self.refuse('missing permissions')
-        return True
+                return self.refuse('missing permissions'), fetched
+        return True, fetched
 
     async def current(self, *, check_evidence=True, control=False):
         try:
@@ -116,20 +136,25 @@ class Invitation:
                 return self.refuse('stale event')
             if age < -5:
                 return self.refuse('clock skew')
-            if not await self.access(control=control):
+            evidence = check_evidence and self.grant
+            allowed, fetched = await self.access(control=control, messages=[
+                self.event.id, *(self.events if evidence else ())])
+            if not allowed:
                 return False
-            current = await self.event.channel.fetch_message(self.event.id)
+            current = settled(fetched[self.event.id])
             if (current.id != self.event.id or current.author.bot or current.webhook_id or
                     fingerprint(current) != self.original or not explicit_mention(current, self.fri.user.id)):
                 return self.refuse('message changed')
-            if check_evidence and self.grant:
+            if evidence:
+                # After the Discord reads, so an erasure during them still counts.
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
-                for mid, event in self.events.items():
-                    current = await self.event.channel.fetch_message(mid)
-                    if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
+                for mid in self.events:
+                    nearby = settled(fetched[mid])
+                    if nearby.webhook_id or nearby.author.bot or fingerprint(nearby) != self.snapshots[mid]:
                         return self.refuse('nearby message changed')
+            self.fetched = {mid: settled(message) for mid, message in fetched.items()}
             return True
         except ControllerUnavailable:
             raise  # Nothing changed; the controller is down, and the caller's outage handling says so.
@@ -156,9 +181,10 @@ class Invitation:
                     revision = await self.agent.revision(self.event.author.id)
                 except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
                     return None
-            if not await self.access():
+            allowed, fetched = await self.access(messages=[self.event.id])
+            if not allowed:
                 return None
-            current = await self.event.channel.fetch_message(self.event.id)
+            current = settled(fetched[self.event.id])
             if (current.id != self.event.id or current.author.id != self.event.author.id or current.author.bot or
                     current.webhook_id or not explicit_mention(current, self.fri.user.id)):
                 return None

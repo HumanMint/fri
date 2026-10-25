@@ -31,11 +31,22 @@ async def run(fri, actions, text, context, result):
         raise commands.UserFeedbackCheckFailure('That turn ran out of time. Saved work remains available; check its status before retrying an action.') from None
 
 
+async def recheck(actions, context):
+    """Before the model hears the turn again: a ping's own check, which covers its image, else the image's.
+    A tool checks before it acts (Actions.execute) and the reply before it goes out, so only model calls
+    need this. An outside ping's model calls check it themselves (see Fri.chat_once)."""
+    invitation = getattr(actions, 'invitation', None)
+    if invitation and (context.get('fence') or {}).get('invitation') is invitation:
+        return
+    if invitation:
+        await invitation.require_current()
+    await require_current_images(context, getattr(actions, 'event', None), checked=bool(invitation))
+
+
 async def _run(fri, actions, text, context, result, progress):
     receipts, seen, research = progress['receipts'], set(), None
     offered = dict(context['actions'])
     for _ in range(MAX_STEPS):
-        await require_current_images(context, getattr(actions, 'event', None))
         action = result.action
         if not action:
             break
@@ -49,13 +60,12 @@ async def _run(fri, actions, text, context, result, progress):
         if kind == 'gene_command' and not actions.command_requested(action):
             receipt = tool_receipt(kind, {'blocked': 'The music request expired or was not requested in this conversation. Ask briefly for a fresh complete request.'})
             receipts.append(receipt)
-            await require_current_images(context, getattr(actions, 'event', None))
+            await recheck(actions, context)
             try:
                 result = await fri.chat_once(text, {**context, 'actions': {}, 'action_result': receipt,
                     'action_results': list(receipts)})
             except commands.UserFeedbackCheckFailure:
                 result = ChatResult(reply=fallback(receipts), status='completed')
-            await require_current_images(context, getattr(actions, 'event', None))
             if not result.action:
                 return result, receipts, research
             return ChatResult(reply=fallback(receipts), status='completed'), receipts, research
@@ -69,7 +79,6 @@ async def _run(fri, actions, text, context, result, progress):
         progress['active'] = None
         receipt = tool_receipt(kind, receipt)
         receipts.append(receipt)
-        await require_current_images(context, getattr(actions, 'event', None))
         if receipt.get('clarification'):
             return ChatResult(reply=receipt['clarification']['question'], status='completed',
                               clarification=receipt['clarification']), receipts, research
@@ -112,13 +121,12 @@ async def _run(fri, actions, text, context, result, progress):
                 offered.pop('image_search', None)
         if len(seen) == MAX_STEPS:
             offered = {}
-        await require_current_images(context, getattr(actions, 'event', None))
+        await recheck(actions, context)
         try:
             result = await fri.chat_once(text, {**context, 'actions': offered,
                 'action_result': receipts[-1], 'action_results': list(receipts)})
         except commands.UserFeedbackCheckFailure:
             result = ChatResult(reply=fallback(receipts), status='completed')
-        await require_current_images(context, getattr(actions, 'event', None))
         if result.action and not offered:
             return ChatResult(reply=fallback(receipts), status='completed'), receipts, research
     if result.action:
