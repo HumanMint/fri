@@ -221,11 +221,12 @@ async def unchanged(context, event):
         return False
 
 
-async def looked_unchanged(context):
+async def looked_unchanged(context, checked=()):
     """Every post look() inspected still exists, by the same author, unedited, with the same images.
 
-    An invitation already refetches its own nearby posts this way, and their authors' privacy."""
-    invitations = []
+    An invitation already refetches its own nearby posts this way, and their authors' privacy;
+    `checked` holds invitations the caller has just confirmed current."""
+    invitations = list(checked)
     try:
         for read in context.get('image_reads', []):
             invitation, post = read['invitation'], read['event']
