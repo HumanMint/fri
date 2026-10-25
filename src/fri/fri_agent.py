@@ -17,7 +17,7 @@ from discord.ext import tasks
 
 from . import feedback as commands
 from .fri_addressing import addressed_text, explicit_mention, pinged
-from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SUMMARY, analyze
+from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SETTINGS_GATE, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_conversation import Bursts
 from .fri_errors import ControllerRejected
@@ -36,6 +36,7 @@ NO_MENTIONS = discord.AllowedMentions.none()
 GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
 REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long, and how many, delivered IDs are remembered.
 DEFERRED = object()  # The burst holding this message answers, or explains, for it.
+ERASED = 'erased'  # owner_control: the author erased their chats while it waited.
 
 
 class BehaviorPreview(PagedPreview):
@@ -86,6 +87,7 @@ class Agent:
         self.delivered = {}  # Discord message ID -> when it first arrived, oldest first.
         self.recording = {}  # (channel, member): set once a delivered reply is recorded.
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
+        self.direct = {}  # Discord message ID: when the direct path took it, so attention never picks it too.
         self.pending = {}
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
         self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
@@ -148,10 +150,12 @@ class Agent:
         except commands.UserFeedbackCheckFailure:
             LOG.warning('Agent usage queued for delivery')
 
-    async def run(self, role, instruction, data, schema, model=None, effort=None, *, images=()):
+    async def run(self, role, instruction, data, schema, model=None, effort=None, *, images=(), erased=None):
         model = model or self.config[role+'_model']
         effort = effort or self.config[role+'_effort']
         async with self.slots:
+            if erased and await erased():  # Erased while waiting for the slot: don't send it to the model.
+                return {}, {}, ERASED
             result, counters, status = await analyze(self.fri.chat, instruction, data, model, effort, schema,
                                                     **({'images': images} if images else {}))
         await self.record(role, model, effort, counters, status)
@@ -245,6 +249,27 @@ class Agent:
             data['historical_topics'] = profile.get('historical_topics', [])
         return data
 
+    async def settings_requested(self, text):
+        """A cheap yes/no on the attention model before the Sol settings call, since most owner lines
+        that match the settings words are just chat. A failed check falls back to the Sol call."""
+        model, effort = self.config['attention_model'], self.config['attention_effort']
+        # Outside self.slots: the owner's reply shouldn't queue behind a background investigation.
+        result, counters, status = await analyze(self.fri.chat,
+            'The verified owner sent this message to Fri, a Discord bot. Answer settings_change if they ask to change '
+            'or tune Fri\'s own behavior or settings: voice, personality, tone or sarcasm, what Fri pays attention to '
+            'or learns about (even when that names people, topics or other software), heartbeat, learning or meme '
+            'intervals, models or effort, meme reactions, reply checks, status or presence, cooldowns, or pausing, '
+            'resuming, enabling or disabling Fri or its features. Requests phrased as questions count. Answer other '
+            'only for banter, jokes, insults, questions that ask for no change, and requests for Fri to do or make '
+            'something right now (a meme, a search, help with someone\'s code or project). When unsure, answer '
+            'settings_change. Examples of settings_change: "be less sarcastic", "set heartbeat to 10 minutes", "learn '
+            'more about bob\'s music recs", "can you stop reacting to memes", "enable reply checks", "use sol for '
+            'summaries". Examples of other: "you\'d be a terrible model lol", "make a meme about bob", "use python for '
+            'this", "how do i set up my project".',
+            {'message': text[:4000]}, model, effort, SETTINGS_GATE)
+        await self.record('owner_settings', model, effort, counters, status)
+        return status != 'completed' or result.get('answer') == 'settings_change'
+
     async def owner_control(self, message, text):
         if message.author.id != self.fri.owner_id:
             return False
@@ -276,8 +301,8 @@ class Agent:
         change = re.search(r'\b(change|set|adjust|tune|tweak|pause|stop|resume|enable|disable|make|use|be|sound|speak|respond)\b', lower)
         if not subject or not (inspect or change):
             return False
-        self.state = state = await self.fri.api('GET', '/agent/state')
         if inspect and not change:
+            self.state = state = await self.fri.api('GET', '/agent/state')
             visible = {k: v for k, v in self.config.items() if not k.endswith('_notes')}
             text = 'Current behavior settings:\n```json\n'+json.dumps(visible, indent=2)+'\n```\n'
             text += ('Tell me what to change and I’ll show an Apply preview. Voice, attention and learning notes are editable; '
@@ -293,20 +318,44 @@ class Agent:
             else:
                 await message.reply(text[:1950], allowed_mentions=NO_MENTIONS)
             return True
-        if self.control_busy:
+        busy, self.control_busy = self.control_busy, True  # Reserve before any await: requests keep arrival order.
+        try:
+            return await self.settings_preview(message, text, busy)
+        finally:
+            if not busy:
+                self.control_busy = False
+
+    async def settings_preview(self, message, text, busy):
+        self.state = state = await self.fri.api('GET', '/agent/state')
+        user = message.author.id
+        scope = self.fri.workshop_id if message.guild is None else getattr(message.channel, 'parent_id', None) or message.channel.id
+        forgotten, revision = self.forgotten.get(user, 0), (await self.profile(scope, user))['revision']
+
+        async def erased():  # Checked after each wait: an erased message is dropped like any waiting one.
+            return self.forgotten.get(user, 0) != forgotten or (await self.profile(scope, user))['revision'] != revision
+
+        # Ordinary chat that happens to say "model" or "make" goes to the normal reply. While Fri is
+        # disabled the normal path can't answer anything, so only the settings call can help.
+        if self.config['enabled'] and not await self.settings_requested(text):
+            return ERASED if await erased() else False
+        if await erased():
+            return ERASED
+        if busy:
             await message.reply('one settings preview at a time, give me a moment.', allowed_mentions=NO_MENTIONS)
             return True
-        self.control_busy = True
         try:
-            result, _, status = await self.run('owner_settings',
-                'The verified owner is asking about Fri behavior. If they explicitly request a change, return minimal changes '
-                'to listed settings. Otherwise return no changes and a brief explanation. Never change permissions, channels, '
-                'owner identity, approval policy or anything outside the allowed settings. Preserve existing unrelated values. '
-                'For voice/personality/system prompt requests, edit voice_notes as style preferences only. '
-                'For heartbeat purpose, use attention_notes or learning_notes; intervals use numeric settings. '
-                'The owner must still click Apply. json_value is a JSON-encoded scalar. Do not claim the change is saved.',
-                {'request': text[:4000], 'current': dict(state['config']), 'ranges': RANGES}, SETTINGS,
-                model='gpt-6.1-sol', effort='high')
+            async with message.channel.typing():
+                result, _, status = await self.run('owner_settings',
+                    'The verified owner is asking about Fri behavior. If they explicitly request a change, return minimal changes '
+                    'to listed settings. Otherwise return no changes and a brief explanation. Never change permissions, channels, '
+                    'owner identity, approval policy or anything outside the allowed settings. Preserve existing unrelated values. '
+                    'For voice/personality/system prompt requests, edit voice_notes as style preferences only. '
+                    'For heartbeat purpose, use attention_notes or learning_notes; intervals use numeric settings. '
+                    'The owner must still click Apply. json_value is a JSON-encoded scalar. Do not claim the change is saved.',
+                    {'request': text[:4000], 'current': dict(state['config']), 'ranges': RANGES}, SETTINGS,
+                    model='gpt-6.1-sol', effort='high', erased=erased)
+            if status == ERASED or await erased():
+                return ERASED
             changes = {r['key']: json.loads(r['json_value']) for r in result.get('changes', [])}
             if status != 'completed' or set(changes)-set(DEFAULTS):
                 await message.reply('i couldn’t prepare that settings change. nothing was saved.', allowed_mentions=NO_MENTIONS)
@@ -321,8 +370,6 @@ class Agent:
                     await message.reply(view.content, view=view, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
         except (ValueError, KeyError, TypeError):
             await message.reply('i couldn’t parse that settings preview. nothing was saved.', allowed_mentions=NO_MENTIONS)
-        finally:
-            self.control_busy = False
         return True
 
     def miss(self, event, reason):
@@ -413,7 +460,10 @@ class Agent:
             return self.miss(message, 'no text')
         directed = text if dm else await addressed_text(message, self.fri.user.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
-        if owner_addressed and message.author.id == self.fri.owner_id and await self.owner_control(message, directed or text):
+        control = owner_addressed and message.author.id == self.fri.owner_id and await self.owner_control(message, directed or text)
+        if control == ERASED:
+            return self.miss(message, 'author privacy changed')
+        if control:
             return self.answered([message])
         privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
         owner_report = (owner_addressed and message.author.id == self.fri.owner_id and
@@ -433,6 +483,8 @@ class Agent:
             profile = await self.profile(parent, message.author.id)
             observed = profile.get('revision', 0)
             if profile['enabled'] and not privacy:
+                if directed is not None or channel == self.dedicated:
+                    self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                     'name': clean(message.author.display_name, 60), 'text': text[:500], 'at': time.time(),
                     'revision': profile.get('revision', 0), 'gene_error': False})
@@ -472,6 +524,7 @@ class Agent:
             return self.miss(message, 'not a visible user mention')
         # Short bursts share context and produce one response to the newest message.
         key = (channel, message.author.id)
+        self.answer_directly(message)
         try:
             self.bursts.add(message, arrived)
         except ValueError as exc:
@@ -508,6 +561,12 @@ class Agent:
             self.handling -= Counter(event.id for event in earlier)
             for event in earlier:
                 self.settle(event)
+
+    def answer_directly(self, message):
+        now = time.time()
+        if len(self.direct) > 200:  # Buffered rows expire after 15 minutes, so older marks are moot.
+            self.direct = {k: v for k, v in self.direct.items() if v > now-900}
+        self.direct[str(message.id)] = now
 
     def ambient_ready(self, channel, user):
         return (user not in self.fri.busy and (channel, user) not in self.pending and
@@ -744,7 +803,9 @@ class Agent:
         now = time.time()
         for channel_id in list(self.recent):
             records = await self.context_messages(channel_id, raw_errors=True)
-            fresh = [r for r in records if not r.get('fri') and int(r['id']) > self.seen.get(channel_id, 0)]
+            # Messages the direct path answers stay in records as context but aren't decided again here.
+            fresh = [r for r in records if not r.get('fri') and r['id'] not in self.direct and
+                     int(r['id']) > self.seen.get(channel_id, 0)]
             if not fresh or now-self.last_attention.get(channel_id, 0) < self.config['heartbeat_seconds']:
                 continue
             self.seen[channel_id] = max(int(r['id']) for r in fresh)

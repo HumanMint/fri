@@ -1,6 +1,7 @@
 import asyncio
+from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +15,7 @@ from compat_tests.test_fri_chat import CONTEXT
 from compat_tests.test_fri_runtime import event
 from fri import feedback as commands
 from fri.fri_actions import Actions
-from fri.fri_agent import BehaviorPreview
+from fri.fri_agent import ERASED, BehaviorPreview
 from fri.fri_chat import ChatResult
 
 
@@ -67,16 +68,212 @@ def test_preview_action_rechecks_owner_version_and_blocks_secrets(monkeypatch, t
     asyncio.run(scenario())
 
 
+def gate(monkeypatch, answer='settings_change', status='completed'):
+    """Stands in for the cheap settings check; the Sol settings call stays on agent.run."""
+    calls = []
+    async def analyze(chat, instruction, data, model, effort, schema, **kwargs):
+        calls.append({'data': data, 'model': model, 'effort': effort, 'answers': schema['properties']['answer']['enum']})
+        return ({'answer': answer} if status == 'completed' else {}), {'input_tokens': 40}, status
+    monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+    return calls
+
+
+def owner_message():
+    return SimpleNamespace(guild=None, author=SimpleNamespace(id=10), reply=AsyncMock(),
+                           channel=SimpleNamespace(typing=Mock(side_effect=nullcontext)))
+
+
+@pytest.mark.parametrize('text', ["you'd be a terrible model lol", 'make a meme about bob',
+                                  'i need to learn python, can you help me set up a project'])
+def test_owner_chat_with_settings_words_skips_the_sol_settings_call(monkeypatch, tmp_path, text):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value=agent.state)
+        calls = gate(monkeypatch, answer='other')
+        agent.run = AsyncMock()
+        agent.record = AsyncMock()
+        message = owner_message()
+        assert not await agent.owner_control(message, text)
+        agent.run.assert_not_awaited()
+        message.reply.assert_not_awaited()
+        message.channel.typing.assert_not_called()  # The normal reply path shows its own typing.
+        # Only the owner's words go to the attention model, never settings, notes or ranges.
+        assert calls == [{'data': {'message': text}, 'model': 'gpt-6-luna', 'effort': 'low',
+                          'answers': ['settings_change', 'other']}]
+        agent.record.assert_awaited_once_with('owner_settings', 'gpt-6-luna', 'low', {'input_tokens': 40}, 'completed')
+        await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('status', ['completed', 'failed'])
+def test_settings_request_or_failed_check_still_reaches_the_sol_preview(monkeypatch, tmp_path, status):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
+        calls = gate(monkeypatch, status=status)  # A failed check keeps the old path rather than losing the control.
+        agent.record = AsyncMock()
+        agent.run = AsyncMock(return_value=({'explanation': '', 'changes': [
+            {'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'))
+        message = owner_message()
+        assert await agent.owner_control(message, 'set heartbeat to 10 minutes')
+        kwargs = agent.run.await_args.kwargs
+        assert len(calls) == 1 and (kwargs['model'], kwargs['effort']) == ('gpt-6.1-sol', 'high')
+        message.channel.typing.assert_called_once()
+        assert message.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
+        await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('answer', ['other', 'settings_change'])
+def test_busy_settings_preview_no_longer_swallows_ordinary_owner_chat(monkeypatch, tmp_path, answer):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value=agent.state)
+        gate(monkeypatch, answer=answer)
+        agent.record = AsyncMock()
+        agent.run = AsyncMock()
+        agent.control_busy = True
+        message = owner_message()
+        handled = await agent.owner_control(message, 'you sound like an outdated model')
+        agent.run.assert_not_awaited()
+        if answer == 'other':
+            assert not handled and not message.reply.await_count  # Answered by the normal path instead.
+        else:
+            assert handled and 'one settings preview at a time' in message.reply.await_args.args[0]
+        assert agent.control_busy
+        await fri.close()
+    asyncio.run(scenario())
+
+
+def erase(agent, how):
+    if how == 'forget me':
+        agent.forget(10)
+    else:  # The panel, Gene or Red: only the privacy revision moves.
+        agent.profile.return_value = {'enabled': True, 'revision': 1, 'summary': ''}
+
+
+@pytest.mark.parametrize('how', ['forget me', 'panel'])
+@pytest.mark.parametrize('when', ['chat check', 'settings check', 'busy', 'slot wait', 'settings call'])
+def test_an_owner_line_erased_while_it_waits_gets_no_reply_or_preview(monkeypatch, tmp_path, how, when):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
+        agent.record = AsyncMock()
+        agent.control_busy = when == 'busy'
+        sol = []
+        async def analyze(chat, instruction, data, model, effort, schema, **kwargs):
+            if 'answer' in schema['properties']:  # The cheap check.
+                if when in ('chat check', 'settings check', 'busy'):
+                    erase(agent, how)
+                return {'answer': 'other' if when == 'chat check' else 'settings_change'}, {}, 'completed'
+            sol.append(model)
+            if when == 'settings call':
+                erase(agent, how)
+            return {'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        typing = asyncio.Event()
+        @asynccontextmanager
+        async def typed():
+            typing.set()
+            yield
+        message = owner_message()
+        message.channel.typing = typed
+        text = 'you sound like an outdated model' if when == 'chat check' else 'set heartbeat to 10 minutes'
+        if when == 'slot wait':
+            await agent.slots.acquire()  # A background investigation holds the model slot.
+            task = asyncio.create_task(agent.owner_control(message, text))
+            await typing.wait()  # Now queued behind it.
+            erase(agent, how)
+            agent.slots.release()
+            assert await task == ERASED
+        else:
+            assert await agent.owner_control(message, text) == ERASED
+        message.reply.assert_not_awaited()  # No preview, busy note or error about the erased line.
+        assert sol == (['gpt-6.1-sol'] if when == 'settings call' else [])
+        assert agent.control_busy == (when == 'busy')
+        await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('slow', ['state read', 'check'])
+def test_an_earlier_settings_request_keeps_its_turn(monkeypatch, tmp_path, slow):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        state = {**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3}
+        started, release = asyncio.Event(), asyncio.Event()
+        reads = []
+        async def api(method, path, payload=None):
+            reads.append(path)
+            if slow == 'state read' and len(reads) == 1:
+                started.set()
+                await release.wait()
+            return state
+        fri.api = api
+        agent.record = AsyncMock()
+        async def analyze(chat, instruction, data, *args, **kwargs):
+            if slow == 'check' and data['message'] == 'set heartbeat to 10 minutes':
+                started.set()
+                await release.wait()
+            return {'answer': 'settings_change'}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        agent.run = AsyncMock(return_value=({'explanation': '', 'changes': [
+            {'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'))
+        first, second = owner_message(), owner_message()
+        task = asyncio.create_task(agent.owner_control(first, 'set heartbeat to 10 minutes'))
+        try:
+            await started.wait()
+            assert await agent.owner_control(second, 'set the meme interval to 2 hours')
+            assert 'one settings preview at a time' in second.reply.await_args.args[0]
+            release.set()
+            assert await task
+            assert first.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
+            agent.run.assert_awaited_once()
+            assert not agent.control_busy
+        finally:
+            release.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_disabled_fri_skips_the_check_since_only_the_settings_call_can_answer(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': False}, 'version': 3})
+        calls = gate(monkeypatch, answer='other')
+        agent.record = AsyncMock()
+        agent.run = AsyncMock(return_value=({'explanation': '', 'changes': [
+            {'key': 'enabled', 'json_value': 'true'}]}, {}, 'completed'))
+        message = owner_message()
+        assert await agent.owner_control(message, 'resume your heartbeat')
+        assert calls == []
+        assert message.reply.await_args.kwargs['view'].changes == {'enabled': True}
+        await fri.close()
+    asyncio.run(scenario())
+
+
+def test_settings_check_does_not_wait_behind_background_model_work(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        gate(monkeypatch, answer='other')
+        agent.record = AsyncMock()
+        async with agent.slots:  # A background investigation holds the model slot.
+            assert not await asyncio.wait_for(agent.settings_requested('make it rain'), 1)
+        await fri.close()
+    asyncio.run(scenario())
+
+
 def test_direct_tone_preview_keeps_original_version_during_background_refresh(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, _, _ = harness(monkeypatch, tmp_path)
-        initial = {**agent.state, 'config': dict(DEFAULTS), 'version': 7}
+        initial = {**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 7}
         fri.api = AsyncMock(return_value=initial)
+        gate(monkeypatch)
+        agent.record = AsyncMock()
         async def prepare(*args, **kwargs):
-            agent.state = {**initial, 'version': 8, 'config': {**DEFAULTS, 'voice_notes': 'Newer preference.'}}
+            agent.state = {**initial, 'version': 8, 'config': {**DEFAULTS, 'enabled': True, 'voice_notes': 'Newer preference.'}}
             return {'changes': [{'key': 'voice_notes', 'json_value': '"Sharper dry humor."'}]}, {}, 'completed'
         agent.run = AsyncMock(side_effect=prepare)
-        message = SimpleNamespace(guild=None, author=SimpleNamespace(id=10), reply=AsyncMock())
+        message = owner_message()
         assert await agent.owner_control(message, 'i want to tune your sarcasm and tone down the assistant tone')
         sent = message.reply.await_args
         assert 'Sharper dry humor.' in sent.args[0] and '```' not in sent.args[0]

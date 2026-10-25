@@ -291,6 +291,26 @@ def test_an_erasure_during_the_burst_wait_names_the_mention(monkeypatch, tmp_pat
     asyncio.run(scenario())
 
 
+def test_an_erasure_during_the_owner_settings_check_names_the_mention(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you sound like an outdated model', user=10)
+        async def analyze(*args, **kwargs):
+            agent.forget(10)
+            return {'answer': 'other'}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_cooldown_burst_names_the_mention_it_answers_for(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
