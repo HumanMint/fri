@@ -33,7 +33,7 @@ def picture(channel, name, kind='image/png'):
 
 def loads(monkeypatch, fail=()):
     """Each image loads as a data URL naming its file, so tests can see which ones Fri looked at."""
-    async def load(url, channel):
+    async def load(url, channel, **_):
         if url.rsplit('/', 1)[1] in fail:
             raise httpx.ConnectError('cdn down')
         return 'data:image/png;base64,'+url.rsplit('/', 1)[1]
@@ -415,7 +415,7 @@ def test_a_channel_they_lose_mid_read_never_reaches_the_next_model_request(monke
         async def history(**kwargs):
             yield meme
         general.history, general.fetch_message = history, AsyncMock(return_value=meme)
-        async def load(url, channel):  # They lose the channel while its images download.
+        async def load(url, channel, **_):  # They lose the channel while its images download.
             if lost == 'access':
                 general.permissions_for = lambda who: (discord.Permissions.none() if getattr(who, 'id', None) == 20
                                                        else discord.Permissions.all())
