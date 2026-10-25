@@ -200,7 +200,9 @@ the same words, or an excerpt containing or contained in them, wherever a single
 (under any category), and stops background learning from using anything the member said before the
 edit, anywhere in the server: no note, archive observation or channel summary comes from those
 messages, however it's phrased. A message sent before the edit but answered after it gets its reply
-and keeps nothing. "Forget me" is unchanged and erases everything. At
+and keeps nothing: Fri's short-lived channel chatter and reply echoes skip it too. Whether a message
+counts as said in front of everyone is decided when Fri first sees it, so a channel opened while Fri
+replies can't widen it. "Forget me" is unchanged and erases everything. At
 startup Fri logs how many configured channels are readable by everyone. If that's none, profiles
 never fill, and the server's channel permissions are the thing to look at.
 

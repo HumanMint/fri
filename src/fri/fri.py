@@ -146,10 +146,22 @@ class Fri(discord.Client):
         self.session = None
         self.agent = None
         self.capabilities = frozenset()
+        self.heard = {}  # Message id: whether everyone could read its channel when Fri first saw it.
 
     @property
     def profiles(self):
         return PROFILES in self.capabilities
+
+    def hear(self, message):
+        """Whether everyone could read this message where it was sent, decided once, when Fri first sees it.
+
+        A channel opened while Fri waits or writes its reply can't widen what was said while it was closed.
+        """
+        if message.id not in self.heard:
+            if len(self.heard) >= 1000:
+                del self.heard[next(iter(self.heard))]
+            self.heard[message.id] = server_wide(message.channel)
+        return self.heard[message.id]
 
     def first_memory(self, saved):
         """Where the first kept note will show, once the controller keeps member profiles."""
@@ -254,6 +266,8 @@ class Fri(discord.Client):
         if invitation and invitation.outside:
             return await self.invited_talk(invitation, text)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
+        heard = [self.hear(item) for item in (event, *(row[1] for row in burst))
+                 if getattr(item, 'guild', None) is not None]  # Before anything here waits.
         channel = self.get_channel(channel_id) if self.agent else None
         source_channel = (getattr(channel, 'parent_id', None) or channel_id) if visibility == 'public' and self.agent else self.workshop_id
         scope = {'guild_id': str(guild_id), 'user_id': str(user_id), 'channel_id': str(source_channel),
@@ -293,9 +307,10 @@ class Fri(discord.Client):
             async with self.chat_slots:
                 context = attributed(await self.api('POST', '/chat/context', profiled(self, scope)))
                 if self.profiles:
-                    # Decided now, from Discord's permissions: only an everyone-readable channel reaches the
-                    # member's profile and their other conversations. Private conversations never do.
-                    context['audience'] = ('server' if visibility == 'public' and
+                    # From Discord's permissions: only a channel everyone could read when each message
+                    # arrived, and still can, reaches the member's profile and their other conversations.
+                    # Private conversations never do.
+                    context['audience'] = ('server' if visibility == 'public' and heard and all(heard) and
                                            server_wide(getattr(event, 'channel', None) or channel) else 'conversation')
                     context['elsewhere'] = self.elsewhere(context.get('elsewhere', []), guild_id)
                 else:

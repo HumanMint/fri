@@ -36,6 +36,11 @@ def server_wide(channel):
         return False
 
 
+def before_removal(message_id, profile):
+    """Sent before the member last edited their memory, so Fri keeps it nowhere (the controller's removed_at)."""
+    return discord.utils.snowflake_time(int(message_id)).timestamp() <= (profile.get('removed_at') or 0)
+
+
 def personal_note(candidate, text):
     """Keep a short exact self-disclosure, not a model-written biography/instruction."""
     if not isinstance(candidate, dict) or candidate.get('category') not in CATEGORIES:

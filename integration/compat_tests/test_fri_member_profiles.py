@@ -6,7 +6,7 @@ import json
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 import httpx
@@ -19,6 +19,7 @@ from gene.fri_memory_store import edit, entries, save
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import CONTEXT, response_event
+from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_runtime import configured
 from fri.fri import FIRST_HERE, FIRST_MEMORY, FIRST_PROFILE, NO_MENTIONS
 from fri.fri_agent import Agent
@@ -238,17 +239,62 @@ def test_a_removed_preference_stays_gone_from_queued_messages_and_other_excerpts
             with w.store.connection() as db:  # Background learning kept a longer excerpt in #gaming.
                 save(db, '123', 'public:2', '20', ('hobbies', 'I like Minecraft modpacks'), time.time())
             listed = entries(w.store, '123', 'private:900', '20')
-            removal = {'kind': 'discord_interaction', 'id': str(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc))),
-                       'user_id': '20', 'display_name': 'friend', 'channel_id': '900', 'guild_id': None}
             profile = next(row for row in listed['entries'] if row['scope'] == 'server')
-            edit(w.store, '123', 'private:900', '20', profile['id'], listed['revision'], removal, 'remove')
+            edit(w.store, '123', 'private:900', '20', profile['id'], listed['revision'], dm_control(), 'remove')
             # Sent before the removal, answered after it: Fri replies but keeps nothing.
             result, saved, _ = await w.say(GENERAL, 'fri I like Minecraft modpacks', 'ok',
                                            note('I like Minecraft modpacks', 'hobbies'), age=3)
-            assert result.reply == 'ok' and saved == {'ok': True, 'first_memory': False}
+            assert result.reply == 'ok' and saved == {'ok': True, 'first_memory': False, 'kept': False}
             await w.say(GAMING, 'fri what should i play')
             assert 'Minecraft' not in json.dumps(model_context(w), default=str)
             assert entries(w.store, '123', 'private:900', '20')['entries'] == []
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def dm_control():
+    return {'kind': 'discord_interaction', 'id': str(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc))),
+            'user_id': '20', 'display_name': 'friend', 'channel_id': '900', 'guild_id': None}
+
+
+def test_a_message_from_before_a_removal_stays_out_of_channel_chatter(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        with store.connection() as db:
+            save(db, '123', 'server', '20', ('games', 'I like Minecraft'), time.time())
+        early = message('fri I like Minecraft modpacks', age=3)  # Waiting while the member edits their memory.
+        removed = entries(store, '123', 'private:900', '20')['entries'][0]
+        edit(store, '123', 'private:900', '20', removed['id'], 0, dm_control(), 'remove')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='Minecraft modpacks, endless')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(early)
+                early.reply.assert_awaited_once()  # Answered, then kept nowhere: not the message, not the reply.
+                assert list(agent.recent[1]) == []
+                await agent.handle(message('fri what is everyone on about', user=30))
+            assert 'Minecraft' not in json.dumps(fri.chat_once.await_args.args[1], default=str)
+        finally:
+            await fri.close()
+    run(scenario)
+
+
+def test_a_channel_opened_mid_reply_keeps_what_was_said_while_closed(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        controller = w.fri.api
+
+        async def api(method, path, payload=None):
+            if path == '/chat/context':
+                w.readable[GENERAL] = True  # Opened to everyone while Fri reads its context.
+            return await controller(method, path, payload)
+        w.fri.api = api
+        w.readable[GENERAL] = False
+        try:
+            _, saved, _ = await w.say(GENERAL, 'fri I like private jazz', 'noted', note('I like private jazz', 'music'))
+            assert saved['memory_scope'] == 'conversation'
+            await w.say(GAMING, 'fri recommend me something')
+            assert 'private jazz' not in json.dumps(model_context(w), default=str)
         finally:
             await w.fri.close()
     run(scenario)
