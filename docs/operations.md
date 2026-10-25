@@ -195,8 +195,7 @@ the turn inherits their provenance, since a member's words can repeat someone el
 removes what was built on them here too.
 "What do you remember about me?" in public lists only what that channel can see. In a DM it lists
 every note with where it shows, and My memory there edits any of them; the panel shows the first 25.
-New wording typed into My memory stays private: an edited profile or channel note moves to the
-conversation where it was edited, and the panel says so.
+An edited note keeps its place: the new wording shows wherever the note did, as its label says.
 Editing a profile note clears the member's saved chats and research receipts across the server, removes
 the same words, or an excerpt containing or contained in them, wherever a single channel kept them
 (under any category), and stops background learning from using anything the member said before the

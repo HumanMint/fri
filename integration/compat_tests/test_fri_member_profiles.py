@@ -115,7 +115,10 @@ def model(w, respond):
     """Fri's own model call, with the model itself replaced."""
     async def call(text, context):
         return await Fri.chat_once(w.fri, text, context)
-    w.fri.chat = SimpleNamespace(respond=respond)
+
+    async def signed_in(text, context, headers=None):
+        return await respond(text, context)
+    w.fri.chat = SimpleNamespace(respond=signed_in, headers=AsyncMock(return_value={'Authorization': 'Bearer test'}))
     w.fri.chat_once = AsyncMock(side_effect=call)
 
 
@@ -358,6 +361,33 @@ def test_a_channel_closed_while_fri_gathers_context_drops_out_of_elsewhere(monke
     run(scenario)
 
 
+def test_a_channel_closed_while_fri_signs_in_drops_out_of_elsewhere(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like mellow jazz')
+            sent = []
+
+            def handler(request):
+                sent.append(json.loads(json.loads(request.content)['input'][-1]['content']))
+                return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(
+                    {'reply': 'sure', 'request_draft': None})))+'\n\n')
+
+            def access_token():
+                w.readable[GENERAL] = False  # Closed while Fri signs in, after it gathered context.
+                return 'test'
+            w.fri.chat = Chat(SimpleNamespace(access_token=access_token), httpx.MockTransport(handler))
+
+            async def call(text, context):
+                return await Fri.chat_once(w.fri, text, context)
+            w.fri.chat_once = AsyncMock(side_effect=call)
+            await w.say(GAMING, 'fri recommend me something')
+            assert sent and sent[-1]['with_you_elsewhere_untrusted'] == []
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
 def test_a_channel_closed_while_fri_replies_keeps_the_note_there(monkeypatch, tmp_path):
     async def scenario():
         w = world(monkeypatch, tmp_path)
@@ -521,7 +551,8 @@ def test_panel_labels_notes_and_stays_inside_discords_limits(monkeypatch, tmp_pa
     run(scenario)
 
 
-def test_wording_edited_in_a_dm_stays_in_the_dm(monkeypatch, tmp_path):
+@pytest.mark.parametrize('where', [DM, GENERAL])
+def test_an_edited_profile_note_keeps_following_the_member(monkeypatch, tmp_path, where):
     async def scenario():
         w = world(monkeypatch, tmp_path)
         shown = AsyncMock()
@@ -529,17 +560,21 @@ def test_wording_edited_in_a_dm_stays_in_the_dm(monkeypatch, tmp_path):
         monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
         try:
             await w.say(GENERAL, 'fri I like chess', 'noted', note('I like chess'))
-            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
-                                     'conversation_id': 'private:900'})
+            # My memory in DMs, or opened from "what do you remember about me?" in #general.
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456' if where == DM else '1',
+                                     'conversation_id': 'private:900' if where == DM else 'public:1'})
             state = await w.fri.api('POST', '/chat/memory/notes', scope)
             assert [row['scope'] for row in state['entries']] == ['server']
             modal = EditMemory(MemoryView(w.fri, scope, state, selected=state['entries'][0]['id']))
             modal.preference._value = 'I prefer quiet conversations'
-            await modal.on_submit(Mock(spec=discord.Interaction, id=int(dm_control()['id']), guild_id=None,
-                                       channel_id=DM, user=SimpleNamespace(id=20, display_name='friend')))
-            assert 'stays private, so it now lives only here' in shown.await_args.kwargs['embed'].description
+            await modal.on_submit(Mock(spec=discord.Interaction, id=int(dm_control()['id']),
+                                       guild_id=None if where == DM else 123, channel_id=where,
+                                       user=SimpleNamespace(id=20, display_name='friend')))
+            body = shown.await_args.kwargs['embed'].description
+            assert 'Updated that preference.' in body and 'across the server' in body
             await w.say(GAMING, 'fri recommend me something')
-            assert 'quiet conversations' not in json.dumps(model_context(w), default=str)
+            assert model_context(w)['personal_memory']['notes'] == [
+                {'category': 'games', 'evidence': 'I prefer quiet conversations', 'scope': 'server'}]
         finally:
             await w.fri.close()
     run(scenario)

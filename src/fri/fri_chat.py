@@ -424,7 +424,8 @@ class Chat:
                 raise SubscriptionError('The subscription model list could not be refreshed. Try reconnecting Fri.')
             return sorted({m['slug'] for m in response.json()['models'] if m.get('visibility') == 'list'})
 
-    async def respond(self, text, context):
+    async def respond(self, text, context, *, headers=None):
+        """headers: already signed in, so the request goes out as built, without waiting first."""
         text = clean(text, 4000)
         result = ChatResult()
         text_parts = {}
@@ -490,7 +491,7 @@ class Chat:
             async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30), trust_env=False,
                                          transport=self.transport) as client:
                 async with client.stream('POST', RESOURCE + '/responses', json=payload,
-                                         headers=await self.headers()) as response:
+                                         headers=headers or await self.headers()) as response:
                     answered = True
                     if response.status_code != 200:
                         exempt = response.status_code in (401, 403, 429)
