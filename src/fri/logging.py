@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import os
 
+import discord
+
 
 def install_secret_filter():
     original = logging.getLogRecordFactory()
@@ -21,4 +23,15 @@ def install_secret_filter():
         return record
 
     logging.setLogRecordFactory(factory)
+
+
+def configure():
+    """Fri's and discord's info lines, and every library's warnings, go to stderr in discord's format.
+
+    discord.py's default only sets up its own logger, which left Fri's info lines with nowhere to go.
+    Other libraries stay at warnings: httpx alone logs every controller request at info.
+    """
+    discord.utils.setup_logging(level=logging.WARNING)
+    for name in ('discord', 'fri'):
+        logging.getLogger(name).setLevel(logging.INFO)
 

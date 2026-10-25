@@ -13,7 +13,7 @@ import pytest
 from compat_tests.conftest import proposed
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_mentions import environment
-from fri.fri_chat import Chat, ChatResult
+from fri.fri_chat import Chat, ChatResult, request_view
 from fri.fri_panel import InputModal
 from fri.fri_request_eval import evaluate as evaluate_requests
 from fri.fri_requests import DraftView
@@ -83,9 +83,21 @@ def test_the_model_sees_dates_and_withdrawals_not_raw_rows(store):
     chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
     asyncio.run(chat.respond('fri what happened to my request', context))
     [row] = json.loads(sent[0]['input'][-1]['content'])['your_gene_requests']
-    assert row['state'] == 'rejected' and row['withdrawn'] is True and 'title' not in row
+    # Gene ends it as rejected; the model must not read that as the owner turning it down.
+    assert row['state'] == 'withdrawn' and 'withdrawn' not in row and 'title' not in row
     assert dt.datetime.fromisoformat(row['created']).tzinfo == dt.timezone.utc
-    assert 'withdrawn means' in sent[0]['instructions']
+    assert "the owner didn't turn it down, so never call it rejected" in ' '.join(sent[0]['instructions'].split())
+
+
+def test_a_request_withdrawn_after_it_shipped_keeps_its_state():
+    row = {'id': 'a1b2c3d4e5f6', 'kind': 'feature', 'state': 'deployed', 'created': 1.0, 'updated': 2.0,
+           'withdrawn': True}  # Gene keeps a finished request's state when a privacy change removes its text.
+    assert request_view(row)['state'] == 'deployed' and request_view(row)['withdrawn'] is True
+
+
+def test_a_request_the_owner_rejected_stays_rejected():
+    row = {'id': 'a1b2c3d4e5f6', 'kind': 'feature', 'state': 'rejected', 'created': 1.0, 'updated': 2.0}
+    assert request_view(row)['state'] == 'rejected' and 'withdrawn' not in request_view(row)
 
 
 def careful_answer(text, rows):

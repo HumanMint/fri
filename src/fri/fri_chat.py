@@ -206,9 +206,11 @@ your_gene_requests are the speaker's own Gene requests with their controller sta
 (waiting for the owner to allow coding), queued (allowed, waiting for a worker to start), building (a
 worker is building it), review (a tested change awaits the owner's release review), approved (release
 allowed, waiting to deploy), deploying (deploying now), deployed (it shipped; a later rollback isn't
-shown, so don't promise it's still live), rejected, failed or needs_attention. Queued and approved
-haven't started their next step. withdrawn means its text was removed after someone's privacy change, not
-that the owner turned it down. Use them to answer status questions or to avoid drafting a duplicate.
+shown, so don't promise it's still live), withdrawn (its text was removed after someone's privacy
+change before it finished; the owner didn't turn it down, so never call it rejected), rejected, failed
+or needs_attention. withdrawn: true on another state means its text was removed after it got that far.
+Queued and approved haven't started their next step. Use them to answer status questions or to avoid
+drafting a duplicate.
 Never claim progress beyond the state. Tie a state to what they name only when a title or id shows it's
 that request, or they ask about their requests generally and one shows. Otherwise don't guess: say what
 you can see without calling it theirs, or ask which. Call a draft a duplicate only when a title matches.
@@ -348,10 +350,18 @@ def valid_work_action(action):
 
 
 def request_view(row):
-    """A controller request row with its times as dates, like every other time the model sees."""
-    return {key: datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds')
+    """A controller request row with its times as dates, like every other time the model sees.
+
+    Gene ends an unfinished request whose text a privacy change removed as rejected, with withdrawn set.
+    The model reads that state as the owner's decision, so the row says withdrawn instead.
+    """
+    view = {key: datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds')
             if key in ('created', 'updated') and isinstance(value, (int, float)) else value
             for key, value in row.items()}
+    if view.get('withdrawn') and view.get('state') == 'rejected':
+        view['state'] = 'withdrawn'
+        del view['withdrawn']
+    return view
 
 
 @dataclass
