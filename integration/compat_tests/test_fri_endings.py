@@ -192,10 +192,10 @@ def test_obvious_closing_avoids_model_and_records_typed_decision(monkeypatch):
 
 
 def delivery():
+    from fri.fri_notices import Busy, WaitingNotices
     fri = SimpleNamespace(guild_id=123, owner_id=10, workshop_id=456, user=SimpleNamespace(id=99),
-                          record_turn=AsyncMock())
-    from fri.fri_notices import WaitingNotices
-    fri.waiting_notices = WaitingNotices(set())
+                          record_turn=AsyncMock(), busy=Busy(), api=AsyncMock(return_value={'revision': 0}))
+    fri.waiting_notices = WaitingNotices(fri.busy)
     agent = Agent(fri)
     agent.config['enabled'] = True
     permissions = SimpleNamespace(view_channel=True, read_message_history=True, add_reactions=True, send_messages=True)
