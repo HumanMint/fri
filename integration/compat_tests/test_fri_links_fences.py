@@ -3,18 +3,21 @@
 import asyncio
 import copy
 import datetime as dt
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import discord
+import httpx
 import pytest
 
+from compat_tests.test_fri_chat import response_event
 from compat_tests.test_fri_looking import loads, picture
-from compat_tests.test_fri_member_profiles import DM, GAMING, GENERAL, world
+from compat_tests.test_fri_member_profiles import DM, GAMING, GENERAL, STAFF, world
 from fri import feedback as commands
-from fri.fri import Fri
+from fri.fri import LINKED, Fri
 from fri.fri_actions import Actions
-from fri.fri_chat import ChatResult
+from fri.fri_chat import Chat, ChatResult
 from fri.fri_conversation import evidence, unchanged
 from fri.fri_images import image_context, look, looked_unchanged
 from fri.fri_memory import open_to_everyone
@@ -231,6 +234,62 @@ def test_fri_can_look_at_its_own_linked_picture(monkeypatch, tmp_path):
             actions = Actions(w.fri.agent, 20, GENERAL, True)
             actions.event, actions.conversation, actions.image_context = event, context, image_context(context)
             assert await actions.valid() and await unchanged(w.fri.agent, event, context)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('here,there', [(DM, STAFF), (GENERAL, GAMING), (GENERAL, GENERAL)])
+def test_an_answer_about_a_post_linked_from_another_channel_is_saved_as_a_breadcrumb(monkeypatch, tmp_path, here, there):
+    """Its saved text can't carry that channel's access, so losing the channel can't replay it later."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        everyone_reads(w, GENERAL, GAMING)
+        quote = 'the code word is sapphire'
+        target = w.message(there, quote, user=30, age=60)
+        hosted(w, there, target)
+        link = f'https://discord.com/channels/123/{there}/{target.id}'
+        try:
+            first, saved, _ = await w.say(here, 'fri quote '+link, reply=quote)
+            assert saved['ok'] and first.reply == quote  # The answer itself still goes out.
+            same = there == here
+            stored = [body for path, body in w.calls if path == '/chat/turn'][-1]
+            assert stored['reply'] == (quote if same else LINKED) and stored['verbatim'] == same
+            before = w.channels[there].permissions_for
+            w.channels[there].permissions_for = lambda who: (
+                discord.Permissions.none() if getattr(who, 'id', None) == 20 else before(who))
+            seen = []
+
+            def transport(request):
+                seen.append(json.loads(request.content))
+                return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(
+                    {'reply': 'nah', 'request_draft': None})))+'\n\n')
+            w.fri.chat = Chat(SimpleNamespace(access_token=lambda: 'synthetic'), httpx.MockTransport(transport))
+
+            async def call(text, context):
+                return await Fri.chat_once(w.fri, text, context)
+            w.fri.chat_once = AsyncMock(side_effect=call)
+            if same:
+                return  # Losing this channel means not talking here at all.
+            await w.say(here, 'fri repeat your last answer')
+            history = [message['content'] for message in seen[0]['input'] if message['role'] == 'assistant']
+            assert LINKED in history and not any(quote in text for text in history)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_link_to_a_channel_discord_now_calls_age_restricted_opens_nothing(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        target = w.message(GAMING, 'not for here', user=30, age=60)
+        hosted(w, GAMING, target)
+        current = copy.copy(w.channels[GAMING])
+        current.nsfw, current.is_nsfw = True, lambda: True  # The cached channel still says it isn't.
+        w.channels[GENERAL].guild.fetch_channel.side_effect = lambda cid: current if cid == GAMING else w.channels[cid]
+        event = w.message(DM, f'fri quote https://discord.com/channels/123/{GAMING}/{target.id}')
+        try:
+            assert (await evidence(w.fri.agent, event, []))['reply_target'] == []
         finally:
             await w.fri.close()
     asyncio.run(scenario())

@@ -196,7 +196,8 @@ async def reply_target(agent, message, posts=None):
             continue
         now = await fetched(linked)
         # Said in a server channel, it must be one everyone in the server can read anyway, or this one.
-        if now is None or (message.guild and linked.id != channel.id and not open_to_everyone(now)):
+        if now is None or age_restricted(now) or (message.guild and linked.id != channel.id and
+                                                  not open_to_everyone(now)):
             continue
         if not await readable(agent, message, linked, now):
             continue
@@ -211,10 +212,14 @@ def in_scope(agent, channel):
     parent = channel.parent if isinstance(channel, discord.Thread) else channel
     if isinstance(channel, discord.Thread) and channel.is_private():
         return False
-    is_nsfw = getattr(parent, 'is_nsfw', None)
-    if parent is None or getattr(parent, 'nsfw', False) or (callable(is_nsfw) and is_nsfw()):
+    if parent is None or age_restricted(parent):
         return False
     return agent.allowed(channel) or str(parent.id) in agent.state.get('history_channels', [])
+
+
+def age_restricted(channel):
+    is_nsfw = getattr(channel, 'is_nsfw', None)
+    return bool(getattr(channel, 'nsfw', False) or (callable(is_nsfw) and is_nsfw()))
 
 
 async def readable(agent, message, channel, now=None):
