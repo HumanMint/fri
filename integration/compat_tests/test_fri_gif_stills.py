@@ -38,12 +38,24 @@ def serve(body, mime):
 
 
 def test_only_discords_own_proxy_serves_a_gif_links_preview():
-    assert allowed_url(PREVIEW, 1)
+    assert allowed_url(PREVIEW, 1, previews=True)
     assert allowed_url('https://media.discordapp.net/external/abc/x.png', 1)
     for url in ('https://media.tenor.com/x/dance.png', 'https://images-ext-1.discordapp.net.evil.test/external/x',
                 'https://images-ext-12.discordapp.net/external/x', 'https://images-ext-1.discordapp.net/attachments/1/x',
                 'http://images-ext-1.discordapp.net/external/x'):
-        assert not allowed_url(url, 1)
+        assert not allowed_url(url, 1, previews=True)
+    # The meme reactions (and anything else that doesn't ask for previews) keep their old reach.
+    assert not allowed_url(PREVIEW, 1)
+
+
+def test_the_meme_reactions_never_fetch_from_the_preview_proxy(monkeypatch, tmp_path):
+    async def scenario():
+        fetched = []
+        transport = httpx.MockTransport(lambda request: fetched.append(request) or httpx.Response(500))
+        with pytest.raises(ValueError, match='outside the Discord CDN scope'):
+            await load_image(PREVIEW, 1, transport=transport)  # How fri_memes calls it.
+        assert fetched == []
+    asyncio.run(scenario())
 
 
 def test_a_gif_links_preview_counts_only_when_asked_and_an_uploaded_gif_never_does():
@@ -60,7 +72,7 @@ def test_an_animated_preview_is_refused_without_decoding(fmt, mime):
         out = io.BytesIO()
         frames[0].save(out, fmt, save_all=True, append_images=frames[1:], duration=100, loop=0)
         with pytest.raises(ValueError):
-            await load_image(PREVIEW, 1, transport=serve(out.getvalue(), mime))
+            await load_image(PREVIEW, 1, transport=serve(out.getvalue(), mime), previews=True)
     asyncio.run(scenario())
 
 
