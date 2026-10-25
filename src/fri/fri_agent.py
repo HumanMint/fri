@@ -280,15 +280,18 @@ class Agent:
         """A member's edit shows in Fri's live view as they left it. Fri's and Gene's rows keep what they
         said, and in-flight bursts and reply fences keep comparing against what arrived."""
         rows = self.recent.get(channel)
+        author = getattr(getattr(message, 'author', None), 'id', None)
         for row in list(rows or ()):
-            if (row['id'] != str(message.id) or row['gene_error'] or row.get('fri') or
-                    row['user_id'] != str(message.author.id)):
+            if row['id'] != str(message.id) or row['gene_error'] or row.get('fri'):
                 continue
-            text = clean(message.content, 4000)[:500]  # As receive() stores it.
-            if text or (row.get('attachments') and message.attachments):
-                row['text'] = text
-            else:
+            if author is None:  # A partial update can't show what they left, so the row goes.
                 rows.remove(row)
+            elif row['user_id'] == str(author):
+                text = clean(getattr(message, 'content', '') or '', 4000)[:500]  # As receive() stores it.
+                if text or (row.get('attachments') and getattr(message, 'attachments', None)):
+                    row['text'] = text
+                else:
+                    rows.remove(row)
 
     def forget(self, user, erased=False):
         """The member used a privacy control through Fri: their messages still waiting for a reply
@@ -873,7 +876,9 @@ class Agent:
             if (profile := await self.incoming(message, invitation, parent, forgotten, control=bool(privacy))) is None:
                 return
             observed = profile.get('revision', 0)
-            if profile['enabled'] and not privacy and not before_removal(message.id, profile):
+            # Not if it was deleted while its profile was read.
+            if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
+                    message.id not in self.unsent):
                 if directed is not None or channel == self.dedicated:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
@@ -1096,10 +1101,20 @@ class Agent:
             missed('message deleted')
             await self.fri.waiting_notices.clear(message.author.id)
             return
+        if result.response_kind not in ('react', 'quiet') and self.unsent.keys() & result.shown:
+            # Someone took back a message the model was shown: the reply may repeat it.
+            if ambient:
+                return missed('nearby message deleted')
+            return await self.withheld(message, events, 'nearby message changed', invitation,
+                                       fenced=since is not None, logged='nearby message deleted')
         if result.response_kind in ('react', 'quiet'):
             if (result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(
                     message, result.reaction, (lambda: self.erasure(message.author.id, *since)) if since else None)):
                 self.answered(events)
+            elif any(event.id in self.unsent for event in events):  # While the reaction waited its turn.
+                missed('message deleted')
+                await self.fri.waiting_notices.clear(message.author.id)
+                return
             else:
                 missed('reaction withheld' if result.response_kind == 'react' else 'chose quiet')
             await self.fri.record_turn(result)  # Records the decision, never claimed reaction delivery.
@@ -1155,7 +1170,8 @@ class Agent:
             saved = await self.fri.record_turn(result, sent)
             # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory,
             # or a save that failed, whose reply may carry exactly what the controller would have refused.
-            if echo and saved is not None and saved.get('kept', True) and message.guild and self.allowed(message.channel):
+            if (echo and saved is not None and saved.get('kept', True) and message.guild and
+                    self.allowed(message.channel) and sent.id not in self.unsent):  # Deleted while it saved.
                 text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']  # As shown.
                 self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
                     'name': 'Fri', 'text': clean(text, 500), 'at': time.time(), 'gene_error': False,

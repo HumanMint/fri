@@ -341,7 +341,20 @@ class Fri(discord.Client):
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
             if fence:  # Checked again before delivery.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
+            if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
+                source = context.get('source') or {}
+                asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),
+                         *(row['source']['id'] for row in context.get('message_burst', []))]
+                if any(int(mid) in self.agent.unsent for mid in asked):
+                    raise GateClosed('message deleted')
+                if 'recent' in context:
+                    context['recent'] = [row for row in context['recent']
+                                         if row.get('gene_error') or int(row['id']) not in self.agent.unsent]
+                    seen.update(int(row['id']) for row in context['recent'] if not row.get('gene_error'))
+        # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
+        seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
         result = await self.chat.respond(text, context, ready=ready)
+        result.shown = seen
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
             'attempt_id': attempt, 'model': context['model'], 'effort': context['effort'],
@@ -546,6 +559,7 @@ class Fri(discord.Client):
                         raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
+                    result.shown = context['fence'].get('messages', set())  # A summary of the steps may still draw on them.
                     if actions.private_evidence:
                         result.draft, result.notes = None, []
                     if invitation:
