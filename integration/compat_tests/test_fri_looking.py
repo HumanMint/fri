@@ -22,7 +22,6 @@ from fri.fri_chat import Chat, ChatResult
 from fri.fri_errors import GateClosed
 from fri.fri_eval import evaluate, sass_cases
 from fri.fri_images import MAX_IMAGES, look, media, require_current
-from fri.fri_meme_media import Still
 
 ASK = '<@99> whats ur favorite meme out of the memes above'
 
@@ -34,11 +33,10 @@ def picture(channel, name, kind='image/png'):
 
 def loads(monkeypatch, fail=()):
     """Each image loads as a data URL naming its file, so tests can see which ones Fri looked at."""
-    async def load(url, channel, **_):
+    async def load(url, channel):
         if url.rsplit('/', 1)[1] in fail:
             raise httpx.ConnectError('cdn down')
-        image = 'data:image/png;base64,'+url.rsplit('/', 1)[1]
-        return Still(image) if url.endswith('.gif') else image  # An animation comes back as its first frame.
+        return 'data:image/png;base64,'+url.rsplit('/', 1)[1]
     loader = AsyncMock(side_effect=load)
     monkeypatch.setattr('fri.fri_images.load_image', loader)
     return loader
@@ -62,7 +60,7 @@ def test_a_ping_about_the_memes_above_looks_at_each_of_them(monkeypatch, tmp_pat
             monkeypatch, tmp_path, channel_id=1 if configured_channel else 8)
         kev = message('', user=30, age=3*3600, attachments=[picture(channel.id, 'circle.png')])
         jo = message('this one', user=40, age=2*3600, attachments=[picture(channel.id, 'square.png')])
-        dance = message('', user=60, age=90*60, attachments=[picture(channel.id, 'dance.gif', 'image/gif')])
+        message('', user=60, age=90*60, attachments=[picture(channel.id, 'dance.gif', 'image/gif')])
         message('', user=70, age=60*60, attachments=[picture(channel.id, 'private.png')])
         sam = message('', user=50, age=30*60, attachments=[picture(channel.id, 'triangle.png')])
         store.personal_control('70', 'disable')
@@ -78,23 +76,20 @@ def test_a_ping_about_the_memes_above_looks_at_each_of_them(monkeypatch, tmp_pat
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
             context = contexts[-1]
-            # Newest first, each image tied to its own post and poster, the gif as its first frame; the
-            # opted-out post isn't.
-            assert context['images'] == ['data:image/png;base64,triangle.png', 'data:image/png;base64,dance.gif',
-                                         'data:image/png;base64,square.png', 'data:image/png;base64,circle.png']
-            assert [(row['images'], row['source']['id'], row['source']['user_id'], row.get('still'))
+            # Newest first, each image tied to its own post and poster; the gif and the opted-out post aren't.
+            assert context['images'] == ['data:image/png;base64,triangle.png', 'data:image/png;base64,square.png',
+                                         'data:image/png;base64,circle.png']
+            assert [(row['images'], row['source']['id'], row['source']['user_id'])
                     for row in context['inspected_images']] == [
-                ([1], str(sam.id), '50', None), ([2], str(dance.id), '60', 'gif first frame'),
-                ([3], str(jo.id), '40', None), ([4], str(kev.id), '30', None)]
+                ([1], str(sam.id), '50'), ([2], str(jo.id), '40'), ([3], str(kev.id), '30')]
             assert sorted(call.args[0].rsplit('/', 1)[1] for call in loader.await_args_list) == [
-                'circle.png', 'dance.gif', 'square.png', 'triangle.png']
-            assert all(call.kwargs == {'gifs': True} for call in loader.await_args_list)
+                'circle.png', 'square.png', 'triangle.png']
             rows = {row['source']['user_id']: row for row in context['invited_context']}
             assert '70' not in rows and rows['60']['attachments'] == ['gif'] and rows['30']['attachments'] == ['image']
             assert rows['30']['text'] == '' and rows['40']['text'] == 'this one'
             if configured_channel:
                 receipt = context['action_result']
-                assert receipt['images_inspected'] == 4 and receipt['images_not_inspected'] == 0
+                assert receipt['images_inspected'] == 3 and receipt['images_not_inspected'] == 1
             event.reply.assert_awaited_once()
             assert event.reply.await_args.args[0] == 'kev’s circle. low effort, high payoff'
             saved = store.chat_context('123', f'public:{channel.id}', '20')
@@ -420,7 +415,7 @@ def test_a_channel_they_lose_mid_read_never_reaches_the_next_model_request(monke
         async def history(**kwargs):
             yield meme
         general.history, general.fetch_message = history, AsyncMock(return_value=meme)
-        async def load(url, channel, **_):  # They lose the channel while its images download.
+        async def load(url, channel):  # They lose the channel while its images download.
             if lost == 'access':
                 general.permissions_for = lambda who: (discord.Permissions.none() if getattr(who, 'id', None) == 20
                                                        else discord.Permissions.all())
