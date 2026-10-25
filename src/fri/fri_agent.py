@@ -26,6 +26,7 @@ from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
 from .fri_reports import report_message
 from .fri_responses import REACTIONS
+from .fri_turns import Turns
 from .fri_usage import usage_requested
 from .previews import PagedPreview
 from .privacy import clean
@@ -36,7 +37,7 @@ NO_MENTIONS = discord.AllowedMentions.none()
 GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
 REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long, and how many, delivered IDs are remembered.
 DEFERRED = object()  # The burst holding this message answers, or explains, for it.
-BUSY = object()  # Another reply to the member is running outside their turn; wait for it.
+BUSY = object()  # A panel or ambient reply to the member started first; wait for it.
 QUEUE_SECONDS = 240  # How long after it was sent a message may wait behind an earlier reply.
 RECHARGING = '🪫'
 
@@ -89,7 +90,7 @@ class Agent:
         self.delivered = {}  # Discord message ID -> when it first arrived, oldest first.
         self.recording = {}  # (channel, member): set once a delivered reply is recorded.
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
-        self.turns = defaultdict(asyncio.Lock)  # member: held through a direct reply's delivery and save.
+        self.turns = Turns(fri)  # Held by a direct reply through its delivery and save.
         self.pending = {}
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
         self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
@@ -334,8 +335,8 @@ class Agent:
 
     async def withheld(self, message, events, reason, invitation=None, *, logged=None):
         """Say why a reply can't go out while the message still stands to be answered; else log why."""
-        from .fri_mentions import NOTICES
-        text = await invitation.notice(reason) if invitation else NOTICES.get(reason)
+        from .fri_mentions import notice_for
+        text = await invitation.notice(reason) if invitation else notice_for(reason)
         if text:
             try:
                 await message.reply(text, mention_author=False, allowed_mentions=NO_MENTIONS)
@@ -348,13 +349,28 @@ class Agent:
         self.explained(events, logged or reason)
         await self.fri.waiting_notices.clear(message.author.id)
 
+    async def erased(self, user, forgotten, revision=None):
+        """Why a member's earlier message must now go unanswered: they erased since, here or (with a
+        revision to compare) through the panel, Gene or Red. None if it still stands."""
+        if self.forgotten.get(user, 0) != forgotten:
+            return 'author privacy changed'
+        if revision is None:
+            return None
+        try:
+            current = (await self.profile(self.fri.workshop_id, user))['revision']
+        except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
+            return 'check failed: '+type(exc).__name__  # Unverified, so treated as erased.
+        return 'author privacy changed' if current != revision else None
+
     async def recharging(self, message, dm):
         """A cooldown's notice shows once. A later message to Fri in it gets a low battery, not silence."""
+        if not self.config['enabled']:
+            return False
         if message.guild:
             permissions = message.channel.permissions_for(message.guild.me)
             if not (permissions.view_channel and permissions.read_message_history and permissions.add_reactions):
                 return False
-        elif not (dm and self.config['support_dms']):
+        elif not (dm and self.config['support_dms'] and await self.member(message.author.id, fresh=True)):
             return False
         try:
             await message.add_reaction(RECHARGING)
@@ -363,60 +379,53 @@ class Agent:
             return False
 
     async def take_turn(self, message, text, dm, *, burst=(), invitation=None):
-        """One direct reply per member at a time. A message that comes in mid-reply waits its turn,
-        in order, until that reply is delivered and saved, instead of being dropped."""
-        user, turn = message.author.id, self.turns[message.author.id]
+        """One direct reply per member at a time, in the order their messages were sent. A message that
+        comes in mid-reply waits through that reply's delivery and save, then is answered."""
         from .fri_pending import cancelled
         if memory_intent(text) or cancelled(text):
             # Privacy controls and cancelling never wait for an earlier reply (see Fri.talk).
             if await self.reply_once(message, text, dm, burst=burst, invitation=invitation) is not BUSY:
                 return
-        if turn.locked() or user in self.fri.busy:
-            events = [message, *(event for _, event, _ in burst if event is not message)]
-            if not await self.wait_turn(message, events, invitation):
-                return
-        else:
-            await turn.acquire()
-        try:
-            while await self.reply_once(message, text, dm, burst=burst, invitation=invitation) is BUSY:
-                await self.fri.busy.finished(user)  # E.g. an ambient or panel reply to them started first.
-        finally:
-            turn.release()
-
-    async def wait_turn(self, message, events, invitation):
-        """True once holding the member's turn, unless the wait ran out or they erased meanwhile."""
-        user, turn, held = message.author.id, self.turns[message.author.id], False
-        forgotten = self.forgotten.get(user, 0)
-        observed = (await self.profile(self.fri.workshop_id, user))['revision']
-        await self.fri.waiting_notices.send(message)  # Deleted once the earlier reply lands; this one follows.
+        user = message.author.id
+        events = [message, *(event for _, event, _ in burst if event is not message)]
+        forgotten, observed, noticed = self.forgotten.get(user, 0), None, False
         until = discord.utils.snowflake_time(message.id).timestamp()+QUEUE_SECONDS
-        try:
-            async with asyncio.timeout(until-time.time()):
-                await turn.acquire()
-                held = True
-                await self.fri.busy.finished(user)
-            # Erased meanwhile, here or through the panel, Gene or Red: drop it, as forget() drops a burst.
-            erased = (self.forgotten.get(user, 0) != forgotten or
-                      (await self.profile(self.fri.workshop_id, user))['revision'] != observed)
-        except TimeoutError:
-            if held:
-                turn.release()
-            if self.forgotten.get(user, 0) != forgotten:
-                for event in events:
-                    self.miss(event, 'author privacy changed')
-            else:
-                await self.withheld(message, events, 'stale event', invitation, logged='earlier reply still running')
-            return False
-        except BaseException:
-            if held:
-                turn.release()
-            raise
-        if erased:
-            turn.release()
-            for event in events:
-                self.miss(event, 'author privacy changed')
-            return False
-        return True
+        while True:
+            if not self.turns.ready(user, message.id):
+                if observed is None:  # The revision it was sent under, to see if they erase meanwhile.
+                    try:
+                        observed = (await self.profile(self.fri.workshop_id, user))['revision']
+                    except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
+                        return await self.withheld(message, events, 'controller unavailable', invitation)
+                if not noticed and user in self.fri.busy:
+                    if invitation and not await invitation.current():
+                        return await self.withheld(message, events, invitation.refusal, invitation,
+                                                   logged=f'reply withheld: {invitation.refusal}')
+                    noticed = True
+                    await self.fri.waiting_notices.send(message)  # Deleted once a reply to them lands.
+                try:
+                    async with asyncio.timeout(until-time.time()):
+                        while not self.turns.ready(user, message.id):
+                            await self.turns.changed(user)
+                except TimeoutError:
+                    if reason := await self.erased(user, forgotten, observed):
+                        return self.missed(events, reason)
+                    return await self.withheld(message, events, 'stale event', invitation,
+                                               logged='earlier reply still running')
+                if reason := await self.erased(user, forgotten, observed):
+                    return self.missed(events, reason)
+                continue  # Ready again, unless another reply started during that check.
+            self.turns.take(user, message.id)
+            try:
+                outcome = await self.reply_once(message, text, dm, burst=burst, invitation=invitation)
+            finally:
+                self.turns.release(user)
+            if outcome is not BUSY:
+                return
+
+    def missed(self, events, reason):
+        for event in events:
+            self.miss(event, reason)
 
     async def handle(self, message):
         # Discord can deliver an event again, e.g. after a resume. Its first delivery answers, or
@@ -432,17 +441,19 @@ class Agent:
             del self.delivered[next(iter(self.delivered))]
         self.delivered[message.id] = now
         self.handling[message.id] += 1
+        self.turns.arrive(message.author.id, message.id)
         try:
             await self.watch(message)
         finally:
             self.handling -= Counter([message.id])
+            self.turns.leave(message.author.id, message.id)
 
     async def watch(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
-        # A copy that outlived the record of delivered events is left to the delivery watched first.
+        if message.id in self.watched:
+            return  # A copy that outlived the delivered record: its first delivery answered or explained it.
         if (message.guild is None or message.author.bot or getattr(message, 'webhook_id', None) or
-                message.id in self.watched or message.id in self.misses or message.id in self.replying or
-                not pinged(message, self.fri.user.id)):
+                message.id in self.misses or message.id in self.replying or not pinged(message, self.fri.user.id)):
             await self.receive(message)
             return
         self.watched[message.id] = self.misses[message.id] = None

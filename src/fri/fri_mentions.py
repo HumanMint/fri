@@ -24,6 +24,11 @@ NOTICES = {'stale event': 'took me too long on that one. ping me again if you st
            'nearby message changed': CONTEXT_CHANGED, 'nearby privacy changed': CONTEXT_CHANGED,
            'check failed: ControllerRejected': CONTEXT_CHANGED}
 GLITCH = 'that one glitched on my end. ping me again.'
+NOTICES['controller unavailable'] = GLITCH
+
+
+def notice_for(reason):
+    return NOTICES.get(reason, GLITCH if reason.startswith('check failed: ') else None)
 
 
 def fingerprint(message):
@@ -46,6 +51,7 @@ class Invitation:
         self.ambiguous_images = False
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
+        self.revision = None  # The author's privacy revision once admitted.
 
     @classmethod
     async def create(cls, agent, message):
@@ -135,10 +141,10 @@ class Invitation:
         """What to say instead of a reply that can't go out, or None to stay quiet.
 
         Only while the ping still stands: Fri can still answer there, the message still pings Fri,
-        and its author hasn't asked Fri to forget them since. Never any content or context.
+        and its author hasn't erased since it was admitted. Never any content or context.
         """
-        text = NOTICES.get(reason, GLITCH if reason.startswith('check failed: ') else None)
-        if not text or self.agent.forgotten.get(self.event.author.id, 0) != self.forgotten:
+        text = notice_for(reason)
+        if not text or await self.agent.erased(self.event.author.id, self.forgotten, self.revision):
             return None
         refusal = self.refusal
         try:
@@ -161,7 +167,7 @@ class Invitation:
         result = await self.fri.api('POST', '/chat/mentions/admit', {**self.scope,
             'source': self.source, 'content': self.event.content, 'bot_id': str(self.fri.user.id)})
         if result.get('allowed'):
-            self.grant = result['mention_grant']
+            self.grant, self.revision = result['mention_grant'], result['revision']
         return result
 
     def granted_scope(self):
