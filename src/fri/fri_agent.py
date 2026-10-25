@@ -948,8 +948,8 @@ class Agent:
             active = False
         if directed is None and not active and channel != self.dedicated:
             return self.miss(message, 'not a visible user mention')
-        if message.id in self.unsent and not privacy:  # Deleted while it waited, e.g. for a reply to be saved.
-            return self.miss(message, 'message deleted')  # A privacy control is carried out regardless.
+        if message.id in self.unsent:  # Deleted while it waited, e.g. for a reply to be saved; a privacy
+            return self.miss(message, 'message deleted')  # control too, as its recheck before running finds.
         # Short bursts share context and produce one response to the newest message.
         key = (channel, message.author.id)
         self.answer_directly(message)
