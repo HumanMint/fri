@@ -42,7 +42,8 @@ def cases():
          'expect': 'Release allowed but not deployed yet. No claim it is live or deploying.'},
         {'name': 'withdrawn_is_not_a_rejection', 'text': 'why did my request get rejected', 'dm': True,
          'requests': [request('rejected', withdrawn=True)],
-         'expect': 'Withdrawn after a privacy change, not turned down by the owner. A short offer to redraft is fine.'},
+         'expect': 'Withdrawn after a privacy change, with no claim that the owner turned it down. A short offer '
+                   'to redraft is fine.'},
         {'name': 'single_untitled_row_is_not_assumed', 'text': 'is my modpack fix done',
          'requests': [request('deployed')],
          'expect': "The one visible request may be a different one: don't say the modpack fix shipped. Say what "
