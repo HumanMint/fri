@@ -226,17 +226,21 @@ async def deliver_one(fri):
         pass  # The durable receipt remains available even if its DM preview was deleted.
 
 
-async def send_once(fri, post, *, transport=None, embed=None):
+async def send_once(fri, post, *, transport=None, embed=None, reply_to=None):
     """Do not use discord.py's retrying HTTPClient for non-repeatable publication.
 
     No redirects, proxy inheritance, rate-limit sleep or retries. Even a 429/5xx is
     returned to the outbox as uncertainty, never used to initiate another attempt.
+    reply_to quotes a message in the same channel, and Discord refuses the send if it's gone.
     """
     target = str(int(post['target_id']))
     if len(post['body'].encode('utf-16-le'))//2 > 2000:
         raise ValueError('Message content exceeds Discord’s UTF-16 limit')
     payload = {'content': post['body'], 'allowed_mentions': {'parse': []},
                'nonce': str(int(post['id'][:20], 16)), 'enforce_nonce': True, 'flags': 4}
+    if reply_to is not None:
+        payload['message_reference'] = {'message_id': str(int(reply_to)), 'channel_id': target,
+                                        'fail_if_not_exists': True}
     if embed is not None:
         if len(embed.get('description', '').encode('utf-16-le'))//2 > 4096:
             raise ValueError('Reminder embed exceeds Discord’s UTF-16 limit')

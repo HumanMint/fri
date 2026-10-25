@@ -214,9 +214,10 @@ class Fri(discord.Client):
         self.agent = Agent(self)
         await patiently(self, self.agent.start)
         self.add_view(HomeView(self))
+        from .fri_fixes import TellReporter
         from .fri_social import SocialButton
         from .fri_workspace import PostButton
-        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton)
+        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton, TellReporter)
 
         @self.tree.command(name='fri', description='Chat, request a feature or fix, and follow development.',
                            guild=discord.Object(id=self.guild_id))
@@ -252,7 +253,9 @@ class Fri(discord.Client):
             from .fri_social import component as social_component
             if social_component(interaction, getattr(self.user, 'id', None)):
                 allowed = True
+            from .fri_fixes import tell_component
             if (not allowed and not owner_dm_component(interaction, getattr(self.user, 'id', None), self.owner_id)
+                    and not tell_component(interaction, getattr(self.user, 'id', None), self.owner_id)
                     and not report_component(interaction, getattr(self.user, 'id', None), self.owner_id)
                     and not request_dm_component(interaction, getattr(self.user, 'id', None))):
                 return
