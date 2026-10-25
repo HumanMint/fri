@@ -99,6 +99,7 @@ MALFORMED = [{}, [], {'access_token': 'private-a', 'token_type': 'Bearer', 'expi
 @pytest.mark.parametrize('outcome', [httpx.Response(503, text='private outage'), httpx.Response(429, json={'error': 'slow down'}),
                                      httpx.Response(200, text='not json'), httpx.ConnectError('private host'),
                                      httpx.Response(200, text='{"access_token": "private-a", "token_type": "Bearer", "expires_in": 1e999}'),
+                                     httpx.Response(200, json={'access_token': 'private-a', 'token_type': 'Bearer', 'expires_in': 10**400}),
                                      *(httpx.Response(200, json=body) for body in MALFORMED)])
 def test_transient_refresh_failure_does_not_tell_anyone_to_reconnect(tmp_path, caplog, outcome):
     path = tmp_path / 'session.json'
@@ -128,7 +129,8 @@ def test_renewal_without_the_plan_scope_is_a_refusal(tmp_path, caplog):
 
 
 @pytest.mark.parametrize('damage', ['expires_at', 'access_token', 'refresh_token', 'client_id', 'ext_agent_host_id',
-                                    'not json', 'not an object', 'null scopes', 'numeric access token', 'string expiry'])
+                                    'not json', 'not an object', 'null scopes', 'numeric access token', 'string expiry',
+                                    'huge expiry'])
 def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_path, caplog, damage):
     path = tmp_path / 'session.json'
     saved = expired(path, expires_at=0 if damage in ('refresh_token', 'client_id', 'ext_agent_host_id') else time.time() + 3600)
@@ -136,9 +138,9 @@ def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_
         path.write_text('{"access_token": "private')
     elif damage == 'not an object':
         path.write_text('["private"]')
-    elif damage in ('null scopes', 'numeric access token', 'string expiry'):
+    elif damage in ('null scopes', 'numeric access token', 'string expiry', 'huge expiry'):
         key, value = {'null scopes': ('scopes', None), 'numeric access token': ('access_token', 7),
-                      'string expiry': ('expires_at', 'soon')}[damage]
+                      'string expiry': ('expires_at', 'soon'), 'huge expiry': ('expires_at', 10**400)}[damage]
         private_json(path, {**saved, key: value})
     else:
         private_json(path, {k: v for k, v in saved.items() if k != damage})
@@ -151,11 +153,12 @@ def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_
     assert session.access_token() == 'old' and not session.rejected
 
 
-def test_rotated_refresh_token_is_kept_even_when_the_rest_of_the_renewal_is_unusable(tmp_path):
+@pytest.mark.parametrize('expires_in', [None, 10**400], ids=['missing expiry', 'huge expiry'])
+def test_rotated_refresh_token_is_kept_even_when_the_rest_of_the_renewal_is_unusable(tmp_path, expires_in):
     path = tmp_path / 'session.json'
     saved = expired(path)
     rotated = httpx.Response(200, json={'access_token': 'private-a', 'refresh_token': 'rotated',
-                                        'token_type': 'Bearer', 'expires_in': None})
+                                        'token_type': 'Bearer', 'expires_in': expires_in})
     with pytest.raises(SubscriptionUnavailable):
         Subscription(path, httpx.MockTransport(lambda _: rotated)).access_token()
     assert json.loads(path.read_text()) == {**saved, 'refresh_token': 'rotated'}  # Still expired, so the next call renews.

@@ -131,7 +131,7 @@ class Fri(discord.Client):
         self.waiting_notices = WaitingNotices(self.busy)
         self.usage_lock = asyncio.Lock()
         self.chat_slots = asyncio.Semaphore(2)
-        self.subscription_noticed = False
+        self.noticed_refusal = None
         self.sign_in_notice = None
         self.session = None
         self.agent = None
@@ -687,15 +687,15 @@ class Fri(discord.Client):
             await self.waiting_notices.clear(message.author.id)
 
     async def subscription_notice(self):
-        """One owner DM per refused sign-in. A usable token re-arms it."""
+        """One owner DM per refused sign-in, counting a usable token in between as the end of one."""
         try:
-            if not self.chat.subscription.rejected:
-                self.subscription_noticed = False
-            elif not self.subscription_noticed:
+            refused = self.chat.subscription.refused
+            if refused is not None and refused != self.noticed_refusal:
                 owner = self.get_user(self.owner_id) or await self.fetch_user(self.owner_id)
-                self.subscription_noticed = True  # At most once: a send whose response was lost isn't repeated.
-                await owner.send(SIGN_IN_NOTICE, allowed_mentions=NO_MENTIONS)
-        except Exception as exc:  # A failed lookup retries next tick; a failed send waits until a token works again.
+                channel = await owner.create_dm()  # Opened here, so a failure to open it retries next tick.
+                self.noticed_refusal = refused  # At most once: a send whose response was lost isn't repeated.
+                await channel.send(SIGN_IN_NOTICE, allowed_mentions=NO_MENTIONS)
+        except Exception as exc:  # A failed lookup retries next tick; a failed send waits for the next refusal.
             LOG.warning('Owner sign-in notice not sent: %s', type(exc).__name__)
 
     @tasks.loop(seconds=15)

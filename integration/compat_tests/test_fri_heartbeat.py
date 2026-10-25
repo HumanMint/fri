@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,6 +14,7 @@ from fri.fri import SIGN_IN_NOTICE, Fri
 from fri.fri_agent import Agent
 from fri.fri_agent_settings import DEFAULTS
 from fri.fri_errors import ControllerRejected
+from fri.subscription import PLAN_SCOPE, Subscription, SubscriptionError, private_json
 
 STATE = {'config': {**DEFAULTS, 'enabled': True, 'meme_enabled': True}, 'version': 1,
          'channels': [], 'history_channels': []}
@@ -137,55 +139,90 @@ def test_heartbeat_cancellation_still_stops_a_stage():
     asyncio.run(scenario())
 
 
-def notice_runtime(rejected=False):
-    owner = SimpleNamespace(send=AsyncMock())
-    fri = SimpleNamespace(owner_id=10, subscription_noticed=False, sign_in_notice=None, get_user=lambda _: owner,
-                          chat=SimpleNamespace(subscription=SimpleNamespace(rejected=rejected)))
+class Owner:
+    """The owner's discord.User: send() opens the DM channel first, so failures can land before the message."""
+
+    def __init__(self):
+        self.dm = SimpleNamespace(send=AsyncMock())
+        self.create_dm = AsyncMock(return_value=self.dm)
+
+
+def notice_runtime(tmp_path, rejected=False):
+    owner = Owner()
+    subscription = Subscription(tmp_path/'session.json')
+    fri = SimpleNamespace(owner_id=10, noticed_refusal=None, sign_in_notice=None, get_user=lambda _: owner,
+                          chat=SimpleNamespace(subscription=subscription))
+    if rejected:
+        refuse(subscription)
     return fri, owner
 
 
-def test_rejected_sign_in_sends_one_owner_dm_until_a_token_works_again():
+def refuse(subscription):
+    """A real refusal: the saved sign-in is missing."""
+    (subscription.path).unlink(missing_ok=True)
+    with pytest.raises(SubscriptionError, match='needs a ChatGPT'):
+        subscription.access_token()
+
+
+def work(subscription):
+    private_json(subscription.path, {'access_token': 'private', 'scopes': [PLAN_SCOPE], 'expires_at': time.time() + 3600})
+    assert subscription.access_token() == 'private'
+
+
+def test_rejected_sign_in_sends_one_owner_dm_until_a_token_works_again(tmp_path):
     async def scenario():
-        fri, owner = notice_runtime()
+        fri, owner = notice_runtime(tmp_path)
+        work(fri.chat.subscription)
         await Fri.subscription_notice(fri)
-        owner.send.assert_not_awaited()
-        fri.chat.subscription.rejected = True
+        owner.create_dm.assert_not_awaited()
+        refuse(fri.chat.subscription)
         for _ in range(3):
             await Fri.subscription_notice(fri)
-        owner.send.assert_awaited_once()
-        assert owner.send.await_args.args == (SIGN_IN_NOTICE,)
-        fri.chat.subscription.rejected = False
+        owner.dm.send.assert_awaited_once()
+        assert owner.dm.send.await_args.args == (SIGN_IN_NOTICE,)
+        work(fri.chat.subscription)
         await Fri.subscription_notice(fri)
-        fri.chat.subscription.rejected = True
+        refuse(fri.chat.subscription)
         await Fri.subscription_notice(fri)
-        assert owner.send.await_count == 2
+        assert owner.dm.send.await_count == 2
+        # A token that worked and a new refusal, both between two ticks, still earn a DM.
+        work(fri.chat.subscription)
+        refuse(fri.chat.subscription)
+        await Fri.subscription_notice(fri)
+        assert owner.dm.send.await_count == 3
+        refuse(fri.chat.subscription)  # The same refusal again isn't a new one.
+        await Fri.subscription_notice(fri)
+        assert owner.dm.send.await_count == 3
     asyncio.run(scenario())
 
 
-def test_sign_in_dm_is_never_repeated_after_a_send_but_a_failed_lookup_retries():
+def test_sign_in_dm_is_never_repeated_after_a_send_but_failures_before_it_retry(tmp_path):
     async def scenario():
-        fri, owner = notice_runtime(rejected=True)
+        fri, owner = notice_runtime(tmp_path, rejected=True)
         # Discord may have accepted it before the response was lost; a retry would carry a new nonce.
-        owner.send.side_effect = TimeoutError()
+        owner.dm.send.side_effect = TimeoutError()
         for _ in range(3):
             await Fri.subscription_notice(fri)
-        owner.send.assert_awaited_once()
-        fri.chat.subscription.rejected = False
-        await Fri.subscription_notice(fri)
-        fri.chat.subscription.rejected = True
+        owner.dm.send.assert_awaited_once()
+        work(fri.chat.subscription)
+        refuse(fri.chat.subscription)
+        owner.dm.send.side_effect = None
         fri.get_user = lambda _: None
-        fri.fetch_user = AsyncMock(side_effect=[TimeoutError(), owner])
+        fri.fetch_user = AsyncMock(side_effect=[TimeoutError(), owner, owner])
+        owner.create_dm.side_effect = [TimeoutError(), owner.dm]  # Opening the DM channel failed: nothing was sent.
         await Fri.subscription_notice(fri)
-        assert owner.send.await_count == 1 and not fri.subscription_noticed  # Nothing was sent yet.
-        owner.send.side_effect = None
         await Fri.subscription_notice(fri)
-        assert owner.send.await_count == 2 and fri.subscription_noticed
+        assert owner.dm.send.await_count == 1
+        await Fri.subscription_notice(fri)
+        assert owner.dm.send.await_count == 2 and owner.create_dm.await_count == 3
+        await Fri.subscription_notice(fri)
+        assert owner.dm.send.await_count == 2
     asyncio.run(scenario())
 
 
-def test_sign_in_notice_runs_beside_reviews_and_usage(monkeypatch):
+def test_sign_in_notice_runs_beside_reviews_and_usage(monkeypatch, tmp_path):
     async def scenario():
-        fri, owner = notice_runtime(rejected=True)
+        fri, owner = notice_runtime(tmp_path, rejected=True)
         fri.subscription_notice = lambda: Fri.subscription_notice(fri)
         fri.flush_usage = AsyncMock()
         notify = AsyncMock()
@@ -195,18 +232,20 @@ def test_sign_in_notice_runs_beside_reviews_and_usage(monkeypatch):
 
         async def rate_limited(*args, **kwargs):
             await release.wait()
-        owner.send.side_effect = rate_limited
+        owner.dm.send.side_effect = rate_limited
         for _ in range(3):
             await Fri.owner_reviews.coro(fri)
             await asyncio.sleep(0)
         assert fri.flush_usage.await_count == notify.await_count == 3
-        assert owner.send.await_count == 1 and not fri.sign_in_notice.done()  # One send in flight, not one per tick.
+        assert owner.dm.send.await_count == 1 and not fri.sign_in_notice.done()  # One send in flight, not one per tick.
         release.set()
         await fri.sign_in_notice
-        assert fri.subscription_noticed
+        await Fri.owner_reviews.coro(fri)
+        await fri.sign_in_notice
+        assert owner.dm.send.await_count == 1
         fri.flush_usage.side_effect = OSError('read-only usage folder')
         await Fri.owner_reviews.coro(fri)  # Logged and retried next tick instead of ending the loop.
-        assert notify.await_count == 4  # A stuck usage folder doesn't hold back owner reviews either.
+        assert notify.await_count == 5  # A stuck usage folder doesn't hold back owner reviews either.
     asyncio.run(scenario())
 
 

@@ -81,9 +81,19 @@ def lifetime(value):
         return None
     try:
         seconds = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # JSON integers can be too big for a float.
         return None
     return int(seconds) if math.isfinite(seconds) and 1 <= seconds <= 365 * 86400 else None
+
+
+def moment(value):
+    """A saved timestamp: a number a float can hold, so not a bool, inf, nan or a huge integer."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def token_record(tokens, previous, *, client_id, host_id, identity=None):
@@ -114,9 +124,15 @@ class Subscription:
     def __init__(self, path, transport=None):
         self.path = Path(path)
         self.transport = transport
-        self.rejected = False  # Set by a refusal that needs the owner, cleared by the next usable token.
+        # The current refusal's number while one needs the owner; a usable token in between starts a new one.
+        self.refused = None
+        self.refusals = 0
         self.guard = threading.Lock()
         self.observed = self.settled = 0
+
+    @property
+    def rejected(self):
+        return self.refused is not None
 
     def observation(self):
         with self.guard:
@@ -126,8 +142,14 @@ class Subscription:
     def settle(self, observation, rejected):
         """Calls finish out of order across threads; only a newer observation may change the flag."""
         with self.guard:
-            if observation > self.settled:
-                self.settled, self.rejected = observation, rejected
+            if observation <= self.settled:
+                return
+            self.settled = observation
+            if not rejected:
+                self.refused = None
+            elif self.refused is None:
+                self.refusals += 1
+                self.refused = self.refusals
 
     def access_token(self):
         observation = self.observation()
@@ -154,8 +176,7 @@ class Subscription:
         except ValueError:
             saved = None
         expires_at = saved.get('expires_at') if isinstance(saved, dict) else None
-        if (not isinstance(saved, dict) or not usable(saved.get('access_token')) or isinstance(expires_at, bool) or
-                not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at)):
+        if not isinstance(saved, dict) or not usable(saved.get('access_token')) or not moment(expires_at):
             raise incomplete()
         scopes = saved.get('scopes')
         if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes) or PLAN_SCOPE not in scopes:
