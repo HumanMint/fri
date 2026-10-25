@@ -129,7 +129,8 @@ def careful_answer(text, rows):
     if len(rows) > 1:
         return 'you have two: one is ' + ' and one is '.join(states) + '. which one?'
     if rows[0].get('withdrawn'):
-        return 'it got withdrawn after a privacy change, not turned down'
+        # Neutral: an owner's earlier rejection looks the same once a privacy change removes the text.
+        return 'its text got removed after a privacy change, so it was withdrawn. want me to redraft it?'
     if 'modpack' in text and 'title' not in rows[0]:
         return "the only one i can see shipped, can't tell if that's the modpack one"
     return {'queued': 'not started, waiting for a worker', 'building': 'being built, not done',
