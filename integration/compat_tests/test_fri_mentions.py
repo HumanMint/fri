@@ -207,7 +207,10 @@ def test_invalid_invitation_fails_before_model(monkeypatch, tmp_path, caplog, fa
             agent.config['enabled'] = False
         try:
             await agent.handle(event)
-            assert not calls
+            # Nothing is admitted. A notice reads only the author's privacy revision, before and after its
+            # checks, to see if they erase meanwhile.
+            reads = {'old': 2, 'foreign_source': 1}.get(failure, 0)
+            assert [path for path, _ in calls] == ['/agent/context']*reads
             fri.chat_once.assert_not_awaited()
             # A member's dropped mention says why in the log, by message ID only. Bots and webhooks aren't members.
             reason = {'old': 'stale event', 'bot': None, 'webhook': None,
