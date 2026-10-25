@@ -18,7 +18,9 @@ from .privacy import clean
 from .private_files import private_json
 
 LOG = logging.getLogger(__name__)
-NOTE = 200  # Characters of what Fri saw in a meme it reacted to, kept with the entry (three days).
+NOTE = 200  # Characters of what Fri saw in a meme it reacted to, kept with the entry.
+KEEP = 3 * 86400  # How long an entry, and the note on it, lasts.
+NOTE_KEYS = ('author', 'revision', 'emoji', 'note', 'edited')
 
 EMOJIS = ('💩', '🤡', '🗿', '🫠', '🧂', '🍿', '👀', '🧠', '🪦', '🐐', '🐸', '🦆',
           '🐀', '🐒', '🍌', '🥔', '🍞', '🥚', '🧀', '🦀', '🐟', '🦴', '🪑', '🛒',
@@ -67,7 +69,7 @@ class Memes:
             fcntl.flock(lock, fcntl.LOCK_EX)
             state = json.loads(self.path.read_text()) if self.path.exists() else {
                 'version': 1, 'next_check': 0, 'entries': {}, 'reactions': [], 'channels': {}}
-            if state.get('version') != 1 or not all(k in state for k in (
+            if not isinstance(state, dict) or state.get('version') != 1 or not all(k in state for k in (
                     'next_check', 'entries', 'reactions', 'channels')):
                 raise ValueError('Meme state is invalid; do not reset its limits automatically')
             if (not isinstance(state['entries'], dict) or not isinstance(state['channels'], dict) or
@@ -117,13 +119,14 @@ class Memes:
     async def check(self):
         now = time.time()
         config = self.agent.config
+        self.expire(now)
         if not config['enabled'] or not config['meme_enabled']:
             return
         with self.state() as state:
             if now < state['next_check']:
                 return
             state['next_check'] = now + config['meme_interval_minutes'] * 60
-            state['entries'] = {k: v for k, v in state['entries'].items() if v['at'] > now-3*86400}
+            state['entries'] = {k: v for k, v in state['entries'].items() if v['at'] > now-KEEP}
             state['reactions'] = [at for at in state['reactions'] if at > now-86400]
         remaining = 2
         # One maintainer-scoped channel initially; bounded even if configured with more.
@@ -169,6 +172,35 @@ class Memes:
                     state['channels'][channel_id] = {**state['channels'].get(channel_id, {}),
                         'name': clean(channel.name, 60), 'last_check': now, 'status': 'check_failed'}
 
+    def expire(self, now=None):
+        """Drop notes past KEEP even while meme checks are off, so nothing outlives its three days."""
+        now = now or time.time()
+        if not self.path.exists():
+            return
+        try:
+            with self.state(write=False) as state:
+                if not any(entry.get('note') and entry['at'] <= now-KEEP for entry in state['entries'].values()):
+                    return
+            with self.state() as state:
+                for entry in state['entries'].values():
+                    if entry['at'] <= now-KEEP:
+                        for key in NOTE_KEYS:
+                            entry.pop(key, None)
+        except (ValueError, OSError) as exc:
+            LOG.warning('Meme notes could not be expired: %s', type(exc).__name__)
+
+    def drop(self, message_ids):
+        """Forget the notes on these posts: the post or its author's privacy changed since."""
+        if not message_ids or not self.path.exists():
+            return
+        try:
+            with self.state() as state:
+                for key in map(str, message_ids):
+                    for field in NOTE_KEYS:
+                        state['entries'].get(key, {}).pop(field, None)
+        except (ValueError, OSError) as exc:
+            LOG.warning('Meme notes could not be dropped: %s', type(exc).__name__)
+
     def remember(self, message, reaction, observation, revision):
         """What Fri reacted with and saw, so a later chat can own it. Only while the author's privacy
         revision and the post stay as they were; forget() drops it with the rest of a member's words."""
@@ -184,7 +216,7 @@ class Memes:
         try:
             with self.state(write=False) as state:
                 return {int(key): entry for key, entry in state['entries'].items()
-                        if entry.get('status') == 'reacted' and entry.get('note') and key.isdigit()}
+                        if key.isdigit() and kept(entry, time.time())}
         except (ValueError, OSError):
             return {}
 
@@ -198,7 +230,7 @@ class Memes:
             with self.state() as state:
                 for entry in state['entries'].values():
                     if entry.get('author') == str(user):
-                        for key in ('author', 'revision', 'emoji', 'note', 'edited'):
+                        for key in NOTE_KEYS:
                             entry.pop(key, None)
         except (ValueError, OSError) as exc:
             LOG.warning('Meme notes could not be forgotten: %s', type(exc).__name__)
@@ -217,6 +249,7 @@ class Memes:
                 channel['last_reaction'] = time.time()
 
     async def inspect(self, message, urls, profile):
+        forgotten = self.agent.forgotten.get(message.author.id, 0)  # Their erasures through Fri so far.
         images = [await load_image(url, message.channel.id) for url in urls]
         result, _, status = await self.agent.run('meme', INSTRUCTION,
             {'caption': clean(message.content, 1000), 'image_count': len(images),
@@ -252,14 +285,31 @@ class Memes:
             return
         self.receipt(message, 'reacted', len(images))
         if result.get('observation'):
-            self.remember(current, result['reaction'], result['observation'], profile['revision'])
+            # Again after the send: an erasure while it waited must not be written back.
+            latest = await self.agent.profile(message.channel.id, message.author.id)
+            if (self.agent.forgotten.get(message.author.id, 0) == forgotten and latest['enabled'] and
+                    latest['revision'] == profile['revision']):
+                self.remember(current, result['reaction'], result['observation'], profile['revision'])
 
 
-def reacted(notes, message, profile):
-    """Fri's own earlier reaction to this post and what it saw, while author and post are unchanged."""
+def kept(entry, now):
+    """A whole, current note: Fri reacted, within KEEP, with every field the right shape."""
+    return (entry.get('status') == 'reacted' and entry['at'] > now-KEEP and isinstance(entry.get('note'), str) and
+            bool(entry['note']) and entry.get('emoji') in EMOJIS and isinstance(entry.get('author'), str) and
+            type(entry.get('revision')) is int and (entry.get('edited') is None or isinstance(entry['edited'], str)))
+
+
+def reacted(notes, message, profile, stale=None):
+    """Fri's own earlier reaction to this post and what it saw, while author and post are unchanged.
+
+    stale, when given, collects the posts whose note no longer applies, for Memes.drop()."""
     note = notes.get(getattr(message, 'id', None))
+    if not note:
+        return {}
     edited = getattr(message, 'edited_at', None)
-    if (not note or note.get('author') != str(message.author.id) or note.get('revision') != profile['revision'] or
-            note.get('edited') != (edited.isoformat() if isinstance(edited, dt.datetime) else None)):
+    if (note['author'] != str(message.author.id) or note['revision'] != profile['revision'] or
+            note['edited'] != (edited.isoformat() if isinstance(edited, dt.datetime) else None)):
+        if stale is not None:
+            stale.append(message.id)
         return {}
     return {'fri_reacted': {'emoji': note['emoji'], 'saw': note['note']}}

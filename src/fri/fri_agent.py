@@ -263,11 +263,11 @@ class Agent:
         if erased:
             self.erased[user] = self.erased.get(user, 0)+1
         self.bursts.forget(user)
-        self.ensure_memes().forget(user)  # What Fri saw in their memes goes with the rest.
         for key in list(self.pending):
             if key[1] == user:
                 del self.pending[key]
         self.uncache(user)
+        self.ensure_memes().forget(user)  # Last, from disk: what Fri saw in their memes goes too.
 
     def uncache(self, user):
         """Drop a member's cached rows, Fri's replies drawing on them, and Fri's attention to them.
@@ -1433,6 +1433,10 @@ class Agent:
             from .fri_social import deliver_one as deliver_reminder
             from .fri_workspace import deliver_one as deliver_post
             # An undeliverable owner report or a broken meme check must not silence attention.
+            try:  # Meme notes keep three days even while meme checks are off.
+                self.ensure_memes().expire()
+            except Exception as exc:  # Never at the cost of the stages below.
+                LOG.warning('Meme notes not expired this tick: %s', type(exc).__name__)
             results = [await self.stage('presence', self.check_presence),
                        await self.stage('posts', lambda: deliver_post(self.fri)),
                        await self.stage('reminders', lambda: deliver_reminder(self.fri)),
