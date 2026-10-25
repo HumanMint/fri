@@ -20,7 +20,7 @@ def notice_text(text):
 
 class ReplyInProgress(commands.UserFeedbackCheckFailure):
     def __init__(self):
-        super().__init__('i’m still replying to you. give me a moment.')
+        super().__init__('hold on, still typing your last one.')
 
 
 class WaitingNotices:
