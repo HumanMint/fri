@@ -17,6 +17,7 @@ from fri.fri_chat import Chat, ChatResult, request_view
 from fri.fri_panel import InputModal
 from fri.fri_request_eval import evaluate as evaluate_requests
 from fri.fri_requests import DraftView
+from fri.reviews import request_reference
 
 
 @pytest.mark.parametrize(('channel', 'visibility', 'titled'), [(999, 'private', True), (1, 'public', False)])
@@ -86,7 +87,25 @@ def test_the_model_sees_dates_and_withdrawals_not_raw_rows(store):
     # Gene ends it as rejected; the model must not read that as the owner turning it down.
     assert row['state'] == 'withdrawn' and 'withdrawn' not in row and 'title' not in row
     assert dt.datetime.fromisoformat(row['created']).tzinfo == dt.timezone.utc
-    assert "the owner didn't turn it down, so never call it rejected" in ' '.join(sent[0]['instructions'].split())
+    assert "don't call it rejected or say the owner turned it down" in ' '.join(sent[0]['instructions'].split())
+
+
+def test_an_owner_rejection_a_privacy_change_later_withdrew_is_not_denied(store):
+    job = store.request('123', '20', 'draft-1', '', 'Build what ash described', [{'user_id': '30', 'revision': 0}])
+    store.review_decision(job['id'], 'intake', request_reference(job), 'reject', 'owner')
+    store.personal_control('30', 'disable')  # Now it reads like a request the privacy change ended.
+    [row] = store.chat_context('123', 'private:9', '20')['requests']
+    assert row['state'] == 'rejected' and row['withdrawn'] is True
+    sent = []
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, text='data: ' + json.dumps(response_event()) + '\n\n')
+    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-token'), httpx.MockTransport(handler))
+    asyncio.run(chat.respond('fri why did my request get rejected', {**CONTEXT, 'requests': [row]}))
+    [shown] = json.loads(sent[0]['input'][-1]['content'])['your_gene_requests']
+    instructions = ' '.join(sent[0]['instructions'].split())
+    # Gene can't tell this from a request the privacy change ended, so Fri is told to claim neither.
+    assert shown['state'] == 'withdrawn' and "didn't turn it down" not in instructions
 
 
 def test_a_request_withdrawn_after_it_shipped_keeps_its_state():

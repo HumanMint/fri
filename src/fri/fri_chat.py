@@ -207,7 +207,7 @@ your_gene_requests are the speaker's own Gene requests with their controller sta
 worker is building it), review (a tested change awaits the owner's release review), approved (release
 allowed, waiting to deploy), deploying (deploying now), deployed (it shipped; a later rollback isn't
 shown, so don't promise it's still live), withdrawn (its text was removed after someone's privacy
-change before it finished; the owner didn't turn it down, so never call it rejected), rejected, failed
+change, which usually ended it; don't call it rejected or say the owner turned it down), rejected, failed
 or needs_attention. withdrawn: true on another state means its text was removed after it got that far.
 Queued and approved haven't started their next step. Use them to answer status questions or to avoid
 drafting a duplicate.
@@ -353,7 +353,9 @@ def request_view(row):
     """A controller request row with its times as dates, like every other time the model sees.
 
     Gene ends an unfinished request whose text a privacy change removed as rejected, with withdrawn set.
-    The model reads that state as the owner's decision, so the row says withdrawn instead.
+    The model reads that state as the owner's decision, so the row says withdrawn instead. An owner's
+    earlier rejection looks the same once a privacy change removes the text, so the instructions claim
+    neither: withdrawn, never "the owner didn't turn it down".
     """
     view = {key: datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds')
             if key in ('created', 'updated') and isinstance(value, (int, float)) else value
