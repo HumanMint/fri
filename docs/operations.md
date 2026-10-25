@@ -158,8 +158,10 @@ advertises it, so the controller must be released first.
   spaces arrive as written, so an emoji is one character instead of a 12-character `\u` escape.
   Everything else stays escaped exactly as before: controls, format and invisible characters
   (bidi overrides, zero-width characters, tag characters), line separators, surrogates,
-  private-use and unassigned code points, invisible letters and marks, and any variation selector
-  except one U+FE0E/U+FE0F after a visible character.
+  private-use and unassigned code points, invisible letters and marks, blank symbols such as
+  U+2800, and every variation selector except one U+FE0E/U+FE0F straight after an emoji symbol in
+  the same string (or inside a keycap like 1️⃣). Selectors after letters, after one another or at
+  the start of a string stay escaped, so they can't carry hidden text.
 
 ## Members' own requests
 

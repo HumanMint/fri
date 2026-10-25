@@ -42,27 +42,48 @@ def clean(text: str, limit: int = 6000) -> str:
     return redact(text.strip())[:limit]
 
 
-# Invisible (default-ignorable) letters and marks, plus every variation selector. The one exception is
-# an emoji's U+FE0E/U+FE0F straight after a visible character; a run of selectors can carry hidden text.
-INVISIBLE = re.compile('[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u3164\uffa0'
-                       '\ufe00-\ufe0f\U000e0100-\U000e01ef]')
+# Invisible (default-ignorable) letters and marks, blank symbols, and every variation selector.
+INVISIBLE = re.compile('[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u2800\u3164\uffa0'
+                       '\ufe00-\ufe0f\U0001d159\U000e0100-\U000e01ef]')
+# Emoji bases outside the So category that take U+FE0E/U+FE0F: double exclamation, info, arrows, wavy dash.
+EMOJI_BASES = '\u203c\u2049\u2139\u2194\u2195\u2196\u2197\u2198\u2199\u21a9\u21aa\u3030\u303d'
 NOT_PRINTABLE_ASCII = re.compile(r'[^\x20-\x7e]')
 
 
-def visible(char, previous):
-    if char in '\ufe0e\ufe0f' and previous and not INVISIBLE.match(previous):
-        return visible(previous, '')
+def visible(text, at):
+    char = text[at]
+    if char in '\ufe0e\ufe0f':
+        # Kept only as an emoji's text or emoji presentation, so selectors after letters, after one
+        # another or after nothing can't carry hidden text.
+        before = text[at-1] if at else ''
+        return bool(before) and (
+            (unicodedata.category(before) == 'So' or before in EMOJI_BASES) and not INVISIBLE.match(before) or
+            before in '0123456789#*' and text[at+1:at+2] == '\u20e3')  # A keycap: 1️⃣.
     category = unicodedata.category(char)
     return (category[0] in 'LMNPS' or category == 'Zs') and not INVISIBLE.match(char)
+
+
+def model_text(text):
+    """A JSON string literal: visible characters raw, everything else escaped as json.dumps does."""
+    parts, start = [], 0
+    for match in NOT_PRINTABLE_ASCII.finditer(text):
+        at = match.start()
+        if not visible(text, at):
+            parts += [json.dumps(text[start:at], ensure_ascii=False)[1:-1], json.dumps(text[at])[1:-1]]
+            start = at+1
+    return '"'+''.join(parts)+json.dumps(text[start:], ensure_ascii=False)[1:]
 
 
 def model_json(value):
     """JSON for model input with visible text as written: emoji, curly quotes and non-English letters
     stay raw instead of becoming \\u escapes. Controls, format and invisible characters (bidi, zero-width,
-    tags), line separators, surrogates, private-use and unassigned code points stay escaped."""
-    text = json.dumps(value, ensure_ascii=False)
-
-    def escape(match):
-        char, at = match.group(), match.start()
-        return char if visible(char, text[at-1] if at else '') else json.dumps(char)[1:-1]
-    return NOT_PRINTABLE_ASCII.sub(escape, text)
+    tags), line separators, surrogates, private-use and unassigned code points stay escaped. The output
+    matches json.dumps for ASCII-only values."""
+    if isinstance(value, str):
+        return model_text(value)
+    if isinstance(value, dict):
+        return '{'+', '.join(model_text(k if isinstance(k, str) else json.dumps(k))+': '+model_json(v)
+                             for k, v in value.items())+'}'
+    if isinstance(value, (list, tuple)):
+        return '['+', '.join(model_json(v) for v in value)+']'
+    return json.dumps(value)
