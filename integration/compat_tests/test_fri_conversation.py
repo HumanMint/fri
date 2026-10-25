@@ -48,8 +48,8 @@ def test_profile_is_persistent_scoped_and_updates_only_current_speaker(tmp_path)
     assert not save('I prefer Terraria')['first_memory']
     store = Store(path)
     notes = store.chat_context('guild', 'public:1', 'one')['personal_memory']['notes']
-    assert notes == [{'category': 'games', 'evidence': 'I prefer Terraria'},
-                     {'category': 'games', 'evidence': 'I like Minecraft'}]
+    assert notes == [{'category': 'games', 'evidence': 'I prefer Terraria', 'scope': 'here'},
+                     {'category': 'games', 'evidence': 'I like Minecraft', 'scope': 'here'}]
     for guild, scope, user in [('other', 'public:1', 'one'), ('guild', 'private:1', 'one'),
                                ('guild', 'public:2', 'one'), ('guild', 'public:1', 'two')]:
         assert not store.chat_context(guild, scope, user)['personal_memory']['notes']

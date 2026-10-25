@@ -19,7 +19,14 @@ from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
 from .fri_errors import ControllerRejected
-from .fri_memory import describe_memory, memory_intent
+from .fri_memory import (
+    PROFILES,
+    describe_memory,
+    describe_profile,
+    memory_intent,
+    note_place,
+    server_wide,
+)
 from .fri_notices import ReplyInProgress, WaitingNotices, notice_text
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
 from .fri_protocol import PROTOCOL, compatible
@@ -37,6 +44,10 @@ LOG = logging.getLogger('fri')
 NO_MENTIONS = discord.AllowedMentions.none()
 FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
                 'or say “forget me” any time.')
+FIRST_PROFILE = ('\n\n-# i kept a small preference from this, and it follows you around the server. '
+                 'ask “what do you remember about me?” or say “forget me” any time.')
+FIRST_HERE = ('\n\n-# i kept a small preference from this, just for this chat. ask “what do you remember '
+              'about me?” or say “forget me” any time.')
 MAX_PROVENANCE = 200
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
@@ -81,6 +92,7 @@ def turn_provenance(context, speaker, actions=None):
     inherited = [item for turn in context.get('turns', []) for item in turn.get('provenance', [])]
     inherited += (context.get('pending') or {}).get('provenance', [])
     inherited += context.get('summary_provenance', []) + context.get('reference_provenance', [])
+    inherited += [item for row in context.get('elsewhere', []) for item in row.get('provenance', [])]
     for item in inherited:
         add(item['user_id'], item['revision'])
     for row in context.get('recent', []):
@@ -131,11 +143,24 @@ class Fri(discord.Client):
         self.chat_slots = asyncio.Semaphore(2)
         self.session = None
         self.agent = None
+        self.capabilities = frozenset()
+
+    @property
+    def profiles(self):
+        return PROFILES in self.capabilities
+
+    def first_memory(self, saved):
+        """Where the first kept note will show, once the controller keeps member profiles."""
+        if not self.profiles:
+            return FIRST_MEMORY
+        return {'server': FIRST_PROFILE, 'conversation': FIRST_HERE}.get(saved.get('memory_scope'), FIRST_MEMORY)
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        if not compatible(await self.api('GET', '/fri/contract')):
+        contract = await self.api('GET', '/fri/contract')
+        if not compatible(contract):
             raise RuntimeError('unsupported gene controller contract; fri did not start')
+        self.capabilities = frozenset(contract['capabilities'])
         from .fri_agent import Agent
         self.agent = Agent(self)
         await self.agent.start()
@@ -233,6 +258,10 @@ class Fri(discord.Client):
                  'conversation_id': f'{visibility}:{channel_id}'}
         # Privacy controls must work while inference is busy or the subscription is down.
         intent = memory_intent(text)
+        if intent == 'show' and self.profiles:
+            profile = (await self.api('POST', '/chat/context', scope))['personal_memory']
+            return ChatResult(reply=await self.memory_overview(scope, profile, visibility == 'private'),
+                              status='completed', memory_scope=scope)
         if intent == 'show':
             context = await self.api('POST', '/chat/context', scope)
             profile = context['personal_memory']
@@ -261,6 +290,14 @@ class Fri(discord.Client):
         try:
             async with self.chat_slots:
                 context = attributed(await self.api('POST', '/chat/context', scope))
+                if self.profiles:
+                    # Decided now, from Discord's permissions: only an everyone-readable channel reaches the
+                    # member's profile and their other conversations. Private conversations never do.
+                    context['audience'] = ('server' if visibility == 'public' and
+                                           server_wide(getattr(event, 'channel', None) or channel) else 'conversation')
+                    context['elsewhere'] = self.elsewhere(context.get('elsewhere', []), guild_id)
+                else:
+                    context['elsewhere'] = []
                 conversation = {}
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence
@@ -434,7 +471,8 @@ class Fri(discord.Client):
                         'burst': context.get('message_burst', []),
                         'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
                                                                          result.post_preview or result.clarification),
-                        'provenance': provenance, 'verbatim': stored == result.reply}
+                        'provenance': provenance, 'verbatim': stored == result.reply,
+                        **({'audience': context['audience']} if context.get('audience') else {})}
                     if len(result.turn['provenance']) > MAX_PROVENANCE:
                         return ChatResult(reply=unrecorded(receipts, reason='too many people were in that context to '
                                                            'track safely.'), status='completed')
@@ -480,10 +518,37 @@ class Fri(discord.Client):
             'model': model or context['model'], 'effort': '' if model else context['effort'],
             'notes': result.notes, 'input_tokens': 0 if model else result.counters.get('input_tokens'),
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
-            'verbatim': result.response_kind == 'reply' and reply == result.reply}
+            'verbatim': result.response_kind == 'reply' and reply == result.reply,
+            **({'audience': context['audience']} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed:
             result.echo = self.echo(scope, context, provenance, reply)
         return result
+
+    def elsewhere(self, rows, guild_id):
+        """The member's exchanges from other channels that everyone in this server can still read."""
+        kept = []
+        for row in rows:
+            kind, _, channel_id = str(row.get('conversation_id', '')).partition(':')
+            channel = self.get_channel(int(channel_id)) if kind == 'public' and channel_id.isdigit() else None
+            if (channel is None or getattr(getattr(channel, 'guild', None), 'id', None) != int(guild_id)
+                    or not server_wide(channel)):
+                continue  # Gone, moved, or restricted since: it stays where it was said.
+            kept.append({**row, 'channel': '#'+channel.name, 'minutes_ago': max(0, int((time.time()-row['at'])//60))})
+        return kept
+
+    async def memory_overview(self, scope, profile, private):
+        """Everything for the member's own eyes in private; in public, only what that channel can see."""
+        escape = discord.utils.escape_markdown
+        if private:
+            state = await self.api('POST', '/chat/memory/notes', scope)
+            enabled, rows = state['enabled'], state['entries']
+        else:
+            enabled, rows = profile['enabled'], profile['notes']
+        groups = {}
+        for row in rows:
+            where = note_place(self.get_channel, row['scope'], scope['conversation_id'], public=not private)
+            groups.setdefault(where, []).append(escape(row['evidence']))
+        return describe_profile(enabled, list(groups.items()), private)
 
     async def resolve_references(self, scope, context):
         """Replace Fri-authored reply targets with the members those replies drew on."""
@@ -530,7 +595,7 @@ class Fri(discord.Client):
             return None
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
             try:
-                await sent.edit(content=(sent.content or '')+FIRST_MEMORY)
+                await sent.edit(content=(sent.content or '')+self.first_memory(saved))
             except discord.HTTPException:
                 LOG.info('First-memory notice was not added')
         return saved
@@ -625,10 +690,16 @@ class Fri(discord.Client):
             # A newer panel interaction can supersede this one; record only what was displayed.
             saved = await self.record_turn(result) if sessions(self).displayed(interaction) else None
             if saved and saved.get('first_memory') and not result.settings_preview:
-                await reply(self, interaction, embed=card('Fri', result.reply+FIRST_MEMORY), view=view)
+                await reply(self, interaction, embed=card('Fri', result.reply+self.first_memory(saved)), view=view)
         except commands.UserFeedbackCheckFailure as exc:
             await reply(self, interaction, str(exc), view=HomeView(self, interaction.user.id))
         await self.waiting_notices.clear(interaction.user.id)
+
+    async def on_ready(self):
+        if self.agent and self.profiles:
+            channels = [self.get_channel(int(c)) for c in self.agent.state.get('channels', []) if str(c).isdigit()]
+            LOG.info('Member profiles: %d of %d configured channels are readable by everyone',
+                     sum(server_wide(c) for c in channels), len(channels))
 
     async def on_message(self, message):
         if self.agent:

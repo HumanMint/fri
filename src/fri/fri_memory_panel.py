@@ -1,4 +1,4 @@
-"""Private, member-bound controls for one conversation's exact personal preferences."""
+"""Private, member-bound controls for a member's exact personal preferences."""
 
 import re
 import uuid
@@ -7,8 +7,10 @@ import discord
 
 from . import feedback as commands
 from .fri_context import discord_source
+from .fri_memory import note_place
 
 NO_MENTIONS = discord.AllowedMentions.none()
+SHOWN = 25  # Discord's limit for one select menu.
 COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit):[a-f0-9]{32}$')
 
 
@@ -51,18 +53,36 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
     if not await allowed(cog, interaction, scope, message=False):
         return
     state = state or await cog.api('POST', '/chat/memory/notes', scope)
+    profiles = getattr(cog, 'profiles', False)
     lines = [notice] if notice else []
     lines += ['Memory is '+('on.' if state['enabled'] else 'off.'),
+              'Server-wide preferences follow you around the server; the rest stay where you said them. '
+              'At most three per category. Each expires after 90 days.' if profiles else
               'Up to ten preferences here, at most three per category. Each expires after 90 days.']
-    for entry in state['entries']:
-        lines.append(f"• {entry['category']}: {discord.utils.escape_markdown(entry['evidence'])} "
-                     f"(expires <t:{int(entry['expires_at'])}:d>)")
+    listed = []
+    for entry in state['entries'][:SHOWN]:
+        where = f" · {place(cog, scope, entry)}" if profiles and 'scope' in entry else ''
+        line = (f"• {entry['category']}{where}: {discord.utils.escape_markdown(entry['evidence'])} "
+                f"(expires <t:{int(entry['expires_at'])}:d>)")
+        if len('\n\n'.join(lines+listed+[line])) > 3500:  # Room for the footer inside an embed's 4096.
+            break
+        listed.append(line)
+    lines += listed
+    if len(listed) < len(state['entries']):
+        lines.append(f"…and {len(state['entries'])-len(listed)} more. Remove some to see the rest.")
     if not state['entries']:
-        lines.append('No saved preferences in this conversation.')
-    lines.append('Editing or removing a preference clears recent saved context here. Discord posts and backups are separate.')
+        lines.append('No saved preferences.' if profiles else 'No saved preferences in this conversation.')
+    lines.append('Editing or removing one clears recent saved chats where it showed, everywhere in the server for a '
+                 'server-wide one. Discord posts and backups are separate.' if profiles else
+                 'Editing or removing a preference clears recent saved context here. Discord posts and backups are separate.')
     from .fri_panel import card, reply
     await reply(cog, interaction, embed=card('My memory', '\n\n'.join(lines)),
                 view=MemoryView(cog, scope, state, selected))
+
+
+def place(cog, scope, entry):
+    return note_place(cog.get_channel, entry['scope'], scope['conversation_id'],
+                      public=scope['conversation_id'].startswith('public:'))
 
 
 class MemoryLauncher(discord.ui.View):
@@ -90,8 +110,10 @@ class MemoryView(MemoryLauncher):
         if state['entries']:
             choose = discord.ui.Select(placeholder='Choose a saved preference',
                 custom_id='fri:memory:choose:'+uuid.uuid4().hex, options=[discord.SelectOption(
-                    label=row['evidence'][:100], description=row['category'], value=str(row['id']),
-                    default=row['id'] == selected) for row in state['entries']])
+                    label=row['evidence'][:100], value=str(row['id']),
+                    description=(row['category']+(' · '+place(cog, scope, row) if getattr(cog, 'profiles', False)
+                                                  and 'scope' in row else ''))[:100],
+                    default=row['id'] == selected) for row in state['entries'][:SHOWN]])
             async def choose_entry(interaction):
                 if await self.interaction_check(interaction):
                     await show(cog, interaction, scope, selected=int(choose.values[0]))
