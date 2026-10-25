@@ -135,6 +135,48 @@ def test_a_revoke_the_cache_has_not_seen_still_fences_another_channel_read(monke
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('where', ['general', 'dm'])
+def test_a_channel_that_keeps_one_role_out_is_not_read_from_public(monkeypatch, tmp_path, where):
+    async def scenario():
+        fri, agent, channels, _, post, thread = around(monkeypatch, tmp_path)
+        thread(channels[2], 2001)
+        post(2, 'movie night friday?', age=300)
+        # @everyone can view #2, but one role can't: not everyone in #general could read it.
+        channels[2].overwrites = {discord.Object(id=50): discord.PermissionOverwrite(view_channel=False)}
+        actions = Actions(agent, 20, 1 if where == 'general' else 999, where == 'general')
+        actions.event = SimpleNamespace(id=1, channel=channels[1])
+        try:
+            wide = await actions.channels(around=True)
+            # In a DM only the member reads the answer, and they can read #2 and its thread.
+            assert ('2' in wide, '2001' in wide) == ((False, False) if where == 'general' else (True, True))
+            if where == 'general':
+                assert (await actions.execute({'kind': 'read_recent', 'channel_id': '2', 'window': 'recent'}))['blocked']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_role_kept_out_after_the_read_drops_it_before_the_next_request(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channels, _, post, _ = around(monkeypatch, tmp_path)
+        post(2, 'movie night friday?', age=300)
+        actions = Actions(agent, 20, 1, True)
+        actions.event = SimpleNamespace(id=1, channel=channels[1])
+        try:
+            await actions.execute({'kind': 'read_recent', 'channel_id': '2', 'window': 'recent'})
+            assert actions.sources == {'2'} and await actions.valid()
+            # Discord now keeps one role out of #2; the cached channel hasn't heard yet.
+            fetched = SimpleNamespace(**{**vars(channels[2]), 'overwrites': {
+                discord.Object(id=50): discord.PermissionOverwrite(read_message_history=False)}})
+            channels[1].guild.fetch_channel = AsyncMock(side_effect=lambda cid: fetched if cid == 2 else channels[cid])
+            assert '2' in await actions.channels(around=True)
+            assert '2' not in await actions.channels(fresh=True, around=True)
+            assert not await actions.valid()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_thread_listing_names_its_channel(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, channels, _, post, thread = around(monkeypatch, tmp_path)

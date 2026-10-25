@@ -113,9 +113,9 @@ class Actions:
         """What this member can read through Fri: in public, this channel.
 
         around, for read_recent, adds active public threads, and in public the other channels Fri
-        reads that everyone here could read anyway. This channel's own threads and, in a thread, its
-        parent and siblings have this channel's audience."""
-        from .fri_memory import PUBLIC_THREADS, server_wide
+        reads that everyone in the server could read anyway (open_to_everyone). This channel's own
+        threads and, in a thread, its parent and siblings have this channel's audience."""
+        from .fri_memory import PUBLIC_THREADS, open_to_everyone
 
         member = await self.agent.member(self.user, fresh=fresh, guild_id=self.guild)
         if not member or not self.agent.config['enabled']:
@@ -127,14 +127,17 @@ class Actions:
         if around and self.public:
             ids = list(dict.fromkeys(ids + [home] + listed))
         result = {}
+        def elsewhere(channel):  # Outside this channel's own audience, so it needs everyone's.
+            return (around and self.public and str(channel.id) != str(self.channel) and
+                    str(getattr(channel, 'parent_id', None) or channel.id) != home)
+
         def readable(channel):
             if (not channel or getattr(getattr(channel, 'guild', None), 'id', None) != self.guild or
                     (not self.agent.allowed(channel) and not {str(channel.id), str(getattr(channel, 'parent_id', None))}
                      & set(self.agent.state['history_channels'])) or getattr(channel, 'nsfw', False) or
                     (isinstance(channel, discord.Thread) and (channel.is_private() or getattr(channel.parent, 'nsfw', True)))):
                 return False
-            if (around and self.public and str(channel.id) != str(self.channel) and
-                    str(getattr(channel, 'parent_id', None) or channel.id) != home and not server_wide(channel)):
+            if elsewhere(channel) and not open_to_everyone(channel):
                 return False
             permissions = channel.permissions_for(member)
             return permissions.view_channel and permissions.read_message_history
@@ -151,12 +154,15 @@ class Actions:
             threads.sort(key=lambda thread: thread.last_message_id or thread.id, reverse=True)
             result.update((str(thread.id), thread) for thread in threads[:MAX_THREADS] if readable(thread))
         if fresh and self.sources & result.keys():
-            result = await self.recheck(result, member)
+            result = await self.recheck(result, member, elsewhere)
         return result
 
-    async def recheck(self, channels, member):
+    async def recheck(self, channels, member, elsewhere=lambda channel: False):
         """Drop each channel this turn read from that `member` can't read now, judged from fetched
-        overwrites and roles: the cached channel can lag a revoke (see Invitation.access)."""
+        overwrites and roles: the cached channel can lag a revoke (see Invitation.access). One read
+        outside this channel's audience must also still keep nobody out."""
+        from .fri_memory import open_to_everyone
+
         read = sorted(self.sources & channels.keys())
         guild = channels[read[0]].guild  # channels() keeps only this server's channels
         try:
@@ -168,7 +174,8 @@ class Actions:
                 parent = copy.copy(parent)
                 parent.guild = fresh_guild
                 permissions = parent.permissions_for(member)
-                if not (permissions.view_channel and permissions.read_message_history):
+                if (not (permissions.view_channel and permissions.read_message_history) or
+                        (elsewhere(channels[channel_id]) and not open_to_everyone(parent))):
                     del channels[channel_id]
         except discord.HTTPException:
             return {key: value for key, value in channels.items() if key not in self.sources}
