@@ -108,6 +108,7 @@ class Agent:
         self.heartbeat_started = self.heartbeat_finished = 0
         self.heartbeat_status = 'starting'
         self.unreachable_notices = {}  # channel: when Fri last said it can't reach the controller.
+        self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
 
     @property
     def config(self):
@@ -322,6 +323,9 @@ class Agent:
     def answered(self, events):
         for event in events:
             self.misses.pop(event.id, None)
+            self.responded[event.id] = None
+        while len(self.responded) > MAX_DELIVERED:
+            del self.responded[next(iter(self.responded))]
 
     def settle(self, event, reason=None):
         if event.id in self.misses:  # IDs and a gate or exception name only, never content or names.
@@ -350,23 +354,31 @@ class Agent:
         finally:
             self.handling -= Counter([message.id])
 
-    async def unreachable(self, message):
-        """A message Fri would answer, read while the controller is down: say so instead of going silent."""
-        if message.author.bot or getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:
-            return
+    async def unreachable(self, message, *, answering=False):
+        """A message Fri would answer, read while the controller is down: say so instead of going silent.
+
+        One notice per channel per five minutes, from either path; True once it's posted. `answering` is a
+        reply Fri had already started, past its gates."""
+        if (message.author.bot or getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id or
+                message.id in self.responded):  # E.g. a preview card posted, then binding it failed.
+            return False
         # A DM only reaches a controller read after its member check; an outside ping keeps its own gates.
-        if message.guild and (not self.allowed(message.channel) or
-                              await addressed_text(message, self.fri.user.id) is None):
-            return
+        if message.guild and not answering and (not self.allowed(message.channel) or
+                                                await addressed_text(message, self.fri.user.id) is None):
+            return False
         now = time.time()
         self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if now-v < 300}
         if message.channel.id in self.unreachable_notices:
-            return
+            return False
         self.unreachable_notices[message.channel.id] = now
         try:
             await message.reply(UNREACHABLE, allowed_mentions=NO_MENTIONS, mention_author=False)
+            return True
         except discord.HTTPException:
+            if self.unreachable_notices.get(message.channel.id) == now:
+                del self.unreachable_notices[message.channel.id]  # Nobody saw it; the next message may try.
             LOG.info('Controller outage notice was not delivered')
+            return False
 
     async def watch(self, message):
         # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
@@ -558,6 +570,15 @@ class Agent:
             missed('earlier reply still running')  # Its waiting notice is deleted once that reply lands.
             if not ambient:
                 await self.fri.waiting_notices.send(message)
+            return
+        except ControllerUnavailable:
+            if invitation and not await invitation.current():
+                return missed(f'reply withheld: {invitation.refusal}')
+            if not ambient and await self.unreachable(message, answering=True):
+                self.answered(events)
+            else:
+                missed('controller unreachable')
+            await self.fri.waiting_notices.clear(message.author.id)
             return
         except commands.UserFeedbackCheckFailure as exc:
             if invitation and not await invitation.current():

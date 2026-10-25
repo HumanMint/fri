@@ -175,7 +175,11 @@ Fri can't restart anything. It only notices and says so.
   mismatch). A stale command poll alone is a busy Gene, not an outage. Recovery edits the same DM
   with the outage length. A new outage within 30 minutes of the last DM edits that DM again instead
   of sending another. State lives in the private `fri-watch.json` in the data directory, so a
-  restart mid-outage neither repeats nor forgets the DM.
+  restart mid-outage neither repeats nor forgets the DM. Fri saves what the DM should say before
+  it touches Discord, with 30 s for each pass, so a stuck send never delays the next read. A send
+  or edit that fails or times out is retried on the next pass, even after a restart. A send that
+  may have landed is looked up in the DM before it's sent again, under the same nonce. A DM the
+  owner deleted mid-outage is sent again; once the outage is over, nothing is sent late.
 - **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
   command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
   there, the member gets a fixed "gene isn't taking commands right now" at once, plus "owner
@@ -183,10 +187,12 @@ Fri can't restart anything. It only notices and says so.
   Red has that one command disabled, the notice says Gene isn't offering it. A command Gene accepts and
   then hangs on still waits out the controller's 115 s; that needs a controller change.
 - **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed
-  to Fri in a configured channel) whose controller read fails gets one fixed notice per channel
-  per 5 minutes instead of silence. Mentions outside configured channels keep their own gates
-  and stay silent. The same text replaces the old "workshop controller is temporarily
-  unavailable" wherever that error was shown.
+  to Fri in a configured channel) whose controller read fails, before or while replying, gets one
+  fixed notice per channel per 5 minutes instead of silence. A notice that fails to post doesn't
+  use up those 5 minutes. Ambient chimes stay quiet. Mentions outside configured channels keep
+  their own gates and stay silent. The same text replaces the old "workshop controller is
+  temporarily unavailable" wherever that error was shown, and a controller 5xx's detail goes to
+  the log only.
 - **`fri health`.** Owner DM only; in a server channel Fri says to DM. It works while the
   controller is down and records no turn. It shows Fri's release, Discord connection, heartbeat
   status and age, loop states, waiting usage receipts, live `/status` and `/controls/health`

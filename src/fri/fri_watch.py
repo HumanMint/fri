@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 
 import discord
@@ -20,6 +21,7 @@ STALE = 60  # Gene's runtime reports every 10 s; a minute without one is several
 RELAPSE = 1800  # A new outage this soon after the last DM edits that DM instead of sending another.
 READ = 10  # A watch read that hangs this long counts as an unreachable controller.
 PROBE = 4  # Each live read in the owner's health report.
+DELIVERY = 30  # Owner lookup, send and edit: a stuck Discord call can't hold up the next read.
 GENE = frozenset({'stale', 'offline', 'stopped'})
 NOT_TAKING = 'gene isn’t taking commands right now, so i didn’t send that.'
 NOT_OFFERED = 'gene isn’t offering that command right now, so i didn’t send it.'
@@ -90,13 +92,16 @@ class Watch:
                 self.state = {}
             if not isinstance(self.state, dict):
                 self.state = {}
+            alert = self.state.get('alert')
+            if not isinstance(alert, dict) or not {'open', 'kind', 'since', 'sent', 'text', 'nonce'} <= set(alert):
+                self.state['alert'] = None
         for key, value in {'bad': 0, 'kind': '', 'since': 0, 'checked': 0, 'alert': None}.items():
             self.state.setdefault(key, value)
         return self.state
 
     def alerted(self, kinds=GENE):
         alert = self.load()['alert']
-        return bool(alert and alert.get('open') and alert.get('kind') in kinds)
+        return bool(alert and alert.get('open') and alert.get('kind') in kinds and alert.get('message_id'))
 
     def refusal(self, offered=()):
         if offered:  # Gene is polling; this one command is disabled or unloaded in Red.
@@ -117,12 +122,15 @@ class Watch:
         return assess(health)
 
     async def check(self):
-        try:
-            await self.observe()
-        except Exception as exc:  # A watchdog loop that stops on one odd error watches nothing.
-            LOG.warning('Gene watch check failed: %s', type(exc).__name__)
+        # A watchdog loop that stops on one odd error watches nothing, and a DM that fails waits for the next pass.
+        for step in (self.observe, self.deliver):
+            try:
+                await step()
+            except Exception as exc:
+                LOG.warning('Gene watch %s failed: %s', step.__name__, type(exc).__name__)
 
     async def observe(self):
+        """Decides what the owner's DM should say; `deliver` makes Discord show it."""
         state = self.load()
         kind, detail = await self.read()
         now = time.time()
@@ -132,13 +140,11 @@ class Watch:
         alert = state['alert']
         if kind == 'ok':
             state.update(bad=0, kind='')
-            recovered = bool(alert and alert.get('open'))
-            if recovered:
-                alert.update(open=False, ended=now)
-            self.save()  # Closed even if the edit below fails: the outage is over either way.
-            if recovered:
+            if alert and alert['open']:
                 minutes = max(1, round((now-alert['since'])/60))
-                await self.edit(alert, alert['text']+f'\n-# back at <t:{int(now)}:t>, down about {minutes} min.')
+                alert.update(open=False, ended=now,
+                             text=alert['text']+f'\n-# back at <t:{int(now)}:t>, down about {minutes} min.')
+            self.save()
             return
         if not state['bad']:
             state['since'] = now
@@ -146,38 +152,67 @@ class Watch:
             state['since'] = min(state['since'], now-detail['age'])  # The heartbeat dates the real start.
         state.update(bad=state['bad']+1, kind=kind)
         text = down(kind, detail, state['since'])
-        if alert and alert.get('open'):
+        if alert and alert['open']:
             if alert['kind'] != kind:  # Still down, differently; keep the one DM current.
-                alert.update(kind=kind, text=text)
-                self.save()
-                await self.edit(alert, text)
+                alert.update(kind=kind, text=text+alert.get('again', ''))
         elif state['bad'] >= CHECKS:
-            again = text+f'\n-# again. it came back at <t:{int(alert.get("ended", now))}:t>.' if alert else ''
-            if alert and now-alert.get('sent', 0) < RELAPSE and await self.edit(alert, again):
-                alert.update(open=True, kind=kind, text=again, since=state['since'])
+            if alert and alert.get('message_id') and now-alert['sent'] < RELAPSE:
+                again = f'\n-# again. it came back at <t:{int(alert["ended"])}:t>.'
+                alert.update(open=True, kind=kind, since=state['since'], text=text+again, again=again)
+            else:
+                # The nonce is saved before the send, so a resend Discord already took returns that message.
+                state['alert'] = {'open': True, 'kind': kind, 'since': state['since'], 'sent': now, 'text': text,
+                                  'nonce': secrets.randbits(62)}
+        self.save()
+
+    async def deliver(self):
+        alert = self.load()['alert']
+        if not alert or alert.get('shown') == alert['text']:
+            return
+        async with asyncio.timeout(DELIVERY):
+            channel = self.fri.get_channel(int(alert['channel_id'])) if alert.get('channel_id') else None
+            if channel is None:
+                owner = self.fri.get_user(self.fri.owner_id) or await self.fri.fetch_user(self.fri.owner_id)
+                channel = owner.dm_channel or await owner.create_dm()
+            if not alert.get('message_id') and alert.get('attempted'):
+                # The last send may have landed after all, before a timeout or a restart.
+                async for sent in channel.history(limit=50):
+                    if sent.author.id == self.fri.user.id and sent.content == alert['attempted']:
+                        alert.update(message_id=str(sent.id), channel_id=str(channel.id), shown=sent.content)
+                        self.save()
+                        break
+            text = alert['text']
+            if not alert.get('message_id'):
+                if not alert['open']:  # Over before the owner heard; a late DM about it is noise.
+                    alert['shown'] = text
+                    self.save()
+                    return
+                alert['attempted'] = text
+                self.save()
+                sent = await channel.send(text, nonce=alert['nonce'], allowed_mentions=NO_MENTIONS)
+                # A nonce Discord already saw returns that first message, maybe with older text; the next pass edits it.
+                alert.update(message_id=str(sent.id), channel_id=str(channel.id), shown=getattr(sent, 'content', text))
+                self.save()
+                LOG.warning('Owner told about a Gene outage: %s', alert['kind'])
+                return
+            try:
+                await channel.get_partial_message(int(alert['message_id'])).edit(
+                    content=text, allowed_mentions=NO_MENTIONS)
+            except discord.NotFound:
+                if alert['open']:  # Deleted mid-outage: the owner still has to hear about this one.
+                    for key in ('message_id', 'channel_id', 'shown', 'attempted'):
+                        alert.pop(key, None)
+                    alert['nonce'] = secrets.randbits(62)
+                else:
+                    alert['shown'] = text
+                    LOG.info('Outage DM is gone; its recovery note was dropped')
                 self.save()
                 return
-            owner = self.fri.get_user(self.fri.owner_id) or await self.fri.fetch_user(self.fri.owner_id)
-            sent = await owner.send(text, allowed_mentions=NO_MENTIONS)
-            state['alert'] = {'channel_id': str(sent.channel.id), 'message_id': str(sent.id), 'sent': now,
-                              'open': True, 'kind': kind, 'text': text, 'since': state['since']}
-            LOG.warning('Owner told about a Gene outage: %s', kind)
-        self.save()
+            alert['shown'] = text
+            self.save()
 
     def save(self):
         private_json(self.path, self.state)
-
-    async def edit(self, alert, content):
-        try:
-            channel = self.fri.get_channel(int(alert['channel_id']))
-            if channel is None:
-                owner = self.fri.get_user(self.fri.owner_id) or await self.fri.fetch_user(self.fri.owner_id)
-                channel = await owner.create_dm()
-            await channel.get_partial_message(int(alert['message_id'])).edit(content=content, allowed_mentions=NO_MENTIONS)
-            return True
-        except discord.HTTPException:
-            LOG.info('Outage DM was not edited')
-            return False
 
     async def report(self):
         """Inference-free, recorded nowhere, and DM-only: it names releases, loops and Lab-free ops detail."""
@@ -226,6 +261,9 @@ class Watch:
         alert = state['alert']
         if alert and alert.get('open'):
             watch = f"outage DM open since <t:{int(alert['since'])}:t> ({alert['kind']})"
+            watch += '' if alert.get('message_id') else ', not delivered yet'
+        elif alert and alert.get('message_id') and alert.get('shown') != alert['text']:
+            watch = 'all quiet, recovery note not delivered yet'
         elif state['bad']:
             watch = f"{state['bad']} bad read{'s' if state['bad'] > 1 else ''} in a row ({state['kind']})"
         else:

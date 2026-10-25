@@ -196,8 +196,9 @@ class Fri(discord.Client):
                 data = await response.json()
                 if 400 <= response.status < 500:
                     raise ControllerRejected(str(data.get('detail', 'Controller rejected this request')))
-                if response.status >= 400:
-                    raise ControllerUnavailable(str(data.get('detail', 'Controller rejected this request')))
+                if response.status >= 400:  # Its detail is a controller fault, for the log, not for members.
+                    LOG.warning('Controller %s %s failed: HTTP %s', method, path.split('?')[0], response.status)
+                    raise ControllerUnavailable(UNREACHABLE)
                 return data
         except (aiohttp.ClientError, TimeoutError):
             raise ControllerUnavailable(UNREACHABLE) from None

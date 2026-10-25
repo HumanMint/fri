@@ -41,20 +41,46 @@ def routed(fri, client, paths=None):
 
 
 def owner_dm(fri):
-    edits, sends = [], []
-    channel = SimpleNamespace(id=777)
-    async def send(content, **options):
-        sends.append(content)
-        return SimpleNamespace(id=555+len(sends), channel=channel)
+    """The owner's DM channel. Like Discord's enforce_nonce, a repeated nonce returns the first message."""
+    dm = SimpleNamespace(id=777, messages={}, nonces={}, sends=[], edits=[], hang=None, fail_send=None,
+                         landed=False, fail_edit=None)
+    async def send(content, *, nonce=None, **options):
+        if dm.hang:
+            await dm.hang.wait()
+        if nonce is not None and nonce in dm.nonces:
+            return dm.nonces[nonce]
+        if dm.fail_send and not dm.landed:
+            raise dm.fail_send
+        sent = SimpleNamespace(id=556+len(dm.messages), channel=dm, content=content, author=SimpleNamespace(id=99))
+        dm.messages[sent.id] = sent
+        dm.sends.append(content)
+        if nonce is not None:
+            dm.nonces[nonce] = sent
+        if dm.fail_send:  # Discord took it; Fri never heard back.
+            raise dm.fail_send
+        return sent
+    async def history(limit=100):
+        for sent in list(reversed(dm.messages.values()))[:limit]:
+            yield sent
     def message(mid):
-        async def edit(**options):
-            edits.append((mid, options['content']))
+        async def edit(*, content, **options):
+            if dm.fail_edit:
+                raise dm.fail_edit
+            dm.messages[mid].content = content
+            dm.edits.append((mid, content))
         return SimpleNamespace(edit=edit)
-    channel.get_partial_message = message
-    owner = SimpleNamespace(id=10, send=send, create_dm=AsyncMock(return_value=channel))
+    dm.send, dm.history, dm.get_partial_message = send, history, message
+    owner = SimpleNamespace(id=10, send=send, dm_channel=None, create_dm=AsyncMock(return_value=dm))
     fri.get_user = lambda uid: owner if uid == 10 else None
-    fri.get_channel = lambda cid: channel if cid == 777 else None
-    return sends, edits
+    fri.get_channel = lambda cid: dm if cid == 777 else None
+    fri._connection.user = SimpleNamespace(id=99)
+    return dm
+
+
+def http(status, code=0):
+    import discord
+    kind = {404: discord.NotFound, 403: discord.Forbidden}.get(status, discord.HTTPException)
+    return kind(SimpleNamespace(status=status, reason='x'), {'code': code, 'message': 'x'})
 
 
 def test_gene_outage_gets_one_owner_dm_edited_on_recovery_and_survives_restart(monkeypatch, tmp_path, controls_api):  # noqa: F811
@@ -63,7 +89,8 @@ def test_gene_outage_gets_one_owner_dm_edited_on_recovery_and_survives_restart(m
         fri = configured(monkeypatch)
         fri.data = tmp_path
         routed(fri, client)
-        sends, edits = owner_dm(fri)
+        dm = owner_dm(fri)
+        sends, edits = dm.sends, dm.edits
         try:
             beat(controls)
             await fri.watcher.check()
@@ -101,7 +128,8 @@ def test_relapse_inside_half_an_hour_edits_the_last_dm_and_later_ones_send_a_new
         fri = configured(monkeypatch)
         fri.data = tmp_path
         routed(fri, client)
-        sends, edits = owner_dm(fri)
+        dm = owner_dm(fri)
+        sends, edits = dm.sends, dm.edits
         clock = [time.time()]
         monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0]))
         async def checks(count):
@@ -139,7 +167,7 @@ def test_a_live_but_broken_gene_is_an_outage_too(monkeypatch, tmp_path, controls
         fri = configured(monkeypatch)
         fri.data = tmp_path
         routed(fri, client)
-        sends, _ = owner_dm(fri)
+        sends = owner_dm(fri).sends
         try:
             beat(controls, **changes)
             for _ in range(CHECKS):
@@ -156,7 +184,7 @@ def test_a_busy_command_poll_is_not_an_outage(monkeypatch, tmp_path, controls_ap
         fri = configured(monkeypatch)
         fri.data = tmp_path
         routed(fri, client)
-        sends, _ = owner_dm(fri)
+        sends = owner_dm(fri).sends
         try:
             beat(controls)
             stale_catalog(controls)  # Gene is inside a long Red command: no poll, heartbeat still fresh.
@@ -178,7 +206,7 @@ def test_controller_trouble_is_its_own_outage(monkeypatch, tmp_path, failure, ex
         fri = configured(monkeypatch)
         fri.data = tmp_path
         fri.api = AsyncMock(side_effect=failure)
-        sends, _ = owner_dm(fri)
+        sends = owner_dm(fri).sends
         try:
             for _ in range(CHECKS):
                 await fri.watcher.check()
@@ -196,7 +224,7 @@ def test_a_hung_controller_read_counts_as_down_and_odd_errors_never_stop_the_loo
         async def hang(*args):
             await asyncio.sleep(60)
         fri.api = hang
-        sends, _ = owner_dm(fri)
+        sends = owner_dm(fri).sends
         try:
             with patch('fri.fri_watch.READ', 0.01):
                 for _ in range(CHECKS):
@@ -210,22 +238,153 @@ def test_a_hung_controller_read_counts_as_down_and_odd_errors_never_stop_the_loo
 
 
 def test_failed_owner_dm_is_retried_next_check(monkeypatch, tmp_path):
-    import discord
     async def scenario():
         fri = configured(monkeypatch)
         fri.data = tmp_path
         fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
-        sends, _ = owner_dm(fri)
-        owner = fri.get_user(10)
-        working = owner.send
-        owner.send = AsyncMock(side_effect=discord.HTTPException(SimpleNamespace(status=500, reason='x'), 'down'))
+        dm = owner_dm(fri)
+        dm.fail_send = http(500)
         try:
             for _ in range(CHECKS):
                 await fri.watcher.check()
-            assert owner.send.await_count == 1 and not fri.watcher.state['alert']
-            owner.send = working
+            assert not dm.sends and not fri.watcher.alerted({'unreachable'})
+            dm.fail_send = None
             await fri.watcher.check()
-            assert len(sends) == 1 and fri.watcher.state['alert']['open']
+            assert len(dm.sends) == 1 and fri.watcher.alerted({'unreachable'})
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_stuck_discord_call_never_holds_up_the_next_read(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        dm.hang = asyncio.Event()  # Discord never answers the send.
+        try:
+            with patch('fri.fri_watch.DELIVERY', 0.05, create=True):
+                for _ in range(CHECKS+1):
+                    await asyncio.wait_for(fri.watcher.check(), 1)
+            assert fri.api.await_count == CHECKS+1 and not dm.sends
+            dm.hang = None
+            await fri.watcher.check()
+            assert len(dm.sends) == 1
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_failed_edits_are_retried_until_the_dm_matches_even_across_a_restart(monkeypatch, tmp_path, controls_api):  # noqa: F811
+    async def scenario():
+        client, controls = controls_api
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        routed(fri, client)
+        dm = owner_dm(fri)
+        try:
+            beat(controls, age=300)
+            for _ in range(CHECKS):
+                await fri.watcher.check()
+            assert len(dm.sends) == 1 and 'gene’s been dead' in dm.sends[0]
+            dm.fail_edit = http(500)
+            beat(controls, guild_connected=False)  # Still down, differently.
+            await fri.watcher.check()
+            assert not dm.edits
+            dm.fail_edit = None
+            await fri.watcher.check()
+            assert len(dm.edits) == 1 and 'cut off from discord' in dm.edits[0][1]
+            dm.fail_edit = http(500)
+            beat(controls)
+            await fri.watcher.check()  # Recovered, but the note didn't land.
+            assert len(dm.edits) == 1
+            fri.watcher = Watch(fri)
+            dm.fail_edit = None
+            await fri.watcher.check()
+            assert len(dm.edits) == 2 and '-# back at <t:' in dm.edits[1][1]
+            assert dm.messages[556].content == dm.edits[1][1]
+            await fri.watcher.check()
+            assert len(dm.edits) == 2 and len(dm.sends) == 1
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+class Crash(BaseException):
+    """Fri's process dying mid-call: no handler of Fri's runs."""
+
+
+@pytest.mark.parametrize('window', [True, False])
+def test_a_dm_that_landed_before_a_crash_is_found_again_not_resent(monkeypatch, tmp_path, window):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        try:
+            for _ in range(CHECKS-1):
+                await fri.watcher.check()
+            dm.fail_send, dm.landed = Crash(), True
+            with pytest.raises(Crash):
+                await fri.watcher.check()
+            assert len(dm.sends) == 1
+            dm.fail_send = None
+            if not window:  # Past Discord's nonce window, only Fri's own record can tell.
+                dm.nonces.clear()
+            fri.watcher = Watch(fri)
+            await fri.watcher.check()
+            assert len(dm.sends) == 1 and fri.watcher.alerted({'unreachable'})
+            assert fri.watcher.state['alert']['message_id'] == '556'
+            fri.api = AsyncMock(return_value={'heartbeat_age_seconds': 1, 'runtime': {
+                'guild_connected': True, 'controls_running': True}})
+            await fri.watcher.check()
+            assert dm.edits and dm.edits[-1][0] == 556 and '-# back at' in dm.edits[-1][1]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_outage_over_before_its_dm_landed_sends_nothing_late(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        dm.fail_send = http(500)
+        try:
+            for _ in range(CHECKS):
+                await fri.watcher.check()
+            dm.fail_send = None
+            fri.api = AsyncMock(return_value={'heartbeat_age_seconds': 1, 'runtime': {
+                'guild_connected': True, 'controls_running': True}})
+            await fri.watcher.check()
+            await fri.watcher.check()
+            assert not dm.sends and not dm.edits
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_deleted_dm_is_resent_while_the_outage_lasts_and_dropped_after(monkeypatch, tmp_path):
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        try:
+            for _ in range(CHECKS):
+                await fri.watcher.check()
+            dm.fail_edit = http(404, 10008)
+            fri.api = AsyncMock(side_effect=ControllerRejected('Unsupported Fri contract'))
+            await fri.watcher.check()  # Kind changed, but the DM is gone: the owner still has to hear.
+            await fri.watcher.check()
+            assert len(dm.sends) == 2 and 'rejecting my health checks' in dm.sends[1]
+            fri.api = AsyncMock(return_value={'heartbeat_age_seconds': 1, 'runtime': {
+                'guild_connected': True, 'controls_running': True}})
+            await fri.watcher.check()
+            await fri.watcher.check()
+            assert len(dm.sends) == 2 and not dm.edits
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -248,7 +407,7 @@ def test_quick_control_with_gene_down_answers_at_once_without_charging_or_queuei
             assert result.reply == NOT_TAKING
             assert '/controls/catalog' in paths
             assert '/chat/operations/admit' not in paths and '/controls' not in paths
-            fri.watcher.state = {'alert': {'open': True, 'kind': 'stale'}}
+            fri.watcher.state = {'alert': {'open': True, 'kind': 'stale', 'text': 'x', 'message_id': '556'}}
             result = await fri.talk(123, 1, 20, actual.content, 'public', event=actual)
             assert result.reply == NOT_TAKING+' owner already knows.'
             client.post('/runtime/controls/poll', headers=headers('runtime'), json={'actions': ['queue']})
@@ -351,6 +510,78 @@ def test_controller_outage_notice_needs_a_message_fri_would_answer(changes):
             await agent.handle(quiet)
         quiet.reply.assert_not_awaited()
         assert not agent.unreachable_notices
+    asyncio.run(scenario())
+
+
+def test_no_outage_notice_after_fri_already_answered():
+    async def scenario():
+        agent = down_agent()
+        posted = message()
+        async def preview_then_bind(event):  # The card lands; binding it on the controller fails.
+            agent.answered([event])
+            raise ControllerUnavailable(UNREACHABLE)
+        agent.receive = preview_then_bind
+        with pytest.raises(ControllerUnavailable):
+            await agent.handle(posted)
+        posted.reply.assert_not_awaited()
+        assert not agent.unreachable_notices
+    asyncio.run(scenario())
+
+
+def test_reply_path_controller_failures_share_the_one_notice_and_never_show_its_detail():
+    from contextlib import asynccontextmanager
+    @asynccontextmanager
+    async def typing():
+        yield
+    async def scenario():
+        agent = down_agent()
+        agent.fri.talk = AsyncMock(side_effect=ControllerUnavailable('sqlite3.OperationalError: database is locked'))
+        agent.fri.waiting_notices = SimpleNamespace(clear=AsyncMock(), send=AsyncMock())
+        agent.ambient_ready = lambda *args: True
+        first, second, ambient = message(), message(), message(channel=457)
+        for each in (first, second, ambient):
+            each.channel.typing = typing
+        await agent.reply_once(first, 'you there?')
+        await agent.reply_once(second, 'hello??')
+        await agent.reply_once(ambient, 'lol', ambient=True)  # Nobody asked; no notice either.
+        assert first.reply.await_args.args == (UNREACHABLE,)
+        second.reply.assert_not_awaited()
+        ambient.reply.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_controller_5xx_detail_stays_in_the_log(monkeypatch):
+    class Response:
+        status = 500
+        async def json(self):
+            return {'detail': 'sqlite3.OperationalError: database is locked'}
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *exc):
+            return False
+    async def scenario():
+        fri = configured(monkeypatch)
+        fri.session = SimpleNamespace(request=lambda *a, **k: Response())
+        with pytest.raises(ControllerUnavailable) as caught:
+            await fri.api('GET', '/fri/contract')
+        assert str(caught.value) == UNREACHABLE
+        fri.session = None
+        await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_undelivered_outage_notice_leaves_the_channel_free():
+    async def scenario():
+        agent = down_agent()
+        first = message()
+        first.reply.side_effect = http(500)
+        with pytest.raises(ControllerUnavailable):
+            await agent.handle(first)
+        assert not agent.unreachable_notices
+        second = message()
+        with pytest.raises(ControllerUnavailable):
+            await agent.handle(second)
+        second.reply.assert_awaited_once()
     asyncio.run(scenario())
 
 
