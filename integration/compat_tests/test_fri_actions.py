@@ -420,7 +420,7 @@ def test_read_recent_schema_always_names_a_window():
     branches = [branch for branch in SCHEMA['properties']['action']['anyOf']
                 if 'read_recent' in branch.get('properties', {}).get('kind', {}).get('enum', [])]
     assert len(branches) == 1 and branches[0]['required'] == ['kind', 'channel_id', 'window']
-    assert branches[0]['properties']['window']['enum'] == ['recent', 'since_my_last_message']
+    assert branches[0]['properties']['window']['enum'] == ['recent', 'since_my_last_message', 'pins']
 
 
 @pytest.mark.parametrize('outcome', ['completed', 'failed', 'second_action', 'erased'])

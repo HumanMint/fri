@@ -26,6 +26,10 @@ CATCH_UP_MESSAGES, CATCH_UP_SECONDS = 100, 12 * 3600
 CATCH_UP_CHARS = 20000  # Serialized rows, so emoji-heavy chat can't blow up the prompt.
 RETURN_SECONDS = 5 * 60  # The speaker's own recent messages ("yo", "back") are part of coming back.
 MAX_THREADS = 6  # Active public threads a read can pick from, most recently active first.
+PINS = 20  # Pinned posts a pins read shows, newest pinned first, any age.
+PINS_AGAIN = 50  # One page when a pins read is checked again, so a new pin can't push one out.
+PINNED = ('The channel\'s pinned posts, newest pinned first, up to twenty of any age: when they ask '
+          'what\'s pinned or say something is in the pins.')
 CATCH_UP = ('Only when the speaker asks what they missed: other members\' text in that channel since '
             'the speaker\'s last message there, up to 100 messages or 12 hours. No images.')
 
@@ -207,7 +211,8 @@ class Actions:
                     'description': 'Read one small recent batch when asked: text, what each post carries '
                     '(image, gif, video, file), and a look at up to four of the newest still images. '
                     'Another listed channel or thread when they ask about it. No saved personal notes.',
-                    'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
+                    'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP,
+                                'pins': PINNED}}}
         if self.invitation:
             actions['read_recent'].update(limit=12, max_age_days=6/24,
                 description='Read up to twelve preceding same-channel messages from the last six hours '
@@ -403,8 +408,9 @@ class Actions:
         if channel_id not in channels:
             return {'blocked': 'That channel is outside this conversation’s readable scope.'}
         catch_up = action.get('window') == 'since_my_last_message'
+        pins = action.get('window') == 'pins'
         self.sources.add(channel_id)
-        if self.invitation and not catch_up and channel_id == str(self.channel):
+        if self.invitation and not catch_up and not pins and channel_id == str(self.channel):
             return await self.invited_context(channel_id)
         channel = channels[channel_id]
         scope = getattr(channel, 'parent_id', None) or channel.id
@@ -415,8 +421,9 @@ class Actions:
             asked = discord.utils.snowflake_time(self.event.id).timestamp()
         if catch_up:
             after = max(after, asked-CATCH_UP_SECONDS)
-        if channel.id == self.agent.dedicated:
-            after = max(after, self.agent.state.get('started', time.time()))
+        # Fri's own channel reads only what was said since Fri started there, pins included.
+        floor = self.agent.state.get('started', time.time()) if channel.id == self.agent.dedicated else 0
+        after = max(after, floor)
         options = {'limit': 20, 'after': dt.datetime.fromtimestamp(after, dt.timezone.utc), 'oldest_first': False}
         if catch_up:
             options['limit'] = CATCH_UP_MESSAGES
@@ -426,9 +433,9 @@ class Actions:
         # they sent just before asking, or that only bots answered, are them coming back, not leaving.
         returned, others, left, full = asked-RETURN_SECONDS, False, None, False
         records, scanned, profiles, shown, size, posts, newest = [], 0, {}, {}, 0, [], 0
-        async for message in channel.history(**options):
+        async for message in (channel.pins(limit=PINS) if pins else channel.history(**options)):
             scanned, newest = scanned+1, max(newest, message.id)
-            if message.author.bot or message.webhook_id:
+            if message.author.bot or message.webhook_id or (floor and message.created_at.timestamp() < floor):
                 continue
             user = message.author.id
             if catch_up and user == self.user:
@@ -465,13 +472,15 @@ class Actions:
             if carries:
                 posts.append(message)
         result = {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
-                  'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': after,
-                  'images_inspected': 0, 'personal_notes_saved': 0}
+                  'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': floor if pins else after,
+                  'images_inspected': 0, 'personal_notes_saved': 0, **({'window': 'pins'} if pins else {})}
         # Asked to look around, Fri looks at the pictures too, as a member scrolling up would.
         if posts and self.media_allowed and self.turn_context is not None:
             result.update(await look(self.turn_context, posts))
             self.image_context = image_context(self.turn_context)
-        if shown:
+        if shown and pins:
+            self.reads.append({'channel': channel, 'pins': PINS_AGAIN, 'shown': shown})
+        elif shown:
             # The same window, ending at the newest post it scanned, so a later post can't push one out.
             self.reads.append({'channel': channel, 'options': {'before': discord.Object(id=newest+1), **options},
                                'shown': shown})
@@ -484,12 +493,14 @@ class Actions:
 
     async def reads_unchanged(self):
         """Every post a read showed still exists unedited, like an invitation's sources: one history
-        refetch per read, before each model request and before delivery."""
+        refetch per read, before each model request and before delivery. A pin read's posts must
+        also still be pinned."""
         try:
             for read in self.reads:
-                shown = read['shown']
+                shown, channel = read['shown'], read['channel']
+                found = channel.pins(limit=read['pins']) if 'pins' in read else channel.history(**read['options'])
                 latest = {message.id: (message.author.id, message.content, message.edited_at)
-                          async for message in read['channel'].history(**read['options']) if message.id in shown}
+                          async for message in found if message.id in shown}
                 if latest != shown:
                     return False
         except discord.HTTPException:

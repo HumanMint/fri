@@ -38,7 +38,8 @@ def media(message):
 
 
 def details(message):
-    """What a reader sees around a post's text: what it carries, its reactions, the post it answers.
+    """What a reader sees around a post's text: what it carries, its reactions, the post it answers,
+    whether it's pinned.
 
     Reaction counts only, never who reacted; Fri's own reaction is marked so it can own it."""
     extra = {}
@@ -54,6 +55,8 @@ def details(message):
             getattr(reference, 'channel_id', None) == channel.id):
         guild = getattr(getattr(message, 'guild', None), 'id', None)
         extra['reply_to'] = f'https://discord.com/channels/{guild or "@me"}/{channel.id}/{reference.message_id}'
+    if getattr(message, 'pinned', None) is True:
+        extra['pinned'] = True
     return extra
 
 

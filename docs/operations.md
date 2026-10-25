@@ -30,7 +30,9 @@ twenty million pixels; external embeds, GIFs and videos are not inspected by thi
 A pasted message link or a replied-to post is opened only when the speaker and Fri can
 read it now (fetched overwrites and roles); from a server channel, only when it is this
 channel or one that keeps no role or member out. Every post a read or a link showed is
-found again unchanged before each later model request and before delivery. Captions
+found again unchanged before each later model request and before delivery. Asked what's
+pinned, Fri reads up to twenty of a channel's pins, any age, with the same channel, audience
+and author checks as any read; each must still be pinned and unchanged before the next request. Captions
 and filenames are never visual evidence. Public research only exports an exact
 public question from the current request, never surrounding chat or image captions.
 
