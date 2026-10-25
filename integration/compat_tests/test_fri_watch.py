@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import json
 import time
 from types import SimpleNamespace
@@ -291,8 +292,12 @@ def test_quick_control_still_runs_when_gene_offers_it(monkeypatch, tmp_path, con
     asyncio.run(scenario())
 
 
+IDS = itertools.count(1)
+
+
 def message(content='fri you there?', channel=456, guild=123, user=11, **changes):
-    value = SimpleNamespace(id=1, guild=SimpleNamespace(id=guild) if guild else None,
+    """A fresh Discord message each time: the agent ignores a second delivery of the same ID."""
+    value = SimpleNamespace(id=next(IDS), guild=SimpleNamespace(id=guild) if guild else None,
         channel=SimpleNamespace(id=channel), author=SimpleNamespace(id=user, bot=False, display_name='friend'),
         content=content, mentions=[], reference=None, webhook_id=None, reply=AsyncMock())
     for key, item in changes.items():
@@ -324,9 +329,10 @@ def test_controller_outage_gets_one_fixed_notice_per_channel_instead_of_silence(
             await agent.handle(again)
         again.reply.assert_not_awaited()  # Once per channel per five minutes.
         agent.unreachable_notices[456] -= 301
+        later = message()
         with pytest.raises(ControllerUnavailable):
-            await agent.handle(again)
-        again.reply.assert_awaited_once()
+            await agent.handle(later)
+        later.reply.assert_awaited_once()
         agent.respond.assert_not_awaited()
     asyncio.run(scenario())
 
