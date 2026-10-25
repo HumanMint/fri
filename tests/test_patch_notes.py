@@ -163,6 +163,24 @@ def test_a_damaged_record_or_a_concurrent_send_is_refused(dm, tmp_path):
     assert dm.sends == []
 
 
+@pytest.mark.parametrize('record', [
+    '{"versions": {"0.4.0": {}}}', '{"versions": {"0.4.0": null}}', '{"versions": {"0.4.0": 7}}',
+    '{"versions": {"0.4.0": {"sha256": "x", "parts": [{}]}}}', '{"versions": "x"}', '{"versions": {',
+    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": [{"message_id": 5}]}}}',
+    '{"versions": {"0.3.0": {"sha256": "' + '0'*64 + '", "parts": []}}}', b'\xff'])
+def test_a_damaged_entry_is_refused_with_exit_2_before_login(monkeypatch, capsys, tmp_path, dm, record):
+    """Truncated JSON, a malformed entry or part, or a null one (which would resend), anywhere in the record."""
+    path = tmp_path / 'patch-notes.json'
+    path.write_bytes(record if isinstance(record, bytes) else record.encode())
+    monkeypatch.setenv('DISCORD_TOKEN', 'secret-token')
+    monkeypatch.setenv('GENE_OWNER_ID', str(OWNER))
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'notes')))
+    assert notes.main(['send', '0.4.0']) == 2
+    assert 'not a patch-notes record' in capsys.readouterr().err
+    assert dm.sends == [] and path.read_bytes() == (record if isinstance(record, bytes) else record.encode())
+
+
 def test_cli_previews_without_credentials_and_checks_the_version(monkeypatch, capsys):
     monkeypatch.delenv('DISCORD_TOKEN', raising=False)
     monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO('**fri 0.4.0**\n\nhi'.encode())))

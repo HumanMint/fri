@@ -74,13 +74,29 @@ def locked(directory):
         os.close(fd)
 
 
+def recorded(part):
+    """One part as send() writes it: when it was attempted, and the message Discord confirmed."""
+    attempted = part.get('attempted_at', 0)
+    return (isinstance(part, dict) and set(part) <= {'attempted_at', 'message_id', 'channel_id'} and
+            isinstance(attempted, (int, float)) and not isinstance(attempted, bool) and
+            all(isinstance(part.get(key, '0'), str) and part.get(key, '0').isdigit() for key in ('message_id', 'channel_id')))
+
+
 def load(path):
+    """The whole record, checked: a damaged one is refused, never guessed past, since a guess can resend."""
     try:
         state = json.loads(path.read_text())
     except FileNotFoundError:
         return {'versions': {}}
-    if not isinstance(state, dict) or not isinstance(state.get('versions'), dict):
-        raise NotesRefused(f'{path.name} is not a patch-notes record')  # Never guess past a damaged record.
+    except (OSError, ValueError):  # Unreadable, truncated or not UTF-8 JSON.
+        state = None
+    versions = state.get('versions') if isinstance(state, dict) else None
+    if not isinstance(versions, dict) or not all(
+            isinstance(entry, dict) and isinstance(entry.get('sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', entry['sha256'])
+            and isinstance(entry.get('parts'), list) and 1 <= len(entry['parts']) <= MAX_PARTS
+            and all(isinstance(part, dict) and recorded(part) for part in entry['parts'])
+            for entry in versions.values()):
+        raise NotesRefused(f'{path.name} is not a patch-notes record')
     return state
 
 
