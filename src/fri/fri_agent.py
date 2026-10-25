@@ -1,6 +1,7 @@
 """Discord harness for Fri's scoped conversations, heartbeat and owner controls."""
 
 import asyncio
+import copy
 import datetime as dt
 import io
 import json
@@ -559,8 +560,11 @@ class Agent:
         for gate in gates:
             if not await gate.current(check_evidence=False):
                 return self.missed(events, f'reply withheld: {gate.refusal}')
-        if not ambient and await self.unreachable(message, answering=True):
+        standing = (lambda: self.forgotten.get(message.author.id, 0) == since[0]) if since else None
+        if not ambient and await self.unreachable(message, answering=True, standing=standing):
             self.answered(events)
+        elif standing and not standing():
+            self.missed(events, 'author privacy changed')
         else:
             self.missed(events, 'controller unreachable')
         await self.fri.waiting_notices.clear(message.author.id)
@@ -614,10 +618,13 @@ class Agent:
             async with self.controls[user] if privacy else nullcontext():
                 if privacy and (reason := await self.excluded(message, dm, invitation, privacy)):
                     return self.missed(events, reason)  # E.g. they left while another control ran.
+                # The message as it stands now, before the control changes anything: e.g. edited to take it
+                # back. A ping's invitation also checks it still pings Fri, with its author's access.
                 if privacy and invitation and not await invitation.current(check_evidence=False, control=True):
-                    # The ping as it stands now, before the control changes anything: e.g. edited to take it back.
                     return await self.withheld(message, events, invitation.refusal, invitation, fenced=False,
                                                logged=f'reply withheld: {invitation.refusal}')
+                if privacy and not invitation and not await self.still_addressed(message, answering=True):
+                    return self.missed(events, 'message changed')  # E.g. a ping sent while Fri was paused.
                 if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since) is not BUSY:
                     return
             recheck = True
@@ -688,11 +695,25 @@ class Agent:
             return None
         if not self.allowed(message.channel):
             return 'channel no longer configured'
-        if not invitation:
-            permissions = member and message.channel.permissions_for(member)
-            if not (permissions and permissions.view_channel and permissions.read_message_history):
-                return 'member changed'
+        if not invitation and not (member and await self.can_read(message, member)):
+            return 'member changed'
         return None
+
+    async def can_read(self, message, member):
+        """Whether `member` can read the message's channel now, from fetched overwrites and roles: the
+        cached channel can lag (see Invitation.access)."""
+        guild = message.guild
+        try:
+            channel = await guild.fetch_channel(message.channel.id)
+            parent = await guild.fetch_channel(channel.parent_id) if isinstance(channel, discord.Thread) else channel
+            fresh = copy.copy(guild)
+            fresh._roles = {role.id: role for role in await guild.fetch_roles()}
+        except discord.HTTPException:
+            return False
+        parent = copy.copy(parent)
+        parent.guild = fresh
+        permissions = parent.permissions_for(member)
+        return permissions.view_channel and permissions.read_message_history
 
     async def unreadable(self, message, events, exc, invitation, forgotten):
         """A message whose author's privacy revision couldn't be read as it came in, other than in an
@@ -730,17 +751,20 @@ class Agent:
             self.handling -= Counter([message.id])
             self.turns.leave(message.author.id, message.id)
 
-    async def unreachable(self, message, *, answering=False):
+    async def unreachable(self, message, *, answering=False, standing=None):
         """A message Fri would answer, read while the controller is down: say so instead of going silent.
 
         One notice per channel per five minutes, from either path; True once it's posted. `answering` is a
-        reply Fri had already started, so it was addressed."""
+        reply Fri had already started, so it was addressed. `standing`, if given, is checked last before
+        posting, e.g. that its author hasn't erased since."""
         if (message.author.bot or getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id or
                 message.id in self.responded):  # E.g. a preview card posted, then binding it failed.
             return False
         # A DM only reaches a controller read after its member check. Outside configured channels a
         # ping keeps its own gates and stays quiet.
         if message.guild and not self.allowed(message.channel) or not await self.still_addressed(message, answering):
+            return False
+        if standing and not standing():
             return False
         now = time.monotonic()
         self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if v is None or now-v < 300}

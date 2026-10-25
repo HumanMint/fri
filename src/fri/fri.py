@@ -328,6 +328,8 @@ class Fri(discord.Client):
     async def chat_once(self, text, context):
         async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
             fence = context.get('fence')
+            if fence and fence.get('gate'):
+                await fence['gate']()
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
@@ -535,12 +537,12 @@ class Fri(discord.Client):
                                              'effort': context['effort']},
                                     'actions': actions, 'shown': set()}
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
-                    # A DM's own gates, last before the model and after every read above: its author is
-                    # still a member, as Discord has it now, and DMs are still on.
-                    if not await self.agent.member(user_id, fresh=True):
-                        raise GateClosed('not a member')
-                    if not self.agent.config['support_dms']:
-                        raise GateClosed('dms off')
+                    async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
+                        if not await self.agent.member(user_id, fresh=True):
+                            raise GateClosed('not a member')
+                        if not self.agent.config['support_dms']:
+                            raise GateClosed('dms off')
+                    context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
                 result = await self.chat_once(text, context)
                 if invitation:
                     await invitation.require_current()
@@ -996,11 +998,12 @@ class Fri(discord.Client):
 
 
 def main():
-    from .logging import install_secret_filter
+    from .logging import configure, install_secret_filter
     install_secret_filter()
+    configure()
     from .fri_instance import instance_lock
     with instance_lock(os.getenv('FRI_DATA', '/data')):
-        Fri().run(os.environ['DISCORD_TOKEN'], log_level=logging.INFO)
+        Fri().run(os.environ['DISCORD_TOKEN'], log_handler=None)  # configure() already set up logging.
 
 
 if __name__ == '__main__':
