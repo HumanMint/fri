@@ -2166,6 +2166,7 @@ def test_a_dm_whose_author_leaves_before_the_model_runs_is_not_answered(monkeypa
             return await api(method, path, payload)
         fri.api = reading
         del fri.chat_once  # The real one, with its last checks before the request.
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()  # Its usage receipt.
         reached = []
         async def respond(text, context, *, ready=None):
             if when == 'sign-in':  # While the subscription signs in, before the request.
