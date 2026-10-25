@@ -407,11 +407,11 @@ class Fri(discord.Client):
                     context['elsewhere'] = self.elsewhere(context.get('elsewhere', []), guild_id)
                 else:
                     context['elsewhere'] = []
-                conversation = {}
+                conversation, targets = {}, []
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence
                     try:
-                        conversation = await evidence(self.agent, event, burst)
+                        conversation = await evidence(self.agent, event, burst, targets)
                     except ValueError as exc:
                         raise commands.UserFeedbackCheckFailure(str(exc)) from None
                     context.update(conversation)
@@ -503,6 +503,10 @@ class Fri(discord.Client):
                 from .fri_images import attach as attach_images
                 if inspect_images:
                     await attach_images(context, event, text, source=image_source, invitation=invitation)
+                    if targets and not context.get('unattributed_reference'):
+                        # The meme they replied to or linked, when it's a still image.
+                        from .fri_images import look
+                        await look(context, [post for post in targets if post.attachments])
                 if actions:
                     from .fri_images import image_context
                     actions.image_context = image_context(context)

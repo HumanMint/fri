@@ -156,32 +156,89 @@ async def live_rows(agent, message, burst):
         raise ValueError('A message in that burst is no longer available. Send a fresh request.') from None
 
 
-async def reply_target(agent, message):
-    """Read only the directly referenced, currently readable message in this audience."""
+LINK = re.compile(r'\bhttps://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/(\d{1,25})/(\d{1,25})/(\d{1,25})\b')
+MAX_LINKS = 2
+
+
+def links(message):
+    """Message links the speaker pasted, outside code, in order: (guild, channel, message) ids."""
+    visible = re.sub(r'```[\s\S]*?```|`[^`]*`', '', getattr(message, 'content', '') or '')
+    found = []
+    for match in LINK.finditer(visible):
+        ids = tuple(int(part) for part in match.groups())
+        if ids not in found:
+            found.append(ids)
+    return found[:MAX_LINKS]
+
+
+async def reply_target(agent, message, posts=None):
+    """The message they replied to, and up to two they linked, when this audience may read them.
+
+    posts, when given, collects each target's Discord message, for the images look() may inspect."""
+    from .fri_memory import server_wide
+
+    rows = []
+    reference = getattr(message, 'reference', None)
+    channel = message.channel
+    if reference and reference.message_id and getattr(reference, 'channel_id', channel.id) in (None, channel.id):
+        if not message.guild or await readable(agent, message, channel):
+            rows += await target_row(agent, channel, reference.message_id,
+                                     str(message.guild.id) if message.guild else None, posts)
+    home = message.guild.id if message.guild else agent.fri.guild_id
+    for guild_id, channel_id, message_id in links(message):
+        if message_id == message.id or any(row['source']['id'] == str(message_id) for row in rows):
+            continue
+        linked = agent.fri.get_channel(channel_id)
+        if guild_id != home or linked is None or getattr(getattr(linked, 'guild', None), 'id', None) != home:
+            continue
+        # Said in a server channel, it must be one everyone there could read anyway, or this one.
+        if message.guild and linked.id != channel.id and not server_wide(linked):
+            continue
+        if not in_scope(agent, linked) or not await readable(agent, message, linked):
+            continue
+        rows += [{**row, 'linked': True} for row in await target_row(agent, linked, message_id, str(home), posts)]
+    return rows
+
+
+def in_scope(agent, channel):
+    """A channel Fri already reads for chat or learning, not age-restricted or a private thread."""
     import discord
 
-    reference = getattr(message, 'reference', None)
-    if not reference or not reference.message_id:
-        return []
-    channel = message.channel
-    if getattr(reference, 'channel_id', channel.id) not in (None, channel.id):
-        return []
-    if message.guild:
-        if not agent.allowed(channel):
-            return []
-        member = await agent.member(message.author.id, fresh=True, guild_id=message.guild.id)
-        if not member:
-            return []
-        for who in (member, message.guild.me):
-            permissions = channel.permissions_for(who)
-            if not permissions.view_channel or not permissions.read_message_history:
-                return []
+    parent = channel.parent if isinstance(channel, discord.Thread) else channel
+    if isinstance(channel, discord.Thread) and channel.is_private():
+        return False
+    is_nsfw = getattr(parent, 'is_nsfw', None)
+    if parent is None or getattr(parent, 'nsfw', False) or (callable(is_nsfw) and is_nsfw()):
+        return False
+    return agent.allowed(channel) or str(parent.id) in agent.state.get('history_channels', [])
+
+
+async def readable(agent, message, channel):
+    """The speaker, now, and Fri can both read that channel's history."""
+    guild = channel.guild
+    if message.guild and not agent.allowed(message.channel):
+        return False
+    member = await agent.member(message.author.id, fresh=True, guild_id=guild.id)
+    if not member:
+        return False
+    for who in (member, guild.me):
+        permissions = channel.permissions_for(who)
+        if not permissions.view_channel or not permissions.read_message_history:
+            return False
+    return True
+
+
+async def target_row(agent, channel, message_id, guild_id, posts):
+    """One referenced message as evidence: recent, by a member who allows it, or Fri itself."""
+    import discord
+
+    from .fri_images import media
     try:
-        target = await channel.fetch_message(reference.message_id)
+        target = await channel.fetch_message(message_id)
         source = discord_source(target)
-        if (target.id != reference.message_id or target.channel.id != channel.id or target.webhook_id or
-                source.guild_id != (str(message.guild.id) if message.guild else None) or
-                not 0 <= time.time()-source.timestamp().timestamp() <= REPLY_SECONDS or not target.content.strip()):
+        if (target.id != message_id or target.channel.id != channel.id or target.webhook_id or
+                source.guild_id != guild_id or not 0 <= time.time()-source.timestamp().timestamp() <= REPLY_SECONDS or
+                not (target.content.strip() or media(target))):
             return []
         if target.author.id != agent.fri.user.id:
             if target.author.bot:
@@ -189,15 +246,20 @@ async def reply_target(agent, message):
             profile = await agent.profile(getattr(channel, 'parent_id', None) or channel.id, target.author.id)
             if not profile['enabled']:
                 return []
-        return [{'source': source.model_dump(), 'text': clean(target.content, 1800),
-                 'privacy_revision': profile['revision'] if target.author.id != agent.fri.user.id else None}]
+        row = {'source': source.model_dump(), 'text': clean(target.content, 1800),
+               'privacy_revision': profile['revision'] if target.author.id != agent.fri.user.id else None}
+        if media(target):
+            row['attachments'] = media(target)
+        if posts is not None:
+            posts.append(target)
+        return [row]
     except discord.HTTPException:
         return []
 
 
-async def evidence(agent, message, burst):
+async def evidence(agent, message, burst, posts=None):
     rows = await live_rows(agent, message, burst) if len(burst) > 1 else []
-    target = await reply_target(agent, message)
+    target = await reply_target(agent, message, posts)
     return {'message_burst': rows, 'reply_target': target}
 
 

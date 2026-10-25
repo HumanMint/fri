@@ -34,7 +34,7 @@ async def workflow(monkeypatch, tmp_path, connection, *, private=True, reply=Tru
         reply=AsyncMock(return_value=SimpleNamespace(id=888)))
     target = Mock(spec=discord.Message, id=current.id-(1000 << 22), content='Paddington game tomorrow at seven',
         author=fri.user if private else SimpleNamespace(id=30, display_name='Other member', bot=False),
-        guild=guild, channel=channel, webhook_id=None)
+        guild=guild, channel=channel, webhook_id=None, edited_at=None, attachments=[], embeds=[])
     if reply:
         current.reference = SimpleNamespace(message_id=target.id, channel_id=channel.id)
     channel.fetch_message = AsyncMock(side_effect=lambda mid: target if mid == target.id else current)

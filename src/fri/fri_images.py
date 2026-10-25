@@ -32,7 +32,35 @@ def media(message):
             kinds.append('linked video')
         elif kind == 'image' or getattr(embed, 'image', None):
             kinds.append('linked image')
+    stickers = getattr(message, 'stickers', None)
+    kinds += ['sticker' for _ in stickers] if isinstance(stickers, (list, tuple)) else []
     return kinds[:10]
+
+
+def details(message):
+    """What a reader sees around a post's text: what it carries, its reactions, the post it answers.
+
+    Reaction counts only, never who reacted; Fri's own reaction is marked so it can own it."""
+    extra = {}
+    if media(message):
+        extra['attachments'] = media(message)
+    reactions = getattr(message, 'reactions', None)
+    if isinstance(reactions, (list, tuple)) and reactions:
+        extra['reactions'] = [{'emoji': label(r.emoji), 'count': r.count, **({'fri': True} if r.me is True else {})}
+                              for r in reactions[:6] if isinstance(getattr(r, 'count', None), int)]
+    reference = getattr(message, 'reference', None)
+    channel = getattr(message, 'channel', None)
+    if (isinstance(getattr(reference, 'message_id', None), int) and channel is not None and
+            getattr(reference, 'channel_id', None) == channel.id):
+        guild = getattr(getattr(message, 'guild', None), 'id', None)
+        extra['reply_to'] = f'https://discord.com/channels/{guild or "@me"}/{channel.id}/{reference.message_id}'
+    return extra
+
+
+def label(emoji):
+    """A unicode emoji as itself, a server emoji by its name."""
+    from .privacy import clean
+    return clean(emoji, 16) if isinstance(emoji, str) else ':'+clean(str(getattr(emoji, 'name', None) or 'emoji'), 32)+':'
 
 
 def image_context(context):

@@ -10,7 +10,7 @@ from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import ControllerUnavailable
-from .fri_images import media
+from .fri_images import details
 from .fri_meme_media import sources
 from .privacy import clean
 
@@ -173,11 +173,9 @@ class Invitation:
             self.events[item.id] = item
             self.snapshots[item.id] = fingerprint(item)
             self.rows = [row for row in self.rows if row['source']['id'] != str(item.id)]
-            row = {'source': discord_source(item).evidence(), 'text': clean(item.content, 500),
-                   'privacy_revision': profile['revision'], 'referenced': item.id == reference_id}
-            if media(item):
-                row['attachments'] = media(item)
-            self.rows.append(row)
+            self.rows.append({'source': discord_source(item).evidence(), 'text': clean(item.content, 500),
+                              'privacy_revision': profile['revision'], 'referenced': item.id == reference_id,
+                              **details(item)})
         self.rows.sort(key=lambda row: int(row['source']['id']))
         own = event if event.attachments else None
         referenced = self.events.get(reference_id)

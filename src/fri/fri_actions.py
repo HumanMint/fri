@@ -14,7 +14,7 @@ from .fri_conversation import PERSISTENT_MODEL_WRITES
 from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
-from .fri_images import image_context, look, media
+from .fri_images import details, image_context, look, media
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
 from .gene_controls import COMMANDS, arguments, grounded, music_control_intent, own_words, requested
@@ -400,12 +400,10 @@ class Actions:
                 records.append(row)
                 continue
             self.observe(scope, user, profile['revision'])
-            row = {'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
-                   'at': message.created_at.isoformat(), 'text': clean(message.content, 500)}
+            records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
+                            'at': message.created_at.isoformat(), 'text': clean(message.content, 500), **details(message)})
             if carries:
-                row['attachments'] = carries
                 posts.append(message)
-            records.append(row)
         result = {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
                   'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': after,
                   'images_inspected': 0, 'personal_notes_saved': 0}
