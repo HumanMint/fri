@@ -175,7 +175,7 @@ async def reply_target(agent, message, posts=None):
     """The message they replied to, and up to two they linked, when this audience may read them.
 
     posts, when given, collects each target's Discord message, for the images look() may inspect."""
-    from .fri_memory import server_wide
+    from .fri_memory import open_to_everyone
 
     rows = []
     reference = getattr(message, 'reference', None)
@@ -189,12 +189,16 @@ async def reply_target(agent, message, posts=None):
         if message_id == message.id or any(row['source']['id'] == str(message_id) for row in rows):
             continue
         linked = agent.fri.get_channel(channel_id)
-        if guild_id != home or linked is None or getattr(getattr(linked, 'guild', None), 'id', None) != home:
+        if (guild_id != home or linked is None or getattr(getattr(linked, 'guild', None), 'id', None) != home or
+                not callable(getattr(linked, 'fetch_message', None))):  # A forum or a category holds no posts.
             continue
-        # Said in a server channel, it must be one everyone there could read anyway, or this one.
-        if message.guild and linked.id != channel.id and not server_wide(linked):
+        if not in_scope(agent, linked):
             continue
-        if not in_scope(agent, linked) or not await readable(agent, message, linked):
+        now = await fetched(linked)
+        # Said in a server channel, it must be one everyone in the server can read anyway, or this one.
+        if now is None or (message.guild and linked.id != channel.id and not open_to_everyone(now)):
+            continue
+        if not await readable(agent, message, linked, now):
             continue
         rows += [{**row, 'linked': True} for row in await target_row(agent, linked, message_id, str(home), posts)]
     return rows
@@ -213,8 +217,10 @@ def in_scope(agent, channel):
     return agent.allowed(channel) or str(parent.id) in agent.state.get('history_channels', [])
 
 
-async def readable(agent, message, channel):
-    """The speaker, now, and Fri can both read that channel's history."""
+async def readable(agent, message, channel, now=None):
+    """The speaker, now, and Fri can both read that channel's history.
+
+    now, from fetched(), judges it as Discord has it rather than from the cache."""
     guild = channel.guild
     if message.guild and not agent.allowed(message.channel):
         return False
@@ -222,10 +228,34 @@ async def readable(agent, message, channel):
     if not member:
         return False
     for who in (member, guild.me):
-        permissions = channel.permissions_for(who)
+        permissions = (now or channel).permissions_for(who)
         if not permissions.view_channel or not permissions.read_message_history:
             return False
     return True
+
+
+async def fetched(channel):
+    """A linked channel (a thread's parent) with its fetched overwrites and the server's fetched roles.
+
+    The cache can lag a revoke, and a link crosses channels (see Invitation.access). None if gone."""
+    import copy
+
+    import discord
+
+    guild = channel.guild
+    try:
+        current = await guild.fetch_channel(channel.id)
+        parent = await guild.fetch_channel(current.parent_id) if isinstance(current, discord.Thread) else current
+        roles = await guild.fetch_roles()
+    except discord.HTTPException:
+        return None
+    if current.id != channel.id or parent.guild.id != guild.id:
+        return None
+    fresh_guild = copy.copy(guild)
+    fresh_guild._roles = {role.id: role for role in roles}
+    parent = copy.copy(parent)
+    parent.guild = fresh_guild
+    return parent
 
 
 async def target_row(agent, channel, message_id, guild_id, posts):

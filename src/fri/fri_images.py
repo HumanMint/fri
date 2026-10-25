@@ -210,7 +210,8 @@ async def looked_unchanged(context):
                     invitations.append(invitation)
                 continue
             current = await post.channel.fetch_message(post.id)
-            if (current.id != post.id or current.author.id != post.author.id or getattr(current.author, 'bot', False) or
+            # The same author as when read: the reads that call look() admit no bot but Fri itself.
+            if (current.id != post.id or current.author.id != post.author.id or
                     current.webhook_id or current.channel.id != post.channel.id or current.content != post.content or
                     current.edited_at != post.edited_at or sources(current, MAX_IMAGES) != read['sources']):
                 return False
