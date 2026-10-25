@@ -213,16 +213,13 @@ class Subscription:
                 RecursionError, OSError) as exc:
             rotated = tokens.get('refresh_token') if isinstance(tokens, dict) else None
             withdrawn = plan_withdrawn(tokens)
-            learned = {}
-            if usable(rotated) and rotated != saved['refresh_token']:
-                learned['refresh_token'] = rotated  # The old one may be spent already.
-            if withdrawn:
-                learned['scopes'] = tokens['scope'].split()  # Or a renewal that leaves out scope would restore the plan.
-            if learned:
+            # The old token may be spent already. A plan-less one isn't kept: only a reconnect brings the plan back,
+            # and a later renewal that leaves out scope would otherwise inherit the saved plan scope.
+            if not withdrawn and usable(rotated) and rotated != saved['refresh_token']:
                 try:
-                    private_json(self.path, {**saved, **learned})
+                    private_json(self.path, {**saved, 'refresh_token': rotated})
                 except (OSError, ValueError, RecursionError) as failed:
-                    LOG.warning('ChatGPT sign-in renewal: refresh token or scopes not saved: %s', type(failed).__name__)
+                    LOG.warning('ChatGPT sign-in renewal: rotated refresh token not saved: %s', type(failed).__name__)
             # A malformed success is the provider's fault, not the grant's; only a refusal needs the owner.
             refused = withdrawn or refusal(exc)
             LOG.warning('ChatGPT sign-in renewal %s: %s', 'rejected' if refused else 'failed',

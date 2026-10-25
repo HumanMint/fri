@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs
 
 import httpx
 import jwt
@@ -204,21 +205,30 @@ def test_incomplete_saved_sign_in_is_a_refusal_and_a_usable_token_clears_it(tmp_
     assert session.access_token() == 'old' and not session.rejected
 
 
-def test_a_withdrawn_plan_stays_withdrawn_after_its_refresh_token_rotates(tmp_path):
+def test_a_withdrawn_plan_stays_refused_and_a_reconnect_still_works(tmp_path):
     path = tmp_path / 'session.json'
     saved = expired(path)
-    replies = [httpx.Response(200, json={'access_token': 'private-a', 'refresh_token': 'rotated', 'scope': 'openid',
-                                         'token_type': 'Bearer', 'expires_in': 60}),
-               # A later renewal that leaves out scope must not fall back to the plan scope saved before.
-               httpx.Response(200, json={'access_token': 'private-b', 'refresh_token': 'rotated-again',
-                                         'token_type': 'Bearer', 'expires_in': 3600})]
-    session = Subscription(path, httpx.MockTransport(lambda _: replies.pop(0)))
+    spent = []
+
+    def refresh(request):
+        token = parse_qs(request.content.decode())['refresh_token'][0]
+        if token in spent:
+            return httpx.Response(400, json={'error': 'invalid_grant'})
+        spent.append(token)
+        return httpx.Response(200, json={'access_token': 'private-a', 'refresh_token': 'rotated', 'scope': 'openid',
+                                         'token_type': 'Bearer', 'expires_in': 60})
+    session = Subscription(path, httpx.MockTransport(refresh))
     for _ in range(2):
         with pytest.raises(SubscriptionError, match='Reconnect') as exc:
             session.access_token()
         assert not isinstance(exc.value, SubscriptionUnavailable) and session.rejected
-    assert len(replies) == 1 and session.refusals == 1
-    assert json.loads(path.read_text()) == {**saved, 'refresh_token': 'rotated', 'scopes': ['openid']}
+    assert session.refusals == 1
+    # Neither the plan-less token nor its scopes are kept, so a renewal that leaves out scope can't revive the
+    # plan, and scripts/connect_chatgpt.py builds the new record on the one it had.
+    assert json.loads(path.read_text()) == saved
+    tokens = {'access_token': 'new', 'refresh_token': 'new-refresh', 'token_type': 'Bearer', 'expires_in': 3600}
+    private_json(path, token_record(tokens, json.loads(path.read_text()), client_id='client', host_id='vm'))
+    assert session.access_token() == 'new' and not session.rejected
 
 
 @pytest.mark.parametrize('expires_in', [None, 10**400], ids=['missing expiry', 'huge expiry'])
@@ -266,7 +276,7 @@ def test_a_failed_save_of_the_rotation_itself_is_still_not_raw(tmp_path, caplog,
     with pytest.raises(SubscriptionUnavailable):
         Subscription(path, httpx.MockTransport(lambda _: rotated)).access_token()
     assert json.loads(path.read_text()) == saved
-    assert 'refresh token or scopes not saved: OSError' in caplog.text and 'private' not in caplog.text
+    assert 'rotated refresh token not saved: OSError' in caplog.text and 'private' not in caplog.text
 
 
 def test_renewal_without_a_refresh_token_keeps_the_saved_one(tmp_path):
