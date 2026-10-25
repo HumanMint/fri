@@ -317,7 +317,8 @@ Before rolling the Gene controller back past member profiles, stop it and run
 `python -m gene.profile_downgrade <controller database>` in the controller's environment. That
 removes profile notes, copies their removals to every configured channel so an older controller saves
 no note from the member's earlier messages, and keeps every conversation's own notes and chats. It
-refuses to run when it can't tell the channels. A Fri-only rollback needs nothing: an older Fri sends no audience
+refuses to run when it can't tell the channels. It never migrates the database, so going below both member
+profiles and turn provenance, it and `gene.provenance_downgrade` can run in either order. A Fri-only rollback needs nothing: an older Fri sends no audience
 and doesn't ask for profiles, so the controller gives it only each conversation's own notes, within the
 limits it was built for. Profile notes stay stored, unseen, until a newer Fri returns or they expire, and
 "forget me" still erases them.

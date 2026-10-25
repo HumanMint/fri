@@ -266,9 +266,17 @@ def dm_control():
             'user_id': '20', 'display_name': 'friend', 'channel_id': '900', 'guild_id': None}
 
 
-def test_a_message_from_before_a_removal_stays_out_of_channel_chatter(monkeypatch, tmp_path):
+@pytest.mark.parametrize('failure', [None, TimeoutError, ControllerRejected])
+def test_a_message_from_before_a_removal_stays_out_of_channel_chatter(monkeypatch, tmp_path, failure):
     async def scenario():
         fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        controller = fri.api
+
+        async def api(method, path, payload=None):
+            if failure and path == '/chat/turn':  # The save times out or is refused: nothing says it was kept.
+                raise failure('save failed')
+            return await controller(method, path, payload)
+        fri.api = api
         with store.connection() as db:
             save(db, '123', 'server', '20', ('games', 'I like Minecraft'), time.time())
         early = message('fri I like Minecraft modpacks', age=3)  # Waiting while the member edits their memory.

@@ -616,8 +616,9 @@ class Agent:
             self.answered(events)
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
             saved = await self.fri.record_turn(result, sent)
-            # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory.
-            if echo and (saved or {}).get('kept', True) and message.guild and self.allowed(message.channel):
+            # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory,
+            # or a save that failed, whose reply may carry exactly what the controller would have refused.
+            if echo and saved is not None and saved.get('kept', True) and message.guild and self.allowed(message.channel):
                 text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']  # As shown.
                 self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
                     'name': 'Fri', 'text': clean(text, 500), 'at': time.time(), 'gene_error': False,
