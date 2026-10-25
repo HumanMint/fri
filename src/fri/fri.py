@@ -960,11 +960,12 @@ class Fri(discord.Client):
 
 
 def main():
-    from .logging import install_secret_filter
+    from .logging import configure, install_secret_filter
     install_secret_filter()
+    configure()
     from .fri_instance import instance_lock
     with instance_lock(os.getenv('FRI_DATA', '/data')):
-        Fri().run(os.environ['DISCORD_TOKEN'], log_level=logging.INFO)
+        Fri().run(os.environ['DISCORD_TOKEN'], log_handler=None)  # configure() already set up logging.
 
 
 if __name__ == '__main__':
