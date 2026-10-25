@@ -223,7 +223,7 @@ class Fri(discord.Client):
         except commands.UserFeedbackCheckFailure:
             LOG.warning('Usage is saved locally; controller delivery will retry')
         if result.error or result.status != 'completed':
-            raise commands.UserFeedbackCheckFailure(result.error or 'Fri could not complete that reply. Try again shortly.')
+            raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         return result
 
     async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None):
@@ -259,7 +259,7 @@ class Fri(discord.Client):
         if user_id in self.busy:
             raise ReplyInProgress()
         if not 1 <= len(text) <= 4000:
-            raise commands.UserFeedbackCheckFailure('Keep each message between 1 and 4000 characters.')
+            raise commands.UserFeedbackCheckFailure('that’s either empty or a novel. keep it between 1 and 4000 characters.')
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
@@ -376,7 +376,7 @@ class Fri(discord.Client):
                 if conversation and (conversation.get('message_burst') or conversation.get('reply_target')):
                     from .fri_conversation import unchanged
                     if not await unchanged(self.agent, event, conversation):
-                        raise commands.UserFeedbackCheckFailure('That conversation changed while I was replying. Ask again for a fresh reply.')
+                        raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
                 from .fri_images import require_current as require_current_images
                 await require_current_images(context, event)
                 if guild_id != self.guild_id:
@@ -385,7 +385,7 @@ class Fri(discord.Client):
                     result.draft, result.notes = None, []
                 if result.action:
                     if not actions or result.action['kind'] not in context['actions']:
-                        raise commands.UserFeedbackCheckFailure('That action is not available here.')
+                        raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
                     if actions.private_evidence:
@@ -451,7 +451,7 @@ class Fri(discord.Client):
                         return ChatResult(reply=unrecorded(receipts), status='completed')
                     return result
                 if context.get('gene_receipts') and not await actions.valid():
-                    raise commands.UserFeedbackCheckFailure('Access changed during that check. Ask again for a fresh reply.')
+                    raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 result = self.stage_turn(scope, source, text, context, result, actions=actions)
                 # The save's privacy fence runs before delivery; the save itself waits for delivery.
                 await self.api('POST', '/chat/turn/check', result.turn)
@@ -552,7 +552,7 @@ class Fri(discord.Client):
         event, user = invitation.event, invitation.event.author.id
         expected = addressed_content(event.content, self.user.id) or 'hey'
         if text != expected or not 1 <= len(text) <= 4000:
-            raise commands.UserFeedbackCheckFailure('Keep each message between 1 and 4000 characters.')
+            raise commands.UserFeedbackCheckFailure('that’s either empty or a novel. keep it between 1 and 4000 characters.')
         # Match the raw live event first; only minimized text may reach a model or tool.
         text = clean(text, 4000)
         if user in self.busy:
@@ -583,7 +583,7 @@ class Fri(discord.Client):
                 research = None
                 if result.action:
                     if result.action['kind'] not in context['actions']:
-                        raise commands.UserFeedbackCheckFailure('That action is not available here.')
+                        raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
                     receipt = research or receipts[-1]
