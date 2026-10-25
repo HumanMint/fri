@@ -11,6 +11,7 @@ from .fri_meme_media import load_image, sources
 CHANGED = ('The image request changed while I was checking it. Any earlier tool actions keep '
            'their recorded outcomes; check their status before retrying. Ask again with the current attachment.')
 MAX_IMAGES = 4  # In one model call, the speaker's own included.
+MAX_LOADS = 2 * MAX_IMAGES  # Downloads one look may try, so a few dead links don't use up the budget.
 MAX_CHARS = 12_000_000  # Their data URLs together, about 9 MB of image.
 KEYS = ('image_sources', 'image_event', 'image_invitation', 'image_reads')
 
@@ -72,8 +73,8 @@ async def look(context, posts, *, invitation=None):
     """Look at still images that a read turned up, newest first, within this call's image budget.
 
     Other people's posts count only through their own attachments, never embeds or pasted links,
-    which could point anywhere. A post that won't load is just not inspected; the model is told
-    which posts it saw and how many it didn't."""
+    which could point anywhere. A post that won't load is just not inspected and the next older one
+    gets its slot; the model is told which posts it saw and how many it didn't."""
     from .fri_context import discord_source
     images = list(context.get('images', []))
     reads = list(context.get('image_reads', []))
@@ -81,7 +82,7 @@ async def look(context, posts, *, invitation=None):
     seen = {read['event'].id for read in reads}
     if context.get('image_event') is not None:
         seen.add(context['image_event'].id)
-    picked, skipped, budget = [], 0, MAX_IMAGES-len(images)
+    queue, skipped, budget = [], 0, MAX_IMAGES-len(images)
     for post in sorted(posts, key=lambda m: m.id, reverse=True):
         if post.id in seen:
             continue
@@ -90,25 +91,37 @@ async def look(context, posts, *, invitation=None):
         if not urls or urls != [str(a.url) for a in post.attachments] or len(urls) > budget:
             skipped += 1
             continue
-        budget -= len(urls)
-        picked.append((post, urls))
-    loads = await asyncio.gather(*(load_image(url, post.channel.id) for post, urls in picked for url in urls),
-                                 return_exceptions=True)
-    for value in loads:
-        if isinstance(value, BaseException) and not isinstance(value, (httpx.HTTPError, TimeoutError, ValueError)):
-            raise value
-    size, looked = sum(map(len, images)), 0
-    for post, urls in picked:
-        loaded, loads = loads[:len(urls)], loads[len(urls):]
-        if any(isinstance(value, BaseException) for value in loaded) or size+sum(map(len, loaded)) > MAX_CHARS:
-            skipped += 1
-            continue
-        size += sum(map(len, loaded))
-        inspected.append({'images': list(range(len(images)+1, len(images)+len(loaded)+1)),
-                          'source': discord_source(post).evidence()})
-        images += loaded
-        reads.append({'event': post, 'sources': urls, 'invitation': invitation})
-        looked += 1
+        queue.append((post, urls))
+    size, looked, tried = sum(map(len, images)), 0, 0
+    while queue and budget > 0 and tried < MAX_LOADS:
+        # Newest first, as many as fit; a post that fails to load leaves its slot to the next round.
+        picked, room = [], min(budget, MAX_LOADS-tried)
+        for post, urls in list(queue):
+            if len(urls) <= room:
+                picked.append((post, urls))
+                queue.remove((post, urls))
+                room -= len(urls)
+        if not picked:
+            break
+        tried += sum(len(urls) for _, urls in picked)
+        loads = await asyncio.gather(*(load_image(url, post.channel.id) for post, urls in picked for url in urls),
+                                     return_exceptions=True)
+        for value in loads:
+            if isinstance(value, BaseException) and not isinstance(value, (httpx.HTTPError, TimeoutError, ValueError)):
+                raise value
+        for post, urls in picked:
+            loaded, loads = loads[:len(urls)], loads[len(urls):]
+            if any(isinstance(value, BaseException) for value in loaded) or size+sum(map(len, loaded)) > MAX_CHARS:
+                skipped += 1
+                continue
+            size += sum(map(len, loaded))
+            inspected.append({'images': list(range(len(images)+1, len(images)+len(loaded)+1)),
+                              'source': discord_source(post).evidence()})
+            images += loaded
+            reads.append({'event': post, 'sources': urls, 'invitation': invitation})
+            budget -= len(urls)
+            looked += 1
+    skipped += len(queue)
     if looked:
         context.update(images=images, image_reads=reads, inspected_images=inspected)
     return {'images_inspected': looked, 'images_not_inspected': skipped}
