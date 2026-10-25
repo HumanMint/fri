@@ -305,7 +305,7 @@ class Fri(discord.Client):
         if intent in ('disable', 'enable'):
             await self.api('POST', '/chat/memory/control', {**scope, 'action': intent})
             if self.agent:
-                self.agent.forget(user_id)
+                self.agent.forget(user_id, erased=intent == 'disable')
             text = ('done. i erased our saved chats and personal notes, and turned memory off. '
                     'say “remember me again” if you change your mind. discord messages and backups are separate.'
                     if intent == 'disable' else 'memory’s back on. i’ll pick up small preferences as we talk.')
