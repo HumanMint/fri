@@ -386,9 +386,13 @@ Fri can't restart anything. It only notices and says so.
   offers `requester-notices` and the report is still on record. A tap first reads Discord: Fri must
   be on with proactive posts on, the member still in the server, and the report still there and
   still theirs, in a configured channel Fri can post in and not an archived thread, or in their DM
-  while support DMs are on. Only then does it claim the controller's mark, which refuses an erased
-  report, a rollback since the repair, or any newer release now live, and checks the config and
-  channel once more with nothing awaited before the send. So a change while Discord answered stops
+  while support DMs are on. A thread Fri had to fetch is read again after the report, since no
+  archive update reaches an uncached copy. Fri then checks the live release itself (an older
+  controller doesn't) and claims the controller's mark, which refuses an erased report, a rollback
+  since the repair, any newer release now live, or another release still going out. It checks the
+  config and channel once more with nothing awaited before the send. Controller data of the wrong
+  shape, or a thread whose channel was deleted, gets the owner a plain "didn't send it" and frees
+  any claim. So a change while Discord answered stops
   the reply. It replies to the report once with a fixed line, mentions off and no request text, and
   records the outcome as the owner. A send Discord refused (a 4xx, rate limits included) can be
   tapped again. One that may have posted is never retried. The owner sees the outcome privately, and

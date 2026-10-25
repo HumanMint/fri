@@ -37,6 +37,9 @@ JOB = re.compile(r'[a-f0-9]{12}')
 TELL_ID = re.compile(r'^fri:tell:(?P<job_id>[a-f0-9]{12})$')
 SOURCE = re.compile(r'https://discord\.com/channels/(?P<guild>[0-9]{1,25}|@me)/(?P<channel>[0-9]{1,25})/(?P<message>[0-9]{1,25})')
 MALFORMED = (KeyError, TypeError, ValueError, OverflowError)
+# What a tap can hit besides a definite refusal: controller data of the wrong shape, a Discord object
+# that changed under it, a transport that gave up. The owner still gets an answer and a claim is finished.
+TAP_FAILURES = (ValueError, KeyError, TypeError, AttributeError, TimeoutError, OSError, discord.DiscordException)
 
 
 def fixed_line(sha):
@@ -124,7 +127,10 @@ def marked(task):
 
 
 def can_send(channel):
-    permissions = channel.permissions_for(channel.guild.me)
+    try:
+        permissions = channel.permissions_for(channel.guild.me)
+    except discord.ClientException:  # A thread whose parent channel was deleted.
+        return False
     return (permissions.view_channel and permissions.read_message_history and
             (permissions.send_messages_in_threads if isinstance(channel, discord.Thread) else permissions.send_messages))
 
@@ -278,9 +284,10 @@ def postable(fri, channel):
 
 async def report(fri, job):
     """The reporter's message and where it is, read before the claim: nothing has been sent yet."""
-    match = SOURCE.fullmatch(job.get('source_url') or '')
-    user = str(job.get('user_id', ''))
-    if (job.get('state') != 'deployed' or not job.get('approved_sha') or not match or not user.isdigit() or
+    source = job.get('source_url') if isinstance(job, dict) else None
+    match = SOURCE.fullmatch(source) if isinstance(source, str) else None
+    user = str(job.get('user_id', '')) if match else ''
+    if (not match or job.get('state') != 'deployed' or not job.get('approved_sha') or not user.isdigit() or
             user in {str(fri.user.id), str(fri.agent.gene_id)}):
         raise Unreachable('there’s no member report on record to reply to')
     postable(fri, None)
@@ -292,11 +299,15 @@ async def report(fri, job):
             if not isinstance(channel, discord.DMChannel) or not channel.recipient or str(channel.recipient.id) != user:
                 raise Unreachable('that dm isn’t theirs anymore')
         else:
-            channel = fri.get_channel(int(match['channel'])) or await fri.fetch_channel(int(match['channel']))
+            cached = fri.get_channel(int(match['channel']))
+            channel = cached or await fri.fetch_channel(int(match['channel']))
             if int(match['guild']) != fri.guild_id or getattr(channel, 'guild', None) is None:
                 raise Unreachable('i can’t post where they reported it anymore')
         postable(fri, channel)
         message = await channel.fetch_message(int(match['message']))
+        if match['guild'] != '@me' and cached is None and isinstance(channel, discord.Thread):
+            # A fetched thread isn't in the cache, so no archive update reaches it: read it again last.
+            channel = await fri.fetch_channel(channel.id)
     except discord.NotFound:
         raise Unreachable('their report is gone') from None
     except discord.HTTPException:
@@ -317,16 +328,25 @@ async def tell(fri, job_id, actor):
     try:
         job = await fri.api('GET', '/requests/'+job_id)
         channel, message = await report(fri, job)
+        # The controller checks this too; an older one (gene #40) doesn't, so Fri reads the live release itself.
+        if (await fri.api('GET', '/status')).get('active_sha') != job['approved_sha']:
+            raise Unreachable('a newer release is live now, so "fixed" might not hold')
+        postable(fri, channel)
         claimed = await fri.api('POST', f'/requests/{job_id}/requester-notice', scope)
     except Unreachable as exc:
         return f'didn’t send it: {exc}.', False
     except commands.UserFeedbackCheckFailure as exc:
         return notice_text(str(exc)), False
-    except (ValueError, KeyError, TimeoutError, OSError):
+    except TAP_FAILURES:
         return 'didn’t send it. tap again later.', False  # Nothing claimed yet, so there's nothing to record.
+    lease = claimed.get('lease') if isinstance(claimed, dict) else None
+    if not isinstance(lease, str) or not lease:
+        LOG.warning('Requester notice claim for %s came back without a lease; nothing sent', job_id)
+        return 'didn’t send it. tap again later.', False
     state, message_id, sending = 'failed', '', False
     try:
-        if any(str(claimed['job'].get(key)) != str(job.get(key)) for key in ('user_id', 'source_url', 'approved_sha')):
+        if not isinstance(claimed.get('job'), dict) or any(
+                str(claimed['job'].get(key)) != str(job.get(key)) for key in ('user_id', 'source_url', 'approved_sha')):
             raise Unreachable('their report changed while i looked. tap again')
         postable(fri, channel)  # Config or the channel may have changed while the claim was out.
         sending = True
@@ -341,13 +361,13 @@ async def tell(fri, job_id, actor):
         state = 'uncertain' if exc.response.status_code >= 500 else 'failed'
         text = (f'discord refused the reply (HTTP {exc.response.status_code}). tap again later.' if state == 'failed'
                 else 'discord didn’t confirm the reply, so it might have posted. not sending it twice.')
-    except (httpx.HTTPError, ValueError, KeyError, TimeoutError, OSError):
+    except (httpx.HTTPError, *TAP_FAILURES):
         state = 'uncertain' if sending else 'failed'
         text = ('discord didn’t confirm the reply, so it might have posted. not sending it twice.' if sending
                 else 'didn’t send it. tap again later.')
     try:
         await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
-                      {**scope, 'lease': claimed['lease'], 'state': state, 'message_id': message_id})
+                      {**scope, 'lease': lease, 'state': state, 'message_id': message_id})
     except commands.UserFeedbackCheckFailure:
         LOG.warning('Requester notice outcome for %s not recorded; it stays unretried', job_id)
     return text, state == 'sent'
