@@ -5,6 +5,7 @@ import copy
 import datetime as dt
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -286,6 +287,83 @@ def test_an_erasure_during_the_burst_wait_names_the_mention(monkeypatch, tmp_pat
             fri.chat_once.assert_not_awaited()
             event.reply.assert_not_awaited()
             assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('when', ['state read', 'check'])
+def test_an_erasure_during_the_owner_settings_check_names_the_mention(monkeypatch, tmp_path, caplog, when):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you sound like an outdated model', user=10)
+        api = fri.api
+        async def erasing(method, path, payload=None):
+            if when == 'state read' and path == '/agent/state':
+                agent.forget(10, erased=True)
+            return await api(method, path, payload)
+        fri.api = erasing
+        async def analyze(*args, **kwargs):
+            if when == 'check':
+                agent.forget(10, erased=True)
+            return {'answer': 'other'}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        monkeypatch.setattr('fri.fri_chat.Chat.headers', AsyncMock(return_value={'Authorization': 'Bearer test'}))
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('reset', ['memory check', 'stale cleanup'])
+def test_a_cache_reset_while_an_owner_settings_request_waits_keeps_its_preview(monkeypatch, tmp_path, reset):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> set heartbeat to 10 minutes', user=10)
+        monkeypatch.setattr('fri.fri_chat.Chat.headers', AsyncMock(return_value={'Authorization': 'Bearer test'}))
+        checking, resume = asyncio.Event(), asyncio.Event()
+        async def analyze(chat, instruction, data, model, effort, schema, **kwargs):
+            if 'answer' in schema['properties']:
+                checking.set()
+                await resume.wait()
+                return {'answer': 'settings_change'}, {}, 'completed'
+            return {'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        task = asyncio.create_task(agent.handle(event))
+        try:
+            await asyncio.wait_for(checking.wait(), 1)
+            if reset == 'memory check':  # Read-only, but it clears Fri's cached context for the owner.
+                with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                    await agent.handle(message('<@99> what do you remember about me?', user=10))
+            else:  # Attention drops a row cached before an older erasure: nothing new was erased.
+                agent.recent[1].append({'id': '5', 'user_id': '10', 'name': 'owner', 'text': 'old', 'at': time.time(),
+                                        'revision': -1, 'gene_error': False})
+                await agent.context_messages(1)
+            assert agent.forgotten[10] and not agent.erased.get(10)
+            resume.set()
+            await task
+            assert event.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
+        finally:
+            resume.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_only_forget_me_counts_as_an_erasure_for_waiting_settings_requests(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(message('<@99> what do you remember about me?', user=20))
+                assert agent.forgotten.get(20) and not agent.erased.get(20)
+                await agent.handle(message('<@99> forget me', user=20))
+            assert agent.erased.get(20)
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -586,6 +664,29 @@ def test_revocation_during_answer_never_sends_or_saves_context(monkeypatch, tmp_
                       'permission': 'missing permissions', 'settings': 'check failed: ControllerRejected'}[change]
             assert [line for line in caplog.messages if line.startswith('Mention ')] == [
                 f'Mention {channel.id}/{event.id} not answered: reply withheld: {reason}']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_nearby_member_who_forgets_while_fri_signs_in_never_reaches_the_model(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path)
+        message('ash says: the surprise party is friday', user=30, age=60)
+        event = message('<@99> what did ash just say?')
+        sent = []
+
+        def access_token():
+            store.erase_user('30')  # Forgets after Fri read the channel, while it signs in.
+            return 'fictional'
+        fri.chat = Chat(SimpleNamespace(access_token=access_token), httpx.MockTransport(
+            lambda request: sent.append(request) or httpx.Response(500)))
+        del fri.chat_once  # Fri's own model call, with the checks it runs once signed in.
+        try:
+            await agent.handle(event)
+            assert sent == []  # Refused before the request, not only before the reply.
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
         finally:
             await fri.close()
     asyncio.run(scenario())

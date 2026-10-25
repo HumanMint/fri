@@ -8,6 +8,7 @@ import json
 
 from .harness import (
     FRI,
+    GAMING,
     GUILD,
     OUTSIDE,
     OWNER,
@@ -126,10 +127,11 @@ KEYWORDS = Scenario(
      Say(OWNER, 'fri lol the token usage today is crazy', label='casual'),
      Say(BO, 'fri what do you remember about me?', label='memory'),
      Say(OWNER, 'fri have you been learning anything', label='learning'),
-     Say(OWNER, 'fri make your tone a bit drier', label='tone')],
-    {'conversation': [reply('wallet in shambles'), reply('a bit, mostly game chatter')],
-     'internal': [{'explanation': 'drier voice', 'changes': [
-         {'key': 'voice_notes', 'json_value': json.dumps('drier, fewer jokes')}]}]},
+     Say(OWNER, 'fri make your tone a bit drier', label='tone'),
+     Say(OWNER, "fri you'd be a terrible model lol", label='banter')],
+    {'conversation': [reply('wallet in shambles'), reply('a bit, mostly game chatter'), reply('and yet here you are')],
+     'internal': [{'answer': 'settings_change'}, {'explanation': 'drier voice', 'changes': [
+         {'key': 'voice_notes', 'json_value': json.dumps('drier, fewer jokes')}]}, {'answer': 'other'}]},
     [Check('explicit usage request is answered locally',
            lambda r: route(r, 'usage')['kind'] == 'local-usage-report' and route(r, 'usage')['model_calls'] == 0),
      Check('casual mention of usage reaches the model', lambda r: route(r, 'casual')['kind'] == 'model'),
@@ -139,7 +141,11 @@ KEYWORDS = Scenario(
            lambda r: route(r, 'learning')['kind'] == 'model'),
      Check('tone change becomes an owner settings preview',
            lambda r: route(r, 'tone')['kind'] == 'owner-control'
-           and any(d.view for d in r.step('tone').deliveries))])
+           and any(d.view for d in r.step('tone').deliveries)
+           and [m['model'] for m in r.step('tone').model] == ['gpt-6-luna', 'gpt-6.1-sol']),
+     Check('owner banter with a settings word costs one cheap check, not the Sol settings call',
+           lambda r: route(r, 'banter')['kind'] == 'model'
+           and [m['model'] for m in r.step('banter').model if m['kind'] == 'internal'] == ['gpt-6-luna'])])
 
 ERASURE = Scenario(
     'derived_content_removed_on_erasure',
@@ -366,7 +372,49 @@ REQUEST_STATUS = Scenario(
     [Check('the model sees the request and its state', lambda r: first_call(r, 'ask')['request_states'] == ['review']),
      Check('no request text in a public channel', lambda r: first_call(r, 'ask')['request_titles'] == 0)])
 
+
+def notice(replay, label):
+    """The first-memory line Fri appended to its delivered reply in that step."""
+    sent = replay.world.rows[replay.step(label).deliveries[0].message_id]
+    return sent.edit.await_args.kwargs['content'] if sent.edit.await_args else ''
+
+
+ZELDA = {'category': 'games', 'evidence': 'I like zelda games'}
+STARDEW = {'category': 'games', 'evidence': 'I like stardew too'}
+
+CROSS_CHANNEL = Scenario(
+    'cross_channel_profile',
+    'A preference said where everyone can read follows the member to another channel; a restricted one stays.',
+    [Say(BO, 'fri I like zelda games, totk mostly', label='share'), Wait(120),
+     Say(BO, 'fri any game recs for this weekend', channel=GAMING, label='follow'),
+     Say(BO, 'fri what do you remember about me?', channel=GAMING, label='recall'),
+     Deny(GAMING, GUILD), Wait(60),
+     Say(BO, 'fri I like stardew too', channel=GAMING, label='restricted'), Wait(60),
+     Say(BO, 'fri ok what about co-op', label='back'), Wait(60),
+     Say(BO, 'fri forget me', label='erase')],
+    {'conversation': [reply('totk carried my whole year', notes=[ZELDA]), reply('echoes of wisdom, then'),
+                      reply('fair, it is cozy', notes=[STARDEW]), reply('it takes two')]},
+    [Check('the first note is kept for the whole server, and the member is told so',
+           lambda r: 'follows you around the server' in notice(r, 'share'), scripted_only=True),
+     Check('another readable channel sees the profile note and the exchange from #general',
+           lambda r: first_call(r, 'follow')['memory_scopes'] == ['server']
+           and first_call(r, 'follow')['elsewhere'] == ['#general'], scripted_only=True),
+     Check('asking there lists the profile note as following them',
+           lambda r: route(r, 'recall')['kind'] == 'local-memory' and route(r, 'recall')['model_calls'] == 0
+           and 'across the server' in r.step('recall').deliveries[0].text
+           and 'I like zelda games' in r.step('recall').deliveries[0].text, scripted_only=True),
+     Check('a note said in a restricted channel stays there, and the member is told so',
+           lambda r: 'just for this chat' in notice(r, 'restricted'), scripted_only=True),
+     Check('back in #general: the restricted note and the now-restricted channel stay out',
+           lambda r: first_call(r, 'back')['memory_scopes'] == ['server'] and first_call(r, 'back')['elsewhere'] == [],
+           scripted_only=True),
+     Check('forget me erases the profile and every channel',
+           lambda r: route(r, 'erase')['kind'] == 'local-privacy'
+           and all(r.stored(BO, channel)['personal_memory'] == {'enabled': False, 'notes': []}
+                   and not r.stored(BO, channel)['turns'] and not r.stored(BO, channel)['elsewhere']
+                   for channel in (1, GAMING)))])
+
 SCENARIOS = [CLOSING, OPEN_QUESTION, WEB_CLARIFICATION, OUTSIDE_MENTION, KEYWORDS, ERASURE, REPLY_TARGET,
              CATCH_UP,
              DELIVERY_FAILURE, TOOL_CONTINUITY, GROUP_VIEW, MIDTURN_ERASURE, HISTORY, HISTORY_MIDTURN, SUMMARY,
-             FRI_REFERENCE, PENDING, REFERENCE_AFTER_ERASURE, REQUEST_STATUS]
+             FRI_REFERENCE, PENDING, REFERENCE_AFTER_ERASURE, REQUEST_STATUS, CROSS_CHANNEL]

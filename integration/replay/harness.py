@@ -38,7 +38,7 @@ from fri.fri_chat import Chat
 from fri.fri_protocol import compatible
 
 GUILD, OWNER, FRI = 123, 10, 99
-WORKSHOP, CONFIGURED, OUTSIDE = 456, 1, 8
+WORKSHOP, CONFIGURED, GAMING, OUTSIDE = 456, 1, 2, 8
 TOKEN = 'fri-' + 'x' * 32
 BASE = 'http://controller.replay'
 ADMISSION = ('/agent/admit', '/chat/mentions/admit', '/chat/operations/admit')
@@ -269,6 +269,8 @@ def manifest(payload, kind):
                   receipts=[row.get('kind') for row in data.get('action_results_untrusted') or []],
                   request_states=[row.get('state') for row in data.get('your_gene_requests') or []],
                   request_titles=sum('title' in row for row in data.get('your_gene_requests') or []),
+                  memory_scopes=[note.get('scope') for note in (data.get('personal_memory') or {}).get('notes', [])],
+                  elsewhere=[row.get('channel') for row in data.get('with_you_elsewhere_untrusted') or []],
                   quiet_allowed=data['response_options']['quiet'],
                   text_only=schema.get('enum') == ['reply'])
     return result
@@ -283,9 +285,9 @@ def classify(request, payload):
     return 'conversation' if name == 'fri_reply' else 'internal'
 
 
-def reply(text, *, allow_closing=False, draft=None):
+def reply(text, *, allow_closing=False, draft=None, notes=()):
     return {'response_kind': 'reply', 'allow_closing': allow_closing, 'reaction': None, 'reply': text,
-            'request_draft': draft, 'notes': [], 'action': None}
+            'request_draft': draft, 'notes': list(notes), 'action': None}
 
 
 def react(emoji='👍'):
@@ -412,10 +414,11 @@ class World:
         self.fail_next_delivery = False
         self.last_id = 0
         self.guild = SimpleNamespace(id=GUILD, me=fri.user, unavailable=False, filesize_limit=8 << 20)
+        self.guild.default_role = SimpleNamespace(id=GUILD)  # Deny(channel, GUILD) restricts a channel.
         self.guild.fetch_channel = AsyncMock(side_effect=lambda cid: self.channels[cid])
         self.guild.fetch_member = AsyncMock(side_effect=self.member)
         self.guild.fetch_roles = AsyncMock(return_value=[])
-        for cid, name in ((WORKSHOP, 'workshop'), (CONFIGURED, 'general'), (OUTSIDE, 'memes')):
+        for cid, name in ((WORKSHOP, 'workshop'), (CONFIGURED, 'general'), (GAMING, 'gaming'), (OUTSIDE, 'memes')):
             self.add_channel(cid, name)
         fri.get_channel = lambda cid: self.channels.get(cid)
         fri.get_guild = lambda gid: self.guild if gid == GUILD else None
@@ -451,8 +454,8 @@ class World:
             denied = (cid, getattr(member, 'id', None)) in world.denied
             return discord.Permissions.none() if denied else discord.Permissions.all()
 
-        channel = SimpleNamespace(id=cid, guild=self.guild, parent_id=None, nsfw=False, name=name,
-                                  typing=typing, history=history, permissions_for=permissions_for)
+        channel = SimpleNamespace(id=cid, guild=self.guild, parent_id=None, nsfw=False, is_nsfw=lambda: False,
+                                  name=name, typing=typing, history=history, permissions_for=permissions_for)
         async def send(content=None, **kwargs):
             return await world._sent(None, channel, content, kwargs)
 
@@ -644,7 +647,7 @@ class Replay:
         from fri.fri_agent import Agent
         settings = Settings(self.root/'controller.sqlite3', str(GUILD), str(OWNER), 'runtime-'+'x'*32,
                             'worker-'+'x'*32, 'deploy-'+'x'*32, workshop_channel_id=str(WORKSHOP),
-                            fri_token=TOKEN, agent_channels=str(CONFIGURED), web_search_enabled=True)
+                            fri_token=TOKEN, agent_channels=f'{CONFIGURED},{GAMING}', web_search_enabled=True)
         self.client = TestClient(create_app(settings), raise_server_exceptions=False)
         self.store = self.client.app.state.store
         AgentStore(self.store, settings).update({'enabled': True}, 0, str(OWNER))
@@ -660,8 +663,10 @@ class Replay:
         fri.chat = Chat(self.subscription, self.transport)
         self.world = World(fri, clock, self.steps)
         try:
-            if not compatible(await fri.api('GET', '/fri/contract')):
+            contract = await fri.api('GET', '/fri/contract')
+            if not compatible(contract):
                 raise RuntimeError('synthetic controller contract is incompatible')
+            fri.capabilities = frozenset(contract['capabilities'])  # As setup_hook does.
             self.agent = fri.agent = Agent(fri)
             self.agent.state = await fri.api('GET', '/agent/state')
             for index, action in enumerate(self.scenario.steps, 1):

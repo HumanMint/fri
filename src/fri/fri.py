@@ -18,8 +18,16 @@ from .fri_actions import Actions
 from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
-from .fri_errors import ControllerRejected
-from .fri_memory import describe_memory, memory_intent
+from .fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
+from .fri_memory import (
+    PROFILES,
+    describe_memory,
+    describe_profile,
+    memory_intent,
+    note_place,
+    profiled,
+    server_wide,
+)
 from .fri_notices import ReplyInProgress, WaitingNotices, notice_text
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
 from .fri_protocol import PROTOCOL, compatible
@@ -35,14 +43,24 @@ from .subscription import Subscription, private_json
 
 LOG = logging.getLogger('fri')
 NO_MENTIONS = discord.AllowedMentions.none()
+SIGN_IN_NOTICE = ('heads up: my chatgpt sign-in stopped working, so every reply fails until you reconnect me. '
+                  'steps are in fri’s docs/operations.md under “New installations”.')
 FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
                 'or say “forget me” any time.')
+FIRST_PROFILE = ('\n\n-# i kept a small preference from this, and it follows you around the server. '
+                 'ask “what do you remember about me?” or say “forget me” any time.')
+FIRST_HERE = ('\n\n-# i kept a small preference from this, just for this chat. ask “what do you remember '
+              'about me?” or say “forget me” any time.')
 MAX_PROVENANCE = 200
+ERROR_BODY = 5  # Seconds for a refusal's small body, well inside the watch's 10 s read.
+CONTRACT_RETRY = 10  # Seconds between contract reads while the controller is down at startup.
+HEARD_SECONDS = 1800  # Longer than any message waits for its reply; ambient attention looks back 15 minutes.
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
 UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
 LEGACY = '[an earlier fri reply from before fri tracked its sources]'
 CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
+CLOSED = 'a channel i was pulling from just went private while i was replying, so that stays unsaid. ask again.'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
 
@@ -69,7 +87,7 @@ def turn_provenance(context, speaker, actions=None):
     """Other members whose messages shaped this turn, with the privacy revision observed.
 
     Every context source carrying another member's words contributes: the live channel view
-    (including Fri's own replies), saved history, a pending clarification, the channel summary,
+    (including Fri's own replies), saved history, notes, a pending clarification, the channel summary,
     reply targets (Fri's resolved to their sources), nearby invited context and read evidence.
     """
     seen = {}
@@ -81,6 +99,11 @@ def turn_provenance(context, speaker, actions=None):
     inherited = [item for turn in context.get('turns', []) for item in turn.get('provenance', [])]
     inherited += (context.get('pending') or {}).get('provenance', [])
     inherited += context.get('summary_provenance', []) + context.get('reference_provenance', [])
+    # A member's words from another channel can repeat someone else's: inherit what they drew on.
+    inherited += [item for row in context.get('elsewhere', []) for item in row.get('provenance', [])]
+    # So can a note: it was learned while other members' words were in view.
+    inherited += [item for note in (context.get('personal_memory') or {}).get('notes', [])
+                  for item in note.get('provenance', [])]
     for item in inherited:
         add(item['user_id'], item['revision'])
     for row in context.get('recent', []):
@@ -108,6 +131,24 @@ class FriTree(app_commands.CommandTree):
         await reply(self.client, interaction, 'That action did not complete. Please try again.')
 
 
+async def patiently(fri, read):
+    """A controller read Fri needs before joining the gateway, waited out while the controller is down.
+
+    Discord's HTTP API already works here, so the watch still tells the owner when the controller is
+    what's down. A rejected or incompatible controller, or a page that isn't the controller's, still
+    stops startup at once: a wrong URL or a proxy's page isn't an outage that waiting fixes."""
+    while True:
+        try:
+            return await read()
+        except ControllerUnavailable as exc:
+            if exc.answered:
+                raise
+            if fri.watcher.due():
+                LOG.warning('Controller unreachable at startup; waiting for it')
+                await fri.watcher.check()
+            await asyncio.sleep(CONTRACT_RETRY)
+
+
 class Fri(discord.Client):
     def __init__(self):
         intents = discord.Intents.none()
@@ -129,19 +170,49 @@ class Fri(discord.Client):
         self.waiting_notices = WaitingNotices(self.busy)
         self.usage_lock = asyncio.Lock()
         self.chat_slots = asyncio.Semaphore(2)
+        self.noticed_refusal = None
+        self.sign_in_notice = None
         self.session = None
         self.agent = None
         self.capabilities = frozenset()
+        from .fri_watch import Watch
+        self.watcher = Watch(self)
+        self.watching = None
+        self.heard = {}  # Message id: (when Fri first saw it, whether everyone could read its channel then).
+
+    @property
+    def profiles(self):
+        return PROFILES in self.capabilities
+
+    def hear(self, message):
+        """Whether everyone could read this message where it was sent, decided once, when Fri first sees it.
+
+        A channel opened while Fri waits or writes its reply can't widen what was said while it was closed.
+        Decisions outlast any wait for a reply; a message first seen later than that counts as restricted.
+        """
+        now = time.monotonic()
+        while self.heard and now-next(iter(self.heard.values()))[0] > HEARD_SECONDS:
+            del self.heard[next(iter(self.heard))]
+        if message.id not in self.heard:
+            age = time.time()-discord.utils.snowflake_time(message.id).timestamp()
+            self.heard[message.id] = (now, age < HEARD_SECONDS and server_wide(message.channel))
+        return self.heard[message.id][1]
+
+    def first_memory(self, saved):
+        """Where the first kept note will show, once the controller keeps member profiles."""
+        if not self.profiles:
+            return FIRST_MEMORY
+        return {'server': FIRST_PROFILE, 'conversation': FIRST_HERE}.get(saved.get('memory_scope'), FIRST_MEMORY)
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        contract = await self.api('GET', '/fri/contract')
+        contract = await patiently(self, lambda: self.api('GET', '/fri/contract'))
         if not compatible(contract):
             raise RuntimeError('unsupported gene controller contract; fri did not start')
         self.capabilities = frozenset(contract['capabilities'])
         from .fri_agent import Agent
         self.agent = Agent(self)
-        await self.agent.start()
+        await patiently(self, self.agent.start)
         self.add_view(HomeView(self))
         from .fri_social import SocialButton
         from .fri_workspace import PostButton
@@ -158,6 +229,7 @@ class Fri(discord.Client):
         await self.tree.sync(guild=discord.Object(id=self.guild_id))
         self.health.start()
         self.owner_reviews.start()
+        self.watching = asyncio.create_task(self.keep_watch())
 
     def dispatch(self, event, /, *args, **kwargs):
         if event == 'interaction' and args:
@@ -193,14 +265,27 @@ class Fri(discord.Client):
         try:
             async with self.session.request(method, self.url + path, json=payload,
                     headers={'Authorization': 'Bearer ' + self.token, 'X-Fri-Contract': PROTOCOL}) as response:
-                data = await response.json()
+                foreign = False  # A reply that isn't JSON or was cut off may not be the controller's: a proxy's page, say.
+                try:
+                    async with asyncio.timeout(ERROR_BODY if response.status >= 400 else None):
+                        data = await response.json()
+                except Exception as exc:  # Not JSON, or cut off or stalled partway: a refusal is still a refusal.
+                    if response.status < 400:
+                        if isinstance(exc, aiohttp.ContentTypeError):  # Someone else's page, sent as a success.
+                            raise ControllerUnavailable(UNREACHABLE, answered=True) from None
+                        raise
+                    data, foreign = None, not isinstance(exc, (ValueError, RecursionError))  # A refusal keeps its status when its JSON can't be read.
+                detail = str(data.get('detail', 'Controller rejected this request')) if isinstance(data, dict) else (
+                    'Controller rejected this request')
                 if 400 <= response.status < 500:
-                    raise ControllerRejected(str(data.get('detail', 'Controller rejected this request')))
-                if response.status >= 400:
-                    raise commands.UserFeedbackCheckFailure(str(data.get('detail', 'Controller rejected this request')))
+                    # Still a refusal, so startup stops; one that isn't the controller's has no status to act on.
+                    raise ControllerRejected(detail, None if foreign else response.status)
+                if response.status >= 400:  # Its detail is a controller fault, for the log, not for members.
+                    LOG.warning('Controller %s %s failed: HTTP %s', method, path.split('?')[0], response.status)
+                    raise ControllerUnavailable(UNREACHABLE)
                 return data
         except (aiohttp.ClientError, TimeoutError):
-            raise commands.UserFeedbackCheckFailure('The workshop controller is temporarily unavailable.') from None
+            raise ControllerUnavailable(UNREACHABLE) from None
 
     async def flush_usage(self):
         async with self.usage_lock:
@@ -209,19 +294,56 @@ class Fri(discord.Client):
                     report = json.loads(path.read_text())
                 except FileNotFoundError:
                     continue  # An isolated evaluation process may have delivered this receipt.
-                await self.api('POST', '/chat/usage/report', report)
+                except (ValueError, RecursionError):  # Deeply nested JSON raises RecursionError.
+                    self.set_aside(path, 'unreadable')
+                    continue
+                try:
+                    await self.api('POST', '/chat/usage/report', report)
+                except ControllerRejected as exc:
+                    if exc.status not in (400, 422):
+                        raise  # Credentials or contract: every receipt would fail alike, so all stay queued.
+                    self.set_aside(path, f'HTTP {exc.status}')
+                    continue
                 path.unlink(missing_ok=True)
 
+    def set_aside(self, path, cause):
+        """A receipt the controller refuses can never succeed; keep it for inspection without blocking later ones."""
+        rejected = path.parent / 'rejected'
+        try:
+            rejected.mkdir(mode=0o700, exist_ok=True)
+            path.replace(rejected / path.name)
+        except FileNotFoundError:
+            return
+        except OSError as exc:  # It stays queued and is offered again, after the receipts behind it.
+            LOG.warning('Usage receipt refused (%s) and could not be set aside: %s', cause, type(exc).__name__)
+            return
+        LOG.warning('Usage receipt set aside in usage/rejected: %s', cause)
+
     async def chat_once(self, text, context):
-        result = await self.chat.respond(text, context)
+        async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
+            fence = context.get('fence')
+            # The delivery check, run before the request too: the words of anyone in view who erased or
+            # changed their privacy since they were read never reach the model. An outside @mention has
+            # its invitation's own check instead, as before it replies.
+            if fence and fence.get('invitation'):
+                await fence['invitation'].require_current()
+            elif fence:
+                await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
+                    context, fence['turn']['user_id'], fence['actions'])})
+            # A channel closed while Fri gathered context: what was said there stays there.
+            context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
+                self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
+            if fence:  # Checked again before delivery.
+                fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
+        result = await self.chat.respond(text, context, ready=ready)
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
             'attempt_id': attempt, 'model': context['model'], 'effort': context['effort'],
             'status': result.status, 'counters': result.counters})
         try:
             await self.flush_usage()
-        except commands.UserFeedbackCheckFailure:
-            LOG.warning('Usage is saved locally; controller delivery will retry')
+        except Exception as exc:  # The receipt is on disk; a delivery problem must not discard a finished reply.
+            LOG.warning('Usage is saved locally; controller delivery will retry: %s', type(exc).__name__)
         if result.error or result.status != 'completed':
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         return result
@@ -230,12 +352,18 @@ class Fri(discord.Client):
         if invitation and invitation.outside:
             return await self.invited_talk(invitation, text)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
+        heard = [self.hear(item) for item in (event, *(row[1] for row in burst))
+                 if getattr(item, 'guild', None) is not None]  # Before anything here waits.
         channel = self.get_channel(channel_id) if self.agent else None
         source_channel = (getattr(channel, 'parent_id', None) or channel_id) if visibility == 'public' and self.agent else self.workshop_id
         scope = {'guild_id': str(guild_id), 'user_id': str(user_id), 'channel_id': str(source_channel),
                  'conversation_id': f'{visibility}:{channel_id}'}
         # Privacy controls must work while inference is busy or the subscription is down.
         intent = memory_intent(text)
+        if intent == 'show' and self.profiles:
+            profile = (await self.api('POST', '/chat/context', profiled(self, scope)))['personal_memory']
+            return ChatResult(reply=await self.memory_overview(scope, profile, visibility == 'private'),
+                              status='completed', memory_scope=scope)
         if intent == 'show':
             context = await self.api('POST', '/chat/context', scope)
             profile = context['personal_memory']
@@ -245,7 +373,7 @@ class Fri(discord.Client):
         if intent in ('disable', 'enable'):
             await self.api('POST', '/chat/memory/control', {**scope, 'action': intent})
             if self.agent:
-                self.agent.forget(user_id)
+                self.agent.forget(user_id, erased=intent == 'disable')
             text = ('done. i erased our saved chats and personal notes, and turned memory off. '
                     'say “remember me again” if you change your mind. discord messages and backups are separate.'
                     if intent == 'disable' else 'memory’s back on. i’ll pick up small preferences as we talk.')
@@ -263,7 +391,16 @@ class Fri(discord.Client):
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
-                context = attributed(await self.api('POST', '/chat/context', scope))
+                context = attributed(await self.api('POST', '/chat/context', profiled(self, scope)))
+                if self.profiles:
+                    # From Discord's permissions: only a channel everyone could read when each message
+                    # arrived, and still can, reaches the member's profile and their other conversations.
+                    # Private conversations never do.
+                    context['audience'] = ('server' if visibility == 'public' and heard and all(heard) and
+                                           server_wide(getattr(event, 'channel', None) or channel) else 'conversation')
+                    context['elsewhere'] = self.elsewhere(context.get('elsewhere', []), guild_id)
+                else:
+                    context['elsewhere'] = []
                 conversation = {}
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence
@@ -370,6 +507,10 @@ class Fri(discord.Client):
                     actions.sources.update(r['channel_id'] for r in context['gene_receipts'])
                     actions.music_context = current_music_context(context['gene_receipts'])
                 text = clean(text, 4000)
+                context['fence'] = {'turn': {**scope, 'revision': context['revision'], 'source': source.model_dump(),
+                                             'input': text, 'reply': '', 'model': context['model'],
+                                             'effort': context['effort']},
+                                    'actions': actions, 'shown': set()}
                 result = await self.chat_once(text, context)
                 if invitation:
                     await invitation.require_current()
@@ -437,7 +578,8 @@ class Fri(discord.Client):
                         'burst': context.get('message_burst', []),
                         'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
                                                                          result.post_preview or result.clarification),
-                        'provenance': provenance, 'verbatim': stored == result.reply}
+                        'provenance': provenance, 'verbatim': stored == result.reply,
+                        **({'audience': context['audience']} if context.get('audience') else {})}
                     if len(result.turn['provenance']) > MAX_PROVENANCE:
                         return ChatResult(reply=unrecorded(receipts, reason='too many people were in that context to '
                                                            'track safely.'), status='completed')
@@ -447,14 +589,16 @@ class Fri(discord.Client):
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored)
                     try:  # The save's privacy fence, applied before anything is shown.
                         await self.api('POST', '/chat/turn/check', result.turn)
+                        self.still_open(context)
                     except commands.UserFeedbackCheckFailure:
                         return ChatResult(reply=unrecorded(receipts), status='completed')
                     return result
-                if context.get('gene_receipts') and not await actions.valid():
+                if context.get('gene_receipts') and not await actions.valid(outage=True):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 result = self.stage_turn(scope, source, text, context, result, actions=actions)
                 # The save's privacy fence runs before delivery; the save itself waits for delivery.
                 await self.api('POST', '/chat/turn/check', result.turn)
+                self.still_open(context)
                 return result
         finally:
             self.busy.discard(user_id)
@@ -483,10 +627,43 @@ class Fri(discord.Client):
             'model': model or context['model'], 'effort': '' if model else context['effort'],
             'notes': result.notes, 'input_tokens': 0 if model else result.counters.get('input_tokens'),
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
-            'verbatim': result.response_kind == 'reply' and reply == result.reply}
+            'verbatim': result.response_kind == 'reply' and reply == result.reply,
+            **({'audience': context['audience']} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed:
             result.echo = self.echo(scope, context, provenance, reply)
         return result
+
+    def still_open(self, context):
+        """Before delivery: every other channel whose words reached the model is still one everyone can read."""
+        for conversation in (context.get('fence') or {}).get('shown', ()):
+            if not server_wide(self.get_channel(int(conversation.split(':', 1)[1]))):
+                raise commands.UserFeedbackCheckFailure(CLOSED)
+
+    def elsewhere(self, rows, guild_id):
+        """What the member said lately in other channels that everyone in this server can still read."""
+        kept = []
+        for row in rows:
+            kind, _, channel_id = str(row.get('conversation_id', '')).partition(':')
+            channel = self.get_channel(int(channel_id)) if kind == 'public' and channel_id.isdigit() else None
+            if (channel is None or getattr(getattr(channel, 'guild', None), 'id', None) != int(guild_id)
+                    or not server_wide(channel)):
+                continue  # Gone, moved, or restricted since: it stays where it was said.
+            kept.append({**row, 'channel': '#'+channel.name, 'minutes_ago': max(0, int((time.time()-row['at'])//60))})
+        return kept
+
+    async def memory_overview(self, scope, profile, private):
+        """Everything for the member's own eyes in private; in public, only what that channel can see."""
+        escape = discord.utils.escape_markdown
+        if private:
+            state = await self.api('POST', '/chat/memory/notes', profiled(self, scope))
+            enabled, rows = state['enabled'], state['entries']
+        else:
+            enabled, rows = profile['enabled'], profile['notes']
+        groups = {}
+        for row in rows:
+            where = note_place(self.get_channel, row['scope'], scope['conversation_id'], public=not private)
+            groups.setdefault(where, []).append(escape(row['evidence']))
+        return describe_profile(enabled, list(groups.items()), private)
 
     async def resolve_references(self, scope, context):
         """Replace Fri-authored reply targets with the members those replies drew on."""
@@ -526,14 +703,22 @@ class Fri(discord.Client):
             delivered = getattr(sent, 'content', None)
             if payload.get('verbatim') and isinstance(delivered, str) and delivered != payload['reply']:
                 payload['reply'] = clean(delivered, 3500)  # E.g. an attachment fallback replaced the answer.
+        if payload.get('audience') == 'server' and not server_wide(
+                self.get_channel(int(payload['conversation_id'].split(':', 1)[1]))):
+            payload = {**payload, 'audience': 'conversation'}  # Closed while Fri replied: it stays where it was said.
         try:
             saved = await self.api('POST', '/chat/turn', payload)
-        except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError):
-            LOG.warning('Delivered turn was not recorded')  # Includes privacy changes mid-reply.
+        except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError) as exc:
+            LOG.warning('Delivered turn was not recorded: %s', type(exc).__name__)  # Includes privacy changes mid-reply.
             return None
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
+            notice = self.first_memory(saved)
+            content = (sent.content or '')+notice
             try:
-                await sent.edit(content=(sent.content or '')+FIRST_MEMORY)
+                if len(content.encode('utf-16-le'))//2 <= 2000:
+                    await sent.edit(content=content)
+                else:  # No room left in a long reply: say it on its own rather than lose it.
+                    await sent.reply(notice.strip(), allowed_mentions=NO_MENTIONS)
             except discord.HTTPException:
                 LOG.info('First-memory notice was not added')
         return saved
@@ -579,6 +764,7 @@ class Fri(discord.Client):
                 context['actions'] = await actions.available()
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
                 actions.image_context = {k: context[k] for k in ('image_sources', 'image_event', 'image_invitation') if k in context}
+                context['fence'] = {'invitation': invitation, 'shown': set()}  # See chat_once.
                 result = await self.chat_once(text, context)
                 research = None
                 if result.action:
@@ -628,17 +814,23 @@ class Fri(discord.Client):
             # A newer panel interaction can supersede this one; record only what was displayed.
             saved = await self.record_turn(result) if sessions(self).displayed(interaction) else None
             if saved and saved.get('first_memory') and not result.settings_preview:
-                await reply(self, interaction, embed=card('Fri', result.reply+FIRST_MEMORY), view=view)
+                await reply(self, interaction, embed=card('Fri', result.reply+self.first_memory(saved)), view=view)
         except commands.UserFeedbackCheckFailure as exc:
             await reply(self, interaction, str(exc), view=HomeView(self, interaction.user.id))
         await self.waiting_notices.clear(interaction.user.id)
+
+    async def on_ready(self):
+        if self.agent and self.profiles:
+            channels = [self.get_channel(int(c)) for c in self.agent.state.get('channels', []) if str(c).isdigit()]
+            LOG.info('Member profiles: %d of %d configured channels are readable by everyone',
+                     sum(server_wide(c) for c in channels), len(channels))
 
     async def on_message(self, message):
         if self.agent:
             try:
                 await self.agent.handle(message)
-            except (commands.UserFeedbackCheckFailure, discord.HTTPException):
-                LOG.warning('Fri interaction could not complete')
+            except (commands.UserFeedbackCheckFailure, discord.HTTPException) as exc:
+                LOG.warning('Fri interaction could not complete: %s', type(exc).__name__)
             return
         if (message.author.bot or getattr(message, 'webhook_id', None) or not message.guild or
                 message.guild.id != self.guild_id):
@@ -663,21 +855,60 @@ class Fri(discord.Client):
             await message.reply(notice_text(str(exc))[:1800], mention_author=False, allowed_mentions=NO_MENTIONS)
             await self.waiting_notices.clear(message.author.id)
 
+    async def subscription_notice(self):
+        """One owner DM per refused sign-in, counting a usable token in between as the end of one."""
+        try:
+            refused = self.chat.subscription.refused
+            if refused is not None and refused != self.noticed_refusal:
+                owner = self.get_user(self.owner_id) or await self.fetch_user(self.owner_id)
+                channel = await owner.create_dm()  # Opened here, so a failure to open it retries next tick.
+                self.noticed_refusal = refused  # At most once: a send whose response was lost isn't repeated.
+                await channel.send(SIGN_IN_NOTICE, allowed_mentions=NO_MENTIONS)
+        except Exception as exc:  # A failed lookup retries next tick; a failed send waits for the next refusal.
+            LOG.warning('Owner sign-in notice not sent: %s', type(exc).__name__)
+
     @tasks.loop(seconds=15)
     async def owner_reviews(self):
+        # Its own task: a rate-limited DM sleeps out Discord's retry_after, which must not hold up reviews or usage.
+        if self.sign_in_notice is None or self.sign_in_notice.done():
+            self.sign_in_notice = asyncio.create_task(self.subscription_notice())
         # Separate, so one undeliverable usage receipt can't hold back owner notifications.
         try:
             await self.flush_usage()
-        except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, TimeoutError):
-            LOG.warning('Usage delivery pending')
+        except Exception as exc:  # Like the heartbeat, a bad tick never ends the loop.
+            LOG.warning('Usage delivery pending: %s', type(exc).__name__)
         try:
             await notify_owner(self)
-        except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, TimeoutError):
-            LOG.warning('Owner notification pending')
+        except Exception as exc:
+            LOG.warning('Owner notification pending: %s', type(exc).__name__)
 
     @owner_reviews.before_loop
     async def before_reviews(self):
         await self.wait_until_ready()
+
+    async def keep_watch(self):
+        # Its own task: a stuck heartbeat or owner DM can't hide an outage. Not a tasks.loop, which schedules
+        # by the wall clock: a clock set back an hour mid-pass would stall it an hour. asyncio sleeps on the
+        # event loop's monotonic clock.
+        from .fri_watch import INTERVAL
+        await self.before_watch()
+        clock = asyncio.get_running_loop()
+        while True:
+            started = clock.time()
+            try:
+                await self.watch()
+            except Exception as exc:  # A watchdog that stops on one odd error watches nothing.
+                LOG.warning('Gene watch pass failed: %s', type(exc).__name__)
+            await asyncio.sleep(max(0, started+INTERVAL-clock.time()))
+
+    async def watch(self):
+        # Reads stay an interval apart across startup's wait, the first pass and restarts; a pending DM
+        # still goes out on every pass.
+        await self.watcher.check(observe=self.watcher.due(slack=15))
+
+    async def before_watch(self):
+        # No wait for the gateway: the watch reads and DMs over HTTP, as it does during startup's wait.
+        await asyncio.sleep(self.watcher.wait())  # Not a pass early, which would skip its read and wait a whole one more.
 
     @tasks.loop(seconds=10)
     async def health(self):
@@ -692,7 +923,8 @@ class Fri(discord.Client):
             'meme_attention': self.agent.memes.status() if self.agent and self.agent.memes else None,
             'agent_heartbeat': {'running': self.agent.heartbeat.is_running(), 'failed': self.agent.heartbeat.failed(),
                 'started': self.agent.heartbeat_started, 'finished': self.agent.heartbeat_finished,
-                'status': self.agent.heartbeat_status} if self.agent else None,
+                'status': self.agent.heartbeat_status, 'stages': self.agent.stages} if self.agent else None,
+            'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,
             'test_scope': {**test, 'connected': bool(self.is_ready() and test_guild and not test_guild.unavailable),
@@ -709,6 +941,10 @@ class Fri(discord.Client):
             self.agent.close()
         self.health.cancel()
         self.owner_reviews.cancel()
+        if self.watching:
+            self.watching.cancel()
+        if self.sign_in_notice:
+            self.sign_in_notice.cancel()
         await sessions(self).close_all()
         if self.session:
             await self.session.close()

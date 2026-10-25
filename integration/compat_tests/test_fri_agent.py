@@ -117,7 +117,8 @@ def test_history_notes_require_attributed_self_disclosure_and_survive_restart(se
     assert finish(agent, claim, rows, notes)['saved'] == 1
     store = Store(settings.db)
     profile = store.chat_context('guild', 'public:1', 'person')['personal_memory']
-    assert profile['notes'] == [{'category': 'music', 'evidence': 'I love trance'}]
+    assert profile['notes'] == [{'category': 'music', 'evidence': 'I love trance', 'scope': 'here',
+                                 'provenance': []}]  # Not the profile.
     assert not store.chat_context('guild', 'private:1', 'person')['personal_memory']['notes']
     assert not store.chat_context('guild', 'public:2', 'person')['personal_memory']['notes']
     assert not store.memories('guild')
@@ -224,7 +225,7 @@ def test_fri_chat_archive_never_enters_startup_learning(monkeypatch):
 
 def test_followups_work_without_name_but_dont_follow_someone_elses_reply():
     async def scenario():
-        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456,
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, hear=lambda message: False,
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
         agent = Agent(fri)
         agent.state['config']['enabled'] = True
@@ -352,6 +353,83 @@ def test_invalid_model_shape_is_rejected_with_usage_retained():
     chat = Chat(SimpleNamespace(access_token=lambda: 'subscription'), httpx.MockTransport(handler))
     output, counters, status = asyncio.run(analyze(chat, 'Summarize.', {}, 'gpt-6-luna', 'medium', SUMMARY))
     assert status == 'invalid_output' and not output and counters['input_tokens'] == 100
+
+
+def test_attention_skips_messages_the_direct_path_is_answering():
+    async def scenario():
+        channel = SimpleNamespace(id=456)
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel,
+                              hear=lambda message: False,
+                              user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
+        agent = Agent(fri)
+        agent.state['config']['enabled'] = True
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.respond = AsyncMock()
+        agent.run = AsyncMock(return_value=({'action': 'quiet', 'source_id': '', 'reason': ''}, {}, 'completed'))
+        def message(mid, content):
+            return SimpleNamespace(id=mid, guild=SimpleNamespace(id=123), channel=channel, content=content,
+                author=SimpleNamespace(id=11, bot=False, display_name='friend'), mentions=[], reference=None,
+                webhook_id=None)
+        with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+            await agent.handle(message(100, 'fri can you help with this error?'))
+        agent.respond.assert_awaited_once()
+        await agent.attend()  # Plausible ("fri", "help", "?"), but the direct reply already owns it.
+        agent.run.assert_not_awaited()
+        await agent.handle(message(101, 'anyone know why the build is broken?'))
+        assert agent.respond.await_count == 1  # Not addressed, so only attention may pick it up.
+        await agent.attend()
+        data = agent.run.await_args.args[2]
+        assert data['fresh_ids'] == ['101']
+        assert [row['id'] for row in data['recent']] == ['100', '101']  # Still context for the decision.
+    asyncio.run(scenario())
+
+
+def test_attention_skips_followups_in_an_active_window():
+    async def scenario():
+        channel = SimpleNamespace(id=456)
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel,
+                              hear=lambda message: False,
+                              user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
+        agent = Agent(fri)
+        agent.state['config']['enabled'] = True
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.respond = AsyncMock()
+        agent.run = AsyncMock()
+        agent.active[(456, 11)] = time.time()+120
+        message = SimpleNamespace(id=100, guild=SimpleNamespace(id=123), channel=channel,
+            content='wait why is it broken?', author=SimpleNamespace(id=11, bot=False, display_name='friend'),
+            mentions=[], reference=None, webhook_id=None)
+        with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+            await agent.handle(message)
+        agent.respond.assert_awaited_once()
+        await agent.attend()
+        agent.run.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_attention_yields_when_the_direct_path_takes_its_pick_meanwhile():
+    async def scenario():
+        channel = SimpleNamespace(id=456, fetch_message=AsyncMock())
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel,
+                              hear=lambda message: False,
+                              user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}), busy=set())
+        agent = Agent(fri)
+        agent.state['config'].update(enabled=True, proactive=True)
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.respond = AsyncMock()
+        message = SimpleNamespace(id=100, guild=SimpleNamespace(id=123), channel=channel,
+            content='anyone know why the build is broken?', author=SimpleNamespace(id=11, bot=False, display_name='friend'),
+            mentions=[], reference=None, webhook_id=None)
+        channel.fetch_message.return_value = message
+        await agent.handle(message)
+        async def decide(*args, **kwargs):
+            agent.answer_directly(message)  # The direct path took it while Luna was deciding.
+            return {'action': 'reply', 'source_id': '100', 'reason': ''}, {}, 'completed'
+        agent.run = AsyncMock(side_effect=decide)
+        await agent.attend()
+        agent.run.assert_awaited_once()
+        agent.respond.assert_not_awaited()
+    asyncio.run(scenario())
 
 
 def test_external_privacy_change_removes_buffer_before_attention_or_context():

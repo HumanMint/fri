@@ -24,6 +24,7 @@ SUMMARY = obj({'summary': STRING, 'notes': {'type': 'array', 'items': obj({
     'source_id': STRING, 'category': {'type': 'string', 'enum': ['nickname', 'games', 'music', 'hobbies', 'conversation']},
     'evidence': STRING})}})
 SETTINGS = obj({'explanation': STRING, 'changes': {'type': 'array', 'items': obj({'key': STRING, 'json_value': STRING})}})
+SETTINGS_GATE = obj({'answer': {'type': 'string', 'enum': ['settings_change', 'other']}})
 DIAGNOSIS = obj({'summary': STRING, 'proposed_request': STRING})
 
 

@@ -194,6 +194,45 @@ empty or unavailable lists aren't guessed, an open request isn't drafted again, 
 leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
 on the same model grades it.
 
+## Member profiles
+
+With a controller that advertises `member-profiles`, Fri asks for profiles on its context and memory
+requests, and each member has one profile per server: up to 15 small preferences (three per
+category) that follow them into every conversation in that server, DMs included. Fri decides where a
+note belongs when the turn is saved. Only a channel the server's default role can view counts, with a
+thread judged by its parent, and only public or news threads. Age-restricted channels never count,
+and neither does anything Fri can't resolve. Notes from DMs, the `/fri` panel, restricted channels,
+private threads and outside invitations stay in that one conversation, and the controller refuses a
+profile write from a private conversation. Notes saved before this release stay where they were said.
+Background learning still keeps per channel.
+
+Each turn also sees what the speaker last said to Fri in the server's other readable channels: up to
+two of their messages from the last 12 hours (`with_you_elsewhere_untrusted`). Only their own words
+travel, never Fri's replies, because a reply can draw on a note or exchange that stays in its own
+conversation. Fri re-checks that each channel is still readable by everyone right before each model
+request and again before posting the reply; if one closed meanwhile, the reply stays unsaid. The turn
+inherits their provenance, since a member's words can repeat someone else's: an erasure removes what
+was built on them here too. Every model request is signed in first and then runs the delivery privacy
+check (for an outside @mention, its invitation check), so the words of someone who erased or changed
+their privacy while Fri gathered context are never sent.
+"What do you remember about me?" in public lists only what that channel can see. In a DM it lists
+every note with where it shows, and My memory there edits any of them; the panel shows the first 25.
+An edited note keeps its place: the new wording shows wherever the note did, as its label says.
+Editing a profile note clears the member's saved chats and research receipts across the server, removes
+the same words, or an excerpt containing or contained in them, wherever a single channel kept them
+(under any category), and stops background learning from using anything the member said before the
+edit, anywhere in the server: no note, archive observation or channel summary comes from those
+messages, however it's phrased. A message sent before the edit but answered after it gets its reply
+and keeps nothing: Fri's short-lived channel chatter and reply echoes skip it too. Whether a message
+counts as said in front of everyone is decided when Fri first sees it, so a channel opened while Fri
+replies can't widen it; a channel closed meanwhile narrows it: its excerpts drop out right before each
+model call, and the turn is saved as staying in its channel. "Forget me" is unchanged and erases everything. At
+startup Fri logs how many configured channels are readable by everyone. If that's none, profiles
+never fill, and the server's channel permissions are the thing to look at.
+
+Without the capability (an older controller), Fri sends no audience and doesn't ask for profiles,
+and memory stays per conversation as before.
+
 ## Reply checks
 
 Needs a controller that advertises the optional `reply-checks` capability at startup; against an
@@ -224,6 +263,34 @@ Offline checks cover the controller wire contract, privacy fences and failure re
 substituted model. They don't measure how well a live model separates banter from real complaints;
 `python -m fri.fri_eval` has no reply-check suite yet.
 
+## Background and owner call costs
+
+Calls whose result can't change what members see are skipped before inference.
+
+- **Attention.** Messages the direct path has taken when attention reads the channel (addressed
+  to Fri, in the dedicated channel, or a follow-up in an active window) stay in the attention
+  model's context but are never offered to it as fresh. A message Fri already answered, reacted to
+  or chose to skip isn't decided twice. A message still being routed (say, the controller hasn't
+  answered whether it continues a conversation) is offered as before; attention checks again that
+  the direct path hasn't taken its pick before sending an ambient reply. The direct path can still
+  take a message after that last check, as before this change.
+- **Owner settings.** An owner line that matches the settings words first goes to a yes/no check on
+  the attention model with only the owner's words, outside the background model slot, recorded as
+  `owner_settings` usage. Its receipt and the Sol call's are saved for the usage loop to deliver, so
+  a slow usage report never holds up the preview (a normal reply still delivers pending receipts
+  first, as it always has). Only a yes (or a failed check, or one still running after 10 seconds)
+  runs the Sol/high settings call, with typing shown. Anything else takes the normal reply path,
+  even while another settings preview is being prepared. Requests queue as they reach the settings
+  handling, before its controller reads; a request gets the busy note only if an earlier one is
+  still being decided or prepared when it's ready. A line the owner erased after it arrived ("forget
+  me", or a privacy change from the panel, Gene or Red, during the controller reads, the sign-in,
+  the check, the model slot wait or the Sol call) gets no reply, preview or busy note and never
+  reaches a model after the erasure is seen, like any waiting message. Asking what Fri remembers, or
+  Fri clearing cached rows from an earlier erasure, doesn't count. While Fri is disabled the check
+  is skipped, since the normal path can't answer then.
+- Meme checks are unchanged: an inspection still runs while the reaction budget is closed, because
+  the budget can reopen (or the owner can raise it) before the model answers.
+
 ## Deployment boundary
 
 The companion runs in its own `fri` Compose project using `fri-runtime:<full Fri SHA>`.
@@ -236,6 +303,84 @@ The trusted release coordinator is `gene.fri_release` in the Gene repository. Th
 copy of `ops/compose.yml` here documents the runtime; the coordinator uses its own
 reviewed `Gene/ops/fri-compose.yml`. Fri's feature code cannot select service mounts.
 The Gene feature deployer still activates only Red and does not read Fri release pins.
+
+## Watching Gene and the controller
+
+Fri can't restart anything. It only notices and says so.
+
+- **Owner DM per outage.** Fri's own watch task reads `/controls/health` every 2 minutes, with
+  no model call, apart from the agent heartbeat and owner DM loop. It's a plain asyncio task
+  timed on the event loop's monotonic clock, not a `tasks.loop`, which times its sleeps by the
+  wall clock: a host clock set back an hour mid-pass would have stalled it for an hour. Once Fri
+  has read in this process, the spacing between reads and the bad-read streak also follow the
+  monotonic clock, so a stepped wall clock can't skip a read or break a streak. It doesn't wait
+  for the gateway: reads and the DM go over Discord's HTTP API. After 3 bad reads in a row it
+  DMs the owner once. A bad read is one of: Gene's heartbeat missing or at least 60 s old, Gene
+  not connected to Discord, Gene's command runner stopped, the controller unreachable (transport
+  error, 5xx, or no answer in 10 s), or the controller rejecting the read (4xx, such as a contract
+  mismatch). A stale command poll alone is a busy Gene, not an outage. Recovery edits the same DM
+  with the outage length. A new outage within 30 minutes of the last DM edits that DM again instead
+  of sending another. State lives in the private `fri-watch.json` in the data directory, so a
+  restart mid-outage neither repeats nor forgets the DM. Fri saves what the DM should say before
+  it touches Discord. Each pass waits up to 30 s for the delivery, then moves on, so a slow send
+  never delays the next read. No Discord call is ever cancelled, because discord.py can't recover
+  from a cancel inside its global rate-limit wait and every later Discord call would stall. A
+  delivery still running is left to finish (aiohttp's 5-minute request timeout still ends a hung
+  call), and no second one starts beside it. A send or edit that fails is retried on the next
+  pass, even after a restart. A send that may have landed is looked up in the DM before it's sent
+  again under the same nonce. Every DM from a minute before the attempt to a minute after that
+  send settled (or after Fri restarted, if it died mid-send) is checked, and a lookup that fails
+  proves nothing, so it's retried. A relapse keeps a DM whose delivery is still unknown rather than
+  starting a second one. The 30-minute relapse window starts when Discord made the DM (not when its reply reached Fri), and a
+  DM whose last edit hasn't landed still reads as down, so it carries the next outage too. An edit
+  whose reply is lost counts as not landed, so it's redone, even back to the text shown before. Only Fri or Discord can delete Fri's message in a DM. If it's gone
+  when Fri goes to edit it mid-outage, Fri sends it again. Once the outage is over, nothing is sent
+  late. If what the DM should say changed while Discord was taking it (Gene recovered while a slow
+  send was underway, say), the same delivery edits it to the new text at once instead of leaving
+  it for the next pass.
+- **Startup with the controller down.** Fri retries its startup controller reads (`/fri/contract`,
+  then `/agent/state`) every 10 s before it joins the gateway, instead of exiting. Discord's HTTP API already works then, so the same watch reads,
+  once per 2 minutes, still DM the owner. Reads stay about 2 minutes apart across that wait, the
+  loop's first pass and restarts, so a restart never shortens the 3-read debounce: the loop's
+  first pass waits until an interval after the last read, rather than skipping a read. Across a
+  restart only the saved wall time dates the last read, so a last read dated in the future, or a
+  clock that went back during the first read itself, starts a fresh streak instead of muting the
+  watch or counting toward an alert. Members see Fri offline until the controller answers, and
+  `fri health` waits too. A rejected or incompatible contract still stops Fri at once, and so does
+  a success that isn't JSON (a wrong URL or a proxy's page), since waiting won't fix it.
+- **Quick controls.** Before charging the operations allowance, a quick control checks Gene's
+  command catalog, which lists only what Gene polled for in the last 20 s. If the command isn't
+  there, the member gets a fixed "gene isn't taking commands right now" at once, plus "owner
+  already knows" while the owner's DM shows an open Gene outage (not while a relapse's edit is
+  still pending on a DM that says Gene is back), and nothing is queued. When Gene is polling but
+  Red has that one command disabled, the notice says Gene isn't offering it. A command Gene accepts and
+  then hangs on still waits out the controller's 115 s; that needs a controller change.
+- **Controller outage notice.** A message Fri would answer (a member DM, or a message addressed
+  to Fri in a configured channel) whose controller read fails, before or while replying, gets one
+  fixed notice per channel per 5 minutes instead of silence. A mention Fri already admitted only
+  needs its Discord-side checks for this notice, since the notice carries no evidence. The notice
+  stands in for the whole burst, so every earlier message in it must also be as it arrived, and
+  each @mention among them still gets those checks, even when the reply answers a later message.
+  discord.py edits its cached copy in place, so only a fresh fetch shows an edit. A privacy
+  recheck that can't reach the controller leads to the notice, not silence, and so does the access
+  recheck before a reply drawn from recent Gene receipts (it used to say "my access changed
+  mid-check"). Rechecks after a tool ran keep their receipt reply. Every notice first
+  fetches the message as Discord has it now: it must still exist and never have been edited, since
+  discord.py updates its cached copy in place. Before a reply has started, a channel message must
+  also still be addressed, and an @mention must pass its channel and access checks with Fri
+  enabled. A posted notice counts as Fri's answer to a ping. A notice that
+  fails to post, for any reason, doesn't use up those 5 minutes, and they count from when Discord
+  took the notice, not from when Fri started sending it (a slow send under a rate limit would
+  otherwise leave a second notice due moments after the first appeared). Ambient chimes stay quiet, and so
+  does a message Fri already answered. Mentions outside configured channels keep their own gates
+  and stay silent. The same text replaces the old "workshop controller is
+  temporarily unavailable" wherever that error was shown, and a controller 5xx's detail goes to
+  the log only.
+- **`fri health`.** Owner DM only; in a server channel Fri says to DM. It works while the
+  controller is down and records no turn. It shows Fri's release, Discord connection, heartbeat
+  status and age, loop states, waiting usage receipts, live `/status` (Gene's deployed release, and
+  whether deploys are paused) and `/controls/health`
+  (4 s each, failures shown as "unreachable" or "rejected"), and the watch state.
 
 ## Existing installation migration
 
@@ -297,6 +442,16 @@ it does not replace it.
 commit uses the same coordinator. To roll back an independent Fri release, run it
 with the previously retained, compatible full Fri SHA/image.
 
+Before rolling the Gene controller back past member profiles, stop it and run
+`python -m gene.profile_downgrade <controller database>` in the controller's environment. That
+removes profile notes, copies their removals to every configured channel so an older controller saves
+no note from the member's earlier messages, and keeps every conversation's own notes and chats. It
+refuses to run when it can't tell the channels. It never migrates the database, so going below both member
+profiles and turn provenance, it and `gene.provenance_downgrade` can run in either order. A Fri-only rollback needs nothing: an older Fri sends no audience
+and doesn't ask for profiles, so the controller gives it only each conversation's own notes, within the
+limits it was built for. Profile notes stay stored, unseen, until a newer Fri returns or they expire, and
+"forget me" still erases them.
+
 Rollback changes the image/configuration against **current** data. It never restores
 an old controller database, reminder/post receipt, erased memory or subscription
 session. Data snapshots are disaster-recovery evidence, not automatic rollback inputs.
@@ -307,6 +462,32 @@ Do not start the old Gene companion profile after migration. The shared data-dir
 lock prevents overlapping processes, but repeatedly restarting a retired service is
 still an operational error. Do not remove the legacy image/container until a later,
 explicitly reviewed retirement step.
+
+## Background work and health
+
+The 30-second heartbeat fetches controller state first, and defers the whole tick
+when that fails. Every later stage (presence, posts, reminders, owner reports,
+learning, attention, memes, reply checks) runs on its own: a failure is logged with
+the stage and exception class only, and never skips the stages after it. `fri-health.json` keeps
+`agent_heartbeat.running/failed/status` for the release coordinator and adds
+`agent_heartbeat.stages`, one `{at, last_ok, error}` entry per enabled stage.
+
+A usage receipt the controller refuses as invalid (HTTP 400 or 422), or one that
+can't be parsed, moves to `usage/rejected/` and stops blocking later receipts.
+`rejected_usage` in the health file counts them. Credential or contract refusals
+keep every receipt queued.
+
+A failed subscription renewal logs its cause: exception class, HTTP status and OAuth
+error code, never the response or tokens. Only a refused grant (HTTP 400/401), a
+renewal without the plan scope, or a missing or incomplete saved sign-in is reported
+as needing a reconnect. Each refusal sends the owner one DM; a token that works in
+between, even briefly, makes the next refusal a new one.
+Network, rate-limit, provider and disk failures, including a malformed renewal
+response, ask members to retry. A renewal that can't be saved still keeps a rotated
+refresh token. A controller 4xx whose JSON body can't be read keeps its status. A 4xx that
+isn't JSON at all, such as a proxy's HTML or text page, or whose body is cut off or stalls (5 s), is
+still a refusal (startup stops, and the watch reports a rejection, not an outage), but with no
+status, so no receipt is set aside.
 
 ## New installations
 
