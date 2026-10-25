@@ -291,13 +291,21 @@ def test_an_erasure_during_the_burst_wait_names_the_mention(monkeypatch, tmp_pat
     asyncio.run(scenario())
 
 
-def test_an_erasure_during_the_owner_settings_check_names_the_mention(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize('when', ['state read', 'check'])
+def test_an_erasure_during_the_owner_settings_check_names_the_mention(monkeypatch, tmp_path, caplog, when):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         event = message('<@99> you sound like an outdated model', user=10)
+        api = fri.api
+        async def erasing(method, path, payload=None):
+            if when == 'state read' and path == '/agent/state':
+                agent.forget(10)
+            return await api(method, path, payload)
+        fri.api = erasing
         async def analyze(*args, **kwargs):
-            agent.forget(10)
+            if when == 'check':
+                agent.forget(10)
             return {'answer': 'other'}, {}, 'completed'
         monkeypatch.setattr('fri.fri_agent.analyze', analyze)
         try:

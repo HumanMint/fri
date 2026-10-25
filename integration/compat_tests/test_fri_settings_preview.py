@@ -195,6 +195,77 @@ def test_an_owner_line_erased_while_it_waits_gets_no_reply_or_preview(monkeypatc
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('how', ['forget me', 'panel'])
+def test_an_owner_line_erased_during_the_state_read_never_reaches_a_model(monkeypatch, tmp_path, how):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        state = {**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3}
+        async def api(method, path, payload=None):
+            erase(agent, how)
+            return state
+        fri.api = api
+        calls = gate(monkeypatch)
+        agent.record = AsyncMock()
+        agent.run = AsyncMock()
+        message = owner_message()
+        assert await agent.owner_control(message, 'set heartbeat to 10 minutes') == ERASED
+        assert calls == []
+        agent.run.assert_not_awaited()
+        message.reply.assert_not_awaited()
+        await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_forget_before_the_line_was_handled_counts_from_arrival(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
+        calls = gate(monkeypatch)
+        agent.record = AsyncMock()
+        agent.run = AsyncMock()
+        arrived = agent.forgotten.get(10, 0)
+        agent.forget(10)  # While the message waited to be handled.
+        message = owner_message()
+        assert await agent.owner_control(message, 'set heartbeat to 10 minutes', arrived) == ERASED
+        assert calls == []
+        await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('fence,busy', [
+    ('before the check', False), ('after the check', False), ('after the check', True),
+    ('in the model slot', False), ('after the settings call', False)])
+def test_forget_me_during_a_privacy_read_that_returns_the_old_revision_still_counts(monkeypatch, tmp_path, fence, busy):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
+        agent.record = AsyncMock()
+        agent.control_busy = busy
+        reads = []
+        at = ['before the check', 'after the check', 'in the model slot', 'after the settings call'].index(fence)+2
+        async def profile(channel, user):
+            reads.append(user)
+            if len(reads) == at:
+                agent.forget(10)  # Lands while the controller still answers with the old revision.
+            return {'enabled': True, 'revision': 0, 'summary': ''}
+        agent.profile = profile
+        checks, sol = [], []
+        async def analyze(chat, instruction, data, model, effort, schema, **kwargs):
+            if 'answer' in schema['properties']:
+                checks.append(model)
+                return {'answer': 'settings_change'}, {}, 'completed'
+            sol.append(model)
+            return {'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        message = owner_message()
+        assert await agent.owner_control(message, 'set heartbeat to 10 minutes') == ERASED
+        assert len(checks) == (0 if fence == 'before the check' else 1)
+        assert len(sol) == (1 if fence == 'after the settings call' else 0)
+        message.reply.assert_not_awaited()
+        await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('slow', ['state read', 'check'])
 def test_an_earlier_settings_request_keeps_its_turn(monkeypatch, tmp_path, slow):
     async def scenario():

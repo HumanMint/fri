@@ -270,7 +270,7 @@ class Agent:
         await self.record('owner_settings', model, effort, counters, status)
         return status != 'completed' or result.get('answer') == 'settings_change'
 
-    async def owner_control(self, message, text):
+    async def owner_control(self, message, text, forgotten=None):
         if message.author.id != self.fri.owner_id:
             return False
         if message.guild and message.guild.id != self.fri.guild_id:
@@ -320,20 +320,24 @@ class Agent:
             return True
         busy, self.control_busy = self.control_busy, True  # Reserve before any await: requests keep arrival order.
         try:
-            return await self.settings_preview(message, text, busy)
+            arrived = self.forgotten.get(message.author.id, 0) if forgotten is None else forgotten
+            return await self.settings_preview(message, text, busy, arrived)
         finally:
             if not busy:
                 self.control_busy = False
 
-    async def settings_preview(self, message, text, busy):
-        self.state = state = await self.fri.api('GET', '/agent/state')
+    async def settings_preview(self, message, text, busy, forgotten):
         user = message.author.id
         scope = self.fri.workshop_id if message.guild is None else getattr(message.channel, 'parent_id', None) or message.channel.id
-        forgotten, revision = self.forgotten.get(user, 0), (await self.profile(scope, user))['revision']
+        revision = (await self.profile(scope, user))['revision']
 
         async def erased():  # Checked after each wait: an erased message is dropped like any waiting one.
-            return self.forgotten.get(user, 0) != forgotten or (await self.profile(scope, user))['revision'] != revision
+            current = (await self.profile(scope, user))['revision']  # Read first: erasing can't slip in after.
+            return self.forgotten.get(user, 0) != forgotten or current != revision
 
+        self.state = state = await self.fri.api('GET', '/agent/state')
+        if await erased():  # Before the owner's words reach any model.
+            return ERASED
         # Ordinary chat that happens to say "model" or "make" goes to the normal reply. While Fri is
         # disabled the normal path can't answer anything, so only the settings call can help.
         if self.config['enabled'] and not await self.settings_requested(text):
@@ -460,7 +464,8 @@ class Agent:
             return self.miss(message, 'no text')
         directed = text if dm else await addressed_text(message, self.fri.user.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
-        control = owner_addressed and message.author.id == self.fri.owner_id and await self.owner_control(message, directed or text)
+        control = (owner_addressed and message.author.id == self.fri.owner_id and
+                   await self.owner_control(message, directed or text, forgotten))
         if control == ERASED:
             return self.miss(message, 'author privacy changed')
         if control:
@@ -561,6 +566,11 @@ class Agent:
             self.handling -= Counter(event.id for event in earlier)
             for event in earlier:
                 self.settle(event)
+
+    def routing(self, record):
+        """A member's message still being handled that the direct path hasn't taken: it may yet."""
+        return (not record.get('fri') and not record.get('gene_error') and record['id'] not in self.direct and
+                int(record['id']) in self.handling)
 
     def answer_directly(self, message):
         now = time.time()
@@ -803,6 +813,8 @@ class Agent:
         now = time.time()
         for channel_id in list(self.recent):
             records = await self.context_messages(channel_id, raw_errors=True)
+            if any(self.routing(r) for r in records):
+                continue  # Decide once each message knows whether the direct path takes it: next beat.
             # Messages the direct path answers stay in records as context but aren't decided again here.
             fresh = [r for r in records if not r.get('fri') and r['id'] not in self.direct and
                      int(r['id']) > self.seen.get(channel_id, 0)]
@@ -843,7 +855,8 @@ class Agent:
                 profile = await self.profile(getattr(channel, 'parent_id', None) or channel_id, message.author.id)
                 # A direct reply can start or finish while Luna/fetch/profile awaits.
                 # Background attention yields instead of producing a second reply or busy notice.
-                if profile['enabled'] and self.ambient_ready(channel_id, message.author.id):
+                if (profile['enabled'] and selected['id'] not in self.direct and
+                        self.ambient_ready(channel_id, message.author.id)):
                     await self.respond(message, message.content[:4000], ambient=True)
 
     async def investigate(self, channel, record):

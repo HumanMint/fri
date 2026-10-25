@@ -211,15 +211,19 @@ Calls whose result can't change what members see are skipped before inference.
 
 - **Attention.** Messages the direct path takes (addressed to Fri, in the dedicated channel, or a
   follow-up in an active window) stay in the attention model's context but are never offered to it
-  as fresh. A message Fri already answered, reacted to or chose to skip isn't decided twice.
+  as fresh. A message Fri already answered, reacted to or chose to skip isn't decided twice. While
+  a member's message is still being routed (say, the controller hasn't answered whether it
+  continues a conversation), attention skips that channel until the next beat, and it checks again
+  that the direct path hasn't taken its pick before sending an ambient reply.
 - **Owner settings.** An owner line that matches the settings words first goes to a yes/no check
   on the attention model with only the owner's words, outside the background model slot, recorded
   as `owner_settings` usage. Only a yes (or a failed check) runs the Sol/high settings call, with
   typing shown. Anything else takes the normal reply path, even while another settings preview is
   being prepared. A request takes its place in the one-preview-at-a-time queue on arrival, before
-  any controller read. A line the owner erased while it waited (for the check, the model slot or
-  the Sol call) gets no reply, preview or busy note, like any waiting message. While Fri is
-  disabled the check is skipped, since the normal path can't answer then.
+  any controller read. A line the owner erased after it arrived (during the controller reads, the
+  check, the model slot wait or the Sol call) gets no reply, preview or busy note and never reaches
+  a model after the erasure is seen, like any waiting message. While Fri is disabled the check is
+  skipped, since the normal path can't answer then.
 - Meme checks are unchanged: an inspection still runs while the reaction budget is closed, because
   the budget can reopen (or the owner can raise it) before the model answers.
 

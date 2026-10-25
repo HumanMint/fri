@@ -404,6 +404,69 @@ def test_attention_skips_followups_in_an_active_window():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('pending', [True, False])
+def test_attention_waits_until_a_message_knows_whether_the_direct_path_takes_it(pending):
+    async def scenario():
+        channel = SimpleNamespace(id=456, fetch_message=AsyncMock())
+        asked, answer = asyncio.Event(), asyncio.Event()
+        async def api(method, path, payload=None):
+            if path == '/chat/pending':
+                asked.set()
+                await answer.wait()
+                return {'pending': pending}
+            return {}
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel,
+                              user=SimpleNamespace(id=99), api=api, busy=set())
+        agent = Agent(fri)
+        agent.state['config'].update(enabled=True, proactive=True)
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.respond = AsyncMock()
+        message = SimpleNamespace(id=100, guild=SimpleNamespace(id=123), channel=channel,
+            content='anyone know why the build is broken?', author=SimpleNamespace(id=11, bot=False, display_name='friend'),
+            mentions=[], reference=None, webhook_id=None)
+        channel.fetch_message.return_value = message
+        agent.run = AsyncMock(return_value=({'action': 'reply', 'source_id': '100', 'reason': ''}, {}, 'completed'))
+        with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+            task = asyncio.create_task(agent.handle(message))
+            await asyncio.wait_for(asked.wait(), 1)
+            await agent.attend()  # The controller hasn't said yet whether it continues a conversation.
+            agent.run.assert_not_awaited()
+            answer.set()
+            await task
+        await agent.attend()
+        if pending:  # A follow-up: only the direct path answers it.
+            agent.run.assert_not_awaited()
+            assert agent.respond.await_count == 1 and not agent.respond.await_args.kwargs.get('ambient')
+        else:  # Not addressed after all, so attention decides it on the next beat.
+            assert agent.run.await_args.args[2]['fresh_ids'] == ['100']
+            assert agent.respond.await_args.kwargs['ambient']
+    asyncio.run(scenario())
+
+
+def test_attention_yields_when_the_direct_path_takes_its_pick_meanwhile():
+    async def scenario():
+        channel = SimpleNamespace(id=456, fetch_message=AsyncMock())
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel,
+                              user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}), busy=set())
+        agent = Agent(fri)
+        agent.state['config'].update(enabled=True, proactive=True)
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.respond = AsyncMock()
+        message = SimpleNamespace(id=100, guild=SimpleNamespace(id=123), channel=channel,
+            content='anyone know why the build is broken?', author=SimpleNamespace(id=11, bot=False, display_name='friend'),
+            mentions=[], reference=None, webhook_id=None)
+        channel.fetch_message.return_value = message
+        await agent.handle(message)
+        async def decide(*args, **kwargs):
+            agent.answer_directly(message)  # The direct path took it while Luna was deciding.
+            return {'action': 'reply', 'source_id': '100', 'reason': ''}, {}, 'completed'
+        agent.run = AsyncMock(side_effect=decide)
+        await agent.attend()
+        agent.run.assert_awaited_once()
+        agent.respond.assert_not_awaited()
+    asyncio.run(scenario())
+
+
 def test_external_privacy_change_removes_buffer_before_attention_or_context():
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456,
