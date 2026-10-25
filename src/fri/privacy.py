@@ -48,7 +48,7 @@ def clean(text: str, limit: int = 6000) -> str:
 INVISIBLE = re.compile('[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u2800\u303f\u3164\uffa0'
                        '\ufe00-\ufe0f\ufffc\U00013441\U00013442\U00016fe4\U0001d159\U0001da7f\U0001da80'
                        '\U000e0100-\U000e01ef]')
-NOT_PRINTABLE_ASCII = re.compile(r'[^\x20-\x7e]')
+TOKEN = re.compile(r'\\(?:u[0-9a-f]{4}|.)|[^\x20-\x7e]')  # An escape json.dumps wrote, or one non-ASCII character.
 CONJOINING = re.compile('[\u1160-\u11ff\ud7b0-\ud7ff]')  # Hangul vowel and final jamo join the syllable before.
 
 
@@ -60,22 +60,31 @@ def joins(char):
     return unicodedata.category(char)[0] == 'M' or bool(CONJOINING.match(char))
 
 
-def redundant(text, index):
-    """Only a character's first mark (or conjoining jamo) arrives raw, and only when it leaves the
-    character normalized. A second mark can repeat the first or swap order with it, and é can arrive
-    composed or not, all looking alike, so those differences could carry hidden bits."""
-    if not joins(text[index]):
-        return False
-    return index == 0 or joins(text[index-1]) or not unicodedata.is_normalized('NFC', text[index-1:index+1])
-
-
 def model_json(value):
     """JSON for model input with visible text as written: emoji, curly quotes and non-English letters
     stay raw instead of becoming \\u escapes. Controls, format and invisible characters (bidi, zero-width,
-    tags, variation selectors), non-ASCII spaces, a character's second and later combining marks, line
-    separators, surrogates, private-use and unassigned code points stay escaped. json.dumps does the traversal, key conversion and errors, and
-    its output keeps every non-ASCII character inside a string, so ASCII-only output is exactly
-    json.dumps'."""
+    tags, variation selectors), non-ASCII spaces, line separators, surrogates, private-use and unassigned
+    code points stay escaped, and so does anything that would look like something else: a character NFC
+    replaces (the Kelvin sign looks like K), and every combining mark (or Hangul vowel or final jamo) but
+    the first on a raw character, where it leaves the pair normalized. A second mark can repeat the first
+    or swap order with it, é can arrive composed or not, and a mark on an escape or a string's opening
+    quote would draw on JSON's own text. json.dumps does the traversal, key conversion and errors, and its
+    output keeps every non-ASCII character inside a string, so ASCII-only output is exactly json.dumps'."""
     text = json.dumps(value, ensure_ascii=False)
-    return NOT_PRINTABLE_ASCII.sub(lambda match: match.group() if visible(match.group()) and not
-                                   redundant(text, match.start()) else json.dumps(match.group())[1:-1], text)
+    ends = {'token': -1, 'base': -1}  # Where the last escape or non-ASCII character, and the last raw base, end.
+
+    def written(match):
+        char, start = match.group(), match.start()
+        if len(char) > 1:
+            keep = True  # json.dumps' own escape.
+        elif joins(char):
+            # Unless a token ends here, the character before is plain ASCII: content, or the opening quote.
+            base = start == ends['base'] if start == ends['token'] else text[start-1] != '"'
+            keep = base and visible(char) and unicodedata.is_normalized('NFC', text[start-1:start+1])
+        else:
+            keep = visible(char) and unicodedata.is_normalized('NFC', char)
+            if keep:
+                ends['base'] = match.end()
+        ends['token'] = match.end()
+        return char if keep else json.dumps(char)[1:-1]
+    return TOKEN.sub(written, text)

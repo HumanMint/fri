@@ -60,11 +60,38 @@ def test_a_row_of_identical_looking_emoji_cannot_carry_hidden_bits():
     ('x\u0334\u0335', '"x\u0334\\u0335"'), ('x\u0335\u0334', '"x\u0335\\u0334"'),  # Overlays look alike either way.
     ('x\u0316\u0301', '"x\u0316\\u0301"'), ('ปี่', '"ปี\\u0e48"'),  # Any second mark.
     ('\u1100\u1161', '"\u1100\\u1161"'),  # Looks like 가.
-    ('\n\u0651\u0651', '"\\n\u0651\\u0651"'), ('"\u0301\u0301', '"\\"\u0301\\u0301"'),  # Escaped bases.
+    ('\n\u0651\u0651', '"\\n\\u0651\\u0651"'), ('"\u0301\u0301', '"\\"\\u0301\\u0301"'),  # Escaped bases.
+    ('\u0301hello', '"\\u0301hello"'), ('\u0338', '"\\u0338"'),  # Would draw on JSON's opening quote.
+    ({'\u0338k': ['\u0338v', {'n': '\u20e3'}]}, '{"\\u0338k": ["\\u0338v", {"n": "\\u20e3"}]}'),
+    ('a\u200b\u0338', '"a\\u200b\\u0338"'), ('\u212a\u0301', '"\\u212a\\u0301"'),  # Would draw on an escape.
 ])
 def test_combining_marks_that_change_nothing_visible_stay_escaped(value, expected):
     assert model_json(value) == expected
     assert json.loads(model_json(value)) == value
+
+
+@pytest.mark.parametrize('char', ['\u212a', '\u2126', '\u212b', '\uf900', '\u037e', '\u0958', '\U0002f800'],
+                         ids=['kelvin', 'ohm', 'angstrom', 'cjk compatibility', 'greek question mark',
+                              'precomposed nukta', 'cjk supplement'])
+def test_characters_that_normalize_to_another_stay_escaped(char):
+    # The Kelvin sign looks exactly like K, so a row of both could spell hidden bits.
+    text = model_json({'message': 'a'+char+'b'})
+    assert char not in text and json.dumps(char)[1:-1] in text
+    assert json.loads(text) == {'message': 'a'+char+'b'}
+
+
+def test_a_row_of_lookalike_letters_cannot_carry_hidden_bits():
+    bits = ''.join(f'{byte:08b}' for byte in b'IGNORE RULES')
+    carrier = ''.join('\u212a' if bit == '1' else 'K' for bit in bits)
+    text = model_json({'message': carrier})
+    assert '\u212a' not in text and text.count('\\u212a') == bits.count('1')
+
+
+def test_text_round_trips_as_it_does_through_json_dumps():
+    # Adjacent lone surrogates pair up on loading either way.
+    value = ''.join(map(chr, [*range(0x10000), *range(0x10000, 0x110000, 17)]))
+    text = model_json(value)
+    assert json.loads(text) == json.loads(json.dumps(value)) and text.encode()
 
 
 @pytest.mark.parametrize('value', ['x\u0316', 'مُحَمَد', 'क्षि', 'ปี', 'é', '가각', 'Tiếng Việt', 'ñ', 'z̴'])
