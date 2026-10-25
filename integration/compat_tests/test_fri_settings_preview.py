@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -68,6 +69,13 @@ def test_preview_action_rechecks_owner_version_and_blocks_secrets(monkeypatch, t
     asyncio.run(scenario())
 
 
+@pytest.fixture(autouse=True)
+def signed_in(monkeypatch):
+    async def headers(self):
+        return {'Authorization': 'Bearer test'}
+    monkeypatch.setattr('fri.fri_chat.Chat.headers', headers)
+
+
 def gate(monkeypatch, answer='settings_change', status='completed'):
     """Stands in for the cheap settings check; the Sol settings call stays on agent.run."""
     calls = []
@@ -78,8 +86,11 @@ def gate(monkeypatch, answer='settings_change', status='completed'):
     return calls
 
 
+MESSAGE_IDS = itertools.count(1000)
+
+
 def owner_message():
-    return SimpleNamespace(guild=None, author=SimpleNamespace(id=10), reply=AsyncMock(),
+    return SimpleNamespace(id=next(MESSAGE_IDS), guild=None, author=SimpleNamespace(id=10), reply=AsyncMock(),
                            channel=SimpleNamespace(typing=Mock(side_effect=nullcontext)))
 
 
@@ -132,7 +143,7 @@ def test_busy_settings_preview_no_longer_swallows_ordinary_owner_chat(monkeypatc
         gate(monkeypatch, answer=answer)
         agent.record = AsyncMock()
         agent.run = AsyncMock()
-        agent.control_busy = True
+        agent.control_queue.append(1)  # An earlier preview is being prepared.
         message = owner_message()
         handled = await agent.owner_control(message, 'you sound like an outdated model')
         agent.run.assert_not_awaited()
@@ -140,7 +151,7 @@ def test_busy_settings_preview_no_longer_swallows_ordinary_owner_chat(monkeypatc
             assert not handled and not message.reply.await_count  # Answered by the normal path instead.
         else:
             assert handled and 'one settings preview at a time' in message.reply.await_args.args[0]
-        assert agent.control_busy
+        assert agent.control_queue == [1]
         await fri.close()
     asyncio.run(scenario())
 
@@ -159,7 +170,7 @@ def test_an_owner_line_erased_while_it_waits_gets_no_reply_or_preview(monkeypatc
         fri, agent, _, _ = harness(monkeypatch, tmp_path)
         fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
         agent.record = AsyncMock()
-        agent.control_busy = when == 'busy'
+        agent.control_queue.extend([1] if when == 'busy' else [])
         sol = []
         async def analyze(chat, instruction, data, model, effort, schema, **kwargs):
             if 'answer' in schema['properties']:  # The cheap check.
@@ -190,7 +201,7 @@ def test_an_owner_line_erased_while_it_waits_gets_no_reply_or_preview(monkeypatc
             assert await agent.owner_control(message, text) == ERASED
         message.reply.assert_not_awaited()  # No preview, busy note or error about the erased line.
         assert sol == (['gpt-6.1-sol'] if when == 'settings call' else [])
-        assert agent.control_busy == (when == 'busy')
+        assert agent.control_queue == ([1] if when == 'busy' else [])
         await fri.close()
     asyncio.run(scenario())
 
@@ -240,7 +251,7 @@ def test_forget_me_during_a_privacy_read_that_returns_the_old_revision_still_cou
         fri, agent, _, _ = harness(monkeypatch, tmp_path)
         fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
         agent.record = AsyncMock()
-        agent.control_busy = busy
+        agent.control_queue.extend([1] if busy else [])
         reads = []
         at = ['before the check', 'after the check', 'in the model slot', 'after the settings call'].index(fence)+2
         async def profile(channel, user):
@@ -299,9 +310,122 @@ def test_an_earlier_settings_request_keeps_its_turn(monkeypatch, tmp_path, slow)
             assert await task
             assert first.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
             agent.run.assert_awaited_once()
-            assert not agent.control_busy
+            assert agent.control_queue == []
         finally:
             release.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('how', ['forget me', 'panel'])
+@pytest.mark.parametrize('during', ['check', 'settings call'])
+def test_an_owner_line_erased_during_sign_in_never_reaches_a_model(monkeypatch, tmp_path, how, during):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
+        agent.record = AsyncMock()
+        signing_in, signed_in = asyncio.Event(), asyncio.Event()
+        signins = []
+        async def headers():
+            signins.append(during)
+            if len(signins) == (1 if during == 'check' else 2):
+                signing_in.set()
+                await signed_in.wait()  # A slow token refresh.
+            return {'Authorization': 'Bearer '+str(len(signins))}
+        fri.chat.headers = headers
+        sent = []
+        async def analyze(chat, instruction, data, model, effort, schema, **kwargs):
+            sent.append(('check' if 'answer' in schema['properties'] else 'settings', kwargs['headers']))
+            if 'answer' in schema['properties']:
+                return {'answer': 'settings_change'}, {}, 'completed'
+            return {'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        message = owner_message()
+        task = asyncio.create_task(agent.owner_control(message, 'set heartbeat to 10 minutes'))
+        try:
+            await asyncio.wait_for(signing_in.wait(), 1)
+            erase(agent, how)
+            signed_in.set()
+            assert await task == ERASED
+            # Each call is sent with the sign-in prepared before its last privacy check.
+            assert sent == ([] if during == 'check' else [('check', {'Authorization': 'Bearer 1'})])
+            message.reply.assert_not_awaited()
+        finally:
+            signed_in.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('waits', ['state read', 'check'])
+def test_a_request_that_waited_takes_the_preview_slot_an_earlier_one_freed(monkeypatch, tmp_path, waits):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        state = {**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3}
+        first_checking, finish_first = asyncio.Event(), asyncio.Event()
+        second_waiting, finish_second = asyncio.Event(), asyncio.Event()
+        reads = []
+        async def api(method, path, payload=None):
+            reads.append(path)
+            if waits == 'state read' and len(reads) == 2:  # The second request's.
+                second_waiting.set()
+                await finish_second.wait()
+            return state
+        fri.api = api
+        async def analyze(chat, instruction, data, *args, **kwargs):
+            if data['message'] == 'set heartbeat to 10 minutes':
+                first_checking.set()
+                await finish_first.wait()
+            elif waits == 'check':
+                second_waiting.set()
+                await finish_second.wait()
+            return {'answer': 'settings_change'}, {}, 'completed'
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        agent.record = AsyncMock()
+        agent.run = AsyncMock(return_value=({'explanation': '', 'changes': [
+            {'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'))
+        first, second = owner_message(), owner_message()
+        earlier = asyncio.create_task(agent.owner_control(first, 'set heartbeat to 10 minutes'))
+        try:
+            await asyncio.wait_for(first_checking.wait(), 1)
+            later = asyncio.create_task(agent.owner_control(second, 'set the meme interval to 2 hours'))
+            await asyncio.wait_for(second_waiting.wait(), 1)
+            finish_first.set()
+            assert await earlier
+            finish_second.set()  # The earlier preview is out, so this one is next.
+            assert await later
+            assert agent.run.await_count == 2
+            for message in (first, second):
+                assert message.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
+            assert agent.control_queue == []
+        finally:
+            finish_first.set()
+            finish_second.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_stalled_settings_check_gives_way_to_the_sol_preview(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
+        monkeypatch.setattr('fri.fri_agent.CHECK_SECONDS', 0.05)
+        stalled = asyncio.Event()
+        async def analyze(*args, **kwargs):
+            stalled.set()
+            await asyncio.Event().wait()  # A stream that never finishes.
+        monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        agent.record = AsyncMock()
+        agent.run = AsyncMock(return_value=({'explanation': '', 'changes': [
+            {'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'))
+        message = owner_message()
+        try:
+            assert await asyncio.wait_for(agent.owner_control(message, 'set heartbeat to 10 minutes'), 2)
+            assert stalled.is_set()
+            assert agent.record.await_args.args[0] == 'owner_settings' and agent.record.await_args.args[3:] == ({}, 'interrupted')
+            message.channel.typing.assert_called_once()
+            assert message.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
+            assert agent.control_queue == []
+        finally:
             await fri.close()
     asyncio.run(scenario())
 
@@ -328,7 +452,7 @@ def test_settings_check_does_not_wait_behind_background_model_work(monkeypatch, 
         gate(monkeypatch, answer='other')
         agent.record = AsyncMock()
         async with agent.slots:  # A background investigation holds the model slot.
-            assert not await asyncio.wait_for(agent.settings_requested('make it rain'), 1)
+            assert not await asyncio.wait_for(agent.settings_requested('make it rain', AsyncMock(return_value=False)), 1)
         await fri.close()
     asyncio.run(scenario())
 

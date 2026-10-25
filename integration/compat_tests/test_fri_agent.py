@@ -443,6 +443,63 @@ def test_attention_waits_until_a_message_knows_whether_the_direct_path_takes_it(
     asyncio.run(scenario())
 
 
+def routed_channel(**config):
+    channel = SimpleNamespace(id=456, guild=SimpleNamespace(id=123), parent_id=None)
+    fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel,
+                          user=SimpleNamespace(id=99), busy=set())
+    agent = Agent(fri)
+    agent.state['config'].update(enabled=True, **config)
+    agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+    agent.investigate = AsyncMock()
+    agent.run = AsyncMock(return_value=({'action': 'quiet', 'source_id': '', 'reason': ''}, {}, 'completed'))
+    return agent
+
+
+def member_row(mid, text='anyone know why the build is broken?'):
+    return {'id': str(mid), 'user_id': '11', 'name': 'friend', 'text': text, 'at': time.time(),
+            'revision': 0, 'gene_error': False}
+
+
+async def beat(agent):
+    agent.last_attention.clear()  # As after heartbeat_seconds.
+    before = agent.run.await_count
+    await agent.attend()
+    return agent.run.await_args.args[2]['fresh_ids'] if agent.run.await_count > before else None
+
+
+@pytest.mark.parametrize('taken', [False, True])
+def test_attention_decides_a_gene_error_while_a_member_message_is_still_routed(taken):
+    async def scenario():
+        agent = routed_channel()
+        agent.run.return_value = ({'action': 'investigate', 'source_id': '101', 'reason': ''}, {}, 'completed')
+        agent.recent[456].extend([member_row(100), {'id': '101', 'user_id': '7', 'name': 'Gene',
+                                  'text': 'Error: queue failed', 'at': time.time(), 'gene_error': True}])
+        agent.handling[100] += 1  # The controller hasn't said whether it continues a conversation.
+        assert await beat(agent) == ['101']
+        agent.investigate.assert_awaited_once()
+        assert await beat(agent) is None  # Still routed, and the error isn't decided twice.
+        if taken:
+            agent.answer_directly(SimpleNamespace(id=100))
+        agent.handling.clear()
+        assert await beat(agent) == (None if taken else ['100'])  # Kept its place behind the error.
+        assert await beat(agent) is None
+        agent.investigate.assert_awaited_once()
+    asyncio.run(scenario())
+
+
+def test_attention_keeps_deciding_while_members_keep_being_routed():
+    async def scenario():
+        agent = routed_channel()
+        offered = []
+        for mid in range(200, 204):
+            agent.handling.clear()  # The previous message wasn't taken by the direct path.
+            agent.handling[mid] += 1
+            agent.recent[456].append(member_row(mid))
+            offered.append(await beat(agent))
+        assert offered == [None, ['200'], ['201'], ['202']]
+    asyncio.run(scenario())
+
+
 def test_attention_yields_when_the_direct_path_takes_its_pick_meanwhile():
     async def scenario():
         channel = SimpleNamespace(id=456, fetch_message=AsyncMock())

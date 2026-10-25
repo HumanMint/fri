@@ -308,6 +308,7 @@ def test_an_erasure_during_the_owner_settings_check_names_the_mention(monkeypatc
                 agent.forget(10)
             return {'answer': 'other'}, {}, 'completed'
         monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+        monkeypatch.setattr('fri.fri_chat.Chat.headers', AsyncMock(return_value={'Authorization': 'Bearer test'}))
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
