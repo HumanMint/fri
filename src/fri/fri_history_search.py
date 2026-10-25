@@ -36,7 +36,9 @@ def requested(text):
         # between shared and dedicated" stay general questions.
         r"|\b(?:what(?:'s|’s|s)?|which)\s+(?:(?:was|were|is)\s+)?(?:that|the|those)\s+\w+(?:\s+\w+){0,3}?\s+"
         r'(?!(?:\w+ly|most|more|least|between|and|or|of|for|with|in|on|to|by|than|as|being|been)\b)\w+\s+'
-        r'(said|mentioned|recommended|posted|linked|shared|sent|dropped)\b', visible))
+        # The verb ends the clause, as in recall; "doctor recommended dose" uses it as an adjective.
+        r'(said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
+        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|in|on|here|there|again|lol|lmao|rn)\b))', visible))
 
 
 def valid_action(action):
