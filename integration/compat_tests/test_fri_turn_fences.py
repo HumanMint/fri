@@ -617,7 +617,7 @@ def test_a_later_history_page_cannot_relabel_an_earlier_one(monkeypatch, tmp_pat
             post.created_at = discord.utils.snowflake_time(post.id)
             post.jump_url = f'https://discord.com/channels/123/1/{post.id}'
         event.reply.return_value = SimpleNamespace(id=event.id+1, content='done')
-        query = {'kind': 'history_search', 'channel_id': '1', 'query': '', 'author': '', 'after': '', 'before': '', 'cursor': ''}
+        query = {'kind': 'history_search', 'channel_id': '1', 'query': '', 'author': '', 'after': '', 'before': '', 'has': '', 'cursor': ''}
         async def http(route, *, params):
             return {'messages': [[{'id': str(p.id), 'channel_id': '1', 'content': p.content,
                 'author': {'id': '30', 'bot': False}, 'hit': True}] for p in posts

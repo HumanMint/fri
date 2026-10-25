@@ -20,7 +20,7 @@ from fri.fri_runner import run
 
 def query(**changes):
     return {'kind': 'history_search', 'channel_id': '1', 'query': 'played', 'author': '',
-            'after': '', 'before': '', 'cursor': '', **changes}
+            'after': '', 'before': '', 'has': '', 'cursor': '', **changes}
 
 
 def setup(monkeypatch, tmp_path, *, public=True, text='find old messages about what we played'):

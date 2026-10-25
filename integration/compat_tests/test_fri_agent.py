@@ -327,7 +327,7 @@ def test_history_search_cannot_quote_a_different_channel_publicly():
         actions.event = event(user=11, content='search history for "private"')
         actions.message = actions.event.content
         result = await actions.execute({'kind': 'history_search', 'channel_id': '789', 'query': 'private',
-                                        'author': '', 'after': '', 'before': '', 'cursor': ''})
+                                        'author': '', 'after': '', 'before': '', 'has': '', 'cursor': ''})
         source.history.assert_not_called()
         fri.api.assert_not_awaited()
         assert 'blocked' in result
