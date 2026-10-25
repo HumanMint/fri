@@ -3,6 +3,7 @@
 import asyncio
 import re
 import time
+from collections import defaultdict
 
 import discord
 
@@ -23,10 +24,28 @@ class ReplyInProgress(commands.UserFeedbackCheckFailure):
         super().__init__('hold on, still typing your last one.')
 
 
+class Busy(set):
+    """Members with a reply running. A message that arrives meanwhile can wait for it to finish."""
+
+    def __init__(self):
+        super().__init__()
+        self.idle = {}  # member: set once their running reply finishes.
+
+    def discard(self, user):
+        super().discard(user)
+        if user in self.idle:
+            self.idle.pop(user).set()
+
+    async def finished(self, user):
+        while user in self:
+            await self.idle.setdefault(user, asyncio.Event()).wait()
+
+
 class WaitingNotices:
     def __init__(self, busy):
         self.busy = busy
-        self.lock = asyncio.Lock()
+        # Per member: a send's last checks can wait on the controller without holding up anyone else.
+        self.locks = defaultdict(asyncio.Lock)
         self.messages = {}
 
     async def remove(self, message):
@@ -35,10 +54,12 @@ class WaitingNotices:
         except discord.HTTPException:
             pass  # Also scheduled for deletion when originally sent.
 
-    async def send(self, event):
-        async with self.lock:
+    async def send(self, event, eligible=None):
+        async with self.locks[event.author.id]:
             if event.author.id not in self.busy:
                 return  # The reply may have finished while this notice waited.
+            if eligible and (not await eligible() or event.author.id not in self.busy):
+                return  # Checked here, as late as possible: another notice may have held the lock.
             # Don't retain expired handles indefinitely if a conversation fails.
             now = time.monotonic()
             self.messages = {user: [(at, msg) for at, msg in rows if now-at < 300]
@@ -56,7 +77,7 @@ class WaitingNotices:
     async def clear(self, user):
         # Serialize with sends so a slow Discord response cannot leave a new
         # waiting notice behind after the real reply has already been delivered.
-        async with self.lock:
+        async with self.locks[user]:
             if user in self.busy:
                 return  # A privacy response or another turn must not clear active work.
             rows = self.messages.pop(user, [])

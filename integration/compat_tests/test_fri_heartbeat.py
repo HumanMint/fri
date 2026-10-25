@@ -28,6 +28,7 @@ STATE = {'config': {**DEFAULTS, 'enabled': True, 'meme_enabled': True}, 'version
 def heartbeat(monkeypatch):
     monkeypatch.setattr('fri.fri_workspace.deliver_one', AsyncMock())
     monkeypatch.setattr('fri.fri_social.deliver_one', AsyncMock())
+    monkeypatch.setattr('fri.fri_fixes.check', AsyncMock())
     owner = SimpleNamespace(send=AsyncMock())
     reports = []
 
@@ -52,7 +53,7 @@ def test_undeliverable_report_card_no_longer_silences_attention_or_memes(heartbe
     agent.check_memes.assert_awaited_once()
     assert agent.heartbeat_status == 'deferred'
     assert agent.stages['reports']['error'] == 'KeyError' and agent.stages['reports']['last_ok'] is None
-    assert all(agent.stages[name]['error'] is None for name in ('posts', 'reminders', 'learning', 'attention', 'memes'))
+    assert all(agent.stages[name]['error'] is None for name in ('posts', 'reminders', 'learning', 'attention', 'fixes', 'memes'))
     assert ('POST', '/agent/reports/'+'a'*32+'/delivered') not in [c.args[:2] for c in heartbeat.fri.api.await_args_list]
 
 
