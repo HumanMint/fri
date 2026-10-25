@@ -30,9 +30,12 @@ class SubscriptionUnavailable(SubscriptionError):
     """Renewal failed in a way a later call may not: network, rate limit or provider outage."""
 
 
+REFUSED = (400, 401)
+
+
 def refusal(exc):
     """Only an explicit OAuth refusal of the grant needs the owner."""
-    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (400, 401)
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in REFUSED
 
 
 def plan_withdrawn(tokens):
@@ -48,7 +51,7 @@ def cause(exc):
         return type(exc).__name__
     try:
         code = exc.response.json().get('error')
-    except (ValueError, AttributeError, RecursionError):  # Deeply nested JSON raises RecursionError.
+    except Exception:  # Only for the log: a body that's unread, undecodable or nested too deep names no code.
         code = None
     code = code if isinstance(code, str) and re.fullmatch(r'[a-z_]{1,40}', code) else ''
     return f'HTTP {exc.response.status_code} {code}'.rstrip()
@@ -193,10 +196,15 @@ class Subscription:
         tokens = None
         try:
             with httpx.Client(timeout=30, trust_env=False, transport=self.transport) as client:
-                response = client.post(TOKEN_URL, data={'grant_type': 'refresh_token',
-                    'client_id': saved['client_id'], 'refresh_token': saved['refresh_token'],
-                    'resource': RESOURCE})
-                response.raise_for_status()
+                with client.stream('POST', TOKEN_URL, data={'grant_type': 'refresh_token',
+                        'client_id': saved['client_id'], 'refresh_token': saved['refresh_token'],
+                        'resource': RESOURCE}) as response:
+                    try:
+                        response.read()
+                    except httpx.HTTPError:
+                        if response.status_code not in REFUSED:
+                            raise  # A refusal is one whatever its body, which only names the OAuth error.
+                    response.raise_for_status()
             tokens = response.json()
             renewed = token_record(tokens, saved, client_id=saved['client_id'],
                                    host_id=saved['ext_agent_host_id'])

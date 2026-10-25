@@ -94,16 +94,17 @@ def test_reply_checks_run_as_their_own_stage(heartbeat, monkeypatch):
     assert check.await_count == 2 and 'reply_checks' not in agent.stages
 
 
-def test_a_controller_without_reply_check_settings_still_runs_every_stage(heartbeat, monkeypatch):
+def test_a_controller_without_a_setting_treats_it_as_off(heartbeat, monkeypatch):
     agent = heartbeat.agent
     check = AsyncMock()
     monkeypatch.setattr('fri.fri_reply_checks.check', check)
     heartbeat.fri.capabilities = frozenset({'reply-checks'})
-    config = {k: v for k, v in STATE['config'].items() if not k.startswith('reply_check')}
+    config = {k: v for k, v in STATE['config'].items() if not k.startswith('reply_check') and k != 'status_enabled'}
     monkeypatch.setitem(STATE, 'config', config)
     asyncio.run(agent.heartbeat.coro(agent))
     check.assert_not_awaited()
-    assert agent.heartbeat_status == 'ok' and 'reply_checks' not in agent.stages
+    assert agent.heartbeat_status == 'ok' and 'reply_checks' not in agent.stages and agent.presence is None
+    assert agent.stages['presence']['error'] is None
     agent.check_memes.assert_awaited_once()
 
 

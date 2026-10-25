@@ -131,6 +131,40 @@ def test_a_refusal_with_an_unreadable_body_is_still_a_refusal(tmp_path, caplog, 
     assert json.loads(path.read_text()) == saved
 
 
+class Corrupt(httpx.SyncByteStream):
+    """A gzip-labelled body that isn't gzip. httpx asks for gzip by default, so error replies often are."""
+
+    def __iter__(self):
+        yield b'private, not gzip'
+
+
+def corrupt(status):
+    return httpx.Response(status, headers={'Content-Encoding': 'gzip'}, stream=Corrupt())
+
+
+@pytest.mark.parametrize('status', [400, 401])
+def test_a_refusal_whose_body_cannot_be_decoded_is_still_a_refusal(tmp_path, caplog, status):
+    path = tmp_path / 'session.json'
+    saved = expired(path)
+    session = Subscription(path, httpx.MockTransport(lambda _: corrupt(status)))
+    with pytest.raises(SubscriptionError, match='Reconnect') as exc:
+        session.access_token()
+    assert not isinstance(exc.value, SubscriptionUnavailable) and session.rejected
+    assert f'renewal rejected: HTTP {status}\n' in caplog.text and 'private' not in caplog.text
+    assert json.loads(path.read_text()) == saved
+
+
+@pytest.mark.parametrize('status', [200, 503])
+def test_any_other_reply_whose_body_cannot_be_decoded_is_transient(tmp_path, caplog, status):
+    path = tmp_path / 'session.json'
+    saved = expired(path)
+    session = Subscription(path, httpx.MockTransport(lambda _: corrupt(status)))
+    with pytest.raises(SubscriptionUnavailable):
+        session.access_token()
+    assert not session.rejected and 'renewal failed: DecodingError' in caplog.text and 'private' not in caplog.text
+    assert json.loads(path.read_text()) == saved
+
+
 def test_renewal_without_the_plan_scope_is_a_refusal(tmp_path, caplog):
     path = tmp_path / 'session.json'
     expired(path)

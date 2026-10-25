@@ -827,7 +827,7 @@ class Agent:
         self.last_spoke[channel] = time.time()
 
     async def check_presence(self):
-        if self.config['status_enabled'] or self.presence:
+        if self.config.get('status_enabled') or self.presence:
             from .fri_presence import Presence
             if self.presence is None:
                 self.presence = Presence(self)
