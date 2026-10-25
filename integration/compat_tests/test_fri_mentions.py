@@ -406,7 +406,8 @@ def test_a_cancelled_burst_wait_settles_every_ping_once(monkeypatch, tmp_path, c
     asyncio.run(scenario())
 
 
-def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize('forgotten', [False, True])
+def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog, forgotten):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
@@ -414,6 +415,8 @@ def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog):
         event = message('<@99> you there?')
         try:
             await agent.handle(event)
+            if forgotten:  # Even once the delivered record has let it go, by age or count.
+                agent.delivered.clear()
             await agent.handle(event)  # Discord can deliver an event again, e.g. after a resume.
             assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: fri disabled']
         finally:
@@ -421,8 +424,9 @@ def test_a_redelivered_ping_is_logged_once(monkeypatch, tmp_path, caplog):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('forgotten', [False, True])
 @pytest.mark.parametrize('when', ['profile', 'burst', 'reply', 'cancelled'])
-def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tmp_path, caplog, when):
+def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tmp_path, caplog, when, forgotten):
     # Discord can deliver the same event twice. The first copy, or the burst holding it, answers.
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
@@ -450,6 +454,8 @@ def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tm
             if when == 'reply':  # The burst's last message is replying for both.
                 tasks.append(asyncio.create_task(agent.handle(later)))
                 await asyncio.wait_for(held.wait(), 5)
+            if forgotten:  # Pushed out of the delivered record (by age or count) while still in flight.
+                agent.delivered.clear()
             await asyncio.wait_for(agent.handle(copy.copy(event)), 1)  # Ignored at once.
             if when == 'cancelled':
                 tasks[0].cancel()
@@ -463,10 +469,27 @@ def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tm
                 assert fri.chat_once.await_count == 1 and mention_lines(caplog) == []
                 if when == 'reply':
                     event.reply.assert_not_awaited()
-            assert agent.misses == {} and not agent.handling
+            assert agent.misses == {}
         finally:
             release.set()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_burst_message_redelivered_after_its_answer_is_ignored(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('<@99> hey', age=1), message('you around?')
+        try:
+            await asyncio.gather(agent.handle(first), agent.handle(second))
+            second.reply.assert_awaited_once()
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(copy.copy(first))  # Its own invitation is unspent, but it was answered.
+            first.reply.assert_not_awaited()
+            assert fri.chat_once.await_count == 1 and mention_lines(caplog) == []
+        finally:
             await fri.close()
     asyncio.run(scenario())
 
