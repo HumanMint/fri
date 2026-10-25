@@ -12,6 +12,7 @@ import httpx
 
 from . import feedback as commands
 from .fri_agent_model import STRING, obj
+from .fri_errors import ControllerRejected
 from .fri_meme_media import load_image, sources
 from .privacy import clean
 from .private_files import private_json
@@ -208,7 +209,13 @@ class Memes:
             return
         self.verified = now
         for message_id, note in list(self.noted.items()):
-            profile = await self.agent.profile(note['channel'], int(note['author']))
+            try:
+                profile = await self.agent.profile(note['channel'], int(note['author']))
+            except ControllerRejected:  # Gene refuses that scope for good (e.g. a removed meme channel).
+                self.noted.pop(message_id, None)
+                continue
+            except commands.UserFeedbackCheckFailure:  # Unavailable: this note waits, the others go on.
+                continue
             if not profile['enabled'] or profile['revision'] != note['revision']:
                 self.noted.pop(message_id, None)
 

@@ -204,3 +204,26 @@ def test_the_heartbeat_expires_notes_even_when_gene_is_down(monkeypatch, tmp_pat
         await agent.heartbeat.coro(agent)
         assert agent.heartbeat_status == 'deferred' and agent.memes.noted == {}
     asyncio.run(scenario())
+
+
+def test_one_channel_gene_refuses_never_stops_the_other_notes_privacy_check(tmp_path):
+    import time
+
+    from fri.fri_errors import ControllerRejected, ControllerUnavailable
+
+    async def scenario():
+        async def profile(channel, user):
+            if channel == 3:
+                raise ControllerRejected('channel out of scope', status=403)  # A meme channel removed.
+            if channel == 4:
+                raise ControllerUnavailable('down')
+            return {'enabled': user != 12, 'revision': 0}
+        memes = Memes(SimpleNamespace(fri=SimpleNamespace(data=tmp_path), profile=profile))
+        now = time.time()
+        for mid, channel, author in ((1, 3, '11'), (2, 1, '12'), (3, 4, '13'), (4, 1, '14')):
+            memes.noted[mid] = {'at': now, 'channel': channel, 'author': author, 'revision': 0, 'emoji': '🗿',
+                                'note': 'a desk', 'edited': None}
+        await memes.verify(now=now+601)
+        # Refused for good: dropped. Opted out: dropped. Unreachable for now: kept for next time. Fine: kept.
+        assert set(memes.noted) == {3, 4}
+    asyncio.run(scenario())
