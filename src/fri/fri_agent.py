@@ -541,15 +541,16 @@ class Agent:
                 del self.misses[event.id]
                 LOG.info('Mention %s/%s not answered, told why: %s', event.channel.id, event.id, reason)
 
-    async def withheld(self, message, events, reason, invitation=None, *, logged=None, fenced=True):
+    async def withheld(self, message, events, reason, invitation=None, *, logged=None, fenced=True, control=False):
         """Say why a reply can't go out while the message still stands to be answered; else log why.
         `invitation`: a ping, or a burst's pings newest first (see pings), the first still standing
-        told why. `fenced`: a ping's notice also needs its author not to have erased since (see notice)."""
+        told why. `fenced`: a ping's notice also needs its author not to have erased since (see notice).
+        `control`: a privacy control's, told why with Fri paused too."""
         from .fri_mentions import notice_for
         pings = invitation if isinstance(invitation, list) else [invitation] if invitation else []
         text = None if pings else notice_for(reason)
         for ping in pings:
-            if text := await ping.notice(reason, fenced=fenced):
+            if text := await ping.notice(reason, fenced=fenced, control=control):
                 message = ping.event  # Checked just now to still stand, unlike the rest of its burst.
                 break
         if text:
@@ -680,7 +681,7 @@ class Agent:
                 # back. A ping's invitation also checks it still pings Fri, with its author's access.
                 if privacy and invitation and not await invitation.current(check_evidence=False, control=True):
                     return await self.withheld(message, events, invitation.refusal, invitation, fenced=False,
-                                               logged=f'reply withheld: {invitation.refusal}')
+                                               control=True, logged=f'reply withheld: {invitation.refusal}')
                 if privacy and not invitation and not await self.still_addressed(message, answering=True):
                     return self.missed(events, 'message changed')  # E.g. a ping sent while Fri was paused.
                 if privacy in MEMORY_CONTROLS and (newer := self.controlled.get(user)) and (
@@ -831,7 +832,8 @@ class Agent:
             # Not a ping, so what its reply would have said, e.g. the controller refusing.
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             return self.answered(events)
-        return await self.withheld(message, events, 'check failed: '+type(exc).__name__, invitation, fenced=not control)
+        return await self.withheld(message, events, 'check failed: '+type(exc).__name__, invitation, fenced=not control,
+                                   control=control)
 
     def missed(self, events, reason):
         for event in events:
@@ -1240,15 +1242,16 @@ class Agent:
         async def refused():
             """The invitation's recheck before Fri answers, True once it failed and that was handled. A dead
             controller there is an outage, not a change. A privacy control's notice isn't fenced by the
-            change it made, or another's."""
+            change it made, or another's, and goes on with Fri paused (fri #64)."""
+            control = since is None  # See take_turn: only a privacy control comes without one.
             try:
-                if await invitation.current():
+                if await invitation.current(control=control):
                     return False
             except ControllerUnavailable:
                 await outage()
                 return True
             await self.withheld(message, events, invitation.refusal, self.pings(events, since, invitation),
-                                fenced=since is not None,
+                                fenced=not control, control=control,
                                 logged=f'reply withheld: {invitation.refusal}')
             return True
 
@@ -1285,7 +1288,7 @@ class Agent:
                 # A ping gets a fixed line, not the controller's text, even when a later message's reply
                 # answers it. Its notice checks the ping still stands, and erasure last.
                 return await self.withheld(message, events, 'check failed: ControllerRejected', pings,
-                                           fenced=since is not None)
+                                           fenced=since is not None, control=since is None)
             if since:  # Said only if they haven't erased since, checked last.
                 if erased := await self.erasure(message.author.id, *since):
                     return await self.dropped(message, events, erased, invitation, since, burst)
@@ -1314,7 +1317,7 @@ class Agent:
             if ambient:
                 return missed('nearby message deleted')
             return await self.withheld(message, events, 'nearby message changed', invitation,
-                                       fenced=since is not None, logged='nearby message deleted')
+                                       fenced=since is not None, control=since is None, logged='nearby message deleted')
         if result.response_kind in ('react', 'quiet'):
             if (result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(
                     message, result.reaction, (lambda: self.erasure(message.author.id, *since)) if since else None)):

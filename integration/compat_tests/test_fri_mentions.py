@@ -2904,3 +2904,35 @@ def test_new_chat_stays_socially_bounded_after_operational_bypass_fix(monkeypatc
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('paused', [False, True])
+@pytest.mark.parametrize('text,path,logged', [
+    ('<@99> forget me', '/agent/context', 'check failed: ControllerRejected'),  # Its arrival read.
+    ('<@99> forget me', '/chat/memory/control', 'check failed: ControllerRejected'),  # The control itself.
+    ('<@99> show my memory', '/chat/context', 'check failed: ControllerRejected'),
+])
+def test_a_privacy_control_ping_refused_by_the_controller_hears_why_even_if_fri_pauses(monkeypatch, tmp_path, caplog,
+                                                                                     paused, text, path, logged):
+    # fri #64: a privacy control works with Fri paused, so its notice must not stop at the pause either.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message(text)
+        api = fri.api
+        async def refused(method, called, payload=None):
+            if called == path:
+                if paused:  # The owner pauses Fri while that call is out.
+                    agent.config['enabled'] = False
+                raise ControllerRejected('nope', 400)
+            return await api(method, called, payload)
+        fri.api = refused
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            # The same notice either way: what it says doesn't depend on the pause.
+            assert [item.args[0] for item in event.reply.await_args_list] == [CONTEXT_CHANGED]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: {logged}']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
