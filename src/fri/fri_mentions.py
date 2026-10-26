@@ -162,12 +162,13 @@ class Invitation:
         if not await self.current():
             raise commands.UserFeedbackCheckFailure(CHANGED)
 
-    async def notice(self, reason, *, fenced=True):
+    async def notice(self, reason, *, fenced=True, control=False):
         """What to say instead of a reply that can't go out, or None to stay quiet.
 
         Only while the ping still stands: Fri can still answer there, the message still pings Fri,
         and, if `fenced`, its author hasn't erased since Fri first saw it. A privacy control isn't:
-        it always hears how it went, whatever it or another one changed. Never any content or context.
+        it always hears how it went, whatever it or another one changed, and with Fri paused, as it works
+        then (see access). Never any content or context.
         """
         if not (text := notice_for(reason)):
             return None
@@ -178,13 +179,15 @@ class Invitation:
                     revision = await self.agent.revision(self.event.author.id)
                 except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
                     return None
-            if not await self.access():
+            if not await self.access(control=control):
                 return None
             current = await self.event.channel.fetch_message(self.event.id)
             if (current.id != self.event.id or current.author.id != self.event.author.id or current.author.bot or
                     current.webhook_id or not explicit_mention(current, self.fri.user.id)):
                 return None
-            if reason == 'message changed' and current.edited_at is None:
+            if reason == 'message changed' and fingerprint(current) == self.original:
+                text = CONTEXT_CHANGED  # Another message in its burst changed, not this one.
+            elif reason == 'message changed' and current.edited_at is None:
                 text = GLITCH  # Not the member's edit, so don't say it was.
             # Last, so an erasure during the checks above still counts.
             if fenced and await self.agent.erasure(self.event.author.id, self.forgotten, revision):

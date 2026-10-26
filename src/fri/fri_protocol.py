@@ -4,7 +4,8 @@ PROTOCOL = 'gene-fri/1'
 CAPABILITIES = ('scoped-context', 'gene-controls', 'owner-reviews', 'privacy-revisions',
                 'workspace-outbox', 'social-outbox', 'research-receipts', 'agent-learning', 'event-mention-chat',
                 'turn-provenance')
-OPTIONAL = ('reply-checks', 'member-profiles')  # Used when the controller offers them; an older controller still runs Fri.
+OPTIONAL = ('reply-checks', 'member-profiles', 'requester-notices',
+            'usage-window')  # Used when the controller offers them; an older controller still runs Fri.
 
 
 def contract():

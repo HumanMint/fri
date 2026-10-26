@@ -1423,11 +1423,11 @@ def test_a_dead_controller_at_the_last_recheck_answers_the_whole_burst(monkeypat
         fri, agent, _, _, _, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         first, second = make_message('<@99> you there?'), make_message('<@99> hello?')
         original = Invitation.current
-        async def current(self, *, check_evidence=True):
+        async def current(self, *, check_evidence=True, control=False):
             # Only reply_once's last check before it answers, after the burst has formed.
             if check_evidence and self.grant and sys._getframe(1).f_code.co_name in ('reply_once', 'withheld'):
                 raise ControllerUnavailable(UNREACHABLE)
-            return await original(self, check_evidence=check_evidence)
+            return await original(self, check_evidence=check_evidence, control=control)
         try:
             with patch.object(Invitation, 'current', current):  # Real waits, so the two pings form a burst.
                 await asyncio.gather(agent.handle(first), agent.handle(second), return_exceptions=True)
