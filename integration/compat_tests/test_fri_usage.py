@@ -9,14 +9,15 @@ from gene.store import Store
 from compat_tests.test_fri_actions import harness
 from compat_tests.test_fri_runtime import event
 from fri.fri_chat import ChatResult
-from fri.fri_usage import describe_usage, usage_requested
+from fri.fri_usage import describe_usage, usage_query, usage_requested, usage_window, window_applied
 
 
 @pytest.mark.parametrize('text', [
     "usage is climbing so let's chat tomorrow",
     'we can check usage later', 'do not show usage', 'someone said "show usage"',
     '> show usage', '`show usage`', 'if I said show usage, what would happen?',
-    'what was that usage dump?', 'show usage today',
+    'what was that usage dump?', 'show usage yesterday', 'show usage since monday', 'usage last h',
+    'show usage last 0 days', 'show usage last 1000 days',
 ])
 def test_mentions_quotes_negation_and_unsupported_periods_are_not_report_requests(text):
     assert not usage_requested(text)
@@ -28,7 +29,36 @@ def test_mentions_quotes_negation_and_unsupported_periods_are_not_report_request
     'please show usage by model', 'usage breakdown',
 ])
 def test_explicit_usage_requests(text):
-    assert usage_requested(text)
+    assert usage_requested(text) and usage_window(text) is None
+
+
+@pytest.mark.parametrize('text,window', [
+    ('fri token usage last 24h', (86400, 'the last 24 hours')),
+    ('show usage today', (86400, 'the last 24 hours')),
+    ('how many tokens have we used today?', (86400, 'the last 24 hours')),
+    ('usage by model for the past 3 days', (3*86400, 'the last 3 days')),
+    ('what’s our token usage over the last week', (7*86400, 'the last week')),
+    ('show usage this week pls', (7*86400, 'the last 7 days')),
+    ('show usage for today', (86400, 'the last 24 hours')),
+    ('show usage by model for this week', (7*86400, 'the last 7 days')),
+    ('usage over this month', (30*86400, 'the last 30 days')),
+    ('usage in the last hour', (3600, 'the last hour')),
+    ('show usage last 1 hour', (3600, 'the last hour')),
+    ('usage last 12 hrs by task', (12*3600, 'the last 12 hours')),
+    ('token usage past 2 wks', (14*86400, 'the last 2 weeks')),
+    ('usage this month', (30*86400, 'the last 30 days')),
+    ('show usage last 3 months', (90*86400, 'the last 3 months')),
+])
+def test_a_named_rolling_window_is_read_exactly(text, window):
+    assert usage_requested(text) and usage_window(text) == window
+
+
+def test_a_window_goes_only_to_a_controller_that_applies_it():
+    assert usage_query('usage last 24h', {'usage-window'}, 100_000.0) == ({'since': 13_600.0}, 'the last 24 hours', False)
+    assert usage_query('usage last 999 months', {'usage-window'}, 100.0)[0] == {'since': 0.0}
+    assert usage_query('usage last 24h', set(), 100_000.0) == ({}, None, True)
+    assert usage_query('show usage', {'usage-window'}, 100_000.0) == ({}, None, False)
+    assert usage_query("usage is climbing today so let's chat", {'usage-window'}, 1.0) == ({}, None, False)
 
 
 def test_report_counts_input_and_output_once_and_labels_missing_counts(tmp_path):
@@ -240,7 +270,84 @@ def test_mentioned_owner_report_uses_conversation_path_even_while_chat_is_paused
         message.reference = None
         with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
             await agent.handle(message)
-        agent.respond.assert_awaited_once_with(message, 'show usage by model', False)
+        agent.respond.assert_awaited_once_with(message, 'show usage by model', False, forgotten=0, revision=0, waited=False,
+                                              addressed=True)
         assert not any(path == '/agent/state' for path, _ in calls)
         await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_windowed_report_names_its_window(tmp_path):
+    store, agent = usage_store(tmp_path)
+    with patch('gene.store.time.time', return_value=1_000.0):
+        store.add_chat_usage('a'*32, 'model', 'high', 'completed', counters(900, 100, 50, 10))
+    with patch('gene.store.time.time', return_value=90_000.0):
+        store.add_chat_usage('b'*32, 'model', 'high', 'completed', counters(100, 20, 70, 15))
+    reply = describe_usage(agent.usage(90_000.0 - 86400), window='the last 24 hours')
+    assert '**120 tokens** across **1 calls** in the last 24 hours:' in reply
+    assert '- chat: 120 tokens · 1 calls (70 cached input, 15 reasoning)' in reply
+    assert 'fri activity in that window, not your remaining plan allowance' in reply and 'cumulative' not in reply
+    assert describe_usage(agent.usage(95_000.0), window='the last hour').startswith(
+        'nothing recorded for fri in the last hour.')
+    everything = describe_usage(agent.usage(), windowless=True)
+    assert everything.startswith("the controller can't cut usage by time yet, so this is everything so far.\n")
+    assert '**1,120 tokens** across **2 calls** so far:' in everything and 'cumulative' in everything
+    assert "can't cut usage by time yet, and nothing's recorded" in describe_usage([], windowless=True)
+
+
+@pytest.mark.parametrize('capable', [True, False, 'downgraded'])
+def test_the_owners_windowed_ask_reaches_the_real_controller(monkeypatch, tmp_path, capable):
+    from pathlib import Path
+
+    from fastapi.testclient import TestClient
+    from gene.api import create_app
+    from gene.config import Settings
+
+    from compat_tests.test_api import headers
+    settings = Settings(Path(tmp_path/'api.sqlite3'), '123', '10', 'runtime-'+'x'*32, 'worker-'+'x'*32,
+                        'deploy-'+'x'*32, workshop_channel_id='456', fri_token='fri-'+'x'*32)
+    client = TestClient(create_app(settings))
+    for attempt, at in (('a', 1_000.0), ('b', 90_000.0)):
+        with patch('gene.store.time.time', return_value=at):
+            assert client.post('/chat/usage/report', headers=headers('fri'), json={
+                'attempt_id': attempt*32, 'role': 'conversation', 'model': 'model', 'effort': 'high',
+                'status': 'completed', 'counters': counters(100, 20, None, None)}).status_code == 200
+
+    async def scenario():
+        fri, _, _, calls = conversation(monkeypatch, tmp_path)
+        fri.capabilities = frozenset({'usage-window'} if capable else ())  # Read at startup, before any downgrade.
+        fake = fri.api
+
+        async def api(method, path, payload=None):
+            if path == '/agent/usage':
+                calls.append((path, payload))
+                # A controller rolled back under a running Fri ignores since, as main's does.
+                sent = {k: v for k, v in payload.items() if k != 'since'} if capable == 'downgraded' else payload
+                response = client.post(path, headers=headers('fri'), json=sent)
+                assert response.status_code == 200, response.text
+                return response.json()
+            return await fake(method, path, payload)
+
+        fri.api = api
+        with patch('fri.fri.time.time', return_value=90_100.0):
+            report = await fri.talk(123, 999, 10, 'fri token usage last 24h', 'private',
+                                    event=event(channel=999, guild=None, content='fri token usage last 24h'))
+        [(_, payload)] = [call for call in calls if call[0] == '/agent/usage']
+        if capable is True:
+            assert payload['since'] == 90_100.0 - 86400 and 'across **1 calls** in the last 24 hours:' in report.reply
+        elif capable == 'downgraded':  # It asked for the window, but these rows are all-time: never label them so.
+            assert payload['since'] == 90_100.0 - 86400 and 'in the last 24 hours' not in report.reply
+            assert "can't cut usage by time yet" in report.reply and 'across **2 calls** so far:' in report.reply
+        else:
+            assert 'since' not in payload and "can't cut usage by time yet" in report.reply
+            assert 'across **2 calls** so far:' in report.reply
+        await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_window_counts_only_when_every_row_says_it_was_applied():
+    query = {'since': 13_600.0}
+    assert window_applied([], query) and window_applied([{'since': 13_600.0}, {'since': 13_600}], query)
+    for rows in ([{'since': 13_600.0}, {}], [{'since': 1.0}], [{'since': '13600'}], [{'since': True}], None, [None]):
+        assert not window_applied(rows, query)
+    assert not window_applied([{'since': 13_600.0}], {})

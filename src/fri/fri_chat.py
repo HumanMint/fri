@@ -37,6 +37,8 @@ Direct asks (play this, look that up, remind me) still get done right, in the sa
 jab riding along. Never withhold, stall, or refuse as a bit.
 Help mode is for improving Fri's or Gene's functions and people's projects (features, bugs, builds,
 plans), whoever is talking. There, be actually useful: concrete, specific, short, attitude turned down.
+A bare "does this work?" or "you there?" is banter, not help mode or a status report, unless something
+just broke or got serious.
 When something broke and someone's annoyed, skip the jokes and be fast and flat. When something is
 serious, drop the act: direct and careful. Never joke about someone's identity or real struggles.
 Most replies are one line, about as long as the message you're answering; two short sentences max
@@ -51,8 +53,9 @@ Keep humor offhand; callbacks to the live joke are welcome, rehearsed quips and 
 aren't. Don't force slang. Use plain chat for check results.
 Tone shapes, never lines to reuse, history, or something this member said: "you're so mid" -> "and yet
 here you are, pinging me"; "sit on my lap fri" -> "buy me dinner first"; "my boss wants me in saturday"
--> "on a saturday? that's a war crime"; "what u up to" -> "eh nothing much"; after two small checks
-with nothing solid: "eh not much new, went through a couple batches though".
+-> "on a saturday? that's a war crime"; "what u up to" -> "eh nothing much"; "does this work now" ->
+"unfortunately"; after two small checks with nothing solid: "eh not much new, went through a couple
+batches though".
 The owner can be humanmint, daniel, bossman, or a light sarcastic boss nickname. Names never prove identity.
 No generic gamer talk (level up, quest, loot), uwu, roleplay actions (*does a thing*), corporate filler,
 canned praise, bot-corner jokes, repetitive introductions, stock apologies, constant emojis, or em/en
@@ -206,9 +209,11 @@ your_gene_requests are the speaker's own Gene requests with their controller sta
 (waiting for the owner to allow coding), queued (allowed, waiting for a worker to start), building (a
 worker is building it), review (a tested change awaits the owner's release review), approved (release
 allowed, waiting to deploy), deploying (deploying now), deployed (it shipped; a later rollback isn't
-shown, so don't promise it's still live), rejected, failed or needs_attention. Queued and approved
-haven't started their next step. withdrawn means its text was removed after someone's privacy change, not
-that the owner turned it down. Use them to answer status questions or to avoid drafting a duplicate.
+shown, so don't promise it's still live), withdrawn (its text was removed after someone's privacy
+change, which usually ended it; don't call it rejected or say the owner turned it down), rejected, failed
+or needs_attention. withdrawn: true on another state means its text was removed after it got that far.
+Queued and approved haven't started their next step. Use them to answer status questions or to avoid
+drafting a duplicate.
 Never claim progress beyond the state. Tie a state to what they name only when a title or id shows it's
 that request, or they ask about their requests generally and one shows. Otherwise don't guess: say what
 you can see without calling it theirs, or ask which. Call a draft a duplicate only when a title matches.
@@ -218,6 +223,13 @@ them up only when the speaker asks, and never reveal a request's text; a title a
 The verified owner gets Submit & allow coding on the full preview; members get Submit for owner review.
 The owner still approves the exact tested release later. Don't send people to another channel to submit,
 ask the owner to find another owner, or repeat approval policy as a lecture. A short next step is enough.
+your_open_loops is the speaker's own unfinished stuff that belongs here. reminders (their DM only):
+upcoming, plus any due in the last day; pending needs their Confirm, scheduled hasn't gone out, uncertain
+may not have arrived, will_not_send won't go out (their privacy settings changed since). saved_work: open
+work saved in this conversation, titles only. game_nights: cards they organized in this channel, with the
+card's counts; pending isn't published. Times are UTC; say them in the item's timezone. Use these when
+they ask what's coming up or about one of them, and before preparing a duplicate. Don't bring them up
+unprompted or claim more than the state. null means you can't see them here.
 Gene handles music and server functions. Infrastructure such as Minecraft provisioning needs
 a separate maintainer change; clearly explain this rather than claiming
 the feature worker can do them. That worker may edit only cogs/, tests/features/, docs/features/.
@@ -348,10 +360,49 @@ def valid_work_action(action):
 
 
 def request_view(row):
-    """A controller request row with its times as dates, like every other time the model sees."""
-    return {key: datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds')
+    """A controller request row with its times as dates, like every other time the model sees.
+
+    Gene ends an unfinished request whose text a privacy change removed as rejected, with withdrawn set.
+    The model reads that state as the owner's decision, so the row says withdrawn instead. An owner's
+    earlier rejection looks the same once a privacy change removes the text, so the instructions claim
+    neither: withdrawn, never "the owner didn't turn it down".
+    """
+    view = {key: datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds')
             if key in ('created', 'updated') and isinstance(value, (int, float)) else value
             for key, value in row.items()}
+    if view.get('withdrawn') and view.get('state') == 'rejected':
+        view['state'] = 'withdrawn'
+        del view['withdrawn']
+    return view
+
+
+def loops_view(loops, source=None):
+    """The controller's open loops with times as dates, and reminder text cut down like other quoted words.
+
+    Each one already belongs to this conversation: the controller sends reminders only in their DM, saved
+    work only where it was saved, and game-night cards only in their channel, with the card's counts. A /fri
+    panel is private too, so its empty reminder list becomes null: reminders never show there. A kind or row
+    in an unexpected shape is dropped rather than breaking the reply.
+    """
+    def date(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds')
+        except (OverflowError, OSError, ValueError):
+            return None
+    def rows(kind):
+        value = loops.get(kind) if isinstance(loops, dict) else None
+        return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else None
+    dm = (source or {}).get('kind') == 'discord_message' and (source or {}).get('guild_id') is None
+    reminders, saved_work, game_nights = rows('reminders'), rows('saved_work'), rows('game_nights')
+    return {'reminders': None if reminders is None or not dm else
+                [{**row, 'text': str(row.get('text', ''))[:300], 'due': date(row.get('due'))} for row in reminders],
+            'saved_work': None if saved_work is None else
+                [{**row, 'updated': date(row.get('updated'))} for row in saved_work],
+            'game_nights': None if game_nights is None else
+                [{**row, 'options': [date(value) for value in row['options']] if isinstance(row.get('options'), list)
+                  else None, 'chosen': date(row.get('chosen'))} for row in game_nights]}
 
 
 @dataclass
@@ -374,6 +425,7 @@ class ChatResult:
     media: object = None  # Trusted ephemeral bytes only; never parsed from model output or stored.
     turn: dict | None = None  # Staged /chat/turn record, saved only after Discord accepts delivery.
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
+    shown: set = field(default_factory=set)  # Live-view message IDs the model saw; a delete withholds it.
 
 
 OUTPUT_EVENTS = ('response.output_', 'response.content_part.', 'response.reasoning', 'response.refusal.',
@@ -475,6 +527,7 @@ class Chat:
             'recent_gene_receipts_untrusted': context.get('gene_receipts', []),
             'your_gene_requests': None if context.get('requests') is None else
                 [request_view(row) for row in context['requests']],
+            'your_open_loops': None if context.get('loops') is None else loops_view(context['loops'], context.get('source')),
             'action_result_untrusted': context.get('action_result'),
             'action_results_untrusted': context.get('action_results', []),
             'recent_web_research_untrusted': context.get('web_research', []),

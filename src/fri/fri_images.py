@@ -89,6 +89,16 @@ async def unchanged(context, event):
         return False
 
 
+async def still_there(message):
+    """An image post chosen before a wait, as Discord has it now: still there, unedited, the same images."""
+    try:
+        current = await message.channel.fetch_message(message.id)
+    except discord.HTTPException:
+        return False
+    return (current.edited_at == message.edited_at and current.content == message.content and
+            sources(current) == sources(message))
+
+
 async def require_current(context, event):
     if not await unchanged(context, event):
         raise commands.UserFeedbackCheckFailure(CHANGED)

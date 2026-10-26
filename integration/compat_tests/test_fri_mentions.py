@@ -8,7 +8,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import discord
 import httpx
@@ -24,10 +24,11 @@ from compat_tests.test_fri_continuity import arm, origin
 from compat_tests.test_fri_runtime import configured
 from fri.fri_actions import Actions
 from fri.fri_addressing import explicit_mention
-from fri.fri_agent import Agent
+from fri.fri_agent import QUEUE_SECONDS, Agent
 from fri.fri_chat import Chat, ChatResult
-from fri.fri_errors import ControllerRejected
-from fri.fri_mentions import Invitation
+from fri.fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
+from fri.fri_mentions import CONTEXT_CHANGED, NOTICES, Invitation
+from fri.fri_notices import ReplyInProgress
 
 
 def environment(monkeypatch, tmp_path, *, channel_id=8):
@@ -176,7 +177,9 @@ def test_ping_after_another_members_meme_gets_text_without_ambient_expansion(mon
             if not configured_channel:
                 assert set(context['actions']) == {'web_search'}
                 assert not agent.recent and not agent.active and not agent.bursts.rows
-                assert not any(path.startswith(('/controls', '/workspace', '/social', '/agent/context')) for path, _ in calls)
+                assert not any(path.startswith(('/controls', '/workspace', '/social')) for path, _ in calls)
+                # Only for the privacy revision the ping came in under, then to check it before sending.
+                assert sum(path == '/agent/context' for path, _ in calls) == 2
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -204,15 +207,22 @@ def test_invalid_invitation_fails_before_model(monkeypatch, tmp_path, caplog, fa
             agent.config['enabled'] = False
         try:
             await agent.handle(event)
-            assert not calls
+            # Nothing is admitted. A notice reads only the author's privacy revision, before and after its
+            # checks, to see if they erase meanwhile.
+            reads = {'old': 2, 'foreign_source': 1}.get(failure, 0)
+            assert [path for path, _ in calls] == ['/agent/context']*reads
             fri.chat_once.assert_not_awaited()
-            event.reply.assert_not_awaited()
             # A member's dropped mention says why in the log, by message ID only. Bots and webhooks aren't members.
             reason = {'old': 'stale event', 'bot': None, 'webhook': None,
                       'foreign_guild': 'outside the main server', 'foreign_source': 'message changed',
                       'permission': 'missing permissions', 'disabled': 'fri disabled'}[failure]
             logged = [line for line in caplog.messages if line.startswith('Mention ')]
-            assert logged == ([f'Mention {channel.id}/{event.id} not answered: {reason}'] if reason else [])
+            if failure == 'old':  # A ping that's still there hears why, never what it said.
+                assert event.reply.await_args.args == (NOTICES['stale event'],)
+                assert logged == [f'Mention {channel.id}/{event.id} not answered, told why: stale event']
+            else:  # Another author's message, or access Fri no longer has, gets nothing.
+                event.reply.assert_not_awaited()
+                assert logged == ([f'Mention {channel.id}/{event.id} not answered: {reason}'] if reason else [])
             assert not any('what do you think' in line for line in caplog.messages)
         finally:
             await fri.close()
@@ -245,12 +255,12 @@ def test_a_discord_refusal_names_the_mention_it_dropped(monkeypatch, tmp_path, c
         async def typing():
             raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
             yield
-        channel.typing = typing
+        channel.typing = typing  # Only cosmetic: the reply itself is what Discord refuses.
         event = message('<@99> you there?')
+        event.reply.side_effect = discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await fri.on_message(event)
-            event.reply.assert_not_awaited()
             assert f'Mention {channel.id}/{event.id} not answered: Forbidden' in caplog.messages
             assert not any('Missing Permissions' in line or 'you there' in line for line in caplog.messages)
         finally:
@@ -345,7 +355,7 @@ def test_a_cache_reset_while_an_owner_settings_request_waits_keeps_its_preview(m
                 agent.recent[1].append({'id': '5', 'user_id': '10', 'name': 'owner', 'text': 'old', 'at': time.time(),
                                         'revision': -1, 'gene_error': False})
                 await agent.context_messages(1)
-            assert agent.forgotten[10] and not agent.erased.get(10)
+            assert not agent.forgotten.get(10) and not agent.erased.get(10)  # Neither erased anything.
             resume.set()
             await task
             assert event.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
@@ -361,7 +371,7 @@ def test_only_forget_me_counts_as_an_erasure_for_waiting_settings_requests(monke
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(message('<@99> what do you remember about me?', user=20))
-                assert agent.forgotten.get(20) and not agent.erased.get(20)
+                assert not agent.forgotten.get(20) and not agent.erased.get(20)
                 await agent.handle(message('<@99> forget me', user=20))
             assert agent.erased.get(20)
         finally:
@@ -369,12 +379,16 @@ def test_only_forget_me_counts_as_an_erasure_for_waiting_settings_requests(monke
     asyncio.run(scenario())
 
 
-def test_a_cooldown_burst_names_the_mention_it_answers_for(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize('reactions', [True, False])
+def test_a_cooldown_burst_shows_a_low_battery_for_the_mention_it_answers_for(monkeypatch, tmp_path, caplog, reactions):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
-        fri, agent, _, controller, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri, agent, _, controller, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         for _ in range(30):  # Spend the allowance; its one cooldown notice has already shown.
             controller.admit('20', 'public')
+        if not reactions:
+            channel.permissions_for = lambda _: discord.Permissions(view_channel=True, send_messages=True,
+                                                                   read_message_history=True)
         first, second = message('<@99> how is it going?', age=1), message('you around?')
         try:
             task = asyncio.create_task(agent.handle(first))
@@ -383,30 +397,1930 @@ def test_a_cooldown_burst_names_the_mention_it_answers_for(monkeypatch, tmp_path
             await agent.handle(second)  # Answers for both, without the mention's invitation.
             await task
             first.reply.assert_not_awaited()
-            second.reply.assert_not_awaited()
-            assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: social cooldown']
+            second.reply.assert_not_awaited()  # Its one text notice already showed.
+            first.add_reaction.assert_not_awaited()
+            if reactions:  # A low battery on the newest message, instead of silence.
+                second.add_reaction.assert_awaited_once_with('🪫')
+                assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered, told why: social cooldown']
+            else:
+                second.add_reaction.assert_not_awaited()
+                assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: social cooldown']
         finally:
             await fri.close()
     asyncio.run(scenario())
 
 
-def test_a_mention_behind_a_finishing_reply_says_why(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize('when', ['before', 'during'])
+def test_a_mention_behind_a_running_reply_is_answered_after_it(monkeypatch, tmp_path, caplog, when):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        notice = SimpleNamespace(delete=AsyncMock())
+        replies = []
+        async def reply(text, **kwargs):
+            replies.append(text)
+            if text == str(ReplyInProgress()):
+                fri.busy.discard(20)  # The earlier reply finishes after this mention starts waiting.
+                return notice
+            return SimpleNamespace(id=event.id+1, content=text)
+        event.reply.side_effect = reply
+        if when == 'before':
+            fri.busy.add(20)  # An earlier reply to the same member (here, its panel) is still running.
+        else:  # The panel reply starts after this mention's turn began, right before it talks.
+            talk, raced = fri.talk, []
+            async def racing(*args, **kwargs):
+                if not raced:
+                    raced.append(True)
+                    fri.busy.add(20)
+                    asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+                    raise ReplyInProgress()
+                return await talk(*args, **kwargs)
+            fri.talk = racing
+        try:
+            await agent.handle(event)
+            assert replies == [str(ReplyInProgress()), 'that meme is doing a lot of work']
+            assert any(path == '/chat/turn' for path, _ in calls)
+            notice.delete.assert_awaited_once()  # The waiting notice goes once the answer lands.
+            assert not mention_lines(caplog)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_message_waiting_behind_a_stuck_reply_hears_why(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.2)
+        event.reply.return_value = SimpleNamespace(delete=AsyncMock())
+        fri.busy.add(20)  # An earlier reply that doesn't finish in time.
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert [item.args for item in event.reply.await_args_list] == [
+                (str(ReplyInProgress()),), (NOTICES['stale event'],)]
+            assert mention_lines(caplog) == [
+                f'Mention 8/{event.id} not answered, told why: earlier reply still running']
+            assert 20 not in agent.turns.holders and 20 not in agent.turns.arrived
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_messages_that_come_in_mid_reply_are_answered_in_order(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second, third = (message(f'fri question {n}') for n in (1, 2, 3))
+        started, finish, answered = asyncio.Event(), asyncio.Event(), []
+        async def answer(text, context):
+            if not started.is_set():
+                started.set()
+                await finish.wait()
+            return ChatResult(status='completed', reply='answer to '+text)
+        fri.chat_once.side_effect = answer
+        for item in (first, second, third):
+            item.reply.side_effect = lambda text, item=item, **_: (answered.append((item.id, text)) or
+                                                                  SimpleNamespace(id=item.id+1, content=text,
+                                                                                  delete=AsyncMock()))
+        pause = asyncio.sleep  # The burst debounce is skipped below; this test's own waits aren't.
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                await started.wait()
+                for item in (second, third):
+                    tasks.append(asyncio.create_task(agent.handle(item)))
+                    while not any(row[0] == item.id for row in answered):
+                        await pause(0.01)  # Its waiting notice.
+                finish.set()
+                await asyncio.gather(*tasks)
+            texts = [(mid, text) for mid, text in answered if text.startswith('answer to')]
+            assert texts == [(first.id, 'answer to fri question 1'), (second.id, 'answer to fri question 2'),
+                             (third.id, 'answer to fri question 3')]
+        finally:
+            finish.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_message_waiting_its_turn_is_dropped_if_its_author_erases(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        async def reply(text, **kwargs):
+            store.personal_control('20', 'disable')  # Erased through Gene or Red while it waits.
+            fri.busy.discard(20)
+            return SimpleNamespace(delete=AsyncMock())
+        event.reply.side_effect = reply
+        fri.busy.add(20)
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert [item.args for item in event.reply.await_args_list] == [(str(ReplyInProgress()),)]
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+            assert 20 not in agent.turns.holders and 20 not in agent.turns.arrived
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erase', [False, True])
+def test_a_reply_that_starts_mid_turn_keeps_the_deadline_and_erasure_checks(monkeypatch, tmp_path, caplog, erase):
+    # A panel reply can take the member's busy slot during the turn's own typing request.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?', age=0 if erase else QUEUE_SECONDS-0.3)
+        event.reply.return_value = SimpleNamespace(delete=AsyncMock())
+        talk = fri.talk
+        async def racing(*args, **kwargs):
+            if 20 not in fri.busy and not fri.chat_once.await_count:
+                fri.busy.add(20)  # The panel reply, which never finishes in time...
+                if erase:  # ...or finishes after the member erased through Gene or Red.
+                    store.personal_control('20', 'disable')
+                    asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+                raise ReplyInProgress()
+            return await talk(*args, **kwargs)
+        fri.talk = racing
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            if erase:  # Not even the waiting notice, once they erased.
+                assert texts == []
+                assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+            else:
+                assert texts == [str(ReplyInProgress()), NOTICES['stale event']]
+                assert mention_lines(caplog) == [
+                    f'Mention 8/{event.id} not answered, told why: earlier reply still running']
+            assert 20 not in agent.turns.holders
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_no_notice_goes_out_after_the_author_erases_through_gene(monkeypatch, tmp_path, caplog, channel_id):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message()
+        async def answer(*_):
+            store.personal_control('20', 'disable')  # Not through Fri, so no forget() here.
+            return ChatResult(status='completed', reply='a reply built before the erasure')
+        fri.chat_once.side_effect = answer
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            assert len(mention_lines(caplog)) == 1
+            assert ' not answered: reply withheld: ' in mention_lines(caplog)[0]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_erasure_while_waiting_out_the_queue_sends_no_notice(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.3)
+        async def reply(text, **kwargs):
+            store.personal_control('20', 'disable')  # While it waits behind a reply that never ends.
+            return SimpleNamespace(delete=AsyncMock())
+        event.reply.side_effect = reply
+        fri.busy.add(20)
+        try:
+            await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(str(ReplyInProgress()),)]
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_slow_check_cannot_let_a_later_message_go_first(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second, third = (message(f'fri question {n}') for n in (1, 2, 3))
+        started, finish, slow, answered = asyncio.Event(), asyncio.Event(), asyncio.Event(), []
+        async def answer(text, context):
+            if not started.is_set():
+                started.set()
+                await finish.wait()
+            return ChatResult(status='completed', reply='answer to '+text)
+        fri.chat_once.side_effect = answer
+        profile, profiles = agent.profile, []
+        async def lagging(channel, user):
+            profiles.append(channel)
+            if profiles.count(456) == 1 and channel == 456:  # The second message's queue check lags.
+                await slow.wait()
+            return await profile(channel, user)
+        agent.profile = lagging
+        for item in (first, second, third):
+            item.reply.side_effect = lambda text, item=item, **_: (answered.append((item.id, text)) or
+                                                                  SimpleNamespace(id=item.id+1, content=text,
+                                                                                  delete=AsyncMock()))
+        pause = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                await started.wait()
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                while 456 not in profiles:
+                    await pause(0.01)
+                tasks.append(asyncio.create_task(agent.handle(third)))
+                while profiles.count(1) < 3:
+                    await pause(0.01)  # The third came in too.
+                finish.set()
+                await pause(0.05)
+                slow.set()
+                await asyncio.gather(*tasks)
+            texts = [mid for mid, text in answered if text.startswith('answer to')]
+            assert texts == [first.id, second.id, third.id]
+        finally:
+            finish.set()
+            slow.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_turns_follow_send_order_even_while_an_earlier_message_is_held_up():
+    from fri.fri_turns import Turns
+    fri = SimpleNamespace(busy=set())
+    turns = Turns(fri)
+    turns.arrive(20, 2)  # E.g. waiting for Fri's previous reply to be saved, in another channel.
+    turns.arrive(20, 3)
+    assert turns.ready(20, 2) and not turns.ready(20, 3)
+    turns.take(20, 2)
+    assert not turns.ready(20, 2)
+    turns.release(20)
+    turns.leave(20, 2)
+    assert turns.ready(20, 3) and turns.ready(30, 1)
+    fri.busy.add(20)
+    assert not turns.ready(20, 3)
+
+
+def test_a_ping_removed_before_its_waiting_notice_gets_none(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        fri.busy.add(20)
+        profile = agent.profile
+        async def unpinged(channel, user):
+            edited = copy.copy(event)
+            edited.content, edited.mentions, edited.edited_at = 'you there?', [], dt.datetime.now(dt.timezone.utc)
+            rows[event.id] = edited
+            return await profile(channel, user)
+        agent.profile = unpinged
+        try:
+            await agent.handle(event)
+            event.reply.assert_not_awaited()
+            fri.chat_once.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: reply withheld: message changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_controller_outage_entering_the_queue_still_says_so(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you there?')
+        fri.busy.add(20)
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        try:
+            with pytest.raises(ControllerUnavailable):  # on_message still logs it.
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
+            assert mention_lines(caplog) == []  # Answered, by the outage notice.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erasure', ['disable', 'clear'])
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_an_erasure_during_a_first_attempt_that_found_them_busy_drops_the_retry(
+        monkeypatch, tmp_path, caplog, channel_id, erasure):
+    # Gene erases once, while a panel reply that started first keeps this attempt waiting.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message('<@99> remember the private marker?')
+        talk = fri.talk
+        async def racing(*args, **kwargs):
+            if not racing.raced:
+                racing.raced = True
+                fri.busy.add(20)
+                store.personal_control('20', 'disable') if erasure == 'disable' else store.clear_chats('20')
+                asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+                raise ReplyInProgress()
+            return await talk(*args, **kwargs)
+        racing.raced = False
+        fri.talk = racing
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            assert 'private marker' not in json.dumps(store.chat_context('123', f'public:{channel_id}', '20'))
+            assert all(item.args[0] == str(ReplyInProgress()) for item in event.reply.await_args_list)
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+            assert 20 not in agent.turns.holders
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_reply_that_ends_during_the_busy_recheck_still_rechecks_erasure(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
         event = message('<@99> you there?')
-        fri.busy.add(20)  # An earlier reply to the same member is still running...
-        original, checks = Invitation.current, []
-        async def current(self, **kwargs):
-            checks.append(await original(self, **kwargs))
-            if len(checks) == 2:
-                fri.busy.discard(20)  # ...and finishes while this mention is rechecked.
-            return checks[-1]
-        monkeypatch.setattr(Invitation, 'current', current)
+        talk = fri.talk
+        async def racing(*args, **kwargs):
+            if not racing.raced:
+                racing.raced = True
+                fri.busy.add(20)
+                agent.forget(20)  # E.g. their "forget me" in another channel.
+                asyncio.get_running_loop().call_soon(fri.busy.discard, 20)  # Within the invitation recheck.
+                raise ReplyInProgress()
+            return await talk(*args, **kwargs)
+        racing.raced = False
+        fri.talk = racing
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erasure', ['local', 'gene'])
+def test_an_erasure_during_the_waiting_notice_checks_sends_no_notice(monkeypatch, tmp_path, caplog, erasure):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        fri.busy.add(20)
+        current = Invitation.current
+        async def checking(self, **kwargs):
+            result = await current(self, **kwargs)
+            if kwargs.get('check_evidence', True):  # The waiting notice's own check, not the first one.
+                agent.forget(20) if erasure == 'local' else store.personal_control('20', 'disable')
+            return result
+        monkeypatch.setattr(Invitation, 'current', checking)
         try:
             await agent.handle(event)
             event.reply.assert_not_awaited()
-            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: earlier reply still running']
+            fri.chat_once.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('arrived', [False, True])
+def test_an_erasure_during_a_notices_own_checks_silences_it(monkeypatch, tmp_path, caplog, arrived):
+    # Already stale as it came in, so no baseline was read yet, or one that went stale while waiting.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, channel, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.3 if arrived else 301)
+        if arrived:
+            fri.busy.add(20)  # A reply that never ends in time.
+            event.reply.return_value = SimpleNamespace(delete=AsyncMock())
+        fetch = channel.guild.fetch_roles
+        async def roles():
+            if fetch.await_count == (2 if arrived else 0):  # The notice's own access check.
+                store.personal_control('20', 'disable')
+            return await fetch()
+        channel.guild.fetch_roles = roles
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert all(item.args[0] == str(ReplyInProgress()) for item in event.reply.await_args_list)
+            assert len(mention_lines(caplog)) == 1 and ' not answered: ' in mention_lines(caplog)[0]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_controller_outage_as_a_configured_ping_comes_in_says_so(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you there?')
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        try:
+            with pytest.raises(ControllerUnavailable):
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
+            fri.chat_once.assert_not_awaited()
+            assert mention_lines(caplog) == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_slow_check_cannot_carry_a_waiting_message_past_its_deadline(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.2)
+        fri.busy.add(20)
+        profile = agent.profile
+        async def slow(channel, user):
+            if slow.calls == 1:  # The check before the waiting notice; the earlier reply ends meanwhile.
+                await asyncio.sleep(0.35)
+                fri.busy.discard(20)
+            slow.calls += 1
+            return await profile(channel, user)
+        slow.calls = 0
+        agent.profile = slow
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert [item.args for item in event.reply.await_args_list] == [(NOTICES['stale event'],)]
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: earlier reply still running']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('down', ['admit', 'everything'])
+def test_a_controller_outage_at_admission_uses_the_outage_notice(monkeypatch, tmp_path, caplog, down):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you there?')
+        api = fri.api
+        async def outage(method, path, payload=None):
+            if path == '/chat/mentions/admit' or (down == 'everything' and outage.admitting):
+                outage.admitting = True
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await api(method, path, payload)
+        outage.admitting = False
+        fri.api = outage
+        try:
+            await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
+            fri.chat_once.assert_not_awaited()
+            assert mention_lines(caplog) == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_a_forget_during_the_arrival_read_still_counts_as_an_erasure(monkeypatch, tmp_path, caplog, channel_id):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message('<@99> you there?')
+        fri.busy.add(20)  # A reply that never ends, so this one would wait.
+        profile = agent.profile
+        async def forgetting(channel, user):
+            if not forgetting.done:
+                forgetting.done = True
+                agent.forget(20)  # "forget me" elsewhere, while this read is in flight.
+            return await profile(channel, user)
+        forgetting.done = False
+        agent.profile = forgetting
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            event.reply.assert_not_awaited()
+            fri.chat_once.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('read', [1, 3])
+def test_a_forget_while_a_revision_read_is_in_flight_still_counts(monkeypatch, tmp_path, caplog, read):
+    # Read 1 is the waiting notice's check; read 3 is the stale notice's own last check.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.3)
+        event.reply.return_value = SimpleNamespace(delete=AsyncMock())
+        fri.busy.add(20)
+        revision = agent.revision
+        async def reading(user):
+            reading.calls += 1
+            current = await revision(user)
+            if reading.calls == read:
+                agent.forget(20)  # Lands before the response does.
+            return current
+        reading.calls = 0
+        agent.revision = reading
+        try:
+            await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            assert [item.args[0] for item in event.reply.await_args_list] == ([] if read == 1 else [str(ReplyInProgress())])
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: ' +
+                                             ('author privacy changed' if read == 1 else 'earlier reply still running')]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erased', [False, True])
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_a_controller_rejection_on_a_ping_gets_a_fixed_line_unless_they_erased(
+        monkeypatch, tmp_path, caplog, channel_id, erased):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message('<@99> you there?')
+        api = fri.api
+        async def rejecting(method, path, payload=None):
+            if path == '/chat/mentions/admit':
+                if erased:
+                    store.clear_chats('20')
+                raise ControllerRejected('This Discord event cannot renew its mention invitation')
+            return await api(method, path, payload)
+        fri.api = rejecting
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            if erased:
+                assert texts == []
+                assert mention_lines(caplog) == [
+                    f'Mention {channel_id}/{event.id} not answered: check failed: ControllerRejected']
+            else:
+                assert texts == [CONTEXT_CHANGED]
+                assert mention_lines(caplog) == [
+                    f'Mention {channel_id}/{event.id} not answered, told why: check failed: ControllerRejected']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_no_low_battery_after_an_erasure_during_admission(monkeypatch, tmp_path, caplog, channel_id):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message('<@99> you there?')
+        api = fri.api
+        async def cooldown(method, path, payload=None):
+            if path == '/chat/mentions/admit':
+                store.clear_chats('20')  # While the cooldown answer is on its way.
+                return {'allowed': False, 'notice': False, 'until': time.time()+600}
+            return await api(method, path, payload)
+        fri.api = cooldown
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            event.add_reaction.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_rejected_revision_read_is_not_an_outage(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        agent.profile = AsyncMock(side_effect=ControllerRejected('Channel is outside Fri scope'))
+        try:
+            await agent.handle(event)
+            event.reply.assert_not_awaited()  # Its revision can't be read, so no word at all.
+            fri.chat_once.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: check failed: ControllerRejected']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('when', ['before notice', 'after waking'])
+def test_a_controller_that_goes_down_while_a_ping_waits_says_so(monkeypatch, tmp_path, caplog, when):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you there?')
+        event.reply.return_value = SimpleNamespace(delete=AsyncMock())
+        fri.busy.add(20)
+        if when == 'after waking':
+            asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+        revision = agent.revision
+        async def down(user):
+            down.calls += 1
+            if when == 'before notice' or down.calls > 1:
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await revision(user)
+        down.calls = 0
+        agent.revision = down
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):  # Its burst's debounce.
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            assert texts == ([UNREACHABLE] if when == 'before notice' else [str(ReplyInProgress()), UNREACHABLE])
+            assert mention_lines(caplog) == []  # The outage notice answered it.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('queued', [False, True])
+@pytest.mark.parametrize('channel_id', [1, 8])
+def test_an_erasure_during_the_typing_call_stops_the_reply(monkeypatch, tmp_path, caplog, channel_id, queued):
+    # Typing starts once the turn is admitted, queued or not; the request never goes out after it.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        from fri.fri import Fri
+        asked = []
+        async def signed_in(text, context, ready=None):  # Only the model is replaced: Fri's last checks run.
+            await ready()
+            asked.append(text)
+            return ChatResult(status='completed', reply='the marker is blue')
+        async def model(text, context):
+            return await Fri.chat_once(fri, text, context)
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()
+        fri.chat = SimpleNamespace(respond=signed_in)
+        fri.chat_once = AsyncMock(side_effect=model)
+        event = message('<@99> remember the private marker?')
+        event.reply.return_value = SimpleNamespace(delete=AsyncMock())
+        @asynccontextmanager
+        async def typing():
+            if not typing.erased:
+                typing.erased = True
+                store.clear_chats('20')
+            yield
+        typing.erased = False
+        channel.typing = typing
+        if queued:
+            fri.busy.add(20)
+            asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert typing.erased and not asked
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            assert all(item.args[0] == str(ReplyInProgress()) for item in event.reply.await_args_list)
+            assert [line.split(': ', 1)[0] for line in mention_lines(caplog)] == [
+                f'Mention {channel_id}/{event.id} not answered']  # Gene's fence on the erasure, never its content.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['erase', 'unping', 'access'])
+def test_the_waiting_notice_checks_run_once_it_can_post(monkeypatch, tmp_path, caplog, change):
+    # Another notice to the same member holds the way; the ping changes meanwhile.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path)
+        event = message('<@99> you there?')
+        fri.busy.add(20)
+        send, sending = fri.waiting_notices.send, asyncio.Event()
+        async def queued(item, eligible=None):
+            sending.set()
+            return await send(item, eligible)
+        fri.waiting_notices.send = queued
+        lock = fri.waiting_notices.locks[20]
+        await lock.acquire()
+        try:
+            task = asyncio.create_task(agent.handle(event))
+            await sending.wait()
+            await asyncio.sleep(0.01)
+            if change == 'erase':
+                store.personal_control('20', 'disable')
+            elif change == 'unping':
+                edited = copy.copy(event)
+                edited.content, edited.mentions = 'you there?', []
+                rows[event.id] = edited
+            else:
+                channel.permissions_for = lambda _: discord.Permissions.none()
+            lock.release()
+            await asyncio.wait_for(task, 5)
+            event.reply.assert_not_awaited()
+            fri.chat_once.assert_not_awaited()
+            assert len(mention_lines(caplog)) == 1 and ' not answered: ' in mention_lines(caplog)[0]
+        finally:
+            if lock.locked():
+                lock.release()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_no_dm_low_battery_after_an_erasure_during_the_membership_check(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, _, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        since = (agent.forgotten.get(20, 0), await agent.revision(20))
+        async def member(*_, **__):
+            store.clear_chats('20')
+            return SimpleNamespace(id=20)
+        agent.member = member
+        event = SimpleNamespace(id=1, guild=None, author=SimpleNamespace(id=20), add_reaction=AsyncMock())
+        try:
+            assert await agent.recharging(event, True, since) is False
+            event.add_reaction.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_forget_me_ping_hears_about_an_outage(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> forget me')
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        try:
+            with pytest.raises(ControllerUnavailable):
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
+            assert mention_lines(caplog) == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('failure', ['outage', 'deadline'])
+def test_a_ping_that_waited_for_a_save_still_gets_its_checks(monkeypatch, tmp_path, caplog, failure):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> you there?', age=QUEUE_SECONDS-0.2 if failure == 'deadline' else 0)
+        saved = agent.recording[(1, 20)] = asyncio.Event()  # An earlier reply is still being saved.
+        asyncio.get_running_loop().call_later(0.35, saved.set)
+        if failure == 'outage':
+            agent.revision = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            expected = UNREACHABLE if failure == 'outage' else NOTICES['stale event']
+            assert [item.args for item in event.reply.await_args_list] == [(expected,)]
+            assert mention_lines(caplog) == ([] if failure == 'outage' else  # The outage notice answered it.
+                                             [f'Mention 1/{event.id} not answered, told why: earlier reply still running'])
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_that_comes_in_during_an_outage_gets_the_outage_notice(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+        agent.profile = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        event = message('hey')
+        event.guild = None
+        try:
+            with pytest.raises(ControllerUnavailable):
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(UNREACHABLE,)]
+            fri.chat_once.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['fri still there?', '<@99> still there?'])
+def test_a_stale_cached_row_does_not_drop_a_message_sent_after_the_erasure(monkeypatch, tmp_path, caplog, text):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        earlier = message('fri remember the private marker', age=30)
+        earlier.reply.return_value = SimpleNamespace(id=earlier.id+1, content='got it')
+        event = message(text)
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='still here')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='still here')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(earlier)
+                assert agent.recent[1]  # Cached under the revision before the erasure...
+                store.clear_chats('20')  # ...which they then clear through Gene, not Fri.
+                await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [('still here',)]
+            assert 'private marker' not in str(fri.chat_once.await_args.args[1])
+            assert not mention_lines(caplog)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('channel_id,erasure', [(1, 'local'), (8, 'local'), (8, 'gene')])
+def test_an_erasure_during_a_pings_last_checks_stops_the_reply(monkeypatch, tmp_path, caplog, channel_id, erasure):
+    # The last Discord read after the controller's checks: the ping in a configured channel, where
+    # Gene's grant fence catches its own erasures, and a nearby message outside one.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        nearby = message('another member nearby', user=30, age=60)
+        event = message()
+        last, seen = event if channel_id == 1 else nearby, []
+        def fetch(mid):
+            if mid == last.id and fri.chat_once.await_count:
+                seen.append(mid)
+                if len(seen) == 2:  # Fri's own last look, after talk's.
+                    agent.forget(20) if erasure == 'local' else store.clear_chats('20')
+            return rows[mid]
+        channel.fetch_message.side_effect = fetch
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert len(seen) >= 2
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_erased_during_its_debounce_is_not_answered(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+        event = message('remember the private marker?')
+        event.guild = None
+        async def debounce(_):
+            store.clear_chats('20')  # Through Gene, while Fri waits to see if more is coming.
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/turn' for path, _ in calls)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_burst_does_not_carry_messages_from_before_an_erasure(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('<@99> remember the private marker'), message('fri anyway, hi')
+        second.reply.return_value = SimpleNamespace(id=second.id+1, content='hi')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='hi')
+        debounced, real_sleep = asyncio.Event(), asyncio.sleep
+        async def debounce(_):
+            await debounced.wait()
+        async def grouped(event):
+            while agent.bursts.group(event) is None:
+                await real_sleep(0.01)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                await asyncio.wait_for(grouped(first), 5)
+                store.clear_chats('20')  # Through Gene, between the two.
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                await asyncio.wait_for(grouped(second), 5)
+                debounced.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_awaited_once()
+            assert 'private marker' not in str(fri.chat_once.await_args)
+            assert [item.args for item in second.reply.await_args_list] == [('hi',)]
+            first.reply.assert_not_awaited()
+            assert mention_lines(caplog) == [f'Mention 1/{first.id} not answered: author privacy changed']
+        finally:
+            debounced.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_privacy_control_in_a_burst_is_carried_out_and_the_rest_answered(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        control, after = message('fri forget me'), message('<@99> lol ok')
+        control.reply.return_value = SimpleNamespace(id=control.id+1, content='done')
+        after.reply.return_value = SimpleNamespace(id=after.id+1, content='ok')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='ok')
+        debounced, real_sleep = asyncio.Event(), asyncio.sleep
+        async def debounce(_):
+            await debounced.wait()
+        async def grouped(event):
+            while agent.bursts.group(event) is None:
+                await real_sleep(0.01)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = [asyncio.create_task(agent.handle(control))]
+                await asyncio.wait_for(grouped(control), 5)
+                tasks.append(asyncio.create_task(agent.handle(after)))
+                await asyncio.wait_for(grouped(after), 5)
+                debounced.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert control.reply.await_args.args[0].startswith('done. i erased our saved chats')
+            assert not (await agent.profile(1, 20))['enabled']
+            assert 'forget me' not in str(fri.chat_once.await_args_list)
+        finally:
+            debounced.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_showing_their_memory_keeps_what_they_sent_before_waiting(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        waiting = message('<@99> you there?')
+        waiting.reply.return_value = SimpleNamespace(id=waiting.id+1, content='here', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='here')
+        fri.busy.add(20)  # A reply to them that's still going.
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(waiting))
+                while not waiting.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                show = message('fri what do you remember about me?')
+                show.reply.return_value = SimpleNamespace(id=show.id+1, content='memory')
+                await agent.handle(show)
+                assert show.reply.await_args.args[0].startswith('Memory is on.')
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            assert [item.args[0] for item in waiting.reply.await_args_list] == [str(ReplyInProgress()), 'here']
+            assert not mention_lines(caplog)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def gated_debounce():
+    """Hold every burst's debounce until released, and wait for a message to join one."""
+    released, real_sleep = asyncio.Event(), asyncio.sleep
+    async def debounce(_):
+        await released.wait()
+    async def grouped(agent, event):
+        while agent.bursts.group(event) is None:
+            await real_sleep(0.01)
+    return released, debounce, grouped
+
+
+def test_two_privacy_controls_sent_together_are_both_carried_out_in_order(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('fri forget me'), message('fri remember me again')
+        for event in (first, second):
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='done')
+        released, debounce, grouped = gated_debounce()
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                await asyncio.wait_for(grouped(agent, first), 5)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                await asyncio.wait_for(grouped(agent, second), 5)
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert [payload['action'] for path, payload in calls if path == '/chat/memory/control'] == ['disable', 'enable']
+            assert first.reply.await_args.args[0].startswith('done. i erased our saved chats')
+            assert second.reply.await_args.args[0].startswith('memory’s back on')
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('case', ['busy', 'erased'])
+def test_an_outside_ping_worded_like_a_privacy_control_is_answered_as_chat(monkeypatch, tmp_path, caplog, case):
+    # Outside, Fri.talk answers it as chat, so it waits its turn and is fenced like any other.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message('<@99> what do you remember about me?')
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='sent', delete=AsyncMock())
+        if case == 'busy':
+            fri.busy.add(20)
+            asyncio.get_running_loop().call_later(0.05, fri.busy.discard, 20)
+        else:
+            async def answer(*_):
+                agent.forget(20)  # "Forget me" elsewhere, while this one is being answered.
+                return ChatResult(status='completed', reply='an answer from before the erasure')
+            fri.chat_once.side_effect = answer
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            if case == 'busy':
+                assert texts == [str(ReplyInProgress()), 'that meme is doing a lot of work']
+            else:
+                assert texts == []
+                assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('failure', ['erased', 'outage'])
+@pytest.mark.parametrize('burst', [True, False])
+def test_a_reply_error_says_nothing_after_an_erasure_and_a_fixed_line_for_a_ping(
+        monkeypatch, tmp_path, caplog, burst, failure):
+    # A ping answered by its follow-up's reply, or one message to Fri by name.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        events = [message('<@99> help'), message('fri more details')] if burst else [message('fri more details')]
+        last = events[-1]
+        if failure == 'erased':
+            async def answer(*_):
+                store.clear_chats('20')  # Through Gene, while Fri is typing.
+                return ChatResult(status='completed', reply='an answer from before the erasure')
+            fri.chat_once.side_effect = answer
+        else:
+            api = fri.api
+            async def down(method, path, payload=None):
+                if path == '/chat/turn/check':
+                    raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+                return await api(method, path, payload)
+            fri.api = down
+        released, debounce, grouped = gated_debounce()
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in events:
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_awaited_once()
+            assert all(not event.reply.await_count for event in events[:-1])
+            texts = [item.args[0] for item in last.reply.await_args_list]
+            if failure == 'erased':  # Gene's fence rejected the save, and its notice stayed quiet.
+                assert texts == []
+                lines = [f'Mention 1/{events[0].id} not answered: check failed: ControllerRejected'] if burst else []
+            else:  # The outage notice, which answers for the whole burst.
+                assert texts == [UNREACHABLE]
+                lines = []
+            assert mention_lines(caplog) == lines
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_reply_error_says_nothing_after_an_erasure(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+        event = message('remember the private marker?')
+        event.guild = None
+        async def answer(*_):
+            store.clear_chats('20')  # Through Gene, while Fri is typing.
+            return ChatResult(status='completed', reply='an answer from before the erasure')
+        fri.chat_once.side_effect = answer
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_awaited_once()
+            event.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_ping_whose_arrival_read_finishes_late_does_not_drop_a_newer_burst(monkeypatch, tmp_path, caplog):
+    # The older ping came in before a Gene erasure, the newer after, but the older one's read lands last.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        older, newer = message('<@99> first question'), message('<@99> second question')
+        newer.reply.return_value = SimpleNamespace(id=newer.id+1, content='answered')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='answered')
+        profile, read, finish = agent.profile, asyncio.Event(), asyncio.Event()
+        async def slow(channel, user):
+            result = await profile(channel, user)
+            if not read.is_set():  # The older ping's, read before the erasure and held up after it.
+                read.set()
+                await finish.wait()
+            return result
+        agent.profile = slow
+        released, debounce, grouped = gated_debounce()
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = [asyncio.create_task(agent.handle(older))]
+                await asyncio.wait_for(read.wait(), 5)
+                store.clear_chats('20')
+                tasks.append(asyncio.create_task(agent.handle(newer)))
+                await asyncio.wait_for(grouped(agent, newer), 5)
+                finish.set()
+                await real_sleep(0.1)  # The older one's read lands, then it comes to the bursts.
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert [item.args[0] for item in newer.reply.await_args_list] == ['answered']
+            older.reply.assert_not_awaited()
+            assert 'first question' not in str(fri.chat_once.await_args_list)
+            assert mention_lines(caplog) == [f'Mention 1/{older.id} not answered: author privacy changed']
+        finally:
+            finish.set()
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['access', 'unpinged', 'deleted'])
+def test_a_burst_pings_fixed_line_needs_the_ping_to_still_stand(monkeypatch, tmp_path, caplog, change):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        ping, after = message('<@99> help'), message('fri more details')
+        api = fri.api
+        async def down(method, path, payload=None):
+            if path == '/chat/turn/check':
+                if change == 'access':  # Still sees and sends there, but can't read the history.
+                    channel.permissions_for = lambda _: discord.Permissions(view_channel=True, send_messages=True)
+                elif change == 'unpinged':
+                    edited = copy.copy(ping)
+                    edited.content, edited.mentions = 'help', []
+                    rows[ping.id] = edited
+                else:
+                    def gone(mid):
+                        if mid == ping.id:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                        return rows[mid]
+                    channel.fetch_message.side_effect = gone
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await api(method, path, payload)
+        fri.api = down
+        released, debounce, grouped = gated_debounce()
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in (ping, after):
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_awaited_once()
+            ping.reply.assert_not_awaited()
+            after.reply.assert_not_awaited()
+            gate = 'missing permissions' if change == 'access' else 'message changed'
+            assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: reply withheld: {gate}']
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text,path', [('<@99> forget me', '/chat/memory/control'),
+                                       ('<@99> show my memory', '/chat/context')])
+def test_a_privacy_control_ping_hears_the_outage_notice_when_the_controller_is_down(monkeypatch, tmp_path, caplog, text, path):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message(text)
+        api = fri.api
+        async def down(method, called, payload=None):
+            if called == path:
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await api(method, called, payload)
+        fri.api = down
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert [item.args[0] for item in event.reply.await_args_list] == [UNREACHABLE]
+            assert mention_lines(caplog) == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erasure', ['local', 'gene'])
+def test_no_reaction_after_an_erasure_during_its_last_check(monkeypatch, tmp_path, erasure):
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('fri lol')
+        event.reactions = []
+        fri.chat_once.return_value = ChatResult(status='completed', response_kind='react', reaction='😂')
+        def fetch(mid):
+            if agent.reaction_lock.locked() and not fetch.erased:  # Reacting's own look at the message.
+                fetch.erased = True
+                agent.forget(20) if erasure == 'local' else store.clear_chats('20')
+            return rows[mid]
+        fetch.erased = False
+        channel.fetch_message.side_effect = fetch
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert fetch.erased
+            event.add_reaction.assert_not_awaited()
+            event.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['none', 'access', 'unpinged', 'deleted'])
+def test_a_queued_burst_pings_outage_line_needs_the_ping_to_still_stand(monkeypatch, tmp_path, caplog, change):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        ping, after = message('<@99> help'), message('fri more details')
+        after.reply.return_value = SimpleNamespace(id=after.id+1, content='hold on', delete=AsyncMock())
+        fri.busy.add(20)  # A reply to them that's still going, so the burst waits its turn.
+        released, debounce, grouped = gated_debounce()
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in (ping, after):
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                while not after.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                if change == 'access':  # Still sees and sends there, but can't read the history.
+                    channel.permissions_for = lambda _: discord.Permissions(view_channel=True, send_messages=True)
+                elif change == 'unpinged':
+                    edited = copy.copy(ping)
+                    edited.content, edited.mentions = 'help', []
+                    rows[ping.id] = edited
+                elif change == 'deleted':
+                    def gone(mid):
+                        if mid == ping.id:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                        return rows[mid]
+                    channel.fetch_message.side_effect = gone
+                agent.revision = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+                fri.busy.discard(20)
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_not_awaited()
+            ping.reply.assert_not_awaited()
+            texts = [item.args[0] for item in after.reply.await_args_list]
+            if change == 'none':
+                assert texts == [str(ReplyInProgress()), UNREACHABLE]
+                assert mention_lines(caplog) == []  # The outage notice answered the burst.
+            else:
+                assert texts == [str(ReplyInProgress())]
+                reason = 'missing permissions' if change == 'access' else 'message changed'
+                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: reply withheld: {reason}']
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text,meanwhile', [('<@99> forget me', 'committed'), ('<@99> remember me again', 'committed'),
+                                            ('<@99> forget me', 'another control')])
+def test_a_privacy_control_ping_hears_about_an_outage_whatever_changed(monkeypatch, tmp_path, caplog, text, meanwhile):
+    # Gene carried it out but the answer never came back, or another control came in meanwhile.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, store, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        if 'remember' in text:
+            store.personal_control('20', 'disable')
+        event = message(text)
+        api = fri.api
+        async def lost(method, path, payload=None):
+            if path == '/chat/memory/control':
+                if meanwhile == 'committed':
+                    await api(method, path, payload)
+                else:
+                    agent.forget(20)
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await api(method, path, payload)
+        fri.api = lost
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert [item.args[0] for item in event.reply.await_args_list] == [UNREACHABLE]
+            assert mention_lines(caplog) == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_stale_ping_redelivered_after_its_record_expires_is_told_once(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        event = message(age=301)
+        try:
+            await agent.handle(event)
+            agent.delivered.clear()  # By age or count.
+            await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(NOTICES['stale event'],)]
+            assert mention_lines(caplog) == [f'Mention 8/{event.id} not answered, told why: stale event']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('another', [False, True])
+def test_a_privacy_control_hears_a_refused_arrival_read_whatever_another_did(monkeypatch, tmp_path, caplog, another):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> forget me')
+        async def profile(*_):
+            if another:  # Another of their controls ran during this read.
+                agent.forget(20)
+            raise ControllerRejected('Controller rejected this request')
+        agent.profile = profile
+        try:
+            await agent.handle(event)
+            assert [item.args for item in event.reply.await_args_list] == [(CONTEXT_CHANGED,)]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: check failed: ControllerRejected']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('newest', ['unmentioned', 'unpinged ping'])
+def test_a_bursts_notice_goes_to_a_ping_that_still_stands(monkeypatch, tmp_path, caplog, newest):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        events = [message('<@99> first question'), message('<@99> more details')]
+        if newest == 'unmentioned':
+            events.append(message('fri final detail'))
+        removed = events[1]  # They take the ping out of this one while Fri types.
+        def unping():
+            edited = copy.copy(removed)
+            edited.content, edited.mentions = 'more details', []
+            rows[removed.id] = edited
+        if newest == 'unmentioned':  # And the controller refuses the reply's save.
+            api = fri.api
+            async def refused(method, path, payload=None):
+                if path == '/chat/turn/check':
+                    unping()
+                    raise ControllerRejected('This conversation changed while Fri was replying.')
+                return await api(method, path, payload)
+            fri.api = refused
+        else:  # The ping their reply answers is the one changed.
+            async def answer(*_):
+                unping()
+                return ChatResult(status='completed', reply='an answer')
+            fri.chat_once.side_effect = answer
+        released, debounce, grouped = gated_debounce()
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in events:
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_awaited_once()
+            assert all(not event.reply.await_count for event in events[1:])
+            assert [item.args[0] for item in events[0].reply.await_args_list] == [CONTEXT_CHANGED]
+            assert f'Mention 1/{events[0].id} not answered, told why: ' in '\n'.join(mention_lines(caplog))
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('kind', ['by name', 'ping', 'outside ping', 'dm'])
+def test_a_message_whose_arrival_read_spans_their_forget_me_never_reaches_the_model(monkeypatch, tmp_path, caplog, kind):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        channel_id = 8 if kind == 'outside ping' else 1
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        event = message(('<@99> ' if 'ping' in kind else 'fri ')+'remember the private marker')
+        if kind == 'dm':
+            agent.config['support_dms'] = True
+            agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+            event.guild = None
+        fri.chat_once.return_value = ChatResult(status='completed', reply='noted')
+        profile, erased = agent.profile, False
+        async def slow(channel, user):
+            nonlocal erased
+            if user == 20 and not erased:  # Their 'forget me' runs before this read comes back.
+                erased = True
+                agent.forget(20, erased=True)
+                store.clear_chats('20')
+            return await profile(channel, user)
+        agent.profile = slow
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert erased
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert not any(row['id'] == str(event.id) for rows in agent.recent.values() for row in rows)
+            assert not any(path == '/chat/turn' for path, _ in calls)
+            if 'ping' in kind:
+                assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_from_someone_who_just_left_is_not_answered_from_the_cache(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = SimpleNamespace(id=20)
+        agent.member = AsyncMock(side_effect=lambda *_, fresh=False, **__: None if fresh else present)
+        event = message('what is ash working on?')
+        event.guild = None
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            assert not any(path == '/chat/context' for path, _ in calls)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('stays', [True, False])
+def test_a_queued_dm_needs_a_current_member_when_its_turn_comes(monkeypatch, tmp_path, stays):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = SimpleNamespace(id=20)
+        agent.member = AsyncMock(return_value=present)
+        event = message('what is ash working on?')
+        event.guild = None
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='hold on', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        fri.busy.add(20)  # A reply to them that's still going, so this waits its turn.
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                while not event.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                if not stays:  # They leave the server meanwhile.
+                    agent.member = AsyncMock(side_effect=lambda *_, fresh=False, **__: None if fresh else present)
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            if stays:
+                fri.chat_once.assert_awaited_once()
+                assert texts == [str(ReplyInProgress()), 'an answer']
+            else:  # Checked fresh, not from the cache their arrival filled.
+                fri.chat_once.assert_not_awaited()
+                assert not any(path == '/chat/context' for path, _ in calls)
+                assert texts == [str(ReplyInProgress())]
+                assert agent.member.await_args_list == [call(20, fresh=True)]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['stays', 'left', 'dms off'])
+def test_a_dm_privacy_control_that_waited_for_another_needs_a_current_member(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = {'member': SimpleNamespace(id=20)}
+        agent.member = AsyncMock(side_effect=lambda *_, **__: present['member'])
+        first, second = message('what do you remember about me?'), message('what do you remember about me?')
+        for event in (first, second):
+            event.guild = None
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='your memory', edit=AsyncMock())
+        talk, released, calls = fri.talk, asyncio.Event(), []
+        async def stalled(*args, **kwargs):
+            calls.append(kwargs.get('event'))
+            if len(calls) == 1:  # The first is still being answered when the second comes in.
+                await released.wait()
+            return await talk(*args, **kwargs)
+        fri.talk = stalled
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                while not calls:
+                    await real_sleep(0.01)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                while not agent.controls[20]._waiters:  # Waiting for the first to finish.
+                    await real_sleep(0.01)
+                if change == 'left':
+                    present['member'] = None
+                elif change == 'dms off':
+                    agent.config['support_dms'] = False
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert calls == ([first, second] if change == 'stays' else [first])
+            assert second.reply.await_count == (change == 'stays')
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['stays', 'disabled', 'unconfigured', 'left', 'access lost', 'overwrites'])
+def test_a_queued_message_needs_fri_on_and_its_channel_still_configured(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, controller, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('fri what is ash working on?')
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='hold on', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        fri.busy.add(20)  # A reply to them that's still going, so this waits its turn.
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                while not event.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                if change == 'disabled':  # The owner pauses Fri meanwhile.
+                    controller.update({'enabled': False}, controller.state()['version'], '10')
+                    agent.state = controller.state()
+                elif change == 'unconfigured':
+                    agent.state = {**agent.state, 'channels': []}
+                elif change == 'left':
+                    channel.guild.fetch_member.side_effect = discord.NotFound(
+                        SimpleNamespace(status=404, reason='Not Found'), 'unknown member')
+                elif change == 'access lost':  # Fri still sees the channel; they no longer do.
+                    channel.permissions_for = lambda who: (discord.Permissions.all() if who.id == 99 else
+                                                           discord.Permissions.none())
+                elif change == 'overwrites':  # The same, seen only in the channel as fetched now.
+                    denied = copy.copy(channel)
+                    denied.permissions_for = lambda who: (discord.Permissions.all() if who.id == 99 else
+                                                          discord.Permissions.none())
+                    channel.guild.fetch_channel.return_value = denied
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            if change == 'stays':
+                fri.chat_once.assert_awaited_once()
+                assert texts == [str(ReplyInProgress()), 'an answer']
+            else:
+                fri.chat_once.assert_not_awaited()
+                assert texts == [str(ReplyInProgress())]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_dms_turned_off_during_a_queued_dms_membership_lookup_stop_it(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = SimpleNamespace(id=20)
+        async def member(*_, fresh=False, **__):
+            if fresh and not fri.busy:  # The recheck's own lookup, while the owner turns DMs off.
+                agent.config['support_dms'] = False
+            return present
+        agent.member = member
+        event = message('what is ash working on?')
+        event.guild = None
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='hold on', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        fri.busy.add(20)
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                while not event.reply.await_count:
+                    await real_sleep(0.01)
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            fri.chat_once.assert_not_awaited()
+            assert [item.args[0] for item in event.reply.await_args_list] == [str(ReplyInProgress())]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['stays', 'unpinged', 'left', 'access lost'])
+def test_a_privacy_control_ping_taken_back_while_it_waits_changes_nothing(monkeypatch, tmp_path, caplog, change):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('<@99> what do you remember about me?'), message('<@99> forget me')
+        for event in (first, second):
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='done', edit=AsyncMock())
+        talk, released, talked = fri.talk, asyncio.Event(), []
+        async def stalled(*args, **kwargs):
+            talked.append(kwargs.get('event'))
+            if len(talked) == 1:  # The first is still being answered when the second comes in.
+                await released.wait()
+            return await talk(*args, **kwargs)
+        fri.talk = stalled
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                while not talked:
+                    await real_sleep(0.01)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                while not agent.controls[20]._waiters:  # Waiting for the first to finish.
+                    await real_sleep(0.01)
+                if change == 'unpinged':  # Taken back before Fri got to it.
+                    edited = copy.copy(second)
+                    edited.content, edited.mentions = 'keep my memory', []
+                    edited.edited_at = dt.datetime.now(dt.timezone.utc)
+                    rows[second.id] = edited
+                elif change == 'left':
+                    def fetch_member(user):
+                        if user == 20:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'unknown member')
+                        return SimpleNamespace(id=user, bot=user == 99)
+                    channel.guild.fetch_member.side_effect = fetch_member
+                elif change == 'access lost':  # Fri still sees the channel; they no longer do.
+                    channel.permissions_for = lambda who: (discord.Permissions.all() if who.id == 99 else
+                                                           discord.Permissions.none())
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            controls = [payload['action'] for path, payload in calls if path == '/chat/memory/control']
+            if change == 'stays':
+                assert controls == ['disable']
+                assert second.reply.await_args.args[0].startswith('done. i erased')
+            else:
+                assert controls == []
+                second.reply.assert_not_awaited()
+                reason = {'unpinged': 'message changed', 'left': 'check failed: NotFound',
+                          'access lost': 'missing permissions'}[change]
+                withheld = [second] if change == 'unpinged' else [first, second]  # Losing access stops both.
+                assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: reply withheld: {reason}'
+                                                 for event in withheld]
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_privacy_control_ping_that_waited_still_runs_with_fri_paused(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, controller, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        first, second = message('<@99> what do you remember about me?'), message('<@99> forget me')
+        for event in (first, second):
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='done', edit=AsyncMock())
+        talk, released, talked = fri.talk, asyncio.Event(), []
+        async def stalled(*args, **kwargs):
+            talked.append(kwargs.get('event'))
+            if len(talked) == 1:
+                await released.wait()
+            return await talk(*args, **kwargs)
+        fri.talk = stalled
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                while not talked:
+                    await real_sleep(0.01)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                while not agent.controls[20]._waiters:
+                    await real_sleep(0.01)
+                controller.update({'enabled': False}, controller.state()['version'], '10')  # The owner pauses Fri.
+                agent.state = controller.state()
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            assert [payload['action'] for path, payload in calls if path == '/chat/memory/control'] == ['disable']
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['stays', 'unpinged', 'deleted'])
+def test_a_privacy_control_ping_taken_back_while_fri_is_paused_changes_nothing(monkeypatch, tmp_path, caplog, change):
+    # Paused, a ping makes no invitation, so the message itself is checked as it stands.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, controller, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        controller.update({'enabled': False}, controller.state()['version'], '10')
+        agent.state = controller.state()
+        first, second = message('<@99> what do you remember about me?'), message('<@99> forget me')
+        for event in (first, second):
+            event.reply.return_value = SimpleNamespace(id=event.id+1, content='done', edit=AsyncMock())
+        talk, released, talked = fri.talk, asyncio.Event(), []
+        async def stalled(*args, **kwargs):
+            talked.append(kwargs.get('event'))
+            if len(talked) == 1:
+                await released.wait()
+            return await talk(*args, **kwargs)
+        fri.talk = stalled
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                tasks = [asyncio.create_task(agent.handle(first))]
+                while not talked:
+                    await real_sleep(0.01)
+                tasks.append(asyncio.create_task(agent.handle(second)))
+                while not agent.controls[20]._waiters:
+                    await real_sleep(0.01)
+                if change == 'unpinged':
+                    edited = copy.copy(second)
+                    edited.content, edited.mentions = 'keep my memory', []
+                    edited.edited_at = dt.datetime.now(dt.timezone.utc)
+                    rows[second.id] = edited
+                elif change == 'deleted':
+                    def gone(mid):
+                        if mid == second.id:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                        return rows[mid]
+                    channel.fetch_message.side_effect = gone
+                released.set()
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            controls = [payload['action'] for path, payload in calls if path == '/chat/memory/control']
+            if change == 'stays':
+                assert controls == ['disable']
+                assert second.reply.await_args.args[0].startswith('done. i erased')
+            else:
+                assert controls == []
+                second.reply.assert_not_awaited()
+                assert mention_lines(caplog) == [f'Mention 1/{second.id} not answered: message changed']
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['disabled', 'unconfigured'])
+def test_settings_changed_during_a_queued_messages_member_lookup_stop_it(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, controller, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        present = SimpleNamespace(id=20)
+        async def member(*_, fresh=False, **__):
+            if fresh and not fri.busy and not member.changed:  # The recheck's own lookup.
+                member.changed = True
+                if change == 'disabled':
+                    controller.update({'enabled': False}, controller.state()['version'], '10')
+                    agent.state = controller.state()
+                else:
+                    agent.state = {**agent.state, 'channels': []}
+            return present
+        member.changed = False
+        agent.member = member
+        event = message('fri what is ash working on?')
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='hold on', delete=AsyncMock())
+        fri.chat_once.return_value = ChatResult(status='completed', reply='an answer')
+        fri.busy.add(20)  # A reply to them that's still going, so this waits its turn.
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                while not event.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                fri.busy.discard(20)
+                await asyncio.wait_for(task, 5)
+            assert member.changed
+            fri.chat_once.assert_not_awaited()
+            assert [item.args[0] for item in event.reply.await_args_list] == [str(ReplyInProgress())]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('kind', ['ping', 'addressed', 'dm'])
+def test_no_outage_notice_for_a_message_whose_author_erased_during_its_arrival_read(monkeypatch, tmp_path, caplog, kind):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message({'ping': '<@99> you there?', 'addressed': 'fri you there?', 'dm': 'you there?'}[kind])
+        if kind == 'dm':
+            event.guild = None
+            agent.config['support_dms'] = True
+            agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+        started, failed = asyncio.Event(), asyncio.Event()
+        async def down(*_):
+            started.set()
+            await failed.wait()
+            raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+        if kind == 'dm':
+            agent.revision = down
+        else:
+            agent.profile = down
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                task = asyncio.create_task(agent.handle(event))
+                await asyncio.wait_for(started.wait(), 5)
+                agent.forget(20, erased=True)  # Their "forget me" landed while the read was out.
+                failed.set()
+                await asyncio.wait_for(task, 5)
+            await real_sleep(0)
+            fri.chat_once.assert_not_awaited()
+            event.reply.assert_not_awaited()
+            if kind == 'ping':
+                assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered: author privacy changed']
+        finally:
+            failed.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['none', 'edited', 'deleted', 'erased'])
+def test_a_queued_bursts_outage_line_needs_its_earlier_message_unchanged(monkeypatch, tmp_path, caplog, change):
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        before, ping = message('fri so about earlier'), message('<@99> help')
+        ping.reply.return_value = SimpleNamespace(id=ping.id+1, content='hold on', delete=AsyncMock())
+        fri.busy.add(20)  # A reply to them that's still going, so the burst waits its turn.
+        released, debounce, grouped = gated_debounce()
+        real_sleep = asyncio.sleep
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+                tasks = []
+                for event in (before, ping):
+                    tasks.append(asyncio.create_task(agent.handle(event)))
+                    await asyncio.wait_for(grouped(agent, event), 5)
+                released.set()
+                while not ping.reply.await_count:  # Told to hold on.
+                    await real_sleep(0.01)
+                if change == 'edited':  # Maybe to take it back.
+                    edited = copy.copy(before)
+                    edited.content, edited.edited_at = 'fri never mind', dt.datetime.now(dt.timezone.utc)
+                    rows[before.id] = edited
+                elif change == 'deleted':
+                    def gone(mid):
+                        if mid == before.id:
+                            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                        return rows[mid]
+                    channel.fetch_message.side_effect = gone
+                elif change == 'erased':
+                    def erasing(mid):  # Their "forget me" lands while the notice checks the burst.
+                        if mid == before.id:
+                            agent.forget(20, erased=True)
+                        return rows[mid]
+                    channel.fetch_message.side_effect = erasing
+                agent.revision = AsyncMock(side_effect=ControllerUnavailable('The workshop controller is temporarily unavailable.'))
+                fri.busy.discard(20)
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            fri.chat_once.assert_not_awaited()
+            before.reply.assert_not_awaited()
+            texts = [item.args[0] for item in ping.reply.await_args_list]
+            if change == 'none':
+                assert texts == [str(ReplyInProgress()), UNREACHABLE]
+                assert mention_lines(caplog) == []
+            else:
+                assert texts == [str(ReplyInProgress())]
+                reason = 'author privacy changed' if change == 'erased' else 'reply withheld: message changed'
+                assert mention_lines(caplog) == [f'Mention 1/{ping.id} not answered: {reason}']
+        finally:
+            released.set()
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('when', ['context', 'sign-in'])
+@pytest.mark.parametrize('change', ['stays', 'left', 'dms off'])
+def test_a_dm_whose_author_leaves_before_the_model_runs_is_not_answered(monkeypatch, tmp_path, change, when):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = {'member': SimpleNamespace(id=20)}
+        agent.member = AsyncMock(side_effect=lambda *_, **__: present['member'])
+        event = message('what is ash working on?')
+        event.guild = None
+        def meanwhile():  # After every arrival check passed.
+            if change == 'left':
+                present['member'] = None
+            elif change == 'dms off':
+                agent.config['support_dms'] = False
+        api = fri.api
+        async def reading(method, path, payload=None):
+            if path == '/chat/context' and when == 'context':
+                meanwhile()
+            return await api(method, path, payload)
+        fri.api = reading
+        del fri.chat_once  # The real one, with its last checks before the request.
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()  # Its usage receipt.
+        reached = []
+        async def respond(text, context, *, ready=None):
+            if when == 'sign-in':  # While the subscription signs in, before the request.
+                meanwhile()
+            await ready()
+            reached.append(text)
+            return ChatResult(status='completed', reply='an answer')
+        fri.chat.respond = respond
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            if change == 'stays':
+                assert reached == ['what is ash working on?']
+                assert [item.args[0] for item in event.reply.await_args_list] == ['an answer']
+            else:
+                assert reached == []
+                event.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('member', [True, False])
+def test_a_dm_low_battery_needs_a_current_member(monkeypatch, tmp_path, member):
+    async def scenario():
+        fri, agent, _, _, _, _, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=20) if member else None)
+        event = SimpleNamespace(id=1, guild=None, author=SimpleNamespace(id=20), add_reaction=AsyncMock())
+        try:
+            assert await agent.recharging(event, True) is member
+            agent.member.assert_awaited_once_with(20, fresh=True)
+            assert event.add_reaction.await_count == int(member)
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -442,8 +2356,9 @@ def test_a_burst_that_fails_names_its_earlier_mention(monkeypatch, tmp_path, cap
         async def typing():
             raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
             yield
-        channel.typing = typing
+        channel.typing = typing  # Only cosmetic: the reply itself is what Discord refuses.
         first, second = message('<@99> hey', age=1), message('you around?')
+        second.reply.side_effect = discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
         try:
             task = asyncio.create_task(agent.handle(first))
             while not agent.bursts.has(1, 20):
@@ -658,12 +2573,17 @@ def test_revocation_during_answer_never_sends_or_saves_context(monkeypatch, tmp_
         fri.chat_once.side_effect = answer
         try:
             await agent.handle(event)
-            event.reply.assert_not_awaited()
             assert not any(path == '/chat/turn' for path, _ in calls)
             reason = {'privacy': 'check failed: ControllerRejected', 'source_edit': 'nearby message changed',
                       'permission': 'missing permissions', 'settings': 'check failed: ControllerRejected'}[change]
-            assert [line for line in caplog.messages if line.startswith('Mention ')] == [
-                f'Mention {channel.id}/{event.id} not answered: reply withheld: {reason}']
+            if change == 'permission':  # Fri can't answer there any more, so it doesn't.
+                event.reply.assert_not_awaited()
+                assert mention_lines(caplog) == [
+                    f'Mention {channel.id}/{event.id} not answered: reply withheld: {reason}']
+            else:  # A fixed notice, never the reply or what it drew on.
+                assert [item.args for item in event.reply.await_args_list] == [(CONTEXT_CHANGED,)]
+                assert mention_lines(caplog) == [
+                    f'Mention {channel.id}/{event.id} not answered, told why: reply withheld: {reason}']
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -685,7 +2605,8 @@ def test_a_nearby_member_who_forgets_while_fri_signs_in_never_reaches_the_model(
         try:
             await agent.handle(event)
             assert sent == []  # Refused before the request, not only before the reply.
-            event.reply.assert_not_awaited()
+            # The ping still stands, so it hears the fixed line, never what changed or who.
+            assert [item.args for item in event.reply.await_args_list] == [(CONTEXT_CHANGED,)]
             assert not any(path == '/chat/turn' for path, _ in calls)
         finally:
             await fri.close()
@@ -710,10 +2631,11 @@ def test_outside_invitation_preserves_cooldown_and_blocks_all_nonweb_actions(mon
                 await agent.handle(item)
             assert fri.chat_once.await_count < 20
             assert any(e.reply.await_args and 'recharge' in e.reply.await_args.args[0] for e in events)
-            later = message()  # The notice shows once; the rest of the cooldown is quiet, but logged.
+            later = message()  # The notice shows once; later pings in the cooldown get a low battery.
             await agent.handle(later)
             later.reply.assert_not_awaited()
-            assert f'Mention 8/{later.id} not answered: social cooldown' in caplog.messages
+            later.add_reaction.assert_awaited_once_with('🪫')
+            assert f'Mention 8/{later.id} not answered, told why: social cooldown' in caplog.messages
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -887,8 +2809,9 @@ def test_on_demand_meme_read_checks_sources_before_reply_and_prevents_persistenc
                 event.reply.assert_awaited_once()
                 assert event.reply.await_args.kwargs['view'] is None
                 assert 'another member caption' not in str(store.chat_context('123', 'public:1', '20'))
-            else:
-                event.reply.assert_not_awaited()
+            else:  # Never the reply; a fixed notice only while Fri can still answer there.
+                assert [item.args for item in event.reply.await_args_list] == (
+                    [] if change == 'permission' else [(CONTEXT_CHANGED,)])
                 assert not any(path == '/chat/turn' for path, _ in calls)
         finally:
             await fri.close()
@@ -978,6 +2901,38 @@ def test_new_chat_stays_socially_bounded_after_operational_bypass_fix(monkeypatc
             paths = [path for path, _ in calls]
             assert ('/chat/mentions/admit' if prefix == '<@99>' else '/agent/admit') in paths
             assert '/chat/operations/admit' not in paths
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('paused', [False, True])
+@pytest.mark.parametrize('text,path,logged', [
+    ('<@99> forget me', '/agent/context', 'check failed: ControllerRejected'),  # Its arrival read.
+    ('<@99> forget me', '/chat/memory/control', 'check failed: ControllerRejected'),  # The control itself.
+    ('<@99> show my memory', '/chat/context', 'check failed: ControllerRejected'),
+])
+def test_a_privacy_control_ping_refused_by_the_controller_hears_why_even_if_fri_pauses(monkeypatch, tmp_path, caplog,
+                                                                                     paused, text, path, logged):
+    # fri #64: a privacy control works with Fri paused, so its notice must not stop at the pause either.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message(text)
+        api = fri.api
+        async def refused(method, called, payload=None):
+            if called == path:
+                if paused:  # The owner pauses Fri while that call is out.
+                    agent.config['enabled'] = False
+                raise ControllerRejected('nope', 400)
+            return await api(method, called, payload)
+        fri.api = refused
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            # The same notice either way: what it says doesn't depend on the pause.
+            assert [item.args[0] for item in event.reply.await_args_list] == [CONTEXT_CHANGED]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: {logged}']
         finally:
             await fri.close()
     asyncio.run(scenario())

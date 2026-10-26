@@ -19,3 +19,12 @@ class ControllerUnavailable(commands.UserFeedbackCheckFailure):
     def __init__(self, detail, answered=False):
         super().__init__(detail)
         self.answered = answered  # Something answered as the controller never would: a proxy's page, a wrong URL.
+
+
+class AuthorErased(Exception):
+    """The author erased after their message came in, so nothing more answers it."""
+
+
+class GateClosed(Exception):
+    """A gate the message passed coming in closed before the model saw it, e.g. its DM author left.
+    The reason is a gate name for the log, never content."""

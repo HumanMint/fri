@@ -74,6 +74,14 @@ def burst_continuation(origin, source, text, action, argument, revision, bot_id=
         return None
 
 
+class Burst(list):
+    """One burst's rows, and its author's erasure baseline (see Agent.erasure) as they came in."""
+
+    def __init__(self, since=None, alone=False):
+        super().__init__()
+        self.since, self.alone = since, alone
+
+
 class Bursts:
     """Only hold in-flight events during the debounce, including when memory is off.
 
@@ -89,15 +97,28 @@ class Bursts:
         groups = self.rows.get((channel, user), [])
         return bool(groups and time.monotonic()-groups[-1][0][0] <= BURST_SECONDS)
 
-    def add(self, message, arrived=None):
+    def add(self, message, arrived=None, since=None, alone=False):
+        """`since`: the author's erasure baseline as it came in. `alone`: a privacy control, which
+        neither joins nor takes in other messages, so it's carried out and they're still answered.
+        False if the message came in before an erasure the open burst came in after, so it's dropped."""
         key, now = (message.channel.id, message.author.id), time.monotonic()
         arrived = now if arrived is None else arrived
         groups, abandoned = [], []
         for rows in self.rows.get(key, []):  # Abandoned ones expire.
             (groups if now-rows[0][0] <= 60 else abandoned).append(rows)
         self.dropped([row[1] for rows in abandoned for row in rows], 'burst abandoned')
-        if not groups or arrived-groups[-1][0][0] > BURST_SECONDS:
-            groups.append([])
+        joins = groups and arrived-groups[-1][0][0] <= BURST_SECONDS and not (alone or groups[-1].alone)
+        if joins and since != groups[-1].since:
+            # They erased in between, so nothing answers what came before, as forget() drops it.
+            # Messages can finish coming in out of order, so that may be this one.
+            if None not in (since, groups[-1].since) and all(a <= b for a, b in zip(since, groups[-1].since)):
+                self.rows[key] = groups
+                self.dropped([message], 'author privacy changed')
+                return False
+            self.dropped([row[1] for row in groups.pop()], 'author privacy changed')
+            joins = False
+        if not joins:
+            groups.append(Burst(since, alone))
         groups[-1].append((arrived, message, message.content))
         self.rows[key] = groups
         rows = groups[-1]
@@ -107,6 +128,7 @@ class Bursts:
                 del self.rows[key]
             self.dropped([row[1] for row in rows[:-1]], 'burst too long')  # The newest gets the notice.
             raise ValueError('Send at most five messages and 4000 characters together, then give me a moment.')
+        return True
 
     def group(self, message):
         return next((rows for rows in self.rows.get((message.channel.id, message.author.id), [])
@@ -132,8 +154,32 @@ class Bursts:
         self.dropped([row[1] for row in rows], reason)
 
     def forget(self, user):
+        """Drop a member's bursts after a privacy control, except other privacy controls."""
         for key in [key for key in self.rows if key[1] == user]:
-            self.dropped([row[1] for rows in self.rows.pop(key) for row in rows], 'author privacy changed')
+            groups = self.rows.pop(key)
+            if kept := [rows for rows in groups if rows.alone]:
+                self.rows[key] = kept
+            self.dropped([row[1] for rows in groups if not rows.alone for row in rows], 'author privacy changed')
+
+    def unsend(self, channel, ids):
+        """Deleted messages leave their burst, and its newest message answers for the rest. A burst
+        whose newest message went is dropped whole: the rest were waiting on what was taken back.
+        So is a privacy control's: deleting it may be taking it back, and an erasure can't be undone."""
+        for key in [key for key in self.rows if key[0] == channel]:
+            groups = []
+            for rows in self.rows[key]:
+                gone = [row[1] for row in rows if row[1].id in ids]
+                if gone and rows[-1][1].id in ids:
+                    self.dropped([row[1] for row in rows], 'message deleted')
+                    continue
+                if gone:
+                    rows[:] = [row for row in rows if row[1].id not in ids]
+                    self.dropped(gone, 'message deleted')
+                groups.append(rows)
+            if groups:
+                self.rows[key] = groups
+            else:
+                del self.rows[key]
 
 
 async def live_rows(agent, message, burst):

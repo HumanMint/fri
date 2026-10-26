@@ -18,7 +18,13 @@ from .fri_actions import Actions
 from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult
 from .fri_context import discord_source
-from .fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
+from .fri_errors import (
+    UNREACHABLE,
+    AuthorErased,
+    ControllerRejected,
+    ControllerUnavailable,
+    GateClosed,
+)
 from .fri_memory import (
     PROFILES,
     describe_memory,
@@ -28,14 +34,14 @@ from .fri_memory import (
     profiled,
     server_wide,
 )
-from .fri_notices import ReplyInProgress, WaitingNotices, notice_text
+from .fri_notices import Busy, ReplyInProgress, WaitingNotices, notice_text
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
 from .fri_protocol import PROTOCOL, compatible
 from .fri_reports import ReportButton, report_component
 from .fri_requests import request_dm_component
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
-from .fri_usage import describe_usage, usage_requested
+from .fri_usage import describe_usage, usage_query, usage_requested, window_applied
 from .panels import defer_panel
 from .privacy import clean
 from .reviews import owner_dm_component
@@ -63,6 +69,10 @@ CHANGED = 'someone in that context changed their privacy settings while i was re
 CLOSED = 'a channel i was pulling from just went private while i was replying, so that stays unsaid. ask again.'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
+
+
+async def noop(stage):
+    pass
 
 
 def private_read(receipts):
@@ -166,7 +176,7 @@ class Fri(discord.Client):
         self.data = Path(os.getenv('FRI_DATA', '/data'))
         self.chat = Chat(Subscription(os.getenv('FRI_CHATGPT_AUTH', '/auth/session.json')))
         self.tree = FriTree(self)
-        self.busy = set()
+        self.busy = Busy()
         self.waiting_notices = WaitingNotices(self.busy)
         self.usage_lock = asyncio.Lock()
         self.chat_slots = asyncio.Semaphore(2)
@@ -214,9 +224,10 @@ class Fri(discord.Client):
         self.agent = Agent(self)
         await patiently(self, self.agent.start)
         self.add_view(HomeView(self))
+        from .fri_fixes import TellReporter
         from .fri_social import SocialButton
         from .fri_workspace import PostButton
-        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton)
+        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton, TellReporter)
 
         @self.tree.command(name='fri', description='Chat, request a feature or fix, and follow development.',
                            guild=discord.Object(id=self.guild_id))
@@ -252,7 +263,9 @@ class Fri(discord.Client):
             from .fri_social import component as social_component
             if social_component(interaction, getattr(self.user, 'id', None)):
                 allowed = True
+            from .fri_fixes import tell_component
             if (not allowed and not owner_dm_component(interaction, getattr(self.user, 'id', None), self.owner_id)
+                    and not tell_component(interaction, getattr(self.user, 'id', None), self.owner_id)
                     and not report_component(interaction, getattr(self.user, 'id', None), self.owner_id)
                     and not request_dm_component(interaction, getattr(self.user, 'id', None))):
                 return
@@ -322,6 +335,8 @@ class Fri(discord.Client):
     async def chat_once(self, text, context):
         async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
             fence = context.get('fence')
+            if fence and fence.get('gate'):
+                await fence['gate']()
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
@@ -335,7 +350,20 @@ class Fri(discord.Client):
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
             if fence:  # Checked again before delivery.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
+            if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
+                source = context.get('source') or {}
+                asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),
+                         *(row['source']['id'] for row in context.get('message_burst', []))]
+                if any(int(mid) in self.agent.unsent for mid in asked):
+                    raise GateClosed('message deleted')
+                if 'recent' in context:
+                    context['recent'] = [row for row in context['recent']
+                                         if row.get('gene_error') or int(row['id']) not in self.agent.unsent]
+                    seen.update(int(row['id']) for row in context['recent'] if not row.get('gene_error'))
+        # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
+        seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
         result = await self.chat.respond(text, context, ready=ready)
+        result.shown = seen
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
             'attempt_id': attempt, 'model': context['model'], 'effort': context['effort'],
@@ -348,9 +376,15 @@ class Fri(discord.Client):
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         return result
 
-    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None):
+    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, typing=None, last_look=None):
+        # `revision`: the author's privacy revision as their message came in, if known. Gene fences the
+        # reply against the one read below, so an erasure before that read must stop it here.
+        # `typing(stage)`: told once a model turn is 'admitted' (no closing, control or cooldown) and
+        # before an 'action' runs, so the caller shows typing only when words are coming. `last_look(result)`:
+        # the caller's own last Discord read, run before the turn's last privacy checks so they cover it.
+        typing = typing or noop
         if invitation and invitation.outside:
-            return await self.invited_talk(invitation, text)
+            return await self.invited_talk(invitation, text, typing)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
         heard = [self.hear(item) for item in (event, *(row[1] for row in burst))
                  if getattr(item, 'guild', None) is not None]  # Before anything here waits.
@@ -374,6 +408,7 @@ class Fri(discord.Client):
             await self.api('POST', '/chat/memory/control', {**scope, 'action': intent})
             if self.agent:
                 self.agent.forget(user_id, erased=intent == 'disable')
+                self.agent.carried_out(user_id, event, intent)
             text = ('done. i erased our saved chats and personal notes, and turned memory off. '
                     'say “remember me again” if you change your mind. discord messages and backups are separate.'
                     if intent == 'disable' else 'memory’s back on. i’ll pick up small preferences as we talk.')
@@ -392,6 +427,8 @@ class Fri(discord.Client):
         try:
             async with self.chat_slots:
                 context = attributed(await self.api('POST', '/chat/context', profiled(self, scope)))
+                if revision is not None and context['revision'] != revision:
+                    raise AuthorErased()
                 if self.profiles:
                     # From Discord's permissions: only a channel everyone could read when each message
                     # arrived, and still can, reaches the member's profile and their other conversations.
@@ -427,9 +464,13 @@ class Fri(discord.Client):
                     await self.api('POST', '/chat/turn/check', result.turn)  # Fence even a reaction.
                     return result
                 if user_id == self.owner_id and guild_id == self.guild_id and usage_requested(text):
+                    window, label, windowless = usage_query(text, self.capabilities, time.time())
                     usage = await self.api('POST', '/agent/usage',
-                                           {'guild_id': str(guild_id), 'user_id': str(user_id)})
-                    report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()))
+                                           {'guild_id': str(guild_id), 'user_id': str(user_id), **window})
+                    if label and not window_applied(usage, window):
+                        label, windowless = None, True  # The controller didn't apply it, so these are all-time.
+                    report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()),
+                                            window=label, windowless=windowless)
                     result = self.stage_turn(scope, source, text, context, ChatResult(reply=report, status='completed'),
                                              model='local-usage-report', derived=False)
                     await self.api('POST', '/chat/turn/check', result.turn)  # An erasure mid-turn stops it.
@@ -463,6 +504,37 @@ class Fri(discord.Client):
                         notice = (f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
                                   f'back in about {minutes} mins') if admission.get('notice') else ''
                         return ChatResult(reply=notice, status='cooldown')
+                async def sources_unchanged():  # The reply target and burst, as Discord has them now.
+                    if conversation and (conversation.get('message_burst') or conversation.get('reply_target')):
+                        from .fri_conversation import unchanged
+                        if not await unchanged(self.agent, event, conversation):
+                            raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
+
+                async def looked(result):  # The caller's last look, then the sources again: it awaited.
+                    if last_look:
+                        await last_look(result)
+                        await sources_unchanged()
+
+                async def as_read():
+                    """Everything read from Discord before typing started, as it stands now: typing waited on
+                    Discord, and nothing edited or deleted meanwhile may reach the model or a tool."""
+                    if invitation:
+                        await invitation.require_current()  # The ping, its access and what it collected.
+                    elif self.agent and source.kind == 'discord_message':
+                        try:
+                            current = await event.channel.fetch_message(event.id)
+                        except discord.HTTPException:
+                            raise GateClosed('message deleted') from None  # Quiet, as for any taken-back message.
+                        if current.edited_at is not None or current.content != event.content:
+                            raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
+                    await sources_unchanged()
+                    from .fri_images import CHANGED as IMAGES_CHANGED
+                    from .fri_images import still_there
+                    if image_source is not None and image_source is not event and not await still_there(image_source):
+                        raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+
+                if await typing('admitted'):
+                    await as_read()
                 if invitation:
                     if invitation.grant and event.reference and event.reference.message_id:
                         await invitation.collect(include_recent=False)
@@ -511,6 +583,11 @@ class Fri(discord.Client):
                                              'input': text, 'reply': '', 'model': context['model'],
                                              'effort': context['effort']},
                                     'actions': actions, 'shown': set()}
+                if self.agent and visibility == 'private' and source.kind == 'discord_message':
+                    async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
+                        if closed := await self.agent.dm_closed(user_id):
+                            raise GateClosed(closed)
+                    context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
                 result = await self.chat_once(text, context)
                 if invitation:
                     await invitation.require_current()
@@ -527,8 +604,13 @@ class Fri(discord.Client):
                 if result.action:
                     if not actions or result.action['kind'] not in context['actions']:
                         raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
+                    if await typing('action'):  # Checked before typing started: again, before the tool sees anything.
+                        await as_read()
+                        await self.api('POST', '/chat/turn/check', {**context['fence']['turn'], 'provenance': turn_provenance(
+                            context, user_id, actions)})
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
+                    result.shown = context['fence'].get('messages', set())  # A summary of the steps may still draw on them.
                     if actions.private_evidence:
                         result.draft, result.notes = None, []
                     if invitation:
@@ -587,6 +669,7 @@ class Fri(discord.Client):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
                     elif not private:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored)
+                    await looked(result)
                     try:  # The save's privacy fence, applied before anything is shown.
                         await self.api('POST', '/chat/turn/check', result.turn)
                         self.still_open(context)
@@ -596,6 +679,7 @@ class Fri(discord.Client):
                 if context.get('gene_receipts') and not await actions.valid(outage=True):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 result = self.stage_turn(scope, source, text, context, result, actions=actions)
+                await looked(result)
                 # The save's privacy fence runs before delivery; the save itself waits for delivery.
                 await self.api('POST', '/chat/turn/check', result.turn)
                 self.still_open(context)
@@ -729,7 +813,7 @@ class Fri(discord.Client):
         return ChatResult(reply=(f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
                                 f'back in about {minutes} mins') if admission.get('notice') else '', status='cooldown')
 
-    async def invited_talk(self, invitation, text):
+    async def invited_talk(self, invitation, text, typing=None):
         """Outside the ambient scope, one ping has only conversation and public research."""
         from .fri_context import addressed_content
         from .fri_images import attach, require_current
@@ -748,6 +832,7 @@ class Fri(discord.Client):
                 admission = await invitation.admit()
                 if not admission['allowed']:
                     return self.mention_cooldown(admission)
+                await (typing or noop)('admitted')
                 scope = invitation.granted_scope()
                 context = attributed(await self.api('POST', '/chat/context', scope))
                 await invitation.collect()
@@ -770,6 +855,7 @@ class Fri(discord.Client):
                 if result.action:
                     if result.action['kind'] not in context['actions']:
                         raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
+                    await (typing or noop)('action')
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
                     receipt = research or receipts[-1]
@@ -824,6 +910,19 @@ class Fri(discord.Client):
             channels = [self.get_channel(int(c)) for c in self.agent.state.get('channels', []) if str(c).isdigit()]
             LOG.info('Member profiles: %d of %d configured channels are readable by everyone',
                      sum(server_wide(c) for c in channels), len(channels))
+
+    # With no message cache, Discord's deletes and edits arrive only as raw events.
+    async def on_raw_message_delete(self, payload):
+        if self.agent:
+            self.agent.unsend(payload.channel_id, [payload.message_id])
+
+    async def on_raw_bulk_message_delete(self, payload):
+        if self.agent:
+            self.agent.unsend(payload.channel_id, payload.message_ids)
+
+    async def on_raw_message_edit(self, payload):
+        if self.agent:
+            self.agent.edit(payload.channel_id, payload.message)
 
     async def on_message(self, message):
         if self.agent:
@@ -952,11 +1051,12 @@ class Fri(discord.Client):
 
 
 def main():
-    from .logging import install_secret_filter
+    from .logging import configure, install_secret_filter
     install_secret_filter()
+    configure()
     from .fri_instance import instance_lock
     with instance_lock(os.getenv('FRI_DATA', '/data')):
-        Fri().run(os.environ['DISCORD_TOKEN'], log_level=logging.INFO)
+        Fri().run(os.environ['DISCORD_TOKEN'], log_handler=None)  # configure() already set up logging.
 
 
 if __name__ == '__main__':
