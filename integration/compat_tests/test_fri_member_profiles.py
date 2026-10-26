@@ -193,6 +193,43 @@ def test_what_is_said_privately_or_in_restricted_places_stays_there(monkeypatch,
     run(scenario)
 
 
+def test_what_a_member_is_working_on_stays_in_the_channel_they_said_it(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            project = "I'm building a Factorio mod"
+            _, saved, sent = await w.say(GENERAL, 'fri '+project, 'another belt person', note(project, 'projects'))
+            assert turns(w)[-1]['audience'] == 'server'  # Everyone can read #general, and still it stays.
+            assert saved == {'ok': True, 'first_memory': True, 'memory_scope': 'conversation'}
+            sent.edit.assert_awaited_once_with(content='another belt person'+FIRST_HERE)
+            assert 'working on' in FIRST_HERE
+            await w.say(GENERAL, 'fri what should i do tonight')
+            assert model_context(w)['personal_memory']['notes'] == [
+                {'category': 'projects', 'evidence': project, 'scope': 'here', 'provenance': []}]
+            for where in (GAMING, THREAD, DM):
+                await w.say(where, 'fri what should i do tonight')
+                assert model_context(w)['personal_memory']['notes'] == []
+            # A preference in the same message follows them; the project beside it doesn't.
+            text = 'fri I like Minecraft and I main Mercy'
+            _, saved, sent = await w.say(GAMING, text, 'sure', note('I like Minecraft')+note('I main Mercy', 'projects'))
+            assert saved == {'ok': True, 'first_memory': True, 'memory_scope': 'server'}
+            sent.edit.assert_awaited_once_with(content='sure'+FIRST_PROFILE)
+            assert 'working on stays where you said it' in FIRST_PROFILE
+            await w.say(GENERAL, 'fri hi')
+            assert [(n['scope'], n['evidence']) for n in model_context(w)['personal_memory']['notes']] == [
+                ('server', 'I like Minecraft'), ('here', project)]
+            overview, _, _ = await w.say(DM, 'fri what do you remember about me')
+            assert ('**across the server**\n- I like Minecraft\n**only in #general**\n- I\'m building a Factorio mod\n'
+                    '**only in #gaming**\n- I main Mercy') in overview.reply
+            assert 'the rest stays where you said it, what you’re working on included' in overview.reply
+            public, _, _ = await w.say(THREAD, 'what do you remember about me fri')
+            assert 'Mercy' not in public.reply and 'Factorio' not in public.reply
+            assert 'except what you’re working on' in public.reply
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
 def test_a_channel_that_becomes_restricted_stops_feeding_elsewhere(monkeypatch, tmp_path):
     async def scenario():
         w = world(monkeypatch, tmp_path)
@@ -612,6 +649,72 @@ def test_an_edited_profile_note_keeps_following_the_member(monkeypatch, tmp_path
             await w.say(GAMING, 'fri recommend me something')
             assert model_context(w)['personal_memory']['notes'] == [
                 {'category': 'games', 'evidence': 'I prefer quiet conversations', 'scope': 'server', 'provenance': []}]
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_the_member_can_share_what_they_are_working_on_from_my_memory(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        shown = AsyncMock()
+        monkeypatch.setattr('fri.fri_panel.reply', shown)
+        monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+        try:
+            project = "I'm working on a pixel art game"
+            await w.say(GENERAL, 'fri '+project, 'noted', note(project, 'projects'))
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            interaction = Mock(spec=discord.Interaction, guild_id=None, channel_id=DM, user=SimpleNamespace(id=20))
+            await show(w.fri, interaction, scope)
+            body = shown.await_args.kwargs['embed'].description
+            assert 'projects · only in #general: I\'m working on a pixel art game' in body
+            assert 'what you’re working on always starts there' in body
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            view = MemoryView(w.fri, scope, state, selected=state['entries'][0]['id'])
+            assert view.children[0].options[0].description == 'projects · only in #general'
+            assert EditMemory(view).preference.label == 'What you’re doing, e.g. I’m working on a mod'
+            # The member's own Share server-wide press, as My memory sends it from their DMs.
+            shared = await w.fri.api('POST', f"/chat/memory/notes/{state['entries'][0]['id']}", {
+                **scope, 'source': dm_control(), 'revision': state['revision'], 'action': 'share'})
+            assert [(row['scope'], row['category']) for row in shared['entries']] == [('server', 'projects')]
+            await show(w.fri, interaction, scope, state=shared)
+            assert 'projects · across the server: I\'m working on a pixel art game' in shown.await_args.kwargs[
+                'embed'].description
+            for where in (GAMING, THREAD, DM):
+                await w.say(where, 'fri what should i do tonight')
+                assert model_context(w)['personal_memory']['notes'] == [
+                    {'category': 'projects', 'evidence': project, 'scope': 'server', 'provenance': []}]
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_an_older_fri_without_projects_still_lists_and_uses_one(monkeypatch, tmp_path):
+    """A Fri released before projects notes, against a controller that keeps them: nothing on the way in checks."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        monkeypatch.setattr('fri.fri_memory.CATEGORIES', ('nickname', 'games', 'music', 'hobbies', 'conversation'))
+        shown = AsyncMock()
+        monkeypatch.setattr('fri.fri_panel.reply', shown)
+        monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+        try:
+            project = 'I main Mercy'
+            w.store.save_chat('123', 'public:1', '20', 0, project, 'ok', 'model', 'high', notes=note(project, 'projects'),
+                              source=discord_source(w.message(GENERAL, project)).model_dump(), provenance=[],
+                              audience='server')
+            await w.say(GENERAL, 'fri hi')
+            assert [n['category'] for n in model_context(w)['personal_memory']['notes']] == ['projects']
+            here, _, _ = await w.say(GENERAL, 'what do you remember about me')
+            dm, _, _ = await w.say(DM, 'what do you remember about me')
+            assert project in here.reply and '**only in #general**\n- '+project in dm.reply
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            await show(w.fri, Mock(spec=discord.Interaction, guild_id=None, channel_id=DM, user=SimpleNamespace(id=20)),
+                       scope)
+            assert 'projects · only in #general: '+project in shown.await_args.kwargs['embed'].description
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            assert MemoryView(w.fri, scope, state).children[0].options[0].label == project
         finally:
             await w.fri.close()
     run(scenario)
