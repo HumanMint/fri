@@ -348,3 +348,46 @@ def test_an_image_only_post_deleted_while_its_author_is_checked_stays_out_of_the
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_meme_outside_the_live_view_deleted_during_the_turn_check_never_reaches_the_next_request(monkeypatch, tmp_path):
+    """A DM read's post isn't in the live view; once looked at, its delete is marked (fri #90)."""
+    async def scenario():
+        w, post, rows, sent = image_world(monkeypatch, tmp_path)
+        w.fri.chat.headers = AsyncMock(return_value={'Authorization': 'Bearer synthetic'})
+        agent, api, deleted = w.fri.agent, w.fri.api, []
+
+        async def delete_during_turn_check(method, path, payload=None):
+            result = await api(method, path, payload)
+            if path == '/chat/turn/check' and len(sent) == 1 and not deleted:  # Gene's check before the second request.
+                deleted.append(post.id)
+                del rows[post.id]
+                agent.unsend(GENERAL, [post.id])
+            return result
+        w.fri.api = delete_during_turn_check
+        text = 'fri pick the best meme in general'
+        try:
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert deleted == [post.id] and len(sent) == 1
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_meme_deleted_after_the_last_request_withholds_the_reply(monkeypatch, tmp_path):
+    """What the model made of a looked-at post is in the turn's shown set, so delivery refuses after its delete."""
+    async def scenario():
+        w, post, rows, sent = image_world(monkeypatch, tmp_path)
+        w.fri.chat.headers = AsyncMock(return_value={'Authorization': 'Bearer synthetic'})
+        agent = w.fri.agent
+        text = 'fri pick the best meme in general'
+        try:
+            result = await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert len(sent) == 2 and result.reply
+            del rows[post.id]
+            agent.unsend(GENERAL, [post.id])  # After the last request, before delivery.
+            assert agent.unsent.keys() & result.shown == {post.id}  # What reply_once refuses on.
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())

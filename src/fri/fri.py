@@ -337,6 +337,11 @@ class Fri(discord.Client):
     async def chat_once(self, text, context):
         async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
             fence = context.get('fence')
+            looked = [read['event'].id for read in context.get('image_reads', [])]
+            if context.get('image_event') is not None:
+                looked.append(context['image_event'].id)
+            if self.agent:  # Before the checks below refetch them: a delete after that is marked (see unsend).
+                self.agent.saw(looked)
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
@@ -370,11 +375,9 @@ class Fri(discord.Client):
                 if any(int(mid) in self.agent.unsent for mid in asked):
                     raise GateClosed('message deleted')
                 # A post Fri looked at, deleted during the last waits (the gate, Gene's check): its image stays out.
-                looked = [read['event'].id for read in context.get('image_reads', [])]
-                if context.get('image_event') is not None:
-                    looked.append(context['image_event'].id)
                 if any(mid in self.agent.unsent for mid in looked):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+                seen.update(looked)  # And a delete before delivery withholds what the model made of it.
                 if 'recent' in context:
                     context['recent'] = [row for row in context['recent']
                                          if row.get('gene_error') or int(row['id']) not in self.agent.unsent]

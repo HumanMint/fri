@@ -165,6 +165,7 @@ class Agent:
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
+        self.looked = {}  # Posts a turn looked at (look()) -> when (monotonic), oldest first: see unsend.
         self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
 
@@ -303,7 +304,7 @@ class Agent:
         investigation."""
         ids, now = {int(i) for i in ids}, time.monotonic()
         def handled(i):
-            return self.handling[i] or i in self.replying or i in self.saving
+            return self.handling[i] or i in self.replying or i in self.saving or i in self.looked
         rows = self.recent.get(channel)  # Never index: that would add a channel for attention to scan.
         # Raw events arrive from every channel Fri can see. Marked: what Fri is handling or saving, and what
         # its live view holds, which a model call may have been shown and attention may pick. So every mark
@@ -327,6 +328,16 @@ class Agent:
         for key in [key for key, latest in self.pending.items() if key[0] == channel and latest in ids]:
             del self.pending[key]  # Its burst is dropped below; nothing is pending for that member now.
         self.bursts.unsend(channel, ids)
+
+    def saw(self, ids):
+        """Posts a turn looked at, outside the live view: a delete is marked for an hour, past any reply
+        still running, so the turn's last checks and its delivery notice it (see unsend)."""
+        now = time.monotonic()
+        for i in ids:
+            self.looked.pop(i, None)
+            self.looked[i] = now
+        while self.looked and now-next(iter(self.looked.values())) > REDELIVERY_SECONDS:
+            del self.looked[next(iter(self.looked))]
 
     def edit(self, channel, message):
         """A member's edit shows in Fri's live view as they left it. Fri's and Gene's rows keep what they
