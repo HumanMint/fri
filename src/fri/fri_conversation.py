@@ -245,14 +245,38 @@ async def evidence(agent, message, burst):
 async def unchanged(agent, message, context):
     """A final privacy/source fence before tools and before returning quoted evidence."""
     import discord
+
+    async def withdrawn(row, limit):
+        """Whether Discord confirms the row's message deleted or edited; if so it leaves the live view too."""
+        from types import SimpleNamespace
+        try:
+            current = await message.channel.fetch_message(int(row['source']['id']))
+        except discord.NotFound:
+            current = None
+        except (discord.HTTPException, ValueError):
+            return False  # Unconfirmed: refused, but not withdrawn.
+        if current is None or getattr(current, 'edited_at', None) is not None or clean(current.content, limit) != row['text']:
+            agent.withdraw(SimpleNamespace(id=int(row['source']['id']), channel=message.channel))
+            return True
+        return False
+
     try:
         if context.get('reply_target') != await reply_target(agent, message):
+            for row in context.get('reply_target', []):
+                await withdrawn(row, 1800)
             return False
-        for row in context.get('message_burst', []):
-            current = await message.channel.fetch_message(int(row['source']['id']))
+        unchanged = True
+        for row in context.get('message_burst', []):  # Every one, so each changed message is withdrawn.
+            try:
+                current = await message.channel.fetch_message(int(row['source']['id']))
+            except discord.NotFound:
+                await withdrawn(row, MAX_TEXT)
+                unchanged = False
+                continue
             if (not same_source(discord_source(current), row['source']) or
                     clean(current.content, MAX_TEXT) != row['text'] or current.webhook_id):
-                return False
-        return True
+                await withdrawn(row, MAX_TEXT)
+                unchanged = False
+        return unchanged
     except (discord.HTTPException, ValueError):
         return False

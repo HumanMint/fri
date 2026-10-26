@@ -557,3 +557,63 @@ def test_withdrawn_ids_are_kept_by_age_not_count(monkeypatch):
     clock[0] += 3601  # An hour later no turn still holds a copy.
     agent.withdraw(SimpleNamespace(id=9999, channel=channel))
     assert list(agent.withdrawn) == ['9999']
+
+
+@pytest.mark.parametrize('kind', ['burst', 'reply_target'])
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+@pytest.mark.parametrize('consumer', ['direct', 'attention'])
+def test_a_change_seen_by_the_final_conversation_check_stays_out_of_later_requests(monkeypatch, tmp_path, kind, change, consumer):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        source = message('fri private caption ' + MARKER)
+        latest = message('fri explain it please', user=20 if kind == 'burst' else 30)
+        cache(agent, channel, source)
+        burst = []
+        if kind == 'burst':
+            burst = [(0, item, item.content) for item in [source, latest]]
+        else:
+            latest.reference = SimpleNamespace(message_id=source.id, channel_id=1)
+
+        requests = []
+        model(fri, requests)
+        fri.chat_once = type(fri).chat_once.__get__(fri)
+        original_handler = fri.chat.transport.handler
+        original_fetch = channel.fetch_message.side_effect
+
+        def during_inference(request):
+            if change == 'edited':
+                current = copy.copy(source)
+                current.content = 'never mind'
+                current.edited_at = dt.datetime.now(dt.timezone.utc)
+                rows[source.id] = current
+            else:
+                def deleted(mid):
+                    if mid == source.id:
+                        raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                    return original_fetch(mid)
+                channel.fetch_message.side_effect = deleted
+            return original_handler(request)
+
+        fri.chat.transport.handler = during_inference
+        try:
+            with pytest.raises(UserFeedbackCheckFailure, match='conversation changed'):
+                await fri.talk(123, 1, latest.author.id, latest.content, 'public', event=latest, burst=burst)
+            # Fri has fetched the changed source and refused the original answer.
+            retained = any(row['id'] == str(source.id) for row in agent.recent[1])
+            assert len(requests) == 1
+            requests.clear()
+            model(fri, requests, attention=consumer == 'attention')
+            fri.chat_once = type(fri).chat_once.__get__(fri)
+            later = message('fri what is up?', user=40)
+            if consumer == 'direct':
+                await fri.talk(123, 1, 40, later.content, 'public', event=later)
+            else:
+                cache(agent, channel, later)
+                await agent.attend()
+            assert len(requests) == 1
+            assert MARKER not in json.dumps(requests), f'{kind}/{change}/{consumer}: changed row retained={retained}'
+        finally:
+            await fri.close()
+
+    asyncio.run(scenario())
