@@ -521,30 +521,6 @@ def test_a_dm_report_waits_for_support_dms(world):
     assert sent and world.sent[0]['target_id'] == '777'
 
 
-def test_a_stalled_reaction_never_holds_up_attention_and_is_never_cancelled(world, monkeypatch):
-    monkeypatch.setattr(fri_fixes, 'MARK', 0.05)
-
-    async def scenario():
-        release = asyncio.Event()
-        error = message(GENE)
-        world.found[error.id] = error
-
-        async def rate_limited(emoji):  # discord.py's global rate-limit wait, which must never be cancelled.
-            await release.wait()
-
-        error.add_reaction = AsyncMock(side_effect=rate_limited)
-        world.agent.run = AsyncMock(return_value=({'summary': 'Evidence uncertain', 'proposed_request': 'Fix it'},
-                                                  {}, 'completed'))
-        await asyncio.wait_for(world.agent.investigate(456, {'id': str(error.id), 'text': 'Track Stuck error'}), 1)
-        [task] = fri_fixes.MARKING
-        assert not task.done() and json.loads((world.fri.data/'gene-fixes.json').read_text())
-        release.set()
-        await task
-        assert not task.cancelled() and not fri_fixes.MARKING
-        error.add_reaction.assert_awaited_once_with('👀')
-    asyncio.run(scenario())
-
-
 def owner_tap(fri, job_id):
     return SimpleNamespace(guild_id=None, type=discord.InteractionType.component, user=SimpleNamespace(id=OWNER),
                            client=fri, message=SimpleNamespace(author=SimpleNamespace(id=FRI)),
@@ -726,3 +702,64 @@ def test_fri_waits_out_another_release_going_out_even_if_the_controller_would_cl
     text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
     assert not sent and not world.sent and 'going out' in text
     assert not [c for c in world.fri.api.await_args_list if c.args[1].endswith('/requester-notice')]
+
+
+def test_a_hung_mark_never_holds_up_the_heartbeat(world, monkeypatch):
+    """Discord holding the 👀's fetch (a rate limit, say) doesn't stall attention or the stages after it,
+    and the mark still lands once Discord answers: it is never cancelled."""
+    async def scenario():
+        agent = world.agent
+        error_id = str(snowflake(5))
+        blocked, release = asyncio.Event(), asyncio.Event()
+        gene_error = SimpleNamespace(author=SimpleNamespace(id=agent.gene_id), webhook_id=None, add_reaction=AsyncMock())
+        async def fetch(mid):
+            blocked.set()
+            await release.wait()
+            return gene_error
+        world.room.fetch_message.side_effect = fetch
+        agent.recent[456].append({'id': error_id, 'text': 'Track Stuck error', 'gene_error': True,
+                                  'user_id': str(agent.gene_id), 'at': __import__('time').time()})
+        agent.run = AsyncMock(side_effect=[
+            ({'action': 'investigate', 'source_id': error_id}, {}, 'completed'),
+            ({'summary': 'uncertain', 'proposed_request': 'Fix the stuck track'}, {}, 'completed'),
+        ])
+        original = world.fri.api
+        async def api(method, path, body=None):
+            return agent.state if path == '/agent/state' else await original(method, path, body)
+        world.fri.api = api
+        monkeypatch.setattr('fri.fri_workspace.deliver_one', AsyncMock())
+        monkeypatch.setattr('fri.fri_social.deliver_one', AsyncMock())
+        monkeypatch.setattr(fri_fixes, 'PASS', 0.01)
+        monkeypatch.setattr(fri_fixes, 'MARK', 0.01)
+        agent.check_presence, agent.send_reports, agent.learn = AsyncMock(), AsyncMock(), AsyncMock()
+        later = agent.check_memes = AsyncMock()
+        agent.config['meme_enabled'] = True
+        await asyncio.wait_for(agent.heartbeat.coro(agent), 2)
+        assert blocked.is_set() and (world.fri.data / fri_fixes.FILE).exists()
+        later.assert_awaited_once()
+        gene_error.add_reaction.assert_not_awaited()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*fri_fixes.MARKING), 2)
+        gene_error.add_reaction.assert_awaited_once_with('👀')
+    asyncio.run(scenario())
+
+
+def test_a_pass_still_running_posts_nothing_once_fri_is_paused(world, monkeypatch):
+    error, job_id = filed(world)
+    ship(world.store, job_id)
+    async def scenario():
+        blocked, release = asyncio.Event(), asyncio.Event()
+        async def fetch(mid):
+            blocked.set()
+            await release.wait()
+            return error
+        world.room.fetch_message.side_effect = fetch
+        monkeypatch.setattr(fri_fixes, 'PASS', 0.01)
+        with pytest.raises(TimeoutError):
+            await check(world.agent)
+        await asyncio.wait_for(blocked.wait(), 2)
+        world.agent.config['enabled'] = False  # The owner pauses Fri while Discord answers.
+        release.set()
+        await asyncio.wait_for(fri_fixes.RUNNING[world.agent], 2)
+        assert world.sent == []
+    asyncio.run(scenario())

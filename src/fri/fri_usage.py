@@ -4,7 +4,10 @@ import re
 from collections import defaultdict
 
 SUBJECT = r'(?:(?:my|our|your|the|current|fri\'s)\s+)?(?:token\s+usage|usage|tokens\s+used|token\s+counts?|token\s+totals?)'
-TAIL = r'(?:\s+(?:so far|right now|rn|please|pls|by task|by model|breakdown))*'
+# Rolling windows only, each named exactly in the reply: "today" is the last 24 hours, not since midnight.
+SPAN = (r'(?:(?:for|over|in|from|during)\s+)?(?:(?:the\s+)?(?:last|past)\s+(?:[1-9][0-9]{0,2}\s*'
+        r'(?:hours?|hrs?|h|days?|d|weeks?|wks?|w|months?)|hour|day|week|month)|today|this\s+(?:week|month))')
+TAIL = rf'(?:\s+(?:so far|right now|rn|please|pls|by task|by model|breakdown|{SPAN}))*'
 REQUEST = re.compile(
     rf'(?:{SUBJECT}|'
     rf'(?:(?:can|could|would)\s+(?:you|u)\s+)?(?:show|check|list|give|tell)\s+(?:(?:me|us)\s+)?{SUBJECT}|'
@@ -21,16 +24,61 @@ LABELS = {'conversation': 'chat', 'web_search': 'web lookups', 'attention': 'att
           'evaluation': 'isolated tests', 'reply_check': 'reply checks'}
 
 
-def usage_requested(text):
+CAPABILITY = 'usage-window'
+PERIOD = re.compile(r'(?:last|past)\s+(?:(?P<count>[1-9][0-9]{0,2})\s*)?(?P<unit>hours?|hrs?|h|days?|d|weeks?|wks?|w|months?)\b'
+                    r'|(?P<today>today)|this\s+(?P<this>week|month)')
+UNITS = {'h': ('hour', 3600), 'd': ('day', 86400), 'w': ('week', 7*86400), 'm': ('month', 30*86400)}
+
+
+def normalized(text):
     text = ' '.join(text.casefold().replace('’', "'").split()).strip(' .!?')
     text = re.sub(r'^(?:(?:hey|yo)\s+)?fri\b[,:]?\s*', '', text)
-    text = re.sub(r'^(?:please|pls)\s+', '', text)
-    return bool(REQUEST.fullmatch(text))
+    return re.sub(r'^(?:please|pls)\s+', '', text)
 
 
-def describe_usage(rows, *, by_model=False):
+def usage_requested(text):
+    return bool(REQUEST.fullmatch(normalized(text)))
+
+
+def usage_window(text):
+    """(seconds, label) for the rolling window an explicit request names, or None for all time."""
+    match = PERIOD.search(normalized(text)) if usage_requested(text) else None
+    if not match:
+        return None
+    if match['today']:
+        return 86400, 'the last 24 hours'
+    if match['this']:
+        return (7*86400, 'the last 7 days') if match['this'] == 'week' else (30*86400, 'the last 30 days')
+    name, seconds = UNITS['m' if match['unit'].startswith('mo') else match['unit'][0]]
+    count = int(match['count'] or 1)
+    return count*seconds, f'the last {name}' if count == 1 else f'the last {count} {name}s'
+
+
+def usage_query(text, capabilities, now):
+    """The window to ask for, its label, and whether one was asked for that this controller can't apply."""
+    window = usage_window(text)
+    if window is None or CAPABILITY not in capabilities:
+        return {}, None, window is not None
+    seconds, label = window
+    return {'since': max(0.0, now-seconds)}, label, False
+
+
+def window_applied(rows, query):
+    """Whether the controller says every row covers the since Fri sent. One rolled back under a running Fri,
+    still listed as offering windows since startup, ignores since and marks nothing."""
+    since = query.get('since')
+    return since is not None and isinstance(rows, list) and all(
+        isinstance(row, dict) and type(row.get('since')) in (int, float) and abs(row['since']-since) < 0.001
+        for row in rows)
+
+
+def describe_usage(rows, *, by_model=False, window=None, windowless=False):
+    """window: the label of the period rows cover. windowless: one was asked for, but these are all-time totals."""
     if not rows:
-        return 'nothing recorded for fri yet. this tracker covers fri activity, not the whole subscription.'
+        if window:
+            return f'nothing recorded for fri in {window}. this tracker covers fri activity, not the whole subscription.'
+        return (("the controller can't cut usage by time yet, and nothing's recorded for fri anyway." if windowless
+                 else 'nothing recorded for fri yet.') + ' this tracker covers fri activity, not the whole subscription.')
     # Cached input and reasoning output are only summed over calls that reported them, so they show as
     # counts with a coverage note, never as shares of totals that include calls without them.
     groups = defaultdict(lambda: {'tokens': 0, 'calls': 0, 'cached': None, 'reasoning': None})
@@ -45,7 +93,9 @@ def describe_usage(rows, *, by_model=False):
     total = sum(value['tokens'] for value in groups.values())
     attempts = sum(value['calls'] for value in groups.values())
     qualifier = 'at least ' if missing else ''
-    lines = [f"fri has logged **{qualifier}{total:,} tokens** across **{attempts:,} calls** so far:"]
+    lines = ["the controller can't cut usage by time yet, so this is everything so far."] if windowless else []
+    lines.append(f"fri has logged **{qualifier}{total:,} tokens** across **{attempts:,} calls** "
+                 + (f'in {window}:' if window else 'so far:'))
     ranked = sorted(groups.items(), key=lambda item: item[1]['tokens'], reverse=True)
     if len(ranked) > 6:
         rest = {'tokens': 0, 'calls': 0, 'cached': None, 'reasoning': None}
@@ -62,7 +112,8 @@ def describe_usage(rows, *, by_model=False):
     if any(group['cached'] is not None or group['reasoning'] is not None for _, group in ranked):
         lines.append('cached input and reasoning only count calls that reported each one, '
                      'so they can cover different calls than the totals.')
-    lines.append("cumulative fri activity, not your remaining plan allowance. gene's coding usage is separate.")
+    lines.append(("fri activity in that window" if window else "cumulative fri activity")
+                 + ", not your remaining plan allowance. gene's coding usage is separate.")
     return '\n'.join(lines)
 
 

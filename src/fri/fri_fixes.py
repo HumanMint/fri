@@ -28,9 +28,9 @@ FILE = 'gene-fixes.json'
 WATCHING = 3*86400  # After this a "fixed" line under Gene's error reads as necro-posting, so the watch just ends.
 QUIET = 60  # Someone spoke this recently: wait for a lull instead of talking over them.
 PASS = 10  # How long a heartbeat waits on a pass over the watch list before moving on. It never cancels it.
+MARK = 5  # How long filing an error waits on its 👀 before the attention stage moves on. It never cancels it.
 RUNNING = weakref.WeakKeyDictionary()  # Each agent's pass, so a slow one is waited on again instead of doubled.
-MARK = 5  # How long filing an error waits on its 👀 before attention moves on. It never cancels it either.
-MARKING = set()  # 👀 still waiting on Discord, held so they finish instead of being collected.
+MARKING = set()  # 👀 still on their way after attention moved on, kept so none is dropped unfinished.
 SETTLED = frozenset({'deployed', 'rejected', 'failed', 'needs_attention'})
 CAPABILITY = 'requester-notices'
 JOB = re.compile(r'[a-f0-9]{12}')
@@ -96,8 +96,8 @@ async def follow(agent, channel_id, message_id, job):
         private_json(agent.fri.data/FILE, entries)
     except OSError as exc:
         LOG.warning('Gene fix watch not saved: %s', type(exc).__name__)
-    # Filed from the attention stage: a reaction stuck in discord.py's rate-limit wait must not hold up
-    # the heartbeat, and cancelling it there would stall every later Discord call.
+    # The 👀 runs as its own task, waited on for MARK and never cancelled (see check): attention calls this
+    # from the heartbeat, which a Discord read held up by a rate limit must not stall.
     task = asyncio.create_task(mark(agent, channel_id, message_id))
     MARKING.add(task)
     task.add_done_callback(marked)
@@ -149,7 +149,7 @@ async def due(agent, job_id, entry):
     fri = agent.fri
     if expired(entry):
         return 'drop'
-    if not agent.config['proactive'] or room(agent, entry) is None:
+    if not (agent.config['enabled'] and agent.config['proactive']) or room(agent, entry) is None:
         return 'keep'  # No reads while Fri couldn't post anyway; the three days still run.
     try:
         job = await fri.api('GET', '/requests/'+job_id)
@@ -176,8 +176,8 @@ async def due(agent, job_id, entry):
     if (await fri.api('GET', '/status')).get('active_sha') != sha:
         return 'drop'  # A rollback or a newer release came first, so "fixed" might not hold.
     channel = room(agent, entry)
-    if not agent.config['proactive'] or channel is None:
-        return 'keep'
+    if not (agent.config['enabled'] and agent.config['proactive']) or channel is None:
+        return 'keep'  # Paused, or proactive posts off, while Discord answered.
     last = channel.last_message_id
     if last and time.time()-discord.utils.snowflake_time(last).timestamp() < QUIET:
         return 'keep'
