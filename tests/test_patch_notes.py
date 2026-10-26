@@ -334,6 +334,35 @@ def test_an_untrustworthy_newest_id_is_not_kept_as_an_anchor(dm, tmp_path):
     assert len(dm.sends) == 1
 
 
+def test_a_retry_keeps_the_first_attempts_boundary(dm, tmp_path, monkeypatch):
+    """The first send's outcome is unknown and it shows up only after the rerun's search: a later rerun still finds it."""
+    dm.messages.append(said(900, 'earlier dm', BOT))
+    dm.lost.add(1)
+    hidden = []
+    sent = dm.send
+    async def unseen(*args, **kwargs):
+        try:
+            return await sent(*args, **kwargs)
+        finally:
+            if len(dm.sends) == 1:
+                hidden.append(dm.messages.pop())  # Not visible in history yet.
+    monkeypatch.setattr(dm, 'send', unseen)
+    with pytest.raises(RuntimeError, match='lost'):
+        run('notes', tmp_path)
+    search = dm.history
+    def late(**kwargs):
+        if kwargs.get('limit') == 1 and hidden:
+            dm.messages.append(hidden.pop())  # Lands between the rerun's search and its anchor read.
+        return search(**kwargs)
+    monkeypatch.setattr(dm, 'history', late)
+    dm.refused.add(2)
+    with pytest.raises(RuntimeError, match='refused'):
+        run('notes', tmp_path)
+    assert json.loads((tmp_path / 'patch-notes.json').read_text())['anchors']['0.4.0']['1']['after'] == '900'
+    run('notes', tmp_path)
+    assert len(dm.sends) == 2 and [m.content for m in dm.messages] == ['earlier dm', 'notes']
+
+
 def test_two_unfinished_releases_with_the_same_text_are_refused_not_guessed(dm, tmp_path):
     """0.3.9's part never reached Discord and 0.4.0's identical part did: the DM can't say whose it is."""
     text = paragraph(1500, 's')

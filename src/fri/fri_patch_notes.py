@@ -229,11 +229,15 @@ async def send(version, text, *, token, owner_id, data, out=print):
                     out(f'part {index}/{len(chunks)}: already sent')
                     continue
                 taken = set(sent_ids(state))
-                message = 'attempted_at' in part and await landed(
-                    dm, client.user.id, chunk, search_from(state, version, index, part), taken)
+                start = 'attempted_at' in part and search_from(state, version, index, part)
+                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, start, taken)
                 if not message:
                     attempted_at = time.time()
-                    set_anchor(state, version, index, await anchor(dm, attempted_at))
+                    mark = await anchor(dm, attempted_at)
+                    if not isinstance(start, (bool, dt.datetime)):
+                        # A retry keeps the earlier boundary: the earlier send may still land behind a new one.
+                        mark = {'attempted_at': attempted_at, 'after': str(start.id) if start else ''}
+                    set_anchor(state, version, index, mark)
                     part.update(attempted_at=attempted_at, sha256=hashes[index - 1])
                     private_json(path, state)
                     message = await dm.send(chunk, nonce=nonce(version, digest, index),
