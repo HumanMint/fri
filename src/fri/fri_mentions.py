@@ -23,6 +23,7 @@ CONTEXT_CHANGED = 'things changed while i was typing. ping me again and i’ll c
 NOTICES = {'stale event': 'took me too long on that one. ping me again if you still need me.',
            'message changed': 'you edited that before i could answer. ping me again with the new version.',
            'nearby message changed': CONTEXT_CHANGED, 'nearby privacy changed': CONTEXT_CHANGED,
+           'image changed': CONTEXT_CHANGED,
            'check failed: ControllerRejected': CONTEXT_CHANGED}
 GLITCH = 'that one glitched on my end. ping me again.'
 
@@ -47,11 +48,19 @@ class Invitation:
                       'channel_id': str(message.channel.id), 'conversation_id': f'public:{message.channel.id}'}
         self.grant = None
         self.rows, self.events, self.profiles, self.snapshots = [], {}, {}, {}
-        self.image = None
+        self.image = None  # The one image post it inspects, snapshotted as chosen (see current).
         self.ambiguous_images = False
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
         self.revision = None  # The author's privacy revision as Fri first read it for this ping.
+
+    @property
+    def image(self):
+        return self._image
+
+    @image.setter
+    def image(self, message):
+        self._image, self.image_snapshot = message, fingerprint(message) if message is not None else None
 
     @classmethod
     async def create(cls, agent, message):
@@ -109,6 +118,11 @@ class Invitation:
                 return self.refuse('missing permissions')
         return True
 
+    def unchanged(self, current):
+        """The ping as Discord has it now is still the one that came in, and still pings Fri."""
+        return (current.id == self.event.id and not current.author.bot and not current.webhook_id and
+                fingerprint(current) == self.original and explicit_mention(current, self.fri.user.id))
+
     async def current(self, *, check_evidence=True, control=False):
         try:
             age = time.time()-discord.utils.snowflake_time(self.event.id).timestamp()
@@ -116,11 +130,16 @@ class Invitation:
                 return self.refuse('stale event')
             if age < -5:
                 return self.refuse('clock skew')
+            # First, the image post it inspects when that's neither the ping nor a nearby message (e.g. their
+            # photo just before the ping), so the reads below, the ping's among them, come after it.
+            image = self.image
+            if check_evidence and image is not None and image.id != self.event.id and image.id not in self.events:
+                if fingerprint(await self.event.channel.fetch_message(image.id)) != self.image_snapshot:
+                    return self.refuse('image changed')
             if not await self.access(control=control):
                 return False
             current = await self.event.channel.fetch_message(self.event.id)
-            if (current.id != self.event.id or current.author.bot or current.webhook_id or
-                    fingerprint(current) != self.original or not explicit_mention(current, self.fri.user.id)):
+            if not self.unchanged(current):
                 return self.refuse('message changed')
             if check_evidence and self.grant:
                 profiles = await self.profile_sources(list(self.events.values()))
@@ -130,6 +149,9 @@ class Invitation:
                     current = await self.event.channel.fetch_message(mid)
                     if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
                         return self.refuse('nearby message changed')
+                # The ping again, as an edit during the privacy read would otherwise go unseen.
+                if not self.unchanged(await self.event.channel.fetch_message(self.event.id)):
+                    return self.refuse('message changed')
             return True
         except ControllerUnavailable:
             raise  # Nothing changed; the controller is down, and the caller's outage handling says so.
@@ -140,12 +162,13 @@ class Invitation:
         if not await self.current():
             raise commands.UserFeedbackCheckFailure(CHANGED)
 
-    async def notice(self, reason, *, fenced=True):
+    async def notice(self, reason, *, fenced=True, control=False):
         """What to say instead of a reply that can't go out, or None to stay quiet.
 
         Only while the ping still stands: Fri can still answer there, the message still pings Fri,
         and, if `fenced`, its author hasn't erased since Fri first saw it. A privacy control isn't:
-        it always hears how it went, whatever it or another one changed. Never any content or context.
+        it always hears how it went, whatever it or another one changed, and with Fri paused, as it works
+        then (see access). Never any content or context.
         """
         if not (text := notice_for(reason)):
             return None
@@ -156,7 +179,7 @@ class Invitation:
                     revision = await self.agent.revision(self.event.author.id)
                 except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
                     return None
-            if not await self.access():
+            if not await self.access(control=control):
                 return None
             current = await self.event.channel.fetch_message(self.event.id)
             if (current.id != self.event.id or current.author.id != self.event.author.id or current.author.bot or

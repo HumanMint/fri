@@ -16,10 +16,11 @@ PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_th
 
 
 def server_wide(channel):
-    """Everyone in the server can read it, now. Only such a channel feeds a member's profile.
+    """Everyone in the server can read it and its history, now. Only such a channel feeds a member's profile.
 
-    A private thread, an age-restricted channel, or one the default role can't view keeps what was
-    said in it to itself. Anything Fri can't resolve counts as restricted.
+    A private thread, an age-restricted channel, one the default role can't view or read back, or one that
+    keeps out any role or member keeps what was said in it to itself: the default role alone doesn't prove
+    everyone can read it (fri #45). Anything Fri can't resolve counts as restricted.
     """
     guild = getattr(channel, 'guild', None)
     if guild is None:
@@ -32,9 +33,16 @@ def server_wide(channel):
     if channel is None or not callable(is_nsfw) or is_nsfw():
         return False
     try:
-        return bool(channel.permissions_for(guild.default_role).view_channel)
+        everyone = channel.permissions_for(guild.default_role)
+        if not (everyone.view_channel and everyone.read_message_history):
+            return False
+        for overwrite in channel.overwrites.values():
+            deny = overwrite.pair()[1]
+            if deny.view_channel or deny.read_message_history:
+                return False
     except (AttributeError, TypeError):
         return False
+    return True
 
 
 def before_removal(message_id, profile):

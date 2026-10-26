@@ -63,8 +63,9 @@ def world(monkeypatch, tmp_path):
     def text_channel(cid, name, nsfw=False):
         item = SimpleNamespace(id=cid, guild=guild, parent_id=None, name=name, typing=typing, history=history)
         item.is_nsfw = lambda: nsfw
-        item.permissions_for = lambda who: (discord.Permissions(view_channel=readable[cid]) if who is everyone
-                                            else discord.Permissions.all())
+        item.permissions_for = lambda who: (discord.Permissions(view_channel=readable[cid], read_message_history=True)
+                                            if who is everyone else discord.Permissions.all())
+        item.overwrites = {}
         return item
 
     channels = {GENERAL: text_channel(GENERAL, 'general'), GAMING: text_channel(GAMING, 'gaming'),
@@ -498,11 +499,20 @@ def test_an_older_controller_or_fri_keeps_todays_per_conversation_memory(monkeyp
 def test_server_wide_needs_everyone_to_read_a_safe_for_work_channel():
     everyone = SimpleNamespace(name='@everyone')
     guild = SimpleNamespace(default_role=everyone)
-    def channel(view=True, nsfw=False):
-        return SimpleNamespace(guild=guild, is_nsfw=lambda: nsfw,
-                               permissions_for=lambda who: discord.Permissions(view_channel=view and who is everyone))
+    def channel(view=True, nsfw=False, history=True, overwrites=None):
+        return SimpleNamespace(guild=guild, is_nsfw=lambda: nsfw, overwrites=overwrites or {},
+                               permissions_for=lambda who: discord.Permissions(
+                                   view_channel=view and who is everyone, read_message_history=history))
     assert server_wide(channel())
     assert not server_wide(channel(view=False)) and not server_wide(channel(nsfw=True))
+    assert not server_wide(channel(history=False))  # Later readers couldn't scroll back to it.
+    # One role or one member kept out (fri #45): the default role alone doesn't prove everyone reads it.
+    for deny in (discord.PermissionOverwrite(view_channel=False), discord.PermissionOverwrite(read_message_history=False)):
+        assert not server_wide(channel(overwrites={'role 50': deny}))
+    assert server_wide(channel(overwrites={'role 50': discord.PermissionOverwrite(send_messages=False)}))
+    without = channel()
+    del without.overwrites
+    assert not server_wide(without)
     assert not server_wide(SimpleNamespace(guild=None)) and not server_wide(None)
     assert not server_wide(SimpleNamespace(guild=guild))  # Unknown channel kinds count as restricted.
     for kind, expected in ((discord.ChannelType.public_thread, True), (discord.ChannelType.news_thread, True),
