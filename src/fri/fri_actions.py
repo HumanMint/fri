@@ -1,6 +1,7 @@
 """Bounded conversational tools. Discord text never selects authority or scope."""
 
 import asyncio
+import copy
 import datetime as dt
 import json
 import time
@@ -14,6 +15,7 @@ from .fri_conversation import PERSISTENT_MODEL_WRITES
 from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
+from .fri_images import image_context, look, media
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
 from .gene_controls import COMMANDS, arguments, grounded, music_control_intent, own_words, requested
@@ -124,7 +126,29 @@ class Actions:
             permissions = channel.permissions_for(member)
             if permissions.view_channel and permissions.read_message_history:
                 result[str(channel.id)] = channel
+        if fresh and self.sources & result.keys():
+            result = await self.recheck(result, member)
         return result
+
+    async def recheck(self, channels, member):
+        """Drop each channel this turn read from that `member` can't read now, judged from fetched
+        overwrites and roles: the cached channel can lag a revoke (see Invitation.access)."""
+        read = sorted(self.sources & channels.keys())
+        guild = channels[read[0]].guild  # channels() keeps only this server's channels
+        try:
+            fresh_guild = copy.copy(guild)
+            fresh_guild._roles = {role.id: role for role in await guild.fetch_roles()}
+            for channel_id in read:
+                channel = await guild.fetch_channel(int(channel_id))
+                parent = await guild.fetch_channel(channel.parent_id) if isinstance(channel, discord.Thread) else channel
+                parent = copy.copy(parent)
+                parent.guild = fresh_guild
+                permissions = parent.permissions_for(member)
+                if not (permissions.view_channel and permissions.read_message_history):
+                    del channels[channel_id]
+        except discord.HTTPException:
+            return {key: value for key, value in channels.items() if key not in self.sources}
+        return channels
 
     async def available(self):
         if self.invitation and self.invitation.outside:
@@ -145,14 +169,17 @@ class Actions:
         actions = {'read_recent': {'channels': [{'channel_id': k, 'name': clean(v.name, 60)}
                                                 for k, v in channels.items()],
                     'default_channel_id': next(iter(channels)), 'limit': 20, 'max_age_days': 7,
-                    'description': 'Read one small recent text batch when asked. No images or saved personal notes.',
+                    'description': 'Read one small recent batch when asked: text, what each post carries '
+                    '(image, gif, video, file), and a look at up to four of the newest still images. '
+                    'No saved personal notes.',
                     'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
         if self.invitation:
-            actions['read_recent'].update(limit=12, max_age_days=30/(24*60),
-                description='Read up to twelve preceding same-channel messages from the last thirty minutes '
-                'when this mention needs nearby conversation or meme context. Can inspect one attributed '
-                'small still-image post, up to two attachments. This read disables persistent writes '
-                'and external image selection for this turn; complete current requests need no read.')
+            actions['read_recent'].update(limit=12, max_age_days=6/24,
+                description='Read up to twelve preceding same-channel messages from the last six hours '
+                'when this mention needs nearby conversation, memes or images. Looks at the image the ping '
+                'replies to or carries, else up to four of the newest nearby still images, each with its author. '
+                'This read disables persistent writes and external image selection for this turn; '
+                'complete current requests need no read.')
         if isinstance(self.event, discord.Message) and history_requested(self.message):
             actions['history_search'] = self.history.descriptor(channels)
         if self.owner:
@@ -329,6 +356,9 @@ class Actions:
             overview = await self.fri.api('POST', '/agent/learning/overview', self.agent.identity(self.user))
             self.overview = self.scoped_overview(overview, channels)
             self.sources.update(self.overview['history_channels'])
+            # A retained report can come from a channel that is no longer a learning channel.
+            self.sources.update(row['channel_id'] for key in ('reports', 'summaries', 'historical_notes')
+                                for row in self.overview[key] if row.get('channel_id'))
             return {'kind': kind, 'completion': receipt, 'evidence': self.overview}
         if kind != 'read_recent':
             return {'blocked': 'That action is not available.'}
@@ -337,10 +367,10 @@ class Actions:
         if channel_id not in channels:
             return {'blocked': 'That channel is outside this conversation’s readable scope.'}
         catch_up = action.get('window') == 'since_my_last_message'
+        self.sources.add(channel_id)
         if self.invitation and not catch_up:
             return await self.invited_context(channel_id)
         channel = channels[channel_id]
-        self.sources.add(channel_id)
         scope = getattr(channel, 'parent_id', None) or channel.id
         after = time.time()-min(7, self.agent.config['history_days'])*86400
         # A catch-up's window hangs off the request, so a slow model call can't move where they left.
@@ -359,7 +389,7 @@ class Actions:
         # A catch-up stops at the speaker's last message before anyone else spoke. Messages
         # they sent just before asking, or that only bots answered, are them coming back, not leaving.
         returned, others, left, full = asked-RETURN_SECONDS, False, None, False
-        records, scanned, profiles, shown, size = [], 0, {}, {}, 0
+        records, scanned, profiles, shown, size, posts = [], 0, {}, {}, 0, []
         async for message in channel.history(**options):
             scanned += 1
             if message.author.bot or message.webhook_id:
@@ -371,7 +401,8 @@ class Actions:
                     break
                 continue
             others = True
-            if not message.content.strip():
+            carries = media(message)
+            if not message.content.strip() and not carries:
                 continue
             if user not in profiles:
                 profiles[user] = await self.agent.profile(scope, user)
@@ -381,6 +412,8 @@ class Actions:
             if catch_up:  # Up to 100 rows, so drop the links and keep each line short.
                 row = {'user_id': user, 'name': clean(message.author.display_name, 60),
                        'at': message.created_at.isoformat(timespec='minutes'), 'text': clean(message.content, 300)}
+                if carries:
+                    row['attachments'] = carries
                 size += len(json.dumps(row))
                 if size > CATCH_UP_CHARS:
                     full = True
@@ -390,11 +423,19 @@ class Actions:
                 records.append(row)
                 continue
             self.observe(scope, user, profile['revision'])
-            records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
-                            'at': message.created_at.isoformat(), 'text': clean(message.content, 500)})
+            row = {'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
+                   'at': message.created_at.isoformat(), 'text': clean(message.content, 500)}
+            if carries:
+                row['attachments'] = carries
+                posts.append(message)
+            records.append(row)
         result = {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
                   'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': after,
-                  'images_inspected': False, 'personal_notes_saved': 0}
+                  'images_inspected': 0, 'personal_notes_saved': 0}
+        # Asked to look around, Fri looks at the pictures too, as a member scrolling up would.
+        if posts and self.media_allowed and self.turn_context is not None:
+            result.update(await look(self.turn_context, posts))
+            self.image_context = image_context(self.turn_context)
         if catch_up:
             self.caught_up = {'channel': channel, 'options': options, 'shown': shown}
             result.update(window='since_my_last_message',
@@ -422,10 +463,11 @@ class Actions:
         context = self.turn_context
         context.update(invitation.context())
         await attach(context, self.event, self.message, source=invitation.image, invitation=invitation)
-        self.image_context = {key: context[key] for key in ('image_sources', 'image_event', 'image_invitation') if key in context}
+        looked = await invitation.look(context) if self.media_allowed else {}
+        self.image_context = image_context(context)
         return {'kind': 'read_recent', 'channel_id': str(channel_id), 'messages': invitation.rows,
-                'images_inspected': bool(context.get('images')), 'personal_notes_saved': 0,
-                'ambiguous_context_images': invitation.ambiguous_images}
+                'images_inspected': len(context.get('images', [])), 'personal_notes_saved': 0,
+                'images_not_inspected': looked.get('images_not_inspected', 0)}
 
     async def control(self, action, channels):
         if self.guild != self.fri.guild_id or not isinstance(self.event, discord.Message):

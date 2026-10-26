@@ -60,7 +60,8 @@ BEFORE = {'plain': (19, 19), 'image': (24, 24), 'image and tool': (24, 24)}
 # After the model: the ping's last check (its access, the ping before and after the privacy read), which
 # covers its image. The tool adds its own checks before acting, its read, and one before the model hears
 # the turn again.
-AFTER = {'plain': (6, 6), 'image': (6, 6), 'image and tool': (47, 47)}
+# With a tool, the posts its read looked at are refetched before the model hears it again (2 reads).
+AFTER = {'plain': (6, 6), 'image': (6, 6), 'image and tool': (49, 49)}
 
 
 @pytest.mark.parametrize('case', ['plain', 'image', 'image and tool'])

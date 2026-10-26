@@ -100,9 +100,12 @@ def harness(monkeypatch, tmp_path):
         for row in rows[:kwargs['limit']]:
             if row.created_at > kwargs['after']:
                 yield row
-    channels = {i: SimpleNamespace(id=i, name='channel-'+str(i), guild=SimpleNamespace(id=123),
+    # One server whose REST copies (fresh access checks) match the cache unless a test changes them.
+    guild = SimpleNamespace(id=123, fetch_roles=AsyncMock(return_value=[]))
+    channels = {i: SimpleNamespace(id=i, name='channel-'+str(i), guild=guild,
         nsfw=False, parent_id=None, history=history, permissions_for=lambda _: SimpleNamespace(
             view_channel=True, read_message_history=True)) for i in (1, 2, 3, 456)}
+    guild.fetch_channel = AsyncMock(side_effect=lambda cid: channels[cid])
     fri.get_channel = lambda cid: channels.get(cid)
     return fri, agent, channels, reads
 

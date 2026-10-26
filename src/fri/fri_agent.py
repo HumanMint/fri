@@ -29,6 +29,7 @@ from .fri_errors import (
     ControllerUnavailable,
     GateClosed,
 )
+from .fri_images import media
 from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
@@ -165,6 +166,7 @@ class Agent:
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
+        self.looked = {}  # Posts a turn looked at (look()) -> when (monotonic), oldest first: see unsend.
         self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
 
@@ -303,7 +305,7 @@ class Agent:
         investigation."""
         ids, now = {int(i) for i in ids}, time.monotonic()
         def handled(i):
-            return self.handling[i] or i in self.replying or i in self.saving
+            return self.handling[i] or i in self.replying or i in self.saving or i in self.looked
         rows = self.recent.get(channel)  # Never index: that would add a channel for attention to scan.
         # Raw events arrive from every channel Fri can see. Marked: what Fri is handling or saving, and what
         # its live view holds, which a model call may have been shown and attention may pick. So every mark
@@ -328,6 +330,16 @@ class Agent:
         for key in [key for key, latest in self.pending.items() if key[0] == channel and latest in ids]:
             del self.pending[key]  # Its burst is dropped below; nothing is pending for that member now.
         self.bursts.unsend(channel, ids)
+
+    def saw(self, ids):
+        """Posts a turn looked at, outside the live view: a delete is marked for an hour, past any reply
+        still running, so the turn's last checks and its delivery notice it (see unsend)."""
+        now = time.monotonic()
+        for i in ids:
+            self.looked.pop(i, None)
+            self.looked[i] = now
+        while self.looked and now-next(iter(self.looked.values())) > REDELIVERY_SECONDS:
+            del self.looked[next(iter(self.looked))]
 
     def edit(self, channel, message):
         """A member's edit shows in Fri's live view as they left it. Fri's and Gene's rows keep what they
@@ -1025,6 +1037,14 @@ class Agent:
                 return
         text = clean(raw, 4000)
         if not text:
+            if not message.author.bot and not dm and self.config['enabled'] and media(message):
+                # An uncaptioned meme or pic still belongs in the live view, or "the memes above" is empty.
+                profile = await self.profile(parent, message.author.id)
+                # Deleted while the profile read waited: like a text post, it stays out.
+                if profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent:
+                    self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
+                        'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
+                        'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
             return self.miss(message, 'no text')
         directed = text if dm else await addressed_text(message, self.fri.user.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
@@ -1064,7 +1084,8 @@ class Agent:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                     'name': clean(message.author.display_name, 60), 'text': text[:500], 'at': time.time(),
-                    'revision': profile.get('revision', 0), 'gene_error': False})
+                    'revision': profile.get('revision', 0), 'gene_error': False,
+                    **({'attachments': media(message)} if media(message) else {})})
         elif message.author.bot:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})
@@ -1584,7 +1605,8 @@ class Agent:
         for channel_id in list(self.recent):
             records = await self.context_messages(channel_id, raw_errors=True)
             # Messages the direct path answers stay in records as context but aren't decided again here.
-            fresh = [r for r in records if not r.get('fri') and r['id'] not in self.direct and
+            # A bare image is context for a reply, never something ambient attention answers by itself.
+            fresh = [r for r in records if not r.get('fri') and r['id'] not in self.direct and r['text'] and
                      int(r['id']) > self.seen.get(channel_id, 0)]
             if not fresh or now-self.last_attention.get(channel_id, 0) < self.config['heartbeat_seconds']:
                 continue

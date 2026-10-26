@@ -25,6 +25,8 @@ from .fri_errors import (
     ControllerUnavailable,
     GateClosed,
 )
+from .fri_images import CHANGED as IMAGES_CHANGED
+from .fri_images import unchanged as images_unchanged
 from .fri_memory import (
     PROFILES,
     describe_memory,
@@ -336,14 +338,30 @@ class Fri(discord.Client):
     async def chat_once(self, text, context):
         async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
             fence = context.get('fence')
-            if fence and fence.get('gate'):
-                await fence['gate']()
+            looked = [read['event'].id for read in context.get('image_reads', [])]
+            if context.get('image_event') is not None:
+                looked.append(context['image_event'].id)
+            if self.agent:  # Before the checks below refetch them: a delete after that is marked (see unsend).
+                self.agent.saw(looked)
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
             if fence and fence.get('invitation'):
                 await fence['invitation'].require_current()
             elif fence:
+                # What came from a channel they can't see now (a read, an invited look around, Gene's
+                # receipts, a learning report) never reaches the request either. Delivery checks it again.
+                # First, so nothing waits between the privacy check below and the request.
+                actions = fence['actions']
+                if actions and actions.sources and not actions.sources <= set(await actions.channels(fresh=True)):
+                    raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
+                # Every post Fri looked at is still there as it was read: an edit or delete while Fri signed
+                # in, or while the access check above waited on Discord, never reaches the model.
+                if actions and not await images_unchanged(actions.image_context, actions.event):
+                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+                # A DM's own gates after those Discord waits, so a member who left during them is caught.
+                if fence.get('gate'):
+                    await fence['gate']()
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
                     context, fence['turn']['user_id'], fence['actions'])})
             # A message its author edited or deleted since the live view was copied: its old words stay out.
@@ -366,10 +384,18 @@ class Fri(discord.Client):
                          *(row['source']['id'] for row in context.get('message_burst', []))]
                 if any(int(mid) in self.agent.unsent for mid in asked):
                     raise GateClosed('message deleted')
+                # A post Fri looked at, deleted during the last waits (the gate, Gene's check): its image stays out.
+                if any(mid in self.agent.unsent for mid in looked):
+                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+                seen.update(looked)  # And a delete before delivery withholds what the model made of it.
                 if 'recent' in context:
                     context['recent'] = [row for row in context['recent']
                                          if row.get('gene_error') or int(row['id']) not in self.agent.unsent]
                     seen.update(int(row['id']) for row in context['recent'] if not row.get('gene_error'))
+            # The DM switch again, with nothing to wait on between it and the request: the checks above
+            # wait on Discord and Gene, and the owner can turn DMs off meanwhile.
+            if fence and fence.get('dms') and not fence['dms']():
+                raise GateClosed('dms off')
         # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
         seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
         result = await self.chat.respond(text, context, ready=ready)
@@ -580,7 +606,8 @@ class Fri(discord.Client):
                 if inspect_images:
                     await attach_images(context, event, text, source=image_source, invitation=invitation)
                 if actions:
-                    actions.image_context = {key: context[key] for key in ('image_sources', 'image_event', 'image_invitation') if key in context}
+                    from .fri_images import image_context
+                    actions.image_context = image_context(context)
                 if actions and guild_id == self.guild_id:
                     from .gene_controls import current_music_context, grounded
                     recent = await self.api('POST', '/controls/recent', scope)
@@ -598,6 +625,7 @@ class Fri(discord.Client):
                         if closed := await self.agent.dm_closed(user_id):
                             raise GateClosed(closed)
                     context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
+                    context['fence']['dms'] = lambda: self.agent.config['support_dms']
                 result = await self.chat_once(text, context)
                 # A ping's last check before sending (Agent.reply_once) covers it and its image, and a tool
                 # checks it again before acting, so nothing here repeats that.
@@ -826,7 +854,7 @@ class Fri(discord.Client):
     async def invited_talk(self, invitation, text, typing=None):
         """Outside the ambient scope, one ping has only conversation and public research."""
         from .fri_context import addressed_content
-        from .fri_images import attach
+        from .fri_images import attach, image_context
         from .fri_mentions import force_text
         event, user = invitation.event, invitation.event.author.id
         expected = addressed_content(event.content, self.user.id) or 'hey'
@@ -858,7 +886,8 @@ class Fri(discord.Client):
                 actions.private_evidence = True
                 context['actions'] = await actions.available()
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
-                actions.image_context = {k: context[k] for k in ('image_sources', 'image_event', 'image_invitation') if k in context}
+                await invitation.look(context)  # Up front: an outside ping has no read to decide on.
+                actions.image_context = image_context(context)
                 context['fence'] = {'invitation': invitation, 'shown': set()}  # See chat_once.
                 result = await self.chat_once(text, context)
                 research = None
