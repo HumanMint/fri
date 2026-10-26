@@ -309,7 +309,8 @@ class Agent:
         # its live view holds, which a model call may have been shown and attention may pick. So every mark
         # was a real message Fri had in hand, and an unrelated flood of deletes marks nothing.
         viewed = {int(row['id']) for row in rows or ()}
-        marks = [i for i in ids if i in viewed or handled(i)]
+        # Withdrawn ones too: they left the live view when a check saw them change, but a turn may still hold a copy.
+        marks = [i for i in ids if i in viewed or handled(i) or str(i) in self.withdrawn]
         # Marks last an hour, well past any reply still running (they give up within minutes), unless the
         # message is still being handled. No count limit: one would drop marks a running reply needs.
         expired = []

@@ -617,3 +617,45 @@ def test_a_change_seen_by_the_final_conversation_check_stays_out_of_later_reques
             await fri.close()
 
     asyncio.run(scenario())
+
+
+def test_a_delete_after_a_check_withdrew_the_row_still_stops_a_reply_in_flight(monkeypatch, tmp_path):
+    """A check that sees a message gone drops it from the live view before Discord's delete event arrives.
+    The delete must still be marked, so a reply already composed from a copy isn't delivered (see unsend)."""
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        source = message('here is ' + MARKER, user=20)
+        cache(agent, channel, source)
+        observer = message('<@99> explain that?', user=30)  # Another mention, already holding the source.
+        observer.reference = SimpleNamespace(message_id=source.id, channel_id=1)
+        invitation = await Invitation.create(agent, observer)
+        await invitation.admit()
+        await invitation.collect(include_recent=False)
+        trigger = message('fri what was the caption?', user=40)
+        fetch, requests = channel.fetch_message.side_effect, []
+
+        async def handler(request):
+            requests.append(json.loads(request.content))
+            assert MARKER in json.dumps(requests[-1])
+            def deleted(mid):
+                if mid == source.id:
+                    raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                return fetch(mid)
+            channel.fetch_message.side_effect = deleted
+            assert not await invitation.current()  # The other mention's check withdraws it first.
+            await fri.on_raw_message_delete(SimpleNamespace(channel_id=1, message_id=source.id))
+            result = {'reply': 'the caption was ' + MARKER, 'request_draft': None}
+            return httpx.Response(200, text='data: ' + json.dumps(response_event(content=json.dumps(result))) + '\n\n')
+
+        fri.chat = Chat(SimpleNamespace(access_token=lambda: 'synthetic-review'), httpx.MockTransport(handler))
+        fri.chat.headers = AsyncMock(return_value={'Authorization': 'Bearer synthetic-review'})
+        fri.chat_once = type(fri).chat_once.__get__(fri)
+        try:
+            await agent.respond(trigger, trigger.content, forgotten=0, revision=0)
+            assert len(requests) == 1 and source.id in agent.unsent
+            assert not any(MARKER in str(call) for call in trigger.reply.await_args_list)
+            assert MARKER not in str(store.chat_context('123', 'public:1', '40')['turns'])
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
