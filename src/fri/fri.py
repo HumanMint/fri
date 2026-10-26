@@ -515,8 +515,26 @@ class Fri(discord.Client):
                         await last_look(result)
                         await sources_unchanged()
 
+                async def as_read():
+                    """Everything read from Discord before typing started, as it stands now: typing waited on
+                    Discord, and nothing edited or deleted meanwhile may reach the model or a tool."""
+                    if invitation:
+                        await invitation.require_current()  # The ping, its access and what it collected.
+                    elif self.agent and source.kind == 'discord_message':
+                        try:
+                            current = await event.channel.fetch_message(event.id)
+                        except discord.HTTPException:
+                            raise GateClosed('message deleted') from None  # Quiet, as for any taken-back message.
+                        if current.edited_at is not None or current.content != event.content:
+                            raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
+                    await sources_unchanged()
+                    from .fri_images import CHANGED as IMAGES_CHANGED
+                    from .fri_images import still_there
+                    if image_source is not None and image_source is not event and not await still_there(image_source):
+                        raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+
                 if await typing('admitted'):
-                    await sources_unchanged()  # Read before typing started: an edit or delete meanwhile mustn't reach the model.
+                    await as_read()
                 if invitation:
                     if invitation.grant and event.reference and event.reference.message_id:
                         await invitation.collect(include_recent=False)
@@ -587,9 +605,9 @@ class Fri(discord.Client):
                     if not actions or result.action['kind'] not in context['actions']:
                         raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
                     if await typing('action'):  # Checked before typing started: again, before the tool sees anything.
+                        await as_read()
                         await self.api('POST', '/chat/turn/check', {**context['fence']['turn'], 'provenance': turn_provenance(
                             context, user_id, actions)})
-                        await sources_unchanged()
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
                     result.shown = context['fence'].get('messages', set())  # A summary of the steps may still draw on them.

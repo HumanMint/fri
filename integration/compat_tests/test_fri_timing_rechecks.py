@@ -1,22 +1,25 @@
 """Timing changes keep the checks that came after the waits they moved (from #33's Codex reviews): an
 ambient reply's history read happens before its last privacy and source checks, a reply target edited or
 deleted while typing starts never reaches the model, and a history read that times out stays quiet, and
-nothing withdrawn while typing starts before a tool reaches the tool or the next model call."""
+nothing withdrawn while typing starts (the ping, the message, its reply target or burst, a photo it
+looks at) reaches a tool or the model."""
 import asyncio
 import copy
 import datetime as dt
 import inspect
+import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import discord
+import httpx
 import pytest
 
 from compat_tests.test_fri_member_profiles import world
-from compat_tests.test_fri_mentions import environment
+from compat_tests.test_fri_mentions import attachment, environment
 from fri.fri import Fri
-from fri.fri_chat import ChatResult
+from fri.fri_chat import Chat, ChatResult
 
 
 def real_chat(fri, tmp_path, callback):
@@ -317,4 +320,93 @@ def test_reference_retracted_while_unaddressed_action_starts(monkeypatch, tmp_pa
                 f'retracted text reached a subsequent model request: {sent_after_retraction}')
         finally:
             await fri.close()
+    asyncio.run(scenario())
+
+
+def test_ping_edited_during_typing(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        trigger = message('<@99> my private marker is blue')
+        seen = []
+
+        @asynccontextmanager
+        async def typing():
+            replacement = copy.copy(trigger)
+            replacement.content = '<@99> i took that back'
+            replacement.edited_at = dt.datetime.now(dt.timezone.utc)
+            rows[trigger.id] = replacement
+            await fri.on_raw_message_edit(SimpleNamespace(channel_id=1, message=replacement))
+            await asyncio.sleep(0)
+            yield
+
+        channel.typing = typing
+
+        def transport(request):
+            seen.append(json.loads(json.loads(request.content)['input'][-1]['content'])['message'])
+            return httpx.Response(500)
+
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()
+        fri.chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(transport))
+        del fri.chat_once
+        real_sleep = asyncio.sleep
+
+        async def immediate(seconds):
+            await real_sleep(0)
+
+        monkeypatch.setattr('fri.fri_agent.asyncio.sleep', immediate)
+        try:
+            await agent.handle(trigger)
+            assert not seen, 'retracted ping text reached model'
+        finally:
+            await fri.close()
+
+    asyncio.run(scenario())
+
+
+def test_previous_photo_deleted_during_typing(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        photo = message('', age=1, attachments=[attachment(1)])
+        trigger = message('fri describe that photo')
+        seen = []
+
+        async def history(*, before, limit, **kwargs):
+            for row in sorted((m for m in rows.values() if m.id < before.id), key=lambda m: m.id, reverse=True)[:limit]:
+                yield row
+
+        channel.history = history
+
+        def fetch(mid):
+            if mid not in rows:
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+            return rows[mid]
+
+        channel.fetch_message.side_effect = fetch
+
+        @asynccontextmanager
+        async def typing():
+            del rows[photo.id]
+            await fri.on_raw_message_delete(SimpleNamespace(channel_id=1, message_id=photo.id))
+            await asyncio.sleep(0)
+            yield
+
+        channel.typing = typing
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(return_value='data:image/png;base64,aGVsbG8='))
+
+        def transport(request):
+            content = json.loads(request.content)['input'][-1]['content']
+            if isinstance(content, list):
+                seen.extend(part['image_url'] for part in content if part['type'] == 'input_image')
+            return httpx.Response(500)
+
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()
+        fri.chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(transport))
+        del fri.chat_once
+        try:
+            options = {'addressed': True} if 'addressed' in inspect.signature(agent.take_turn).parameters else {}
+            await agent.respond(trigger, trigger.content, **options)
+            assert not seen, 'deleted photo reached model'
+        finally:
+            await fri.close()
+
     asyncio.run(scenario())
