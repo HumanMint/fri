@@ -1224,25 +1224,31 @@ def test_a_stale_cached_row_does_not_drop_a_message_sent_after_the_erasure(monke
 
 @pytest.mark.parametrize('channel_id,erasure', [(1, 'local'), (8, 'local'), (8, 'gene')])
 def test_an_erasure_during_a_pings_last_checks_stops_the_reply(monkeypatch, tmp_path, caplog, channel_id, erasure):
-    # The last Discord read after the controller's checks: the ping in a configured channel, where
-    # Gene's grant fence catches its own erasures, and a nearby message outside one.
+    # Fri's own last Discord look, after talk's checks: the ping in a configured channel, where Gene's
+    # grant fence catches its own erasures, and a nearby message outside one.
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=channel_id)
         nearby = message('another member nearby', user=30, age=60)
         event = message()
-        last, seen = event if channel_id == 1 else nearby, []
+        last, seen, talked = event if channel_id == 1 else nearby, [], []
+        talk = fri.talk
+        async def talking(*args, **kwargs):
+            result = await talk(*args, **kwargs)
+            talked.append(True)
+            return result
+        fri.talk = talking
         def fetch(mid):
-            if mid == last.id and fri.chat_once.await_count:
+            if mid == last.id and talked:
                 seen.append(mid)
-                if len(seen) == 2:  # Fri's own last look, after talk's.
+                if len(seen) == 1:
                     agent.forget(20) if erasure == 'local' else store.clear_chats('20')
             return rows[mid]
         channel.fetch_message.side_effect = fetch
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
-            assert len(seen) >= 2
+            assert seen
             event.reply.assert_not_awaited()
             assert not any(path == '/chat/turn' for path, _ in calls)
             # A Gene erasure during the last look outside a configured channel is now caught by the
@@ -2476,13 +2482,28 @@ def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tm
     asyncio.run(scenario())
 
 
+async def burst(agent, first, second):
+    """`second` sent while `first` is still in its debounce, so one reply answers both."""
+    released, debounce, grouped = gated_debounce()
+    try:
+        with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+            task = asyncio.create_task(agent.handle(first))
+            await asyncio.wait_for(grouped(agent, first), 5)
+            later = asyncio.create_task(agent.handle(second))
+            await asyncio.wait_for(grouped(agent, second), 5)
+            released.set()
+            await asyncio.wait_for(asyncio.gather(task, later), 5)
+    finally:
+        released.set()
+
+
 def test_a_burst_message_redelivered_after_its_answer_is_ignored(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         first, second = message('<@99> hey', age=1), message('you around?')
         try:
-            await asyncio.gather(agent.handle(first), agent.handle(second))
+            await burst(agent, first, second)
             second.reply.assert_awaited_once()
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(copy.copy(first))  # Its own invitation is unspent, but it was answered.
@@ -2502,7 +2523,7 @@ def test_an_answered_mention_logs_nothing(monkeypatch, tmp_path, caplog):
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(alone)
             alone.reply.assert_awaited_once()
-            await asyncio.gather(agent.handle(first), agent.handle(second))  # One reply answers both.
+            await burst(agent, first, second)  # One reply answers both.
             second.reply.assert_awaited_once()
             assert mention_lines(caplog) == [] and agent.misses == {}
         finally:

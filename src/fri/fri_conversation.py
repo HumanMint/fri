@@ -188,17 +188,32 @@ async def live_rows(agent, message, burst):
 
     from . import feedback as commands
 
-    rows = []
-    try:
-        for _, event, original in burst:
+    rows, changed, unavailable = [], False, False
+    # Every message is checked before refusing, so each one edited or deleted leaves the live view.
+    for _, event, original in burst:
+        try:
             current = await message.channel.fetch_message(event.id)
-            if (current.author.id != message.author.id or current.author.bot or current.webhook_id or
-                    current.content != original or current.channel.id != message.channel.id):
-                raise ValueError('A message in that burst changed. Send a fresh request.')
-            # A fetch has no server nickname; the arriving event's source matches the turn's own.
-            rows.append({'source': discord_source(event).model_dump(), 'text': clean(original, MAX_TEXT)})
+        except discord.NotFound:
+            agent.withdraw(event)  # Out of the live view too, so a later turn can't show it.
+            unavailable = True
+            continue
+        except discord.HTTPException:  # Unconfirmed: refused, but not withdrawn.
+            unavailable = True
+            continue
+        if (current.author.id != message.author.id or current.author.bot or current.webhook_id or
+                current.content != original or current.channel.id != message.channel.id):
+            agent.withdraw(event)
+            changed = True
+            continue
+        # A fetch has no server nickname; the arriving event's source matches the turn's own.
+        rows.append({'source': discord_source(event).model_dump(), 'text': clean(original, MAX_TEXT)})
+    if changed:
+        raise ValueError('A message in that burst changed. Send a fresh request.')
+    if unavailable:
+        raise ValueError('A message in that burst is no longer available. Send a fresh request.')
+    try:
         return checked_burst(rows, discord_source(message), clean(message.content, MAX_TEXT), fresh=True)
-    except (discord.HTTPException, commands.UserFeedbackCheckFailure):
+    except commands.UserFeedbackCheckFailure:
         raise ValueError('A message in that burst is no longer available. Send a fresh request.') from None
 
 
@@ -250,14 +265,38 @@ async def evidence(agent, message, burst):
 async def unchanged(agent, message, context):
     """A final privacy/source fence before tools and before returning quoted evidence."""
     import discord
+
+    async def withdrawn(row, limit):
+        """Whether Discord confirms the row's message deleted or edited; if so it leaves the live view too."""
+        from types import SimpleNamespace
+        try:
+            current = await message.channel.fetch_message(int(row['source']['id']))
+        except discord.NotFound:
+            current = None
+        except (discord.HTTPException, ValueError):
+            return False  # Unconfirmed: refused, but not withdrawn.
+        if current is None or getattr(current, 'edited_at', None) is not None or clean(current.content, limit) != row['text']:
+            agent.withdraw(SimpleNamespace(id=int(row['source']['id']), channel=message.channel))
+            return True
+        return False
+
     try:
         if context.get('reply_target') != await reply_target(agent, message):
+            for row in context.get('reply_target', []):
+                await withdrawn(row, 1800)
             return False
-        for row in context.get('message_burst', []):
-            current = await message.channel.fetch_message(int(row['source']['id']))
+        unchanged = True
+        for row in context.get('message_burst', []):  # Every one, so each changed message is withdrawn.
+            try:
+                current = await message.channel.fetch_message(int(row['source']['id']))
+            except discord.NotFound:
+                await withdrawn(row, MAX_TEXT)
+                unchanged = False
+                continue
             if (not same_source(discord_source(current), row['source']) or
                     clean(current.content, MAX_TEXT) != row['text'] or current.webhook_id):
-                return False
-        return True
+                await withdrawn(row, MAX_TEXT)
+                unchanged = False
+        return unchanged
     except (discord.HTTPException, ValueError):
         return False
