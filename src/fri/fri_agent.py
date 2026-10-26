@@ -1320,12 +1320,11 @@ class Agent:
                 authors.update((item['user_id'], item['revision']) for item in row['provenance'])
             else:
                 authors.add((row['user_id'], row.get('revision', 0)))
-        profiles = {}
-        for user, revision in authors:
-            if user not in profiles:
-                profiles[user] = await self.profile(parent, user)
-            if not profiles[user]['enabled'] or profiles[user]['revision'] != revision:
-                return False
+        # Read together, so one author's answer doesn't age while another's is awaited.
+        users = sorted({user for user, _ in authors})
+        profiles = dict(zip(users, await asyncio.gather(*(self.profile(parent, user) for user in users))))
+        if any(not profiles[user]['enabled'] or profiles[user]['revision'] != revision for user, revision in authors):
+            return False
         # Again after those reads: a row withdrawn or forgotten during them must not go out either.
         live = {r['id'] for r in self.recent.get(channel, ())}
         return all(row['id'] in live for row in records)
