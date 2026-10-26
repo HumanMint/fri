@@ -1154,15 +1154,16 @@ class Agent:
         async def refused():
             """The invitation's recheck before Fri answers, True once it failed and that was handled. A dead
             controller there is an outage, not a change. A privacy control's notice isn't fenced by the
-            change it made, or another's."""
+            change it made, or another's, and goes on with Fri paused (fri #64)."""
+            control = since is None  # See take_turn: only a privacy control comes without one.
             try:
-                if await invitation.current():
+                if await invitation.current(control=control):
                     return False
             except ControllerUnavailable:
                 await outage()
                 return True
             await self.withheld(message, events, invitation.refusal, self.pings(events, since, invitation),
-                                fenced=since is not None,
+                                fenced=not control, control=control,
                                 logged=f'reply withheld: {invitation.refusal}')
             return True
 
@@ -1194,7 +1195,7 @@ class Agent:
                 # A ping gets a fixed line, not the controller's text, even when a later message's reply
                 # answers it. Its notice checks the ping still stands, and erasure last.
                 return await self.withheld(message, events, 'check failed: ControllerRejected', pings,
-                                           fenced=since is not None)
+                                           fenced=since is not None, control=since is None)
             if since:  # Said only if they haven't erased since, checked last.
                 if erased := await self.erasure(message.author.id, *since):
                     return await self.dropped(message, events, erased, invitation, since, burst)
@@ -1223,7 +1224,7 @@ class Agent:
             if ambient:
                 return missed('nearby message deleted')
             return await self.withheld(message, events, 'nearby message changed', invitation,
-                                       fenced=since is not None, logged='nearby message deleted')
+                                       fenced=since is not None, control=since is None, logged='nearby message deleted')
         if result.response_kind in ('react', 'quiet'):
             if (result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(
                     message, result.reaction, (lambda: self.erasure(message.author.id, *since)) if since else None)):
