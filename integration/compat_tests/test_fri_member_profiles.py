@@ -766,7 +766,13 @@ def test_a_dm_note_is_shared_and_pulled_back_only_on_the_members_press(monkeypat
             state = await w.fri.api('POST', '/chat/memory/notes', scope)
             view = MemoryView(w.fri, scope, state, selected=state['entries'][0]['id'])
             assert [item.label for item in view.children[1:]] == ['Remove selected', 'Edit selected', 'Share server-wide']
-            await view.children[3].callback(press())
+            await view.children[3].callback(press())  # The first press only asks.
+            assert 'Share it server-wide?' in shown.await_args.kwargs['embed'].description
+            confirm = shown.await_args.kwargs['view']
+            assert confirm.children[3].label == 'Yes, share server-wide'
+            await w.say(GAMING, 'fri recommend me something')
+            assert model_context(w)['personal_memory']['notes'] == []
+            await confirm.children[3].callback(press())
             assert 'Shared that preference across the server.' in shown.await_args.kwargs['embed'].description
             await w.say(GAMING, 'fri recommend me something')
             assert [row['evidence'] for row in model_context(w)['personal_memory']['notes']] == ['I like jazz']

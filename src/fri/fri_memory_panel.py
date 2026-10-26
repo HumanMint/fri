@@ -11,7 +11,7 @@ from .fri_memory import MOVES, clip, note_place, profiled, units
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
-COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit|share|keep):[a-f0-9]{32}$')
+COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit|share|confirm|keep):[a-f0-9]{32}$')
 
 
 def memory_component(interaction, bot_id):
@@ -48,7 +48,7 @@ async def allowed(cog, interaction, scope, *, message=True):
     return True
 
 
-async def show(cog, interaction, scope=None, *, state=None, selected=None, notice=''):
+async def show(cog, interaction, scope=None, *, state=None, selected=None, notice='', confirm=False):
     scope = profiled(cog, scope or scope_for(cog, interaction))
     if not await allowed(cog, interaction, scope, message=False):
         return
@@ -77,7 +77,7 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
                  'Editing or removing a preference clears recent saved context here. Discord posts and backups are separate.')
     from .fri_panel import card, reply
     await reply(cog, interaction, embed=card('My memory', '\n\n'.join(lines)),
-                view=MemoryView(cog, scope, state, selected))
+                view=MemoryView(cog, scope, state, selected, confirm=confirm))
 
 
 def movable(cog, scope):
@@ -108,7 +108,7 @@ class MemoryLauncher(discord.ui.View):
 
 
 class MemoryView(MemoryLauncher):
-    def __init__(self, cog, scope, state, selected=None):
+    def __init__(self, cog, scope, state, selected=None, *, confirm=False):
         super().__init__(cog, scope)
         self.clear_items()
         self.state = state
@@ -135,10 +135,15 @@ class MemoryView(MemoryLauncher):
             self.add_item(replace)
             if movable(cog, scope):
                 # Only the member's press moves a note between their profile and this private chat.
+                # Sharing widens who sees a note, so it takes a second press; keeping it here narrows, so it doesn't.
                 server = self.selected.get('scope') == 'server'
-                move = discord.ui.Button(label='Keep here only' if server else 'Share server-wide',
-                                         custom_id=f"fri:memory:{'keep' if server else 'share'}:"+uuid.uuid4().hex)
-                move.callback = self.keep if server else self.share
+                action = 'keep' if server else 'confirm' if confirm else 'share'
+                move = discord.ui.Button(label={'keep': 'Keep here only', 'share': 'Share server-wide',
+                                                'confirm': 'Yes, share server-wide'}[action],
+                                         style=discord.ButtonStyle.danger if action == 'confirm' else
+                                         discord.ButtonStyle.secondary,
+                                         custom_id=f'fri:memory:{action}:'+uuid.uuid4().hex)
+                move.callback = {'keep': self.keep, 'share': self.ask_share, 'confirm': self.share}[action]
                 self.add_item(move)
 
     async def remove(self, interaction):
@@ -152,6 +157,12 @@ class MemoryView(MemoryLauncher):
             await show(self.cog, interaction, self.scope, state=state, notice='Removed that preference.')
         except commands.UserFeedbackCheckFailure as exc:
             await show(self.cog, interaction, self.scope, notice=str(exc))
+
+    async def ask_share(self, interaction):
+        if await self.interaction_check(interaction):
+            await show(self.cog, interaction, self.scope, selected=self.selected['id'], confirm=True,
+                       notice='Share it server-wide? Fri could then bring it up in any channel of the server, '
+                              'where others can read it. Press Yes, share server-wide to go ahead.')
 
     async def share(self, interaction):
         await self.move(interaction, 'share', 'Shared that preference across the server.')
