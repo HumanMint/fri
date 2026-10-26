@@ -340,6 +340,34 @@ def test_attention_drops_a_caption_withdrawn_while_it_waited_for_a_model_slot(tm
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('failure', ['failed', 'raised'])
+def test_a_gene_error_is_offered_again_after_a_failed_attention_call(failure):
+    async def scenario():
+        channel = SimpleNamespace(id=456)
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel)
+        agent = Agent(fri)
+        agent.state['config']['enabled'] = True
+        first = TimeoutError() if failure == 'raised' else ({}, {}, 'failed')
+        agent.run = AsyncMock(side_effect=[first, ({'action': 'investigate', 'source_id': '100'}, {}, 'completed')])
+        agent.investigate = AsyncMock()
+        agent.recent[456].append({'id': '100', 'at': time.time(), 'gene_error': True,
+                                  'user_id': '20', 'text': 'Error in command play'})
+        if failure == 'raised':
+            with pytest.raises(TimeoutError):
+                await agent.attend()
+        else:
+            await agent.attend()
+        agent.investigate.assert_not_awaited()
+        await agent.attend()  # Within the same heartbeat window: not retried yet.
+        assert agent.run.await_count == 1
+        agent.last_attention[456] = 0  # The next window.
+        await agent.attend()
+        assert agent.run.await_count == 2
+        agent.investigate.assert_awaited_once()
+        assert agent.run.await_args_list[1].args[2]['fresh_ids'] == ['100']
+    asyncio.run(scenario())
+
+
 def test_history_search_cannot_quote_a_different_channel_publicly():
     async def scenario():
         from compat_tests.test_fri_runtime import event
