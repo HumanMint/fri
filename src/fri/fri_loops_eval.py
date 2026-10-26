@@ -6,6 +6,7 @@ No Discord client, controller writes or member context. The caller records only 
 from .fri_agent_model import STRING, analyze, obj
 from .fri_chat import ChatResult
 from .fri_request_eval import source
+from .privacy import model_json
 
 VERDICT = obj({'verdict': {'type': 'string', 'enum': ['pass', 'fail']}, 'reason': STRING})
 JUDGE = '''Grade one Discord reply from Fri against the case rubric. The open_loops rows are the only truth
@@ -65,7 +66,7 @@ def cases():
 
 async def evaluate(chat, model, effort, voice_notes, *, judge=None):
     async def grade(data):
-        return await analyze(chat, JUDGE, data, model, effort, VERDICT)
+        return await analyze(chat, JUDGE, data, model, effort, VERDICT, encode=model_json)  # Same in --baseline.
     judge = judge or grade
     for case in cases():
         context = {'model': model, 'effort': effort, 'voice_notes': voice_notes, 'facts': [], 'turns': [],

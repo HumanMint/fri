@@ -166,3 +166,35 @@ def test_a_malformed_loops_payload_never_breaks_a_reply(loops):
     json.dumps(shown, allow_nan=False)  # Whatever arrives, the model input stays valid JSON.
     sent, _ = respond({'loops': loops, 'source': dm})
     assert sent == shown
+
+
+def test_the_loops_grader_reads_a_baseline_run_the_same_way(monkeypatch):
+    """--baseline escapes Fri's own model input, never the grader's, so both runs are judged alike."""
+    import json as _json
+
+    import httpx
+
+    from fri import fri_agent_model, fri_chat, fri_eval, fri_web
+    from fri.fri_loops_eval import cases
+    judged = []
+
+    def handler(request):
+        judged.append(_json.loads(request.content)['input'][0]['content'])
+        body = response_event(content=_json.dumps({'verdict': 'pass', 'reason': 'fine'}))
+        return httpx.Response(200, text='data: '+_json.dumps(body)+'\n\n')
+    grader = Chat(SimpleNamespace(access_token=lambda: 'subscription'), httpx.MockTransport(handler))
+
+    async def answer(text, context):
+        return ChatResult(status='completed', reply='ㅋㅋ 👍')
+
+    async def first_grade():
+        async for case, _ in evaluate_loops(SimpleNamespace(transport=grader.transport, headers=grader.headers,
+                                                             respond=answer), 'gpt-6.1-sol', 'high', ''):
+            if case['name'].endswith('_judge'):
+                return case
+    for module in (fri_agent_model, fri_chat, fri_web):
+        monkeypatch.setattr(module, 'model_json', module.model_json)  # Restored after the test.
+    assert len(cases()) and asyncio.run(first_grade())
+    fri_eval.ascii_baseline()
+    asyncio.run(first_grade())
+    assert judged[0] == judged[1] and 'ㅋㅋ 👍' in judged[0]
