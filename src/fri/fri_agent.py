@@ -955,7 +955,8 @@ class Agent:
             if not message.author.bot and not dm and self.config['enabled'] and media(message):
                 # An uncaptioned meme or pic still belongs in the live view, or "the memes above" is empty.
                 profile = await self.profile(parent, message.author.id)
-                if profile['enabled'] and not before_removal(message.id, profile):
+                # Deleted while the profile read waited: like a text post, it stays out.
+                if profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent:
                     self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                         'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
                         'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})

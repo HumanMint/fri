@@ -291,3 +291,60 @@ def test_leaving_the_server_during_the_access_recheck_stops_the_image_request(mo
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['delete', 'edit'])
+def test_a_meme_changed_during_the_access_recheck_never_reaches_the_next_request(monkeypatch, tmp_path, change):
+    """The looked-at posts are refetched after the access check's Discord waits, not before them."""
+    import time
+
+    async def scenario():
+        w, post, rows, sent = image_world(monkeypatch, tmp_path)
+        w.fri.chat.headers = AsyncMock(return_value={'Authorization': 'Bearer synthetic'})
+        agent = w.fri.agent
+        agent.recent[GENERAL].append({'id': str(post.id), 'user_id': '30', 'name': 'member 30', 'text': 'original caption',
+                                      'at': time.time(), 'revision': 0, 'gene_error': False, 'attachments': ['image']})
+        guild = w.channels[GENERAL].guild
+        fetching, changed = guild.fetch_channel, []
+
+        async def change_then_fetch(cid):
+            result = await fetching(cid)
+            if len(sent) == 1 and not changed:  # While the access check waits before the second request.
+                changed.append(change)
+                if change == 'delete':
+                    del rows[post.id]
+                    agent.unsend(GENERAL, [post.id])
+                else:
+                    rows[post.id] = edited(post)
+            return result
+        guild.fetch_channel = change_then_fetch
+        text = 'fri pick the best meme in general'
+        try:
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert changed == [change] and len(sent) == 1
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_image_only_post_deleted_while_its_author_is_checked_stays_out_of_the_live_view(monkeypatch, tmp_path):
+    from compat_tests.test_fri_mentions import attachment
+
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        post = message('', attachments=[attachment(channel.id)])
+        profile = agent.profile
+
+        async def delete_during_profile(parent, user):
+            result = await profile(parent, user)
+            del rows[post.id]
+            agent.unsend(channel.id, [post.id])  # Deleted while Fri reads the author's profile.
+            return result
+        agent.profile = delete_during_profile
+        try:
+            await agent.handle(post)
+            assert not any(row['id'] == str(post.id) for row in agent.messages(channel.id))
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

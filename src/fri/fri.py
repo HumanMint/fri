@@ -343,12 +343,12 @@ class Fri(discord.Client):
                 # receipts, a learning report) never reaches the request either. Delivery checks it again.
                 # First, so nothing waits between the privacy check below and the request.
                 actions = fence['actions']
-                # Every post Fri looked at is still there as it was read: an edit or delete while Fri
-                # signed in never reaches the model. Discord reads first, like the access check.
-                if actions and not await images_unchanged(actions.image_context, actions.event):
-                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
                 if actions and actions.sources and not actions.sources <= set(await actions.channels(fresh=True)):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
+                # Every post Fri looked at is still there as it was read: an edit or delete while Fri signed
+                # in, or while the access check above waited on Discord, never reaches the model.
+                if actions and not await images_unchanged(actions.image_context, actions.event):
+                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
                 # A DM's own gates after those Discord waits, so a member who left during them is caught.
                 if fence.get('gate'):
                     await fence['gate']()
@@ -365,6 +365,12 @@ class Fri(discord.Client):
                          *(row['source']['id'] for row in context.get('message_burst', []))]
                 if any(int(mid) in self.agent.unsent for mid in asked):
                     raise GateClosed('message deleted')
+                # A post Fri looked at, deleted during the last waits (the gate, Gene's check): its image stays out.
+                looked = [read['event'].id for read in context.get('image_reads', [])]
+                if context.get('image_event') is not None:
+                    looked.append(context['image_event'].id)
+                if any(mid in self.agent.unsent for mid in looked):
+                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
                 if 'recent' in context:
                     context['recent'] = [row for row in context['recent']
                                          if row.get('gene_error') or int(row['id']) not in self.agent.unsent]
