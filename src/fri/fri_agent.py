@@ -459,9 +459,15 @@ class Agent:
 
     async def withheld(self, message, events, reason, invitation=None, *, logged=None, fenced=True):
         """Say why a reply can't go out while the message still stands to be answered; else log why.
-        `fenced`: a ping's notice also needs its author not to have erased since (see notice)."""
+        `invitation`: a ping, or a burst's pings newest first (see pings), the first still standing
+        told why. `fenced`: a ping's notice also needs its author not to have erased since (see notice)."""
         from .fri_mentions import notice_for
-        text = await invitation.notice(reason, fenced=fenced) if invitation else notice_for(reason)
+        pings = invitation if isinstance(invitation, list) else [invitation] if invitation else []
+        text = None if pings else notice_for(reason)
+        for ping in pings:
+            if text := await ping.notice(reason, fenced=fenced):
+                message = ping.event  # Checked just now to still stand, unlike the rest of its burst.
+                break
         if text:
             try:
                 await message.reply(text, mention_author=False, allowed_mentions=NO_MENTIONS)
@@ -618,7 +624,8 @@ class Agent:
                         return not (refusal or erasure or exclusion)
                     await self.fri.waiting_notices.send(message, eligible)  # Deleted once a reply to them lands.
                     if refusal:
-                        return await self.withheld(message, events, refusal, invitation, logged=f'reply withheld: {refusal}')
+                        return await self.withheld(message, events, refusal, self.pings(events, since, invitation),
+                                                   logged=f'reply withheld: {refusal}')
                     if exclusion:
                         return self.missed(events, exclusion)
                     if erasure:
@@ -640,7 +647,7 @@ class Agent:
                 if reason := await self.excluded(message, dm, invitation, privacy, text):
                     return self.missed(events, reason)
                 if time.time() >= until:
-                    return await self.withheld(message, events, 'stale event', invitation or self.ping_among(events, since),
+                    return await self.withheld(message, events, 'stale event', self.pings(events, since, invitation),
                                                logged='earlier reply still running')
                 recheck = False
                 if not self.turns.ready(user, message.id):
@@ -728,16 +735,17 @@ class Agent:
         permissions = parent.permissions_for(member)
         return permissions.view_channel and permissions.read_message_history
 
-    async def unreadable(self, message, events, exc, invitation, forgotten):
+    async def unreadable(self, message, events, exc, invitation, forgotten, control=False):
         """A message whose author's privacy revision couldn't be read as it came in, other than in an
-        outage (see listen): say why, as its reply would have, unless they erased meanwhile."""
-        if self.forgotten.get(message.author.id, 0) != forgotten:
+        outage (see listen): say why, as its reply would have, unless they erased meanwhile. A privacy
+        `control` hears it whatever changed."""
+        if not control and self.forgotten.get(message.author.id, 0) != forgotten:
             return self.missed(events, 'author privacy changed')
         if not invitation and isinstance(exc, commands.UserFeedbackCheckFailure):
             # Not a ping, so what its reply would have said, e.g. the controller refusing.
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             return self.answered(events)
-        return await self.withheld(message, events, 'check failed: '+type(exc).__name__, invitation)
+        return await self.withheld(message, events, 'check failed: '+type(exc).__name__, invitation, fenced=not control)
 
     def missed(self, events, reason):
         for event in events:
@@ -864,8 +872,8 @@ class Agent:
             return
         dm = message.guild is None
         if dm:
-            if message.author.bot or not self.config['support_dms'] or not await self.member(message.author.id):
-                return
+            if message.author.bot or not self.config['support_dms'] or not await self.member(message.author.id, fresh=True):
+                return  # Fresh: someone who just left mustn't hear server context through a cached lookup.
         elif not self.allowed(message.channel):
             self.memory_controls.leave(message.author.id, message.id)  # Outside, it's chat (see Fri.talk).
             # An outside ping is one event, never a new ambient/active channel.
@@ -875,6 +883,8 @@ class Agent:
             from .fri_mentions import Invitation
             invitation = await Invitation.create(self, message)
             if invitation and await self.incoming(message, invitation, self.fri.workshop_id, forgotten) is not None:
+                if self.forgotten.get(message.author.id, 0) != forgotten:
+                    return self.miss(message, 'author privacy changed')  # During that read, as below.
                 await self.respond(message, await addressed_text(message, self.fri.user.id), invitation=invitation,
                                    forgotten=forgotten, revision=invitation.revision)
             return
@@ -918,6 +928,8 @@ class Agent:
         if not dm and not message.author.bot:
             if (profile := await self.incoming(message, invitation, parent, forgotten, control=bool(privacy))) is None:
                 return
+            if not privacy and self.forgotten.get(message.author.id, 0) != forgotten:
+                return self.miss(message, 'author privacy changed')  # During that read: it may be from after.
             observed = profile.get('revision', 0)
             if profile['enabled'] and not privacy and not before_removal(message.id, profile):
                 if directed is not None or channel == self.dedicated:
@@ -938,6 +950,8 @@ class Agent:
                 raise  # Its notice is the outage notice (see listen).
             except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
                 return await self.unreadable(message, [message], exc, invitation, forgotten)
+            if self.forgotten.get(message.author.id, 0) != forgotten:
+                return self.miss(message, 'author privacy changed')
         if message.id in self.replying:
             return  # A redelivered event: its reply is already being delivered or recorded.
         recording = self.recording.get((channel, message.author.id))
@@ -1011,7 +1025,8 @@ class Agent:
     async def incoming(self, message, invitation, channel, forgotten, *, control=False):
         """The author's profile as a message to Fri comes in. A ping keeps it, and the local erasures
         so far, as the baseline its notices compare with. None once a ping was told why it can't be
-        answered, or the author erased during the read; other messages raise as before."""
+        answered (see unreadable for a privacy `control`), or the author erased during the read; other
+        messages raise as before."""
         if invitation:
             invitation.forgotten = forgotten
         try:
@@ -1024,21 +1039,24 @@ class Agent:
         except commands.UserFeedbackCheckFailure as exc:
             if not invitation:
                 raise
-            await self.unreadable(message, [message], exc, invitation, forgotten)
+            await self.unreadable(message, [message], exc, invitation, forgotten, control)
             return None
         if invitation:
             invitation.revision = profile.get('revision', 0)
         return profile
 
-    def ping_among(self, events, since):
-        """A ping among a burst's messages, to check it still stands, since `since`, before a notice."""
+    def pings(self, events, since, invitation=None):
+        """Who a burst's notice goes to: its reply's own ping, then the burst's other pings newest first,
+        each checked since `since` (see withheld). None without any."""
         from .fri_mentions import Invitation
-        for event in reversed(events):
-            if event.guild and event.guild.id == self.fri.guild_id and explicit_mention(event, self.fri.user.id):
+        pings = [invitation] if invitation else []
+        for event in sorted(events, key=lambda event: event.id, reverse=True) if since else ():
+            if (not (invitation and event.id == invitation.event.id) and event.guild and
+                    event.guild.id == self.fri.guild_id and explicit_mention(event, self.fri.user.id)):
                 ping = Invitation(self, event)
                 ping.forgotten, ping.revision = since
-                return ping
-        return None
+                pings.append(ping)
+        return pings or None
 
     def answer_directly(self, message):
         now = time.time()
@@ -1085,7 +1103,8 @@ class Agent:
             except ControllerUnavailable:
                 await outage()
                 return True
-            await self.withheld(message, events, invitation.refusal, invitation, fenced=since is not None,
+            await self.withheld(message, events, invitation.refusal, self.pings(events, since, invitation),
+                                fenced=since is not None,
                                 logged=f'reply withheld: {invitation.refusal}')
             return True
 
@@ -1113,11 +1132,10 @@ class Agent:
         except commands.UserFeedbackCheckFailure as exc:
             if invitation and await refused():
                 return
-            if isinstance(exc, ControllerRejected) and (
-                    ping := invitation or (since and self.ping_among(events, since))):
+            if isinstance(exc, ControllerRejected) and (pings := self.pings(events, since, invitation)):
                 # A ping gets a fixed line, not the controller's text, even when a later message's reply
                 # answers it. Its notice checks the ping still stands, and erasure last.
-                return await self.withheld(message, events, 'check failed: ControllerRejected', ping,
+                return await self.withheld(message, events, 'check failed: ControllerRejected', pings,
                                            fenced=since is not None)
             if since:  # Said only if they haven't erased since, checked last.
                 if erased := await self.erasure(message.author.id, *since):
