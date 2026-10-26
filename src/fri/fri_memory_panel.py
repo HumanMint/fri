@@ -7,11 +7,11 @@ import discord
 
 from . import feedback as commands
 from .fri_context import discord_source
-from .fri_memory import clip, note_place, profiled, units
+from .fri_memory import MOVES, clip, note_place, profiled, units
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
-COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit):[a-f0-9]{32}$')
+COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit|share|keep):[a-f0-9]{32}$')
 
 
 def memory_component(interaction, bot_id):
@@ -80,6 +80,12 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
                 view=MemoryView(cog, scope, state, selected))
 
 
+def movable(cog, scope):
+    """A note moves only from a private chat, where the member sees all of it, and only if the controller can."""
+    return (getattr(cog, 'profiles', False) and MOVES in getattr(cog, 'capabilities', ()) and
+            scope.get('profiles') and scope['conversation_id'].startswith('private:'))
+
+
 def place(cog, scope, entry):
     return note_place(cog.get_channel, entry['scope'], scope['conversation_id'],
                       public=scope['conversation_id'].startswith('public:'))
@@ -127,6 +133,13 @@ class MemoryView(MemoryLauncher):
             replace = discord.ui.Button(label='Edit selected', custom_id='fri:memory:replace:'+uuid.uuid4().hex)
             replace.callback = self.replace
             self.add_item(replace)
+            if movable(cog, scope):
+                # Only the member's press moves a note between their profile and this private chat.
+                server = self.selected.get('scope') == 'server'
+                move = discord.ui.Button(label='Keep here only' if server else 'Share server-wide',
+                                         custom_id=f"fri:memory:{'keep' if server else 'share'}:"+uuid.uuid4().hex)
+                move.callback = self.keep if server else self.share
+                self.add_item(move)
 
     async def remove(self, interaction):
         if not await self.interaction_check(interaction):
@@ -137,6 +150,25 @@ class MemoryView(MemoryLauncher):
                 'action': 'remove'})
             self.cog.agent.forget(interaction.user.id)
             await show(self.cog, interaction, self.scope, state=state, notice='Removed that preference.')
+        except commands.UserFeedbackCheckFailure as exc:
+            await show(self.cog, interaction, self.scope, notice=str(exc))
+
+    async def share(self, interaction):
+        await self.move(interaction, 'share', 'Shared that preference across the server.')
+
+    async def keep(self, interaction):
+        await self.move(interaction, 'keep', 'That preference stays here now, out of the server.')
+
+    async def move(self, interaction, action, notice):
+        if not await self.interaction_check(interaction):
+            return
+        try:
+            state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
+                **self.scope, 'source': discord_source(interaction).model_dump(), 'revision': self.state['revision'],
+                'action': action})
+            if action == 'keep':  # It no longer shows in the server, so nothing Fri holds there may keep it.
+                self.cog.agent.forget(interaction.user.id)
+            await show(self.cog, interaction, self.scope, state=state, notice=notice)
         except commands.UserFeedbackCheckFailure as exc:
             await show(self.cog, interaction, self.scope, notice=str(exc))
 

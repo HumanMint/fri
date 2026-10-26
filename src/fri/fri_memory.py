@@ -11,6 +11,7 @@ MAX_NOTES = 10
 PER_CATEGORY = 3
 TTL = 90 * 86400
 PROFILES = 'member-profiles'  # The controller keeps one profile per member across readable channels.
+MOVES = 'memory-moves'  # The controller moves a note into or out of the profile on the member's press.
 PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_thread)
 
 

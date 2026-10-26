@@ -736,3 +736,61 @@ def test_a_channel_closed_while_fri_thinks_keeps_the_reply_unsaid(monkeypatch, t
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_dm_note_is_shared_and_pulled_back_only_on_the_members_press(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        shown = AsyncMock()
+        monkeypatch.setattr('fri.fri_panel.reply', shown)
+        monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+        w.fri.agent.forget = Mock()
+        press = lambda: Mock(spec=discord.Interaction, id=int(dm_control()['id']), guild_id=None, channel_id=DM,  # noqa: E731
+                             user=SimpleNamespace(id=20, display_name='friend'))
+        try:
+            await w.say(DM, 'fri I like jazz', 'noted', note('I like jazz', 'music'))
+            await w.say(GAMING, 'fri recommend me something')
+            assert model_context(w)['personal_memory']['notes'] == []
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            view = MemoryView(w.fri, scope, state, selected=state['entries'][0]['id'])
+            assert [item.label for item in view.children[1:]] == ['Remove selected', 'Edit selected', 'Share server-wide']
+            await view.children[3].callback(press())
+            assert 'Shared that preference across the server.' in shown.await_args.kwargs['embed'].description
+            await w.say(GAMING, 'fri recommend me something')
+            assert [row['evidence'] for row in model_context(w)['personal_memory']['notes']] == ['I like jazz']
+
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            assert [row['scope'] for row in state['entries']] == ['server']
+            view = MemoryView(w.fri, scope, state, selected=state['entries'][0]['id'])
+            assert view.children[3].label == 'Keep here only'
+            await view.children[3].callback(press())
+            assert 'stays here now' in shown.await_args.kwargs['embed'].description
+            w.fri.agent.forget.assert_called_once_with(20)
+            await w.say(GAMING, 'fri recommend me something')
+            assert model_context(w)['personal_memory']['notes'] == []
+            await w.say(DM, 'fri recommend me something')
+            assert [(row['scope'], row['evidence']) for row in model_context(w)['personal_memory']['notes']] == [
+                ('here', 'I like jazz')]
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('where,capable', [(DM, False), (GENERAL, True)])
+def test_no_move_buttons_in_public_or_against_an_older_controller(monkeypatch, tmp_path, where, capable):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        if not capable:
+            w.fri.capabilities = w.fri.capabilities - {'memory-moves'}
+        try:
+            await w.say(GENERAL, 'fri I like chess', 'noted', note('I like chess'))
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456' if where == DM else '1',
+                                     'conversation_id': 'private:900' if where == DM else 'public:1'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            view = MemoryView(w.fri, scope, state, selected=state['entries'][0]['id'])
+            assert [item.label for item in view.children[1:]] == ['Remove selected', 'Edit selected']
+        finally:
+            await w.fri.close()
+    run(scenario)
