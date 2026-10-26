@@ -144,7 +144,7 @@ def test_production_datetime_reads_follow_the_virtual_clock(tmp_path):
         return (now-event.created_at).total_seconds()
 
     scenario = Scenario('clock', 'Fresh message after virtual waits.',
-                        [Wait(600), Say(20, 'fri yo', label='yo'), Inspect('skew', skew)],
+                        [Wait(600), Say(20, 'fri yo how is it going', label='yo'), Inspect('skew', skew)],
                         {'conversation': [reply('yo')]})
     replay = Replay(scenario, tmp_path).run()
     assert -5 <= replay.inspections['skew'] <= 5

@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 from collections import Counter, defaultdict, deque
-from contextlib import closing, nullcontext
+from contextlib import AsyncExitStack, closing, nullcontext
 
 import discord
 from discord.ext import tasks
@@ -47,6 +47,10 @@ REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long, and how many, deliv
 DEFERRED = object()  # The burst holding this message answers, or explains, for it.
 BUSY = object()  # A panel or ambient reply to the member started first; wait for it.
 QUEUE_SECONDS = 240  # How long after it was sent a message may wait behind an earlier reply.
+REST_SECONDS = 8  # How long a bare "fri" waits for the question that usually follows it.
+# Just the name, a hello, or both: "fri", "yo fri", "fri?", "hey fri", a bare ping (read as "hey").
+GREETING = r'(?:hey+|hi+|hello|yo+|oi+|ayo?|sup|psst|ok(?:ay)?|bro|um+|uh+)'
+SUMMONS = re.compile(rf'(?i)(?:{GREETING}\b[\s,.!?~-]*)*(?:fri\b[\s,.!?~-]*)?(?:{GREETING}\b[\s,.!?~-]*)*')
 RECHARGING = '🪫'
 ERASED = 'erased'  # owner_control: the author erased their chats while it waited.
 CHECK_SECONDS = 10  # A slower owner settings check gives way to the Sol settings call.
@@ -89,6 +93,32 @@ class BehaviorPreview(PagedPreview):
                                                        allowed_mentions=NO_MENTIONS)
             self.finished = True
             self.stop()
+
+
+class Typing:
+    """Discord's typing indicator for one reply, shown only once words are coming: a turn addressed to Fri
+    after it passes admission, or any turn about to run an action. People who decide not to answer
+    don't type first. It's cosmetic, so a refused typing request never stops the reply."""
+
+    def __init__(self, channel, addressed):
+        self.channel, self.addressed, self.stack, self.started = channel, addressed, AsyncExitStack(), False
+
+    async def __call__(self, stage):
+        """True when this call started it: the caller waited on Discord, so it rechecks what it read before."""
+        if self.started or not (self.addressed or stage == 'action'):
+            return False
+        self.started = True
+        try:
+            await self.stack.enter_async_context(self.channel.typing())
+        except discord.HTTPException:
+            LOG.info('Typing indicator was not shown')
+        return True
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.stack.aclose()
 
 
 class Agent:
@@ -134,6 +164,8 @@ class Agent:
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
+        self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
+        self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
 
     @property
     def config(self):
@@ -613,7 +645,7 @@ class Agent:
             return False
 
     async def take_turn(self, message, text, dm, *, burst=(), invitation=None, forgotten=None, revision=None,
-                        waited=False):
+                        waited=False, addressed=False):
         """One direct reply per member at a time, in the order their messages were sent. A message that
         comes in mid-reply waits through that reply's delivery and save, then is answered, unless its
         author erased since it came in: since `forgotten` local erasures and privacy `revision`. One
@@ -655,7 +687,8 @@ class Agent:
                         newer[0] > message.id and newer[1] != privacy):
                     # Sent before one that already went through, e.g. delivered late: it mustn't undo that.
                     return await self.superseded(message, events)
-                if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since) is not BUSY:
+                if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since,
+                                         addressed=addressed) is not BUSY:
                     return
             recheck = True
         while True:
@@ -706,7 +739,8 @@ class Agent:
                     continue  # Another reply started during those checks.
             self.turns.take(user, message.id)
             try:
-                outcome = await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since)
+                outcome = await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since,
+                                                addressed=addressed)
             finally:
                 self.turns.release(user)
             if outcome is not BUSY:
@@ -937,7 +971,7 @@ class Agent:
             if invitation and await self.incoming(message, invitation, self.fri.workshop_id, forgotten) is not None:
                 if self.forgotten.get(message.author.id, 0) != forgotten:
                     return self.miss(message, 'author privacy changed')  # During that read, as below.
-                await self.respond(message, await addressed_text(message, self.fri.user.id), invitation=invitation,
+                await self.respond(message, await addressed_text(message, self.fri.user.id), invitation=invitation, addressed=True,
                                    forgotten=forgotten, revision=invitation.revision)
             return
         channel = message.channel.id
@@ -1046,8 +1080,18 @@ class Agent:
             await message.reply(notice_text(str(exc)), allowed_mentions=NO_MENTIONS, mention_author=False)
             return self.answered([message])
         self.pending[key] = message.id
+        now = time.monotonic()
+        self.called = {k: v for k, v in self.called.items() if now-v < 600}  # Bursts end within a minute.
+        if (summoned := self.summons.get(key)) and summoned[0] != message.id:
+            summoned[1].set()  # The rest of a bare "fri": it stops waiting, and this one counts as spoken to Fri.
+        if dm or directed is not None or summoned:
+            self.called[message.id] = now
+        followed = False
         try:
-            await asyncio.sleep(1.5)
+            if self.summoning(message, directed, privacy):
+                followed = await self.rest_of(key, message)
+            else:
+                await asyncio.sleep(1.5)
         except BaseException as exc:
             if self.bursts.latest(message):  # No later message will answer this burst now.
                 if self.pending.get(key) == message.id:
@@ -1059,16 +1103,20 @@ class Agent:
             return DEFERRED
         if self.pending.get(key) == message.id:
             self.pending.pop(key, None)
+        if followed:  # The rest came too late to share its burst. It's answered with this in Fri's view.
+            self.bursts.drop(message, 'rest came separately')
+            return DEFERRED
         burst = self.bursts.take(message)
         earlier = [event for _, event, _ in burst if event is not message]
+        addressed = any(self.called.pop(event.id, None) is not None for _, event, _ in burst)
         self.handling.update(event.id for event in earlier)  # Until this reply answers for them too.
         try:
             if len(burst) > 1:
                 await self.respond(message, directed or text, dm, burst=burst, forgotten=forgotten, revision=observed,
-                                   waited=waited, **({'invitation': invitation} if invitation else {}))
+                                   waited=waited, addressed=addressed, **({'invitation': invitation} if invitation else {}))
             else:
                 await self.respond(message, directed or text, dm, forgotten=forgotten, revision=observed,
-                                   waited=waited, **({'invitation': invitation} if invitation else {}))
+                                   waited=waited, addressed=addressed, **({'invitation': invitation} if invitation else {}))
         except BaseException as exc:
             for event in earlier:
                 self.miss(event, type(exc).__name__)
@@ -1077,6 +1125,31 @@ class Agent:
             self.handling -= Counter(event.id for event in earlier)
             for event in earlier:
                 self.settle(event)
+
+    def summoning(self, message, directed, privacy):
+        """Just Fri's name or a hello, on its own: what they want usually comes in the next message."""
+        if any(isinstance(items := getattr(message, name, None), (list, tuple)) and items
+               for name in ('attachments', 'stickers')):
+            return False  # The picture or sticker is what it's about.
+        return bool(directed and not privacy and not message.author.bot and not getattr(message, 'reference', None) and
+                    SUMMONS.fullmatch(directed.strip()))
+
+    async def rest_of(self, key, message):
+        """Wait up to REST_SECONDS for the member's next message here, letting it in without "fri". True
+        if it came."""
+        came = asyncio.Event()
+        self.summons[key] = (message.id, came)
+        if message.guild:  # In a DM every message is already to Fri.
+            self.active[key] = max(self.active.get(key, 0), time.time()+REST_SECONDS)
+        waits = [asyncio.ensure_future(asyncio.sleep(REST_SECONDS)), asyncio.ensure_future(came.wait())]
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for wait in waits:
+                wait.cancel()
+            if self.summons.get(key, (None,))[0] == message.id:
+                del self.summons[key]
+        return came.is_set()
 
     async def incoming(self, message, invitation, channel, forgotten, *, control=False):
         """The author's profile as a message to Fri comes in. A ping keeps it, and the local erasures
@@ -1114,6 +1187,18 @@ class Agent:
                 pings.append(ping)
         return pings or None
 
+    async def moved_on(self, message):
+        """Someone other than its author spoke after a message ambient attention is answering, as Discord
+        has the channel now (the live view leaves out members with memory off). Unreadable counts too."""
+        try:
+            async for later in message.channel.history(limit=20, after=message, oldest_first=True):
+                if (not later.author.bot and not getattr(later, 'webhook_id', None) and
+                        later.author.id != message.author.id):
+                    return True
+            return False
+        except (discord.HTTPException, TimeoutError):
+            return True
+
     def answer_directly(self, message):
         now = time.time()
         if len(self.direct) > 200:  # Buffered rows expire after 15 minutes, so older marks are moot.
@@ -1138,7 +1223,10 @@ class Agent:
         finally:
             self.replying.discard(message.id)
 
-    async def reply_once(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None, since=None):
+    async def reply_once(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None, since=None,
+                         addressed=False):
+        # `addressed`: someone spoke to Fri (a ping, its name, a reply to Fri, a DM), so it types once the
+        # turn is admitted. Otherwise, e.g. a follow-up or ambient attention, it types only for an action.
         # `since`: the author's (local erasures, privacy revision) as the message came in. A ping's
         # error or a low battery doesn't go out once they erased after it.
         events = [message, *(event for _, event, _ in burst if event is not message)]  # This turn answers for all.
@@ -1164,15 +1252,18 @@ class Agent:
                                 logged=f'reply withheld: {invitation.refusal}')
             return True
 
+        async def room(result):  # An ambient reply's last look, before talk's last privacy checks.
+            if result.response_kind not in ('react', 'quiet') and await self.moved_on(message):
+                raise GateClosed('room moved on')  # Nothing posted or saved: as if it had stayed quiet.
+
         try:
-            async with message.channel.typing():
-                # Entering Discord's typing context itself awaits an HTTP request.
-                if ambient and not self.ambient_ready(message.channel.id, message.author.id):
-                    return
+            if ambient and not self.ambient_ready(message.channel.id, message.author.id):
+                return
+            async with Typing(message.channel, addressed and not ambient) as typing:
                 result = await self.fri.talk(self.fri.guild_id if dm else message.guild.id, message.channel.id, message.author.id,
                     text, 'private' if dm else 'public', message.author.display_name, event=message,
-                    burst=burst, inspect_images=not ambient, **({'invitation': invitation} if invitation else {}),
-                    **({'revision': since[1]} if since else {}))
+                    burst=burst, inspect_images=not ambient, typing=typing, **({'invitation': invitation} if invitation else {}),
+                    **({'revision': since[1]} if since else {}), **({'last_look': room} if ambient else {}))
         except AuthorErased:
             return missed('author privacy changed')
         except GateClosed as exc:
@@ -1186,6 +1277,8 @@ class Agent:
         except ControllerUnavailable:
             return await outage()
         except commands.UserFeedbackCheckFailure as exc:
+            if ambient:  # Nobody asked: an unprompted reply that can't go out just stays quiet.
+                return missed('reply withheld: '+type(exc).__name__)
             if invitation and await refused():
                 return
             if isinstance(exc, ControllerRejected) and (pings := self.pings(events, since, invitation)):
