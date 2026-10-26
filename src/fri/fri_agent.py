@@ -680,8 +680,11 @@ class Agent:
         rows = self.recent.get(message.channel.id)
         if rows is not None:
             self.recent[message.channel.id] = deque((r for r in rows if r['id'] != str(message.id)), maxlen=30)
-        self.withdrawn[str(message.id)] = time.time()
-        while len(self.withdrawn) > 1000:
+        now = time.time()
+        self.withdrawn.pop(str(message.id), None)
+        self.withdrawn[str(message.id)] = now
+        # Kept an hour, longer than any turn that could still hold a copy runs; the cap only bounds memory.
+        while self.withdrawn and (next(iter(self.withdrawn.values())) < now-3600 or len(self.withdrawn) > 100000):
             del self.withdrawn[next(iter(self.withdrawn))]
 
     async def excluded(self, message, dm, invitation=None, privacy=None, text=''):

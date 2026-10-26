@@ -543,3 +543,17 @@ def test_a_turn_whose_own_message_is_withdrawn_during_signin_is_refused(monkeypa
             await fri.close()
 
     asyncio.run(scenario())
+
+
+def test_withdrawn_ids_are_kept_by_age_not_count(monkeypatch):
+    agent = Agent(SimpleNamespace(get_channel=lambda _: None, guild_id=123))
+    channel = SimpleNamespace(id=456)
+    clock = [1000.0]
+    monkeypatch.setattr('fri.fri_agent.time.time', lambda: clock[0])
+    agent.withdraw(SimpleNamespace(id=1, channel=channel))
+    for mid in range(2, 1502):  # A burst of other withdrawals doesn't push an in-flight one out.
+        agent.withdraw(SimpleNamespace(id=mid, channel=channel))
+    assert '1' in agent.withdrawn
+    clock[0] += 3601  # An hour later no turn still holds a copy.
+    agent.withdraw(SimpleNamespace(id=9999, channel=channel))
+    assert list(agent.withdrawn) == ['9999']
