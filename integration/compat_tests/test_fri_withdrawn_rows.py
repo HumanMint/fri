@@ -15,9 +15,11 @@ import pytest
 
 from compat_tests.test_fri_chat import response_event
 from compat_tests.test_fri_mentions import environment
+from fri.feedback import UserFeedbackCheckFailure
 from fri.fri_agent import Agent
 from fri.fri_chat import Chat
 from fri.fri_errors import ControllerUnavailable
+from fri.fri_mentions import Invitation
 
 MARKER = 'lavender-bicycle-private'
 
@@ -268,4 +270,86 @@ def test_all_changed_burst_rows_leave_while_fri_echo_and_unchanged_rows_stay():
         assert await agent.unwithdrawn(456, records)
         agent.profile.return_value = {'enabled': False, 'revision': 1}
         assert not await agent.unwithdrawn(456, records)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+def test_queued_burst_ending_in_ping_purges_earlier_withdrawn_message(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        first = message('fri help with '+MARKER)
+        last = message('<@99> still there?')
+        burst = [(time.monotonic(), item, item.content) for item in [first, last]]
+        for item in [first, last]:
+            cache(agent, channel, item)
+        invitation = await Invitation.create(agent, last)
+        waiting = asyncio.Event()
+        async def notice(*args, **kwargs):
+            waiting.set()
+            return SimpleNamespace(id=last.id+1, content='hold on', delete=AsyncMock())
+        last.reply.side_effect = notice
+        fri.busy.add(20)
+        task = None
+        try:
+            task = asyncio.create_task(agent.respond(last, last.content, burst=burst, invitation=invitation,
+                                                    forgotten=0, revision=0))
+            await asyncio.wait_for(waiting.wait(), 2)
+            if change == 'edited':
+                edited = copy.copy(first)
+                edited.content = 'never mind'
+                edited.edited_at = dt.datetime.now(dt.timezone.utc)
+                rows[first.id] = edited
+            else:
+                fetch = channel.fetch_message.side_effect
+                def deleted(mid):
+                    if mid == first.id:
+                        raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                    return fetch(mid)
+                channel.fetch_message.side_effect = deleted
+            fri.busy.discard(20)
+            await asyncio.wait_for(task, 2)
+            fri.chat_once.assert_not_awaited()
+            retained = any(row['id'] == str(first.id) for row in agent.recent[1])
+            requests = []
+            model(fri, requests)
+            fri.chat_once = type(fri).chat_once.__get__(fri)
+            later = message('fri what is up?', user=30)
+            await fri.talk(123, 1, 30, later.content, 'public', event=later)
+            assert len(requests) == 1
+            assert MARKER not in json.dumps(requests), f'withdrawn row retained={retained}; marker sent in later request'
+        finally:
+            fri.busy.discard(20)
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_reply_to_a_message_withdrawn_during_signin_is_refused_before_the_request(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        earlier = message('here is '+MARKER, user=20)
+        cache(agent, channel, earlier)
+        later = message('fri explain this?', user=30)
+        later.reference = SimpleNamespace(message_id=earlier.id, channel_id=1)
+        requests = []
+        model(fri, requests)
+        fri.chat_once = type(fri).chat_once.__get__(fri)
+        async def headers():
+            edited = copy.copy(earlier)
+            edited.content, edited.edited_at = 'never mind', dt.datetime.now(dt.timezone.utc)
+            rows[earlier.id] = edited
+            assert not await agent.unedited([earlier])
+            assert not agent.recent[1]
+            return {'Authorization': 'Bearer synthetic-review'}
+        fri.chat.headers = headers
+        try:
+            with pytest.raises(UserFeedbackCheckFailure, match='edited or deleted'):
+                await fri.talk(123, 1, 30, later.content, 'public', event=later)
+            assert not requests  # Refused before the model sees the old words.
+        finally:
+            await fri.close()
     asyncio.run(scenario())

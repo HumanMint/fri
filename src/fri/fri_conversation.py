@@ -171,9 +171,14 @@ async def live_rows(agent, message, burst):
     rows = []
     try:
         for _, event, original in burst:
-            current = await message.channel.fetch_message(event.id)
+            try:
+                current = await message.channel.fetch_message(event.id)
+            except discord.NotFound:
+                agent.withdraw(event)  # Out of the live view too, so a later turn can't show it.
+                raise
             if (current.author.id != message.author.id or current.author.bot or current.webhook_id or
                     current.content != original or current.channel.id != message.channel.id):
+                agent.withdraw(event)
                 raise ValueError('A message in that burst changed. Send a fresh request.')
             # A fetch has no server nickname; the arriving event's source matches the turn's own.
             rows.append({'source': discord_source(event).model_dump(), 'text': clean(original, MAX_TEXT)})
