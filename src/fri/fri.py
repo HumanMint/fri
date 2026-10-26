@@ -51,12 +51,12 @@ LOG = logging.getLogger('fri')
 NO_MENTIONS = discord.AllowedMentions.none()
 SIGN_IN_NOTICE = ('heads up: my chatgpt sign-in stopped working, so every reply fails until you reconnect me. '
                   'steps are in fri’s docs/operations.md under “New installations”.')
-FIRST_MEMORY = ('\n\n-# i kept a small preference from this. ask “what do you remember about me?” '
-                'or say “forget me” any time.')
-FIRST_PROFILE = ('\n\n-# i kept a small preference from this, and it follows you around the server. '
-                 'ask “what do you remember about me?” or say “forget me” any time.')
-FIRST_HERE = ('\n\n-# i kept a small preference from this, just for this chat. ask “what do you remember '
-              'about me?” or say “forget me” any time.')
+FIRST_MEMORY = ('\n\n-# i kept a small note from this, something you like or are working on. ask “what do you '
+                'remember about me?” or say “forget me” any time.')
+FIRST_PROFILE = ('\n\n-# i kept a small note from this, and it follows you around the server. what you’re working '
+                 'on stays where you said it. ask “what do you remember about me?” or say “forget me” any time.')
+FIRST_HERE = ('\n\n-# i kept a small note from this, something you like or are working on, just for this chat. '
+              'ask “what do you remember about me?” or say “forget me” any time.')
 MAX_PROVENANCE = 200
 ERROR_BODY = 5  # Seconds for a refusal's small body, well inside the watch's 10 s read.
 CONTRACT_RETRY = 10  # Seconds between contract reads while the controller is down at startup.
