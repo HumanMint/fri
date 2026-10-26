@@ -49,8 +49,8 @@ never content or names. Examples: `not a visible user mention` (the role pill, o
 in quotes or code), `message changed`, `stale event`, `missing permissions`, `fri disabled`,
 `author privacy changed`, `burst too long`, `earlier reply still running` (its waiting
 notice is deleted once that reply lands), `social cooldown` (after the cooldown's one
-notice), `image share withdrawn`, `reply withheld: <recheck>` when a recheck failed after
-composing, and an exception type such as `Forbidden`. A burst's earlier messages are
+notice), `image share withdrawn`, `message deleted`, `nearby message deleted`, `reply withheld:
+<recheck>` when a recheck failed after composing, and an exception type such as `Forbidden`. A burst's earlier messages are
 logged under the reason its last message got. A reply, a notice, a preview or a reaction
 counts as an answer. Bots, webhooks and DMs aren't logged. Fri ignores a copy of an event
 that Discord delivers again while the first delivery, or the burst holding it, is still
@@ -58,6 +58,21 @@ being handled. Separately, it remembers each event ID for an hour from its first
 (at most 10,000 IDs, oldest dropped first) and ignores copies in that time, so the first
 delivery answers or explains for every copy. A ping is logged at most once while it is among the last
 10,000 pings watched.
+
+Fri's live view of a configured channel is its last 15 minutes (at most 30 messages). A deleted
+message leaves it, and so does a reply of Fri's that someone deletes. Gene's error posts stay until
+they expire, so a quick delete can't hide one from the repair investigation. A deleted message
+also leaves a burst that is still gathering, and the burst's last message answers for the rest; if
+the last one is deleted, the whole burst is dropped. A deleted "forget me" or other privacy control
+isn't carried out: deleting it may be taking it back, and an erasure can't be undone. A reply
+still being composed for a deleted
+message is neither sent nor saved (`message deleted`), and one deleted before the model is
+asked never reaches it. Another member's message deleted before then is left out of what the
+model sees; deleted after, the reply is withheld (`nearby message deleted`), with the "things
+changed while i was typing" notice when someone addressed Fri. An edit replaces a member's row
+with the edited text; an edit Discord sends without its author drops the row. Fri's and Gene's
+rows, bursts and the reply fences keep comparing against what arrived. Fri's own reply to a
+message that was later deleted stays in the view as long as it stays in the channel.
 
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.
@@ -99,6 +114,14 @@ advertises it, so the controller must be released first.
   pending. Waiting messages still group into bursts by when they arrived. They are dropped if their
   author's privacy revision moves meanwhile: "forget me", the panel's "Forget my chats", or Gene/Red
   erasure. Privacy commands, plain or @mentioned, never wait.
+- **Memory controls in send order.** A member's "forget me" and "remember me again" take effect in the
+  order they were sent, not the order their arrival reads finish: a later one waits (up to 240
+  seconds) while an earlier one is still coming in. One that arrives after a newer, different one
+  already went through (e.g. delivered late) isn't carried out; Fri says so and asks them to send it
+  again if they still mean it.
+- **DMs at delivery.** A DM reply, reaction or quiet decision is neither sent nor saved once its author
+  has left the server (read fresh from Discord) or DMs were turned off while Fri wrote it, as before
+  the model request. A memory control that already went through still says so.
 - **Saved only after delivery.** A turn is staged while Fri composes the reply. Just before
   delivery, `/chat/turn/check` runs the save's privacy fence without writing: the speaker's
   revision, plus every referenced member's revision and memory setting. Only after Discord
@@ -509,6 +532,15 @@ A usage receipt the controller refuses as invalid (HTTP 400 or 422), or one that
 can't be parsed, moves to `usage/rejected/` and stops blocking later receipts.
 `rejected_usage` in the health file counts them. Credential or contract refusals
 keep every receipt queued.
+
+The owner's usage report ("fri token usage", "show usage by model") is cumulative unless
+the ask names a rolling window: "last 24h", "past 3 days", "last week", "this month" and the
+like, up to 999 of a unit. "today" means the last 24 hours and "this week" the last 7 days,
+not calendar periods, and the reply names the exact window. Fri sends the window as `since`
+only to a controller that offers `usage-window`, and names it only when every row the
+controller returns carries that `since`. An older controller, including one rolled back
+while Fri kept running, gets or returns a plain report, and the reply says it's all-time. Attempts count by when the controller recorded
+them, so a receipt held through an outage lands in the window it arrives in.
 
 A failed subscription renewal logs its cause: exception class, HTTP status and OAuth
 error code, never the response or tokens. Only a refused grant (HTTP 400/401), a

@@ -41,7 +41,7 @@ from .fri_reports import ReportButton, report_component
 from .fri_requests import request_dm_component
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
-from .fri_usage import describe_usage, usage_requested
+from .fri_usage import describe_usage, usage_query, usage_requested, window_applied
 from .panels import defer_panel
 from .privacy import clean
 from .reviews import owner_dm_component
@@ -346,7 +346,20 @@ class Fri(discord.Client):
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
             if fence:  # Checked again before delivery.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
+            if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
+                source = context.get('source') or {}
+                asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),
+                         *(row['source']['id'] for row in context.get('message_burst', []))]
+                if any(int(mid) in self.agent.unsent for mid in asked):
+                    raise GateClosed('message deleted')
+                if 'recent' in context:
+                    context['recent'] = [row for row in context['recent']
+                                         if row.get('gene_error') or int(row['id']) not in self.agent.unsent]
+                    seen.update(int(row['id']) for row in context['recent'] if not row.get('gene_error'))
+        # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
+        seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
         result = await self.chat.respond(text, context, ready=ready)
+        result.shown = seen
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
             'attempt_id': attempt, 'model': context['model'], 'effort': context['effort'],
@@ -387,6 +400,7 @@ class Fri(discord.Client):
             await self.api('POST', '/chat/memory/control', {**scope, 'action': intent})
             if self.agent:
                 self.agent.forget(user_id, erased=intent == 'disable')
+                self.agent.carried_out(user_id, event, intent)
             text = ('done. i erased our saved chats and personal notes, and turned memory off. '
                     'say “remember me again” if you change your mind. discord messages and backups are separate.'
                     if intent == 'disable' else 'memory’s back on. i’ll pick up small preferences as we talk.')
@@ -442,9 +456,13 @@ class Fri(discord.Client):
                     await self.api('POST', '/chat/turn/check', result.turn)  # Fence even a reaction.
                     return result
                 if user_id == self.owner_id and guild_id == self.guild_id and usage_requested(text):
+                    window, label, windowless = usage_query(text, self.capabilities, time.time())
                     usage = await self.api('POST', '/agent/usage',
-                                           {'guild_id': str(guild_id), 'user_id': str(user_id)})
-                    report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()))
+                                           {'guild_id': str(guild_id), 'user_id': str(user_id), **window})
+                    if label and not window_applied(usage, window):
+                        label, windowless = None, True  # The controller didn't apply it, so these are all-time.
+                    report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()),
+                                            window=label, windowless=windowless)
                     result = self.stage_turn(scope, source, text, context, ChatResult(reply=report, status='completed'),
                                              model='local-usage-report', derived=False)
                     await self.api('POST', '/chat/turn/check', result.turn)  # An erasure mid-turn stops it.
@@ -528,10 +546,8 @@ class Fri(discord.Client):
                                     'actions': actions, 'shown': set()}
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
                     async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
-                        if not await self.agent.member(user_id, fresh=True):
-                            raise GateClosed('not a member')
-                        if not self.agent.config['support_dms']:
-                            raise GateClosed('dms off')
+                        if closed := await self.agent.dm_closed(user_id):
+                            raise GateClosed(closed)
                     context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
                 result = await self.chat_once(text, context)
                 if invitation:
@@ -551,6 +567,7 @@ class Fri(discord.Client):
                         raise commands.UserFeedbackCheckFailure('nah, that’s not available here.')
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
+                    result.shown = context['fence'].get('messages', set())  # A summary of the steps may still draw on them.
                     if actions.private_evidence:
                         result.draft, result.notes = None, []
                     if invitation:
@@ -846,6 +863,19 @@ class Fri(discord.Client):
             channels = [self.get_channel(int(c)) for c in self.agent.state.get('channels', []) if str(c).isdigit()]
             LOG.info('Member profiles: %d of %d configured channels are readable by everyone',
                      sum(server_wide(c) for c in channels), len(channels))
+
+    # With no message cache, Discord's deletes and edits arrive only as raw events.
+    async def on_raw_message_delete(self, payload):
+        if self.agent:
+            self.agent.unsend(payload.channel_id, [payload.message_id])
+
+    async def on_raw_bulk_message_delete(self, payload):
+        if self.agent:
+            self.agent.unsend(payload.channel_id, payload.message_ids)
+
+    async def on_raw_message_edit(self, payload):
+        if self.agent:
+            self.agent.edit(payload.channel_id, payload.message)
 
     async def on_message(self, message):
         if self.agent:
