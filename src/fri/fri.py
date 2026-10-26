@@ -346,8 +346,10 @@ class Fri(discord.Client):
             if self.agent and context.get('recent'):
                 context['recent'] = [row for row in context['recent'] if row.get('id') not in self.agent.withdrawn]
             # One this turn quotes or replies to refuses it instead: the answer would be about words taken back.
+            # So does one the turn itself answers: its own message, or one of its burst.
             if self.agent and any(str(row.get('source', {}).get('id')) in self.agent.withdrawn for row in
-                                  context.get('reply_target', []) + context.get('invited_context', [])):
+                                  context.get('reply_target', []) + context.get('invited_context', []) +
+                                  context.get('message_burst', []) + ([fence['turn']] if fence else [])):
                 raise commands.UserFeedbackCheckFailure(WITHDRAWN)
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(

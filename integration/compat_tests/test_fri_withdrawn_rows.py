@@ -492,3 +492,54 @@ def test_a_nearby_source_withdrawn_during_a_mention_reply_leaves_the_live_view(m
             await fri.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('burst_input', [False, True])
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+def test_a_turn_whose_own_message_is_withdrawn_during_signin_is_refused(monkeypatch, tmp_path, burst_input, change):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        secret = message('fri help with ' + MARKER)
+        latest = message('fri please explain it') if burst_input else secret
+        events = [secret, latest] if burst_input else [secret]
+        burst = [(time.monotonic(), e, e.content) for e in events] if burst_input else []
+        for event in events:
+            cache(agent, channel, event)
+        other = message('<@99> explain this?', user=30)
+        other.reference = SimpleNamespace(message_id=secret.id, channel_id=1)
+        quoted = await Invitation.create(agent, other)
+        await quoted.admit()
+        await quoted.collect(include_recent=False)
+        assert secret.id in quoted.events
+        requests = []
+        model(fri, requests)
+        fri.chat_once = type(fri).chat_once.__get__(fri)
+
+        async def headers():
+            if change == 'edited':
+                current = copy.copy(secret)
+                current.content, current.edited_at = 'never mind', dt.datetime.now(dt.timezone.utc)
+                rows[secret.id] = current
+            else:
+                fetch = channel.fetch_message.side_effect
+                def deleted(mid):
+                    if mid == secret.id:
+                        raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                    return fetch(mid)
+                channel.fetch_message.side_effect = deleted
+            # Another member's already-running mention notices the edit.
+            assert not await quoted.current()
+            assert quoted.refusal == 'nearby message changed'
+            assert str(secret.id) in agent.withdrawn
+            return {'Authorization': 'Bearer synthetic-review'}
+
+        fri.chat.headers = headers
+        try:
+            with pytest.raises(UserFeedbackCheckFailure, match='edited or deleted'):
+                await fri.talk(123, 1, 20, latest.content, 'public', event=latest, burst=burst)
+            assert not requests
+        finally:
+            await fri.close()
+
+    asyncio.run(scenario())
