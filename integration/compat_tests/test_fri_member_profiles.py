@@ -736,3 +736,42 @@ def test_a_channel_closed_while_fri_thinks_keeps_the_reply_unsaid(monkeypatch, t
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_profile_note_said_where_not_everyone_reads_now_stays_out_of_public(monkeypatch, tmp_path):
+    # fri #98: a note already in the profile from a channel that no longer counts as server-wide.
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like private jazz', 'noted', note('I like private jazz', 'music'))
+            await w.say(GAMING, 'fri I like chess', 'noted', note('I like chess'))
+            w.readable[GENERAL] = False
+            await w.say(GAMING, 'fri what should i play')
+            notes = model_context(w)['personal_memory']['notes']
+            assert [row['evidence'] for row in notes] == ['I like chess']
+            sent = json.dumps(model_context(w), default=str)
+            assert 'private jazz' not in sent
+            overview, _, _ = await w.say(GAMING, 'fri what do you remember about me')
+            assert 'private jazz' not in overview.reply and 'chess' in overview.reply
+            await w.say(DM, 'fri what should i listen to')  # Their own DM still has all of it.
+            assert {row['evidence'] for row in model_context(w)['personal_memory']['notes']} == {
+                'I like private jazz', 'I like chess'}
+            w.readable[GENERAL] = True
+            await w.say(GAMING, 'fri what should i play')
+            assert {row['evidence'] for row in model_context(w)['personal_memory']['notes']} == {
+                'I like private jazz', 'I like chess'}
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('origins', [None, ['public:1', None], ['public:1'], 'junk'])
+def test_placing_notes_fails_closed_on_a_mismatch(origins):
+    from fri.fri_memory import place_notes
+    notes = [{'scope': 'server', 'evidence': 'a'}, {'scope': 'here', 'evidence': 'b'}]
+    channels = {1: None}  # Gone, or never cached: can't tell, so restricted.
+    context = place_notes(channels.get, {'personal_memory': {'notes': notes}, 'profile_origins': origins}, 'public:2')
+    assert [row['evidence'] for row in context['personal_memory']['notes']] == (['a', 'b'] if origins is None else ['b'])
+    private = place_notes(channels.get, {'personal_memory': {'notes': list(notes)}, 'profile_origins': origins},
+                          'private:9')
+    assert len(private['personal_memory']['notes']) == 2 and 'profile_origins' not in private

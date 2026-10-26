@@ -29,8 +29,10 @@ from .fri_memory import (
     PROFILES,
     describe_memory,
     describe_profile,
+    drop_unheard,
     memory_intent,
     note_place,
+    place_notes,
     profiled,
     server_wide,
 )
@@ -344,6 +346,7 @@ class Fri(discord.Client):
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
+            drop_unheard(self.get_channel, context)  # Nor a profile note said there (fri #98).
             if fence:  # Checked again before delivery.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
             if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
@@ -387,7 +390,8 @@ class Fri(discord.Client):
         # Privacy controls must work while inference is busy or the subscription is down.
         intent = memory_intent(text)
         if intent == 'show' and self.profiles:
-            profile = (await self.api('POST', '/chat/context', profiled(self, scope)))['personal_memory']
+            profile = place_notes(self.get_channel, await self.api('POST', '/chat/context', profiled(self, scope)),
+                                  scope['conversation_id'])['personal_memory']
             return ChatResult(reply=await self.memory_overview(scope, profile, visibility == 'private'),
                               status='completed', memory_scope=scope)
         if intent == 'show':
@@ -418,7 +422,8 @@ class Fri(discord.Client):
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
-                context = attributed(await self.api('POST', '/chat/context', profiled(self, scope)))
+                context = place_notes(self.get_channel, attributed(await self.api(
+                    'POST', '/chat/context', profiled(self, scope))), scope['conversation_id'])
                 if revision is not None and context['revision'] != revision:
                     raise AuthorErased()
                 if self.profiles:

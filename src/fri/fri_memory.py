@@ -36,6 +36,47 @@ def server_wide(channel):
         return False
 
 
+def place_notes(get_channel, context, conversation):
+    """In public, keep where each profile note was said (the controller's profile_origins) beside the notes,
+    never in them, and drop any said where not everyone can read now (fri #98). Fri checks again right before
+    the model reads them (drop_unheard). The model's input never carries profile_origins.
+
+    A private conversation is the member's own: all their notes show there, so nothing is dropped.
+    """
+    origins = context.pop('profile_origins', None)
+    if origins is None or not conversation.startswith('public:'):
+        return context  # An older controller says nothing, as before.
+    notes = (context.get('personal_memory') or {}).get('notes', [])
+    aligned = isinstance(origins, list) and len(origins) == len(notes)  # Otherwise every one is unknown.
+    context['profile_origins'] = {note_key(note): origin for note, origin in zip(notes, origins)
+                                  if note.get('scope') == 'server'} if aligned else {}
+    return drop_unheard(get_channel, context)
+
+
+def note_key(note):
+    return f"{note.get('category')}\0{note.get('evidence')}"
+
+
+def drop_unheard(get_channel, context):
+    origins = context.get('profile_origins')
+    if origins is not None and (memory := context.get('personal_memory')):
+        memory['notes'] = [note for note in memory.get('notes', []) if note.get('scope') != 'server' or
+                           said_to_everyone(get_channel, origins.get(note_key(note), 'unknown'))]
+        kept = {note_key(note) for note in memory['notes']}  # Nothing of a dropped note stays behind.
+        context['profile_origins'] = {key: origin for key, origin in origins.items() if key in kept}
+    return context
+
+
+def said_to_everyone(get_channel, origin):
+    """Where a profile note was said is still readable by everyone. A note the member moved into their
+    profile from a private chat (origin private:) went there on their own press; an older note (None) is
+    unknown, as before. Somewhere Fri can't resolve, or that keeps a role or member out, stays out of public."""
+    if origin is None or str(origin).startswith('private:'):
+        return True
+    kind, _, channel_id = str(origin).partition(':')
+    return kind == 'public' and channel_id.isdigit() and server_wide(get_channel(int(channel_id)))
+
+
 def before_removal(message_id, profile):
     """Sent before the member last edited their memory, so Fri keeps it nowhere (the controller's removed_at)."""
     return discord.utils.snowflake_time(int(message_id)).timestamp() <= (profile.get('removed_at') or 0)
