@@ -66,6 +66,7 @@ UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for
 UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
 LEGACY = '[an earlier fri reply from before fri tracked its sources]'
 CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
+WITHDRAWN = 'the message i was answering got edited or deleted while i was on it. ask again if you still want it.'
 CLOSED = 'a channel i was pulling from just went private while i was replying, so that stays unsaid. ask again.'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
@@ -345,6 +346,15 @@ class Fri(discord.Client):
             elif fence:
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
                     context, fence['turn']['user_id'], fence['actions'])})
+            # A message its author edited or deleted since the live view was copied: its old words stay out.
+            if self.agent and context.get('recent'):
+                context['recent'] = [row for row in context['recent'] if row.get('id') not in self.agent.withdrawn]
+            # One this turn quotes or replies to refuses it instead: the answer would be about words taken back.
+            # So does one the turn itself answers: its own message, or one of its burst.
+            if self.agent and any(str(row.get('source', {}).get('id')) in self.agent.withdrawn for row in
+                                  context.get('reply_target', []) + context.get('invited_context', []) +
+                                  context.get('message_burst', []) + ([fence['turn']] if fence and 'turn' in fence else [])):
+                raise commands.UserFeedbackCheckFailure(WITHDRAWN)
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
