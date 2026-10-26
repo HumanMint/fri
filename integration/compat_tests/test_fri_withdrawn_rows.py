@@ -353,3 +353,96 @@ def test_a_reply_to_a_message_withdrawn_during_signin_is_refused_before_the_requ
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+@pytest.mark.parametrize('consumer', ['direct', 'attention'])
+def test_every_withdrawn_message_of_a_ping_burst_leaves_the_live_view(monkeypatch, tmp_path, change, consumer):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        first = message('fri first withdrawn caption')
+        second = message('fri help with ' + MARKER)
+        last = message('<@99> still there?')
+        events = [first, second, last]
+        for event in events:
+            cache(agent, channel, event)
+        burst = [(time.monotonic(), event, event.content) for event in events]
+        invitation = await Invitation.create(agent, last)
+        waiting = asyncio.Event()
+
+        async def notice(*args, **kwargs):
+            waiting.set()
+            return SimpleNamespace(id=last.id + 1, content='hold on', delete=AsyncMock())
+
+        last.reply.side_effect = notice
+        fri.busy.add(20)
+        task = asyncio.create_task(agent.respond(last, last.content, burst=burst,
+            invitation=invitation, forgotten=0, revision=0))
+        try:
+            await asyncio.wait_for(waiting.wait(), 2)
+            if change == 'edited':
+                for event in events[:2]:
+                    current = copy.copy(event)
+                    current.content = 'never mind'
+                    current.edited_at = dt.datetime.now(dt.timezone.utc)
+                    rows[event.id] = current
+            else:
+                original_fetch = channel.fetch_message.side_effect
+
+                def deleted(mid):
+                    if mid in (first.id, second.id):
+                        raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                    return original_fetch(mid)
+
+                channel.fetch_message.side_effect = deleted
+            fri.busy.discard(20)
+            await asyncio.wait_for(task, 2)
+            fri.chat_once.assert_not_awaited()
+            live = {row['id'] for row in agent.recent[1]}
+            assert str(first.id) not in live and str(second.id) not in live
+            requests = []
+            model(fri, requests, attention=consumer == 'attention')
+            fri.chat_once = type(fri).chat_once.__get__(fri)
+            if consumer == 'direct':
+                later = message('fri what is up?', user=30)
+                await fri.talk(123, 1, 30, later.content, 'public', event=later)
+            else:
+                await agent.attend()
+            assert len(requests) == 1
+            assert MARKER not in json.dumps(requests)
+        finally:
+            fri.busy.discard(20)
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await fri.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_transient_discord_error_does_not_withdraw_an_unchanged_message(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        earlier = message('fri what is the weather?')
+        cache(agent, channel, earlier)
+        original_fetch = channel.fetch_message.side_effect
+        channel.fetch_message.side_effect = discord.HTTPException(
+            SimpleNamespace(status=503, reason='Service Unavailable'), 'temporary failure')
+        try:
+            assert not await agent.unedited([earlier])
+            assert str(earlier.id) not in agent.withdrawn  # Unconfirmed: unanswered, but not withdrawn.
+            channel.fetch_message.side_effect = original_fetch
+            assert await agent.still_addressed(earlier, answering=True)
+            later = message('fri explain this?', user=30)
+            later.reference = SimpleNamespace(message_id=earlier.id, channel_id=1)
+            requests = []
+            model(fri, requests)
+            fri.chat_once = type(fri).chat_once.__get__(fri)
+            await fri.talk(123, 1, 30, later.content, 'public', event=later)
+            assert len(requests) == 1
+        finally:
+            await fri.close()
+
+    asyncio.run(scenario())

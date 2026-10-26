@@ -515,8 +515,11 @@ class Agent:
         for _, event, arrived in entries:
             try:
                 current = await event.channel.fetch_message(event.id)
-            except discord.HTTPException:
+            except discord.NotFound:
                 current = None
+            except discord.HTTPException:  # Unconfirmed: the notice waits, the row stays.
+                changed = changed or event is not message
+                continue
             if (current is None or getattr(current, 'edited_at', None) is not None or
                     (event is not message and current.content != arrived)):
                 self.withdraw(event)
@@ -657,8 +660,17 @@ class Agent:
         One that isn't also leaves the live view, so a later turn can't show the model what was taken back."""
         unchanged = True
         for event in events:
-            if not await self.still_addressed(event, answering=True):
+            try:
+                current = await event.channel.fetch_message(event.id)
+            except discord.NotFound:
                 self.withdraw(event)
+                unchanged = False
+                continue
+            except discord.HTTPException:  # Unconfirmed, so unanswered but not withdrawn.
+                unchanged = False
+                continue
+            if getattr(current, 'edited_at', None) is not None or current.content != event.content:
+                self.withdraw(event)  # Edited since it was sent, maybe to take it back.
                 unchanged = False
         return unchanged
 

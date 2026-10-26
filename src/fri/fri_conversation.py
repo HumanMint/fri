@@ -168,22 +168,32 @@ async def live_rows(agent, message, burst):
 
     from . import feedback as commands
 
-    rows = []
+    rows, changed, unavailable = [], False, False
+    # Every message is checked before refusing, so each one edited or deleted leaves the live view.
+    for _, event, original in burst:
+        try:
+            current = await message.channel.fetch_message(event.id)
+        except discord.NotFound:
+            agent.withdraw(event)  # Out of the live view too, so a later turn can't show it.
+            unavailable = True
+            continue
+        except discord.HTTPException:  # Unconfirmed: refused, but not withdrawn.
+            unavailable = True
+            continue
+        if (current.author.id != message.author.id or current.author.bot or current.webhook_id or
+                current.content != original or current.channel.id != message.channel.id):
+            agent.withdraw(event)
+            changed = True
+            continue
+        # A fetch has no server nickname; the arriving event's source matches the turn's own.
+        rows.append({'source': discord_source(event).model_dump(), 'text': clean(original, MAX_TEXT)})
+    if changed:
+        raise ValueError('A message in that burst changed. Send a fresh request.')
+    if unavailable:
+        raise ValueError('A message in that burst is no longer available. Send a fresh request.')
     try:
-        for _, event, original in burst:
-            try:
-                current = await message.channel.fetch_message(event.id)
-            except discord.NotFound:
-                agent.withdraw(event)  # Out of the live view too, so a later turn can't show it.
-                raise
-            if (current.author.id != message.author.id or current.author.bot or current.webhook_id or
-                    current.content != original or current.channel.id != message.channel.id):
-                agent.withdraw(event)
-                raise ValueError('A message in that burst changed. Send a fresh request.')
-            # A fetch has no server nickname; the arriving event's source matches the turn's own.
-            rows.append({'source': discord_source(event).model_dump(), 'text': clean(original, MAX_TEXT)})
         return checked_burst(rows, discord_source(message), clean(message.content, MAX_TEXT), fresh=True)
-    except (discord.HTTPException, commands.UserFeedbackCheckFailure):
+    except commands.UserFeedbackCheckFailure:
         raise ValueError('A message in that burst is no longer available. Send a fresh request.') from None
 
 
