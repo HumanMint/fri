@@ -341,6 +341,9 @@ class Fri(discord.Client):
             elif fence:
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
                     context, fence['turn']['user_id'], fence['actions'])})
+            # A message its author edited or deleted since the live view was copied: its old words stay out.
+            if self.agent and context.get('recent'):
+                context['recent'] = [row for row in context['recent'] if row.get('id') not in self.agent.withdrawn]
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]

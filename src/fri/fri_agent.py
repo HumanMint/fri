@@ -108,6 +108,7 @@ class Agent:
         self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
         self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
         self.seen = {}
+        self.withdrawn = {}  # Message IDs edited or deleted while handled, newest last (see withdraw).
         self.last_attention = {}
         self.last_spoke = {}
         self.acknowledged = {}
@@ -506,20 +507,26 @@ class Agent:
         from .fri_mentions import Invitation
         token = re.compile(r'(?<!\\)<@!?'+str(self.fri.user.id)+'>')
         gates = [invitation] if invitation else []
-        for _, event, arrived in burst:
-            if event is message:
-                continue
+        # Every message, this one too, is fetched: any edited or deleted leaves the live view, so later
+        # turns can't show the model what was taken back. Only an earlier one's change silences the notice.
+        entries = list(burst) if any(event is message for _, event, _ in burst) else [
+            *burst, (None, message, message.content)]
+        changed = False
+        for _, event, arrived in entries:
             try:
                 current = await event.channel.fetch_message(event.id)
             except discord.HTTPException:
+                current = None
+            if (current is None or getattr(current, 'edited_at', None) is not None or
+                    (event is not message and current.content != arrived)):
                 self.withdraw(event)
-                return self.missed(events, 'reply withheld: message changed')
-            if getattr(current, 'edited_at', None) is not None or current.content != arrived:
-                self.withdraw(event)
-                return self.missed(events, 'reply withheld: message changed')
-            if (getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
+                changed = changed or event is not message
+                continue
+            if (event is not message and getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
                     token.search(visible_content(arrived or ''))):
                 gates.append(Invitation(self, event))
+        if changed:
+            return self.missed(events, 'reply withheld: message changed')
         for gate in gates:
             if not await gate.current(check_evidence=False):
                 return self.missed(events, f'reply withheld: {gate.refusal}')
@@ -656,10 +663,14 @@ class Agent:
         return unchanged
 
     def withdraw(self, message):
-        """Drop a message its author edited or deleted from the live view (an edit's new text isn't fetched)."""
+        """Drop a message its author edited or deleted from the live view (an edit's new text isn't fetched),
+        and remember it, so a turn that already copied the row drops it before its request (see Fri.chat_once)."""
         rows = self.recent.get(message.channel.id)
         if rows is not None:
             self.recent[message.channel.id] = deque((r for r in rows if r['id'] != str(message.id)), maxlen=30)
+        self.withdrawn[str(message.id)] = time.time()
+        while len(self.withdrawn) > 1000:
+            del self.withdrawn[next(iter(self.withdrawn))]
 
     async def excluded(self, message, dm, invitation=None, privacy=None, text=''):
         """Why a message that waited (its turn, or another control) is no longer one Fri answers, by
@@ -1315,7 +1326,9 @@ class Agent:
                 profiles[user] = await self.profile(parent, user)
             if not profiles[user]['enabled'] or profiles[user]['revision'] != revision:
                 return False
-        return True
+        # Again after those reads: a row withdrawn or forgotten during them must not go out either.
+        live = {r['id'] for r in self.recent.get(channel, ())}
+        return all(row['id'] in live for row in records)
 
     def unsee(self, channel, before, newest):
         """An attention call that didn't decide: its batch is offered again (a Gene error still gets its
