@@ -54,8 +54,9 @@ def counted_environment(monkeypatch, tmp_path):
     return fri, agent, store, channel, message, calls, rows, reads
 
 
-# Before the model, unchanged but for one more read of the ping after the image post's privacy read.
-BEFORE = {'plain': (13, 13), 'image': (18, 18), 'image and tool': (18, 18)}
+# Before the model: main's reads plus a reread of the ping after the privacy read, and for an image ping one
+# more after the image post's privacy read.
+BEFORE = {'plain': (19, 19), 'image': (24, 24), 'image and tool': (24, 24)}
 # After the model: the ping's last check (its access, the ping before and after the privacy read), which
 # covers its image. The tool adds its own checks before acting, its read, and one before the model hears
 # the turn again.
@@ -82,8 +83,8 @@ def test_an_at_mention_waits_on_few_discord_rounds(monkeypatch, tmp_path, case):
             event.reply.assert_awaited_once()
             before, total = seen['model'], reads.snapshot()
             after = (total[0]-before[0], total[1]-before[1])
-            # (reads, rounds) on #19's head: before the model (13, 13), (17, 17), (17, 17); after it
-            # (10, 10), (16, 16), (97, 97).
+            # (reads, rounds) on main d41a93a: before the model (18, 18), (22, 22), (22, 22); after it
+            # (10, 10), (16, 16), (97, 97). The last check before the model also rereads the ping.
             assert before <= BEFORE[case] and after <= AFTER[case], (before, after)
         finally:
             await fri.close()
