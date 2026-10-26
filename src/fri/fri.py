@@ -349,7 +349,7 @@ class Fri(discord.Client):
             # So does one the turn itself answers: its own message, or one of its burst.
             if self.agent and any(str(row.get('source', {}).get('id')) in self.agent.withdrawn for row in
                                   context.get('reply_target', []) + context.get('invited_context', []) +
-                                  context.get('message_burst', []) + ([fence['turn']] if fence else [])):
+                                  context.get('message_burst', []) + ([fence['turn']] if fence and 'turn' in fence else [])):
                 raise commands.UserFeedbackCheckFailure(WITHDRAWN)
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
