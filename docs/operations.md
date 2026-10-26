@@ -49,8 +49,8 @@ never content or names. Examples: `not a visible user mention` (the role pill, o
 in quotes or code), `message changed`, `stale event`, `missing permissions`, `fri disabled`,
 `author privacy changed`, `burst too long`, `earlier reply still running` (its waiting
 notice is deleted once that reply lands), `social cooldown` (after the cooldown's one
-notice), `image share withdrawn`, `reply withheld: <recheck>` when a recheck failed after
-composing, and an exception type such as `Forbidden`. A burst's earlier messages are
+notice), `image share withdrawn`, `message deleted`, `nearby message deleted`, `reply withheld:
+<recheck>` when a recheck failed after composing, and an exception type such as `Forbidden`. A burst's earlier messages are
 logged under the reason its last message got. A reply, a notice, a preview or a reaction
 counts as an answer. Bots, webhooks and DMs aren't logged. Fri ignores a copy of an event
 that Discord delivers again while the first delivery, or the burst holding it, is still
@@ -58,6 +58,21 @@ being handled. Separately, it remembers each event ID for an hour from its first
 (at most 10,000 IDs, oldest dropped first) and ignores copies in that time, so the first
 delivery answers or explains for every copy. A ping is logged at most once while it is among the last
 10,000 pings watched.
+
+Fri's live view of a configured channel is its last 15 minutes (at most 30 messages). A deleted
+message leaves it, and so does a reply of Fri's that someone deletes. Gene's error posts stay until
+they expire, so a quick delete can't hide one from the repair investigation. A deleted message
+also leaves a burst that is still gathering, and the burst's last message answers for the rest; if
+the last one is deleted, the whole burst is dropped. A deleted "forget me" or other privacy control
+isn't carried out: deleting it may be taking it back, and an erasure can't be undone. A reply
+still being composed for a deleted
+message is neither sent nor saved (`message deleted`), and one deleted before the model is
+asked never reaches it. Another member's message deleted before then is left out of what the
+model sees; deleted after, the reply is withheld (`nearby message deleted`), with the "things
+changed while i was typing" notice when someone addressed Fri. An edit replaces a member's row
+with the edited text; an edit Discord sends without its author drops the row. Fri's and Gene's
+rows, bursts and the reply fences keep comparing against what arrived. Fri's own reply to a
+message that was later deleted stays in the view as long as it stays in the channel.
 
 Offline synthetic integration checks cover handler replies, image provenance,
 privacy/access revocation, expiry, allowances and the real controller wire contract.

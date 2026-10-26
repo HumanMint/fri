@@ -389,6 +389,7 @@ class ChatResult:
     media: object = None  # Trusted ephemeral bytes only; never parsed from model output or stored.
     turn: dict | None = None  # Staged /chat/turn record, saved only after Discord accepts delivery.
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
+    shown: set = field(default_factory=set)  # Live-view message IDs the model saw; a delete withholds it.
 
 
 OUTPUT_EVENTS = ('response.output_', 'response.content_part.', 'response.reasoning', 'response.refusal.',
