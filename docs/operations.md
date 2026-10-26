@@ -99,6 +99,14 @@ advertises it, so the controller must be released first.
   pending. Waiting messages still group into bursts by when they arrived. They are dropped if their
   author's privacy revision moves meanwhile: "forget me", the panel's "Forget my chats", or Gene/Red
   erasure. Privacy commands, plain or @mentioned, never wait.
+- **Memory controls in send order.** A member's "forget me" and "remember me again" take effect in the
+  order they were sent, not the order their arrival reads finish: a later one waits (up to 240
+  seconds) while an earlier one is still coming in. One that arrives after a newer, different one
+  already went through (e.g. delivered late) isn't carried out; Fri says so and asks them to send it
+  again if they still mean it.
+- **DMs at delivery.** A DM reply, reaction or quiet decision is neither sent nor saved once its author
+  has left the server (read fresh from Discord) or DMs were turned off while Fri wrote it, as before
+  the model request. A memory control that already went through still says so.
 - **Saved only after delivery.** A turn is staged while Fri composes the reply. Just before
   delivery, `/chat/turn/check` runs the save's privacy fence without writing: the speaker's
   revision, plus every referenced member's revision and memory setting. Only after Discord

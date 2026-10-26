@@ -387,6 +387,7 @@ class Fri(discord.Client):
             await self.api('POST', '/chat/memory/control', {**scope, 'action': intent})
             if self.agent:
                 self.agent.forget(user_id, erased=intent == 'disable')
+                self.agent.carried_out(user_id, event, intent)
             text = ('done. i erased our saved chats and personal notes, and turned memory off. '
                     'say “remember me again” if you change your mind. discord messages and backups are separate.'
                     if intent == 'disable' else 'memory’s back on. i’ll pick up small preferences as we talk.')
@@ -528,10 +529,8 @@ class Fri(discord.Client):
                                     'actions': actions, 'shown': set()}
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
                     async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
-                        if not await self.agent.member(user_id, fresh=True):
-                            raise GateClosed('not a member')
-                        if not self.agent.config['support_dms']:
-                            raise GateClosed('dms off')
+                        if closed := await self.agent.dm_closed(user_id):
+                            raise GateClosed(closed)
                     context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
                 result = await self.chat_once(text, context)
                 if invitation:

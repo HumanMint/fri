@@ -20,6 +20,7 @@ from . import feedback as commands
 from .fri_addressing import addressed_text, explicit_mention, pinged, visible_content
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SETTINGS_GATE, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
+from .fri_context import addressed_content
 from .fri_conversation import Bursts
 from .fri_errors import (
     UNREACHABLE,
@@ -33,7 +34,7 @@ from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
 from .fri_reports import report_message
 from .fri_responses import REACTIONS
-from .fri_turns import Turns
+from .fri_turns import Arrivals, Turns
 from .fri_usage import usage_requested
 from .previews import PagedPreview
 from .privacy import clean
@@ -49,6 +50,8 @@ QUEUE_SECONDS = 240  # How long after it was sent a message may wait behind an e
 RECHARGING = '🪫'
 ERASED = 'erased'  # owner_control: the author erased their chats while it waited.
 CHECK_SECONDS = 10  # A slower owner settings check gives way to the Sol settings call.
+MEMORY_CONTROLS = ('disable', 'enable')  # "forget me", "remember me again": they change what Fri keeps.
+STALE_CONTROL = 'skipped that one. a newer memory request of yours already went through. send it again if you still mean it.'
 
 
 class BehaviorPreview(PagedPreview):
@@ -102,6 +105,8 @@ class Agent:
         self.erased = {}  # member: how many of those erased their chats ("forget me"), not just a cache reset.
         self.turns = Turns(fri)  # Held by a direct reply through its delivery and save.
         self.controls = defaultdict(asyncio.Lock)  # member: held while a privacy control of theirs is carried out.
+        self.memory_controls = Arrivals()  # Memory controls still coming in, so they take effect in send order.
+        self.controlled = {}  # member: (message ID, action) of the newest-sent memory control carried out.
         self.direct = {}  # Discord message ID: when the direct path took it, so attention never picks it too.
         self.pending = {}
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
@@ -576,6 +581,8 @@ class Agent:
             # Privacy controls and cancelling don't wait their turn (see Fri.talk), though privacy
             # controls go one at a time. A cancel did wait in receive() for a delivered reply to be
             # saved, so it cancels what that reply asked.
+            if privacy in MEMORY_CONTROLS:  # In send order: an earlier one still coming in goes first.
+                await self.memory_controls.first(user, message.id, QUEUE_SECONDS)
             async with self.controls[user] if privacy else nullcontext():
                 if privacy and (reason := await self.excluded(message, dm, invitation, privacy)):
                     return self.missed(events, reason)  # E.g. they left while another control ran.
@@ -586,6 +593,10 @@ class Agent:
                                                logged=f'reply withheld: {invitation.refusal}')
                 if privacy and not invitation and not await self.still_addressed(message, answering=True):
                     return self.missed(events, 'message changed')  # E.g. a ping sent while Fri was paused.
+                if privacy in MEMORY_CONTROLS and (newer := self.controlled.get(user)) and (
+                        newer[0] > message.id and newer[1] != privacy):
+                    # Sent before one that already went through, e.g. delivered late: it mustn't undo that.
+                    return await self.superseded(message, events)
                 if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since) is not BUSY:
                     return
             recheck = True
@@ -642,6 +653,32 @@ class Agent:
             if outcome is not BUSY:
                 return
             recheck = True  # E.g. they erased while a panel or ambient reply kept this one waiting.
+
+    async def superseded(self, message, events):
+        try:
+            await message.reply(STALE_CONTROL, mention_author=False, allowed_mentions=NO_MENTIONS)
+        except discord.HTTPException:
+            return self.missed(events, 'superseded control')
+        self.answered(events)
+        await self.fri.waiting_notices.clear(message.author.id)
+
+    def carried_out(self, user, event, action):
+        """A memory control went through (see Fri.talk): an earlier-sent one coming in later can't undo it."""
+        if event is not None and event.id > self.controlled.get(user, (0, None))[0]:
+            self.controlled[user] = (event.id, action)
+
+    def memory_control(self, message):
+        """Whether a message reads as a memory control (see receive), known before anything awaits."""
+        content = getattr(message, 'content', None)
+        return (isinstance(content, str) and not getattr(message.author, 'bot', False) and
+                any(memory_intent(text) in MEMORY_CONTROLS for text in (
+                    clean(content, 4000), addressed_content(content, getattr(self.fri.user, 'id', 0)))))
+
+    async def dm_closed(self, user):
+        """Why a DM can't be answered now: its author left the server, as Discord has it now, or DMs went off."""
+        if not await self.member(user, fresh=True):  # The read first, then the setting, which could change during it.
+            return 'not a member'
+        return None if self.config['support_dms'] else 'dms off'
 
     async def unedited(self, events):
         """Every message of a burst that waited is still there and never edited (see still_addressed)."""
@@ -721,11 +758,14 @@ class Agent:
         self.delivered[message.id] = now
         self.handling[message.id] += 1
         self.turns.arrive(message.author.id, message.id)
+        if self.memory_control(message):  # Before anything awaits, so a later one can't overtake it.
+            self.memory_controls.arrive(message.author.id, message.id)
         try:
             await self.watch(message)
         finally:
             self.handling -= Counter([message.id])
             self.turns.leave(message.author.id, message.id)
+            self.memory_controls.leave(message.author.id, message.id)
 
     async def unreachable(self, message, *, answering=False, standing=None):
         """A message Fri would answer, read while the controller is down: say so instead of going silent.
@@ -827,6 +867,7 @@ class Agent:
             if message.author.bot or not self.config['support_dms'] or not await self.member(message.author.id):
                 return
         elif not self.allowed(message.channel):
+            self.memory_controls.leave(message.author.id, message.id)  # Outside, it's chat (see Fri.talk).
             # An outside ping is one event, never a new ambient/active channel.
             if message.guild.id != self.fri.guild_id or not explicit_mention(message, self.fri.user.id):
                 return self.miss(message, 'outside the main server' if message.guild.id != self.fri.guild_id
@@ -858,6 +899,8 @@ class Agent:
         if control:
             return self.answered([message])
         privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
+        if privacy not in MEMORY_CONTROLS:  # Nothing for a later memory control to wait for.
+            self.memory_controls.leave(message.author.id, message.id)
         owner_report = (owner_addressed and message.author.id == self.fri.owner_id and
                         (dm or message.guild.id == self.fri.guild_id) and usage_requested(directed or text))
         if not self.config['enabled'] and not privacy and not owner_report:
@@ -1088,6 +1131,8 @@ class Agent:
                 return
             from .fri_mentions import force_text
             result = force_text(result)
+        if dm and memory_intent(text) not in MEMORY_CONTROLS and (closed := await self.dm_closed(message.author.id)):
+            return missed(closed)  # Left, or DMs went off, while Fri wrote it: nothing goes out or is saved.
         if since:  # Last before sending. Talk ended on Gene's fence, but a ping's reads above came after it.
             reason = (await self.erasure(message.author.id, *since) if invitation else
                       'author privacy changed' if self.forgotten.get(message.author.id, 0) != since[0] else None)
