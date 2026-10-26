@@ -317,7 +317,7 @@ class Actions:
             if not await unchanged(self.agent, self.event, self.conversation):
                 return {'blocked': 'The conversation evidence changed. Send a fresh request.'}
         from .fri_images import require_current
-        await require_current(self.image_context, self.event)
+        await require_current(self.image_context, self.event)  # Fresh: the conversation check above awaited.
         kind = action.get('kind')
         channels = await self.channels(fresh=True, around=kind == 'read_recent')
         if not channels:
@@ -676,23 +676,25 @@ class Actions:
                     result['proposed_request'] = ''
         return result
 
-    async def valid(self, *, outage=False):
+    async def valid(self, *, outage=False, sending=False):
         """Fail closed if access or source privacy changed while the model was answering.
 
         With outage, a controller that can't be reached raises instead, so a caller with no receipt to
-        keep gives the fixed outage notice rather than an access error."""
+        keep gives the fixed outage notice rather than an access error. `sending`: only checks before
+        delivery follow, and a ping's last one covers it and its image (see Fri.talk), so those two parts
+        aren't repeated for a ping."""
         try:
-            if self.invitation:
+            if self.invitation and not sending:
                 if not await self.invitation.current():
                     return False
-                if self.invitation.outside:
-                    return True
+            if self.invitation and self.invitation.outside:
+                return True
             if self.conversation and (self.conversation.get('message_burst') or self.conversation.get('reply_target')):
                 from .fri_conversation import unchanged
                 if not await unchanged(self.agent, self.event, self.conversation):
                     return False
             from .fri_images import unchanged
-            if not await unchanged(self.image_context, self.event):
+            if not (sending and self.invitation) and not await unchanged(self.image_context, self.event):
                 return False
             if not await self.reads_unchanged():
                 return False

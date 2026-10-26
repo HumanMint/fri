@@ -44,6 +44,8 @@ def test_withdrawn_queued_message_is_neither_answered_nor_saved(monkeypatch, tmp
                 await asyncio.wait_for(task, 2)
             fri.chat_once.assert_not_awaited()
             assert not any(path == '/chat/turn' for path, _ in calls)
+            # Nor can a later turn, even another member's, show the model what it said.
+            assert not any(row['id'] == str(event.id) for rows in agent.recent.values() for row in rows)
         finally:
             fri.busy.discard(20)
             if task and not task.done():

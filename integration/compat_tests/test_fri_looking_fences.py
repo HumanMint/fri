@@ -160,11 +160,13 @@ def test_a_configured_mention_drops_a_meme_edited_during_sign_in(monkeypatch, tm
 
         fri.chat.headers = sign_in
         try:
-            with pytest.raises(commands.UserFeedbackCheckFailure):
-                await fri.talk(123, channel.id, 20, 'whats ur favorite meme out of the memes above',
-                               'public', event=event,
-                               invitation=await Invitation.create(agent, event))
-            assert len(sent) == 1
+            try:  # Refused, or after the read ran, the runner's no-words fallback: either way, not about the meme.
+                result = await fri.talk(123, channel.id, 20, 'whats ur favorite meme out of the memes above',
+                                        'public', event=event, invitation=await Invitation.create(agent, event))
+            except commands.UserFeedbackCheckFailure:
+                result = None
+            assert len(sent) == 1  # The request carrying the edited meme never went out.
+            assert result is None or 'original wins' not in result.reply
         finally:
             await fri.close()
 
@@ -288,6 +290,106 @@ def test_leaving_the_server_during_the_access_recheck_stops_the_image_request(mo
             with pytest.raises(GateClosed):
                 await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
             assert left and len(sent) == 1  # The read went out; the request carrying the meme didn't.
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['delete', 'edit'])
+def test_a_meme_changed_during_the_access_recheck_never_reaches_the_next_request(monkeypatch, tmp_path, change):
+    """The looked-at posts are refetched after the access check's Discord waits, not before them."""
+    import time
+
+    async def scenario():
+        w, post, rows, sent = image_world(monkeypatch, tmp_path)
+        w.fri.chat.headers = AsyncMock(return_value={'Authorization': 'Bearer synthetic'})
+        agent = w.fri.agent
+        agent.recent[GENERAL].append({'id': str(post.id), 'user_id': '30', 'name': 'member 30', 'text': 'original caption',
+                                      'at': time.time(), 'revision': 0, 'gene_error': False, 'attachments': ['image']})
+        guild = w.channels[GENERAL].guild
+        fetching, changed = guild.fetch_channel, []
+
+        async def change_then_fetch(cid):
+            result = await fetching(cid)
+            if len(sent) == 1 and not changed:  # While the access check waits before the second request.
+                changed.append(change)
+                if change == 'delete':
+                    del rows[post.id]
+                    agent.unsend(GENERAL, [post.id])
+                else:
+                    rows[post.id] = edited(post)
+            return result
+        guild.fetch_channel = change_then_fetch
+        text = 'fri pick the best meme in general'
+        try:
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert changed == [change] and len(sent) == 1
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_image_only_post_deleted_while_its_author_is_checked_stays_out_of_the_live_view(monkeypatch, tmp_path):
+    from compat_tests.test_fri_mentions import attachment
+
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        post = message('', attachments=[attachment(channel.id)])
+        profile = agent.profile
+
+        async def delete_during_profile(parent, user):
+            result = await profile(parent, user)
+            del rows[post.id]
+            agent.unsend(channel.id, [post.id])  # Deleted while Fri reads the author's profile.
+            return result
+        agent.profile = delete_during_profile
+        try:
+            await agent.handle(post)
+            assert not any(row['id'] == str(post.id) for row in agent.messages(channel.id))
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_meme_outside_the_live_view_deleted_during_the_turn_check_never_reaches_the_next_request(monkeypatch, tmp_path):
+    """A DM read's post isn't in the live view; once looked at, its delete is marked (fri #90)."""
+    async def scenario():
+        w, post, rows, sent = image_world(monkeypatch, tmp_path)
+        w.fri.chat.headers = AsyncMock(return_value={'Authorization': 'Bearer synthetic'})
+        agent, api, deleted = w.fri.agent, w.fri.api, []
+
+        async def delete_during_turn_check(method, path, payload=None):
+            result = await api(method, path, payload)
+            if path == '/chat/turn/check' and len(sent) == 1 and not deleted:  # Gene's check before the second request.
+                deleted.append(post.id)
+                del rows[post.id]
+                agent.unsend(GENERAL, [post.id])
+            return result
+        w.fri.api = delete_during_turn_check
+        text = 'fri pick the best meme in general'
+        try:
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert deleted == [post.id] and len(sent) == 1
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_meme_deleted_after_the_last_request_withholds_the_reply(monkeypatch, tmp_path):
+    """What the model made of a looked-at post is in the turn's shown set, so delivery refuses after its delete."""
+    async def scenario():
+        w, post, rows, sent = image_world(monkeypatch, tmp_path)
+        w.fri.chat.headers = AsyncMock(return_value={'Authorization': 'Bearer synthetic'})
+        agent = w.fri.agent
+        text = 'fri pick the best meme in general'
+        try:
+            result = await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert len(sent) == 2 and result.reply
+            del rows[post.id]
+            agent.unsend(GENERAL, [post.id])  # After the last request, before delivery.
+            assert agent.unsent.keys() & result.shown == {post.id}  # What reply_once refuses on.
         finally:
             await w.fri.close()
     asyncio.run(scenario())

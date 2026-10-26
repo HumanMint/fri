@@ -309,6 +309,37 @@ def test_member_error_text_cannot_trigger_gene_investigation():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('change', ['opted out', 'left the live view'])
+def test_attention_drops_a_caption_withdrawn_while_it_waited_for_a_model_slot(tmp_path, change):
+    async def scenario():
+        channel = SimpleNamespace(id=456)
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel, data=tmp_path,
+                              chat=SimpleNamespace(headers=AsyncMock(return_value={})), flush_usage=AsyncMock())
+        agent = Agent(fri)
+        agent.state['config']['enabled'] = True
+        state = {'enabled': True, 'revision': 0}
+        agent.profile = AsyncMock(side_effect=lambda *_: dict(state))
+        agent.recent[456].append({'id': '100', 'at': time.time(), 'gene_error': False, 'revision': 0,
+                                  'user_id': '11', 'text': 'my caption lavender-bicycle, help?'})
+        model = AsyncMock(return_value=({'action': 'quiet'}, {}, 'completed'))
+        with patch('fri.fri_agent.analyze', model):
+            await agent.slots.acquire()  # A background investigation holds the slot.
+            task = asyncio.create_task(agent.attend())
+            for _ in range(50):
+                if agent.profile.await_count:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.01)
+            if change == 'opted out':
+                state.update(enabled=False, revision=1)
+            else:
+                agent.uncache(11)
+            agent.slots.release()
+            await asyncio.wait_for(task, 5)
+        model.assert_not_awaited()
+    asyncio.run(scenario())
+
+
 def test_history_search_cannot_quote_a_different_channel_publicly():
     async def scenario():
         from compat_tests.test_fri_runtime import event

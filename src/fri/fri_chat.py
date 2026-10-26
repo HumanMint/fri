@@ -240,6 +240,13 @@ them up only when the speaker asks, and never reveal a request's text; a title a
 The verified owner gets Submit & allow coding on the full preview; members get Submit for owner review.
 The owner still approves the exact tested release later. Don't send people to another channel to submit,
 ask the owner to find another owner, or repeat approval policy as a lecture. A short next step is enough.
+your_open_loops is the speaker's own unfinished stuff that belongs here. reminders (their DM only):
+upcoming, plus any due in the last day; pending needs their Confirm, scheduled hasn't gone out, uncertain
+may not have arrived, will_not_send won't go out (their privacy settings changed since). saved_work: open
+work saved in this conversation, titles only. game_nights: cards they organized in this channel, with the
+card's counts; pending isn't published. Times are UTC; say them in the item's timezone. Use these when
+they ask what's coming up or about one of them, and before preparing a duplicate. Don't bring them up
+unprompted or claim more than the state. null means you can't see them here.
 Gene handles music and server functions. Infrastructure such as Minecraft provisioning needs
 a separate maintainer change; clearly explain this rather than claiming
 the feature worker can do them. That worker may edit only cogs/, tests/features/, docs/features/.
@@ -387,6 +394,35 @@ def request_view(row):
     return view
 
 
+def loops_view(loops, source=None):
+    """The controller's open loops with times as dates, and reminder text cut down like other quoted words.
+
+    Each one already belongs to this conversation: the controller sends reminders only in their DM, saved
+    work only where it was saved, and game-night cards only in their channel, with the card's counts. A /fri
+    panel is private too, so its empty reminder list becomes null: reminders never show there. A kind or row
+    in an unexpected shape is dropped rather than breaking the reply.
+    """
+    def date(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds')
+        except (OverflowError, OSError, ValueError):
+            return None
+    def rows(kind):
+        value = loops.get(kind) if isinstance(loops, dict) else None
+        return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else None
+    dm = (source or {}).get('kind') == 'discord_message' and (source or {}).get('guild_id') is None
+    reminders, saved_work, game_nights = rows('reminders'), rows('saved_work'), rows('game_nights')
+    return {'reminders': None if reminders is None or not dm else
+                [{**row, 'text': str(row.get('text', ''))[:300], 'due': date(row.get('due'))} for row in reminders],
+            'saved_work': None if saved_work is None else
+                [{**row, 'updated': date(row.get('updated'))} for row in saved_work],
+            'game_nights': None if game_nights is None else
+                [{**row, 'options': [date(value) for value in row['options']] if isinstance(row.get('options'), list)
+                  else None, 'chosen': date(row.get('chosen'))} for row in game_nights]}
+
+
 @dataclass
 class ChatResult:
     reply: str = ''
@@ -407,6 +443,7 @@ class ChatResult:
     media: object = None  # Trusted ephemeral bytes only; never parsed from model output or stored.
     turn: dict | None = None  # Staged /chat/turn record, saved only after Discord accepts delivery.
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
+    shown: set = field(default_factory=set)  # Live-view message IDs the model saw; a delete withholds it.
 
 
 OUTPUT_EVENTS = ('response.output_', 'response.content_part.', 'response.reasoning', 'response.refusal.',
@@ -508,6 +545,7 @@ class Chat:
             'recent_gene_receipts_untrusted': context.get('gene_receipts', []),
             'your_gene_requests': None if context.get('requests') is None else
                 [request_view(row) for row in context['requests']],
+            'your_open_loops': None if context.get('loops') is None else loops_view(context['loops'], context.get('source')),
             'action_result_untrusted': context.get('action_result'),
             'action_results_untrusted': context.get('action_results', []),
             'recent_web_research_untrusted': context.get('web_research', []),

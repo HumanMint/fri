@@ -63,8 +63,9 @@ def world(monkeypatch, tmp_path):
     def text_channel(cid, name, nsfw=False):
         item = SimpleNamespace(id=cid, guild=guild, parent_id=None, name=name, typing=typing, history=history)
         item.is_nsfw = lambda: nsfw
-        item.permissions_for = lambda who: (discord.Permissions(view_channel=readable[cid]) if who is everyone
-                                            else discord.Permissions.all())
+        item.permissions_for = lambda who: (discord.Permissions(view_channel=readable[cid], read_message_history=True)
+                                            if who is everyone else discord.Permissions.all())
+        item.overwrites = {}
         return item
 
     channels = {GENERAL: text_channel(GENERAL, 'general'), GAMING: text_channel(GAMING, 'gaming'),
@@ -498,11 +499,20 @@ def test_an_older_controller_or_fri_keeps_todays_per_conversation_memory(monkeyp
 def test_server_wide_needs_everyone_to_read_a_safe_for_work_channel():
     everyone = SimpleNamespace(name='@everyone')
     guild = SimpleNamespace(default_role=everyone)
-    def channel(view=True, nsfw=False):
-        return SimpleNamespace(guild=guild, is_nsfw=lambda: nsfw,
-                               permissions_for=lambda who: discord.Permissions(view_channel=view and who is everyone))
+    def channel(view=True, nsfw=False, history=True, overwrites=None):
+        return SimpleNamespace(guild=guild, is_nsfw=lambda: nsfw, overwrites=overwrites or {},
+                               permissions_for=lambda who: discord.Permissions(
+                                   view_channel=view and who is everyone, read_message_history=history))
     assert server_wide(channel())
     assert not server_wide(channel(view=False)) and not server_wide(channel(nsfw=True))
+    assert not server_wide(channel(history=False))  # Later readers couldn't scroll back to it.
+    # One role or one member kept out (fri #45): the default role alone doesn't prove everyone reads it.
+    for deny in (discord.PermissionOverwrite(view_channel=False), discord.PermissionOverwrite(read_message_history=False)):
+        assert not server_wide(channel(overwrites={'role 50': deny}))
+    assert server_wide(channel(overwrites={'role 50': discord.PermissionOverwrite(send_messages=False)}))
+    without = channel()
+    del without.overwrites
+    assert not server_wide(without)
     assert not server_wide(SimpleNamespace(guild=None)) and not server_wide(None)
     assert not server_wide(SimpleNamespace(guild=guild))  # Unknown channel kinds count as restricted.
     for kind, expected in ((discord.ChannelType.public_thread, True), (discord.ChannelType.news_thread, True),
@@ -733,6 +743,70 @@ def test_a_channel_closed_while_fri_thinks_keeps_the_reply_unsaid(monkeypatch, t
             w.readable[GENERAL] = True
             await w.say(GAMING, 'fri what are my plans')  # Open again, so it's said.
             assert len(turns(w)) == saved+1
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_dm_note_is_shared_and_pulled_back_only_on_the_members_press(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        shown = AsyncMock()
+        monkeypatch.setattr('fri.fri_panel.reply', shown)
+        monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+        w.fri.agent.forget = Mock()
+        press = lambda: Mock(spec=discord.Interaction, id=int(dm_control()['id']), guild_id=None, channel_id=DM,  # noqa: E731
+                             user=SimpleNamespace(id=20, display_name='friend'))
+        try:
+            await w.say(DM, 'fri I like jazz', 'noted', note('I like jazz', 'music'))
+            await w.say(GAMING, 'fri recommend me something')
+            assert model_context(w)['personal_memory']['notes'] == []
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            view = MemoryView(w.fri, scope, state, selected=state['entries'][0]['id'])
+            assert [item.label for item in view.children[1:]] == ['Remove selected', 'Edit selected', 'Share server-wide']
+            await view.children[3].callback(press())  # The first press only asks.
+            assert 'Share it server-wide?' in shown.await_args.kwargs['embed'].description
+            confirm = shown.await_args.kwargs['view']
+            assert confirm.children[3].label == 'Yes, share server-wide'
+            await w.say(GAMING, 'fri recommend me something')
+            assert model_context(w)['personal_memory']['notes'] == []
+            await confirm.children[3].callback(press())
+            assert 'Shared that preference across the server.' in shown.await_args.kwargs['embed'].description
+            await w.say(GAMING, 'fri recommend me something')
+            assert [row['evidence'] for row in model_context(w)['personal_memory']['notes']] == ['I like jazz']
+
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            assert [row['scope'] for row in state['entries']] == ['server']
+            view = MemoryView(w.fri, scope, state, selected=state['entries'][0]['id'])
+            assert view.children[3].label == 'Keep here only'
+            await view.children[3].callback(press())
+            assert 'stays here now' in shown.await_args.kwargs['embed'].description
+            w.fri.agent.forget.assert_called_once_with(20)
+            await w.say(GAMING, 'fri recommend me something')
+            assert model_context(w)['personal_memory']['notes'] == []
+            await w.say(DM, 'fri recommend me something')
+            assert [(row['scope'], row['evidence']) for row in model_context(w)['personal_memory']['notes']] == [
+                ('here', 'I like jazz')]
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('where,capable', [(DM, False), (GENERAL, True)])
+def test_no_move_buttons_in_public_or_against_an_older_controller(monkeypatch, tmp_path, where, capable):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        if not capable:
+            w.fri.capabilities = w.fri.capabilities - {'memory-moves'}
+        try:
+            await w.say(GENERAL, 'fri I like chess', 'noted', note('I like chess'))
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456' if where == DM else '1',
+                                     'conversation_id': 'private:900' if where == DM else 'public:1'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            view = MemoryView(w.fri, scope, state, selected=state['entries'][0]['id'])
+            assert [item.label for item in view.children[1:]] == ['Remove selected', 'Edit selected']
         finally:
             await w.fri.close()
     run(scenario)
