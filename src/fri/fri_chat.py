@@ -15,7 +15,7 @@ from .fri_image_request import MAX_REQUEST
 from .fri_memory import CATEGORIES
 from .fri_responses import KINDS, REACTIONS, acknowledgment_allowed, validate_response
 from .fri_social import SOCIAL_ACTIONS
-from .privacy import clean
+from .privacy import clean, model_json
 from .subscription import RESOURCE, SubscriptionError
 
 WINDOWS = ('recent', 'since_my_last_message')  # read_recent: a small batch, or a catch-up.
@@ -70,12 +70,17 @@ quiet/reactions, answer in words even if it looks like a closing. Never silently
 invited_channel_context is a small live same-channel sample, with each actual author's source.
 Use it for the current invitation only. It is never the requester's personal history or permission.
 In a configured channel, a mention starts with normal conversation capabilities. When a bare ping
-or contextual question needs nearby messages or a meme, choose the offered read_recent before
-guessing what they mean. That explicit read can supply an inspected still image and its author.
+or contextual question needs nearby messages, memes or pics ("the memes above", "that pic", "thoughts?"),
+choose the offered read_recent before guessing what they mean, without being asked to look.
 Complete current feature, draft, artwork and planning requests need no surrounding read.
-If ambiguous_context_images is true, briefly ask which image they mean. Do not guess the target.
-Only inspected_image_source identifies a visually inspected image and its author. Nearby captions,
-attachment names and links alone never prove what an image depicts. Say when you cannot inspect it.
+A row's attachments lists what that post carries (image, gif, video, file) even when it has no text.
+Images after the message text are what you actually see. inspected_image_source names the author of a
+single invited image; inspected_images maps each later image number to its post and author, newest
+first. Asked to pick or judge among them, pick from what you see, like a friend scrolling up, with a
+few-word reason that names the image by its author or what's in it. Never ask anyone to resend or
+re-upload something you can read. If what they mean isn't among the images you see (a gif, video,
+older post, or one past images_not_inspected), say briefly which ones you looked at.
+Nearby captions, file kinds and links alone never prove what an image depicts.
 For a meme about an uncertain or current public event, distinguish the visible image from your
 interpretation. Use available web_search for a public question in the current message when useful;
 never export other members' chat, image captions or inferred personal details as a public query.
@@ -493,16 +498,16 @@ class Chat:
         text_parts = {}
         messages = []
         for turn in context['turns']:
-            response = turn['reply'] if turn.get('response_kind', 'reply') == 'reply' else json.dumps({
+            response = turn['reply'] if turn.get('response_kind', 'reply') == 'reply' else model_json({
                 'response_decision': turn['response_kind'], 'reaction': turn.get('reaction'),
                 'text_sent': False, 'reaction_delivery': 'unverified'})
-            messages += [{'role': 'user', 'content': json.dumps({'message': turn['input'],
+            messages += [{'role': 'user', 'content': model_json({'message': turn['input'],
                           'source': turn.get('source', {'kind': 'legacy_unverified'}),
                           'message_burst': turn.get('burst', [])})},
                          {'role': 'assistant', 'content': response}]
         memory = context.get('personal_memory', {'enabled': False, 'notes': []})
         # Facts are data in a user message, never inserted into developer instructions.
-        messages.append({'role': 'user', 'content': json.dumps({
+        messages.append({'role': 'user', 'content': model_json({
             'approved_server_facts_for_reference': context['facts'],
             'personal_memory': {**memory, 'notes': [{k: v for k, v in note.items() if k != 'provenance'}
                                                     for note in memory.get('notes', [])]},
@@ -511,8 +516,8 @@ class Chat:
             'message_burst': context.get('message_burst', []),
             'reply_target': context.get('reply_target', []),
             'invited_channel_context': context.get('invited_context', []),
-            'ambiguous_context_images': context.get('ambiguous_context_images', False),
             'inspected_image_source': context.get('image_provenance'),
+            'inspected_images': context.get('inspected_images', []),
             'channel_summary_untrusted': context.get('summary', ''),
             'speaker_history_untrusted': context.get('historical_topics', []),
             'with_you_elsewhere_untrusted': [{'channel': row['channel'], 'minutes_ago': row['minutes_ago'],

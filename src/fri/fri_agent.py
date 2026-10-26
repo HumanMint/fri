@@ -29,6 +29,7 @@ from .fri_errors import (
     ControllerUnavailable,
     GateClosed,
 )
+from .fri_images import media
 from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
@@ -143,6 +144,7 @@ class Agent:
         self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
         self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
         self.seen = {}
+        self.withdrawn = {}  # Message IDs edited or deleted while handled, newest last (see withdraw).
         self.last_attention = {}
         self.last_spoke = {}
         self.acknowledged = {}
@@ -164,6 +166,7 @@ class Agent:
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
+        self.looked = {}  # Posts a turn looked at (look()) -> when (monotonic), oldest first: see unsend.
         self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
 
@@ -302,13 +305,14 @@ class Agent:
         investigation."""
         ids, now = {int(i) for i in ids}, time.monotonic()
         def handled(i):
-            return self.handling[i] or i in self.replying or i in self.saving
+            return self.handling[i] or i in self.replying or i in self.saving or i in self.looked
         rows = self.recent.get(channel)  # Never index: that would add a channel for attention to scan.
         # Raw events arrive from every channel Fri can see. Marked: what Fri is handling or saving, and what
         # its live view holds, which a model call may have been shown and attention may pick. So every mark
         # was a real message Fri had in hand, and an unrelated flood of deletes marks nothing.
         viewed = {int(row['id']) for row in rows or ()}
-        marks = [i for i in ids if i in viewed or handled(i)]
+        # Withdrawn ones too: they left the live view when a check saw them change, but a turn may still hold a copy.
+        marks = [i for i in ids if i in viewed or handled(i) or str(i) in self.withdrawn]
         # Marks last an hour, well past any reply still running (they give up within minutes), unless the
         # message is still being handled. No count limit: one would drop marks a running reply needs.
         expired = []
@@ -326,6 +330,16 @@ class Agent:
         for key in [key for key, latest in self.pending.items() if key[0] == channel and latest in ids]:
             del self.pending[key]  # Its burst is dropped below; nothing is pending for that member now.
         self.bursts.unsend(channel, ids)
+
+    def saw(self, ids):
+        """Posts a turn looked at, outside the live view: a delete is marked for an hour, past any reply
+        still running, so the turn's last checks and its delivery notice it (see unsend)."""
+        now = time.monotonic()
+        for i in ids:
+            self.looked.pop(i, None)
+            self.looked[i] = now
+        while self.looked and now-next(iter(self.looked.values())) > REDELIVERY_SECONDS:
+            del self.looked[next(iter(self.looked))]
 
     def edit(self, channel, message):
         """A member's edit shows in Fri's live view as they left it. Fri's and Gene's rows keep what they
@@ -602,18 +616,29 @@ class Agent:
         from .fri_mentions import Invitation
         token = re.compile(r'(?<!\\)<@!?'+str(self.fri.user.id)+'>')
         gates = [invitation] if invitation else []
-        for _, event, arrived in burst:
-            if event is message:
-                continue
+        # Every message, this one too, is fetched: any edited or deleted leaves the live view, so later
+        # turns can't show the model what was taken back. Only an earlier one's change silences the notice.
+        entries = list(burst) if any(event is message for _, event, _ in burst) else [
+            *burst, (None, message, message.content)]
+        changed = False
+        for _, event, arrived in entries:
             try:
                 current = await event.channel.fetch_message(event.id)
-            except discord.HTTPException:
-                return self.missed(events, 'reply withheld: message changed')
-            if getattr(current, 'edited_at', None) is not None or current.content != arrived:
-                return self.missed(events, 'reply withheld: message changed')
-            if (getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
+            except discord.NotFound:
+                current = None
+            except discord.HTTPException:  # Unconfirmed: the notice waits, the row stays.
+                changed = changed or event is not message
+                continue
+            if (current is None or getattr(current, 'edited_at', None) is not None or
+                    (event is not message and current.content != arrived)):
+                self.withdraw(event)
+                changed = changed or event is not message
+                continue
+            if (event is not message and getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
                     token.search(visible_content(arrived or ''))):
                 gates.append(Invitation(self, event))
+        if changed:
+            return self.missed(events, 'reply withheld: message changed')
         for gate in gates:
             if not await gate.current(check_evidence=False):
                 return self.missed(events, f'reply withheld: {gate.refusal}')
@@ -775,11 +800,36 @@ class Agent:
         return None if self.config['support_dms'] else 'dms off'
 
     async def unedited(self, events):
-        """Every message of a burst that waited is still there and never edited (see still_addressed)."""
+        """Every message of a burst that waited is still there and never edited (see still_addressed).
+        One that isn't also leaves the live view, so a later turn can't show the model what was taken back."""
+        unchanged = True
         for event in events:
-            if not await self.still_addressed(event, answering=True):
-                return False
-        return True
+            try:
+                current = await event.channel.fetch_message(event.id)
+            except discord.NotFound:
+                self.withdraw(event)
+                unchanged = False
+                continue
+            except discord.HTTPException:  # Unconfirmed, so unanswered but not withdrawn.
+                unchanged = False
+                continue
+            if getattr(current, 'edited_at', None) is not None or current.content != event.content:
+                self.withdraw(event)  # Edited since it was sent, maybe to take it back.
+                unchanged = False
+        return unchanged
+
+    def withdraw(self, message):
+        """Drop a message its author edited or deleted from the live view (an edit's new text isn't fetched),
+        and remember it, so a turn that already copied the row drops it before its request (see Fri.chat_once)."""
+        rows = self.recent.get(message.channel.id)
+        if rows is not None:
+            self.recent[message.channel.id] = deque((r for r in rows if r['id'] != str(message.id)), maxlen=30)
+        now = time.time()
+        self.withdrawn.pop(str(message.id), None)
+        self.withdrawn[str(message.id)] = now
+        # Kept an hour, longer than any turn that could still hold a copy runs; the cap only bounds memory.
+        while self.withdrawn and (next(iter(self.withdrawn.values())) < now-3600 or len(self.withdrawn) > 100000):
+            del self.withdrawn[next(iter(self.withdrawn))]
 
     async def excluded(self, message, dm, invitation=None, privacy=None, text=''):
         """Why a message that waited (its turn, or another control) is no longer one Fri answers, by
@@ -987,6 +1037,14 @@ class Agent:
                 return
         text = clean(raw, 4000)
         if not text:
+            if not message.author.bot and not dm and self.config['enabled'] and media(message):
+                # An uncaptioned meme or pic still belongs in the live view, or "the memes above" is empty.
+                profile = await self.profile(parent, message.author.id)
+                # Deleted while the profile read waited: like a text post, it stays out.
+                if profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent:
+                    self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
+                        'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
+                        'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
             return self.miss(message, 'no text')
         directed = text if dm else await addressed_text(message, self.fri.user.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
@@ -1026,7 +1084,8 @@ class Agent:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                     'name': clean(message.author.display_name, 60), 'text': text[:500], 'at': time.time(),
-                    'revision': profile.get('revision', 0), 'gene_error': False})
+                    'revision': profile.get('revision', 0), 'gene_error': False,
+                    **({'attachments': media(message)} if media(message) else {})})
         elif message.author.bot:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})
@@ -1516,12 +1575,38 @@ class Agent:
             LOG.warning('Learning completed; owner report delivery is pending')
         return receipt
 
+    async def unwithdrawn(self, channel, records):
+        """Every row of `records` is still in the live view and each author it draws on still allows it,
+        at the revision it was collected under (the check context_messages ran, rerun after a wait)."""
+        live = {r['id'] for r in self.recent.get(channel, ())}
+        source = self.fri.get_channel(channel)
+        parent = getattr(source, 'parent_id', None) or channel
+        authors = set()
+        for row in records:
+            if row['id'] not in live:
+                return False
+            if row['gene_error']:
+                continue
+            if row.get('fri'):
+                authors.update((item['user_id'], item['revision']) for item in row['provenance'])
+            else:
+                authors.add((row['user_id'], row.get('revision', 0)))
+        # Read together, so one author's answer doesn't age while another's is awaited.
+        users = sorted({user for user, _ in authors})
+        profiles = dict(zip(users, await asyncio.gather(*(self.profile(parent, user) for user in users))))
+        if any(not profiles[user]['enabled'] or profiles[user]['revision'] != revision for user, revision in authors):
+            return False
+        # Again after those reads: a row withdrawn or forgotten during them must not go out either.
+        live = {r['id'] for r in self.recent.get(channel, ())}
+        return all(row['id'] in live for row in records)
+
     async def attend(self):
         now = time.time()
         for channel_id in list(self.recent):
             records = await self.context_messages(channel_id, raw_errors=True)
             # Messages the direct path answers stay in records as context but aren't decided again here.
-            fresh = [r for r in records if not r.get('fri') and r['id'] not in self.direct and
+            # A bare image is context for a reply, never something ambient attention answers by itself.
+            fresh = [r for r in records if not r.get('fri') and r['id'] not in self.direct and r['text'] and
                      int(r['id']) > self.seen.get(channel_id, 0)]
             if not fresh or now-self.last_attention.get(channel_id, 0) < self.config['heartbeat_seconds']:
                 continue
@@ -1533,12 +1618,15 @@ class Agent:
             plausible = any(r['gene_error'] or '?' in r['text'] or re.search(r'(?i)\b(help|fri|broken|error)\b', r['text']) for r in fresh)
             if not plausible:
                 continue
+            async def withdrawn(records=records, channel_id=channel_id):
+                """An author opted out, or a row left the live view, while attention waited for a slot or sign-in."""
+                return not await self.unwithdrawn(channel_id, records)
             result, _, status = await self.run('attention',
                 'Decide whether Fri should join. Default quiet. Reply only with clear evidence people want Fri/help, '
                 'no human has already answered, and the latest conversation still needs it. A question alone is not enough. '
                 'Investigate only an actual Gene bot error marked gene_error in trusted metadata. '
                 'source_id must identify a supplied fresh message. Owner attention preference: '+self.config['attention_notes'],
-                {'recent': records, 'fresh_ids': [r['id'] for r in fresh]}, ATTENTION)
+                {'recent': records, 'fresh_ids': [r['id'] for r in fresh]}, ATTENTION, erased=withdrawn)
             if status != 'completed':
                 continue
             selected = next((r for r in fresh if r['id'] == result.get('source_id')), None)

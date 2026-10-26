@@ -194,6 +194,25 @@ advertises it, so the controller must be released first.
   speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
+- **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
+  research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
+  an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead
+  of six. Only a pinned allowlist is raw (`privacy.RAW`): Emoji_Presentation emoji from Unicode 14.0
+  except the regional indicators (🇫🇷 and Clipperton's 🇨🇵 are the same flag), plus ❤, Hangul
+  syllables and the modern Hangul compatibility jamo such as ㅋ. None of them looks like another or
+  like ASCII, alone or in a row, so a row of lookalikes can't spell bits a
+  person reading the log won't see. Everything else stays escaped exactly as before: other scripts
+  and symbols (Latin A and Cyrillic А, the Kelvin sign and K, look-alike combining marks, and ’”
+  and ”’ render alike), combining marks, every variation selector (even an emoji's own U+FE0F: 👍 and 👍️
+  look the same), controls, format and invisible characters, spaces and separators, surrogates,
+  private-use and unassigned code points. Widening the list needs the same test: no member may look
+  like another raw character. `json.dumps` still does the traversal, key conversion and errors. To
+  compare against the old escaping, run `python -m fri.fri_eval --suite model-text` with and without
+  `--baseline` (same cases and settings, model-graded: boundaries, attribution, tone, Korean and
+  Korean chat shorthand, and hidden carriers (thumbs, doubled shaddas, overlay order, Kelvin signs,
+  Cyrillic A, French-looking flags)). The baseline escapes all of Fri's own model input, internal tasks such as image
+  selection included; the graders pin `privacy.model_json`, so they read both runs the same way. A
+  case whose reply fails, or whose grade fails, fails the run.
 
 ## Members' own requests
 
@@ -720,7 +739,8 @@ Each step records:
 - the observed route: local intercept, admission, model, tools, outcome, and how the turn was
   stored;
 - a context manifest: field sizes, offered actions, prompt version, model and effort, with no raw
-  member text;
+  member text; `input_chars` counts the characters of text the model reads, not the request's own
+  JSON escaping;
 - token usage.
 
 Production source is unchanged. Routes come from observable effects plus a pass-through spy on

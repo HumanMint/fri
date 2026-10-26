@@ -5,7 +5,7 @@ CAPABILITIES = ('scoped-context', 'gene-controls', 'owner-reviews', 'privacy-rev
                 'workspace-outbox', 'social-outbox', 'research-receipts', 'agent-learning', 'event-mention-chat',
                 'turn-provenance')
 OPTIONAL = ('reply-checks', 'member-profiles', 'requester-notices',
-            'usage-window')  # Used when the controller offers them; an older controller still runs Fri.
+            'usage-window', 'memory-moves')  # Used when the controller offers them; an older controller still runs Fri.
 
 
 def contract():
