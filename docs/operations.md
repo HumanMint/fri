@@ -128,6 +128,14 @@ advertises it, so the controller must be released first.
   pending. Waiting messages still group into bursts by when they arrived. They are dropped if their
   author's privacy revision moves meanwhile: "forget me", the panel's "Forget my chats", or Gene/Red
   erasure. Privacy commands, plain or @mentioned, never wait.
+- **Memory controls in send order.** A member's "forget me" and "remember me again" take effect in the
+  order they were sent, not the order their arrival reads finish: a later one waits (up to 240
+  seconds) while an earlier one is still coming in. One that arrives after a newer, different one
+  already went through (e.g. delivered late) isn't carried out; Fri says so and asks them to send it
+  again if they still mean it.
+- **DMs at delivery.** A DM reply, reaction or quiet decision is neither sent nor saved once its author
+  has left the server (read fresh from Discord) or DMs were turned off while Fri wrote it, as before
+  the model request. A memory control that already went through still says so.
 - **Saved only after delivery.** A turn is staged while Fri composes the reply. Just before
   delivery, `/chat/turn/check` runs the save's privacy fence without writing: the speaker's
   revision, plus every referenced member's revision and memory setting. Only after Discord
@@ -392,6 +400,33 @@ Fri can't restart anything. It only notices and says so.
   whether deploys are paused) and `/controls/health`
   (4 s each, failures shown as "unreachable" or "rejected"), and the watch state.
 
+## When Gene gets fixed
+
+- **Gene errors Fri files.** When attention files a Gene error (an automatic repair check, or an
+  owner-review request), Fri puts a 👀 on Gene's message and watches that job in the private
+  `gene-fixes.json` in the data directory. It holds only the job, channel and message ids. Each
+  error is watched once, for 3 days from when Gene posted it: filing the same error again through
+  the other path opens a second job, and that one isn't watched. The `fixes` heartbeat stage reads
+  each watched job. Once the job is deployed and its commit is still the live release, Fri replies
+  to Gene's message with one dry line, but only while proactive posts are on, the channel is still
+  configured and sendable (an archived thread isn't reopened), nobody spoke there in the last
+  60 s, and Gene's message still exists. The release and these gates are checked again after
+  Discord returns Gene's message, so a rollback or a config change meanwhile still stops it. A job
+  that's rejected, failed or needs attention, and one a rollback or newer release beat to it, just
+  stop being watched. A hand-off to the owner isn't announced, and neither are failures. The job is
+  marked done before the send, so a line Discord didn't confirm is never sent twice. It goes
+  through the same non-retrying send as one-off posts. A heartbeat waits up to 10 s on a pass and
+  never cancels one stuck in a Discord rate limit: the stage reports `TimeoutError`, and the next
+  heartbeat waits on that same pass.
+- **Tell reporter.** The owner's deployed DM for a repair a member reported (including one the owner
+  finished after its checks handed it over) gets a **Tell reporter** button, when the controller
+  offers `requester-notices` and the report is still on record. A tap claims the controller's mark,
+  checks the report again (still there, still the member's, in a configured channel Fri can post in
+  and not an archived thread, or their DM while they're still in the server), and replies to it once
+  with a fixed line, mentions off and no request text. A send Discord refused (a 4xx, rate limits
+  included) can be tapped again. One that may have posted is never retried. The owner sees the
+  outcome privately, and the button goes away once the reply is sent.
+
 ## Existing installation migration
 
 1. Deploy a reviewed Gene controller supporting `/fri/contract` and `gene-fri/1`.
@@ -473,11 +508,36 @@ lock prevents overlapping processes, but repeatedly restarting a retired service
 still an operational error. Do not remove the legacy image/container until a later,
 explicitly reviewed retirement step.
 
+## Release patch notes
+
+After a release, the maintainer sends the owner that release's notes from Fri's account:
+
+```sh
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.4.0 < notes.md
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes preview 0.4.0 < notes.md  # no send
+```
+
+The recipient is always `GENE_OWNER_ID`; there is no way to name anyone else. It logs in over
+REST only, so the running Fri's gateway session is untouched, and sends with mentions and link
+embeds off. Notes are split at blank lines into at most four messages of 2000 characters,
+counted the way Discord counts them (UTF-16 units, so most emoji count 2).
+`/data/patch-notes.json` records each version's confirmed parts, so a rerun finishes a partial
+send and never repeats a part: a part whose send was attempted but never confirmed is looked for
+in the DM first (Fri's own messages since the attempt with exactly that text, skipping any the
+record already gives another part), and every part carries a fixed nonce. If two versions each
+have an unconfirmed part with the same text, the DM can't say whose a message is, so both are
+refused until someone checks the DM and fixes the record by hand.
+
+Exit codes: 0 sent (or already sent); 2 refused: the same version with
+different notes (send a correction as a new version), notes that don't fit, a damaged record, or
+missing settings; 1 failed: Discord refused, answered badly or the connection dropped. Every confirmed part is on
+record, so rerunning the same command after a 1 is safe. Members see nothing.
+
 ## Background work and health
 
 The 30-second heartbeat fetches controller state first, and defers the whole tick
 when that fails. Every later stage (presence, posts, reminders, owner reports,
-learning, attention, memes, reply checks) runs on its own: a failure is logged with
+learning, attention, gene fixes, memes, reply checks) runs on its own: a failure is logged with
 the stage and exception class only, and never skips the stages after it. `fri-health.json` keeps
 `agent_heartbeat.running/failed/status` for the release coordinator and adds
 `agent_heartbeat.stages`, one `{at, last_ok, error}` entry per enabled stage.
@@ -486,6 +546,15 @@ A usage receipt the controller refuses as invalid (HTTP 400 or 422), or one that
 can't be parsed, moves to `usage/rejected/` and stops blocking later receipts.
 `rejected_usage` in the health file counts them. Credential or contract refusals
 keep every receipt queued.
+
+The owner's usage report ("fri token usage", "show usage by model") is cumulative unless
+the ask names a rolling window: "last 24h", "past 3 days", "last week", "this month" and the
+like, up to 999 of a unit. "today" means the last 24 hours and "this week" the last 7 days,
+not calendar periods, and the reply names the exact window. Fri sends the window as `since`
+only to a controller that offers `usage-window`, and names it only when every row the
+controller returns carries that `since`. An older controller, including one rolled back
+while Fri kept running, gets or returns a plain report, and the reply says it's all-time. Attempts count by when the controller recorded
+them, so a receipt held through an outage lands in the window it arrives in.
 
 A failed subscription renewal logs its cause: exception class, HTTP status and OAuth
 error code, never the response or tokens. Only a refused grant (HTTP 400/401), a

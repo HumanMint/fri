@@ -41,7 +41,7 @@ from .fri_reports import ReportButton, report_component
 from .fri_requests import request_dm_component
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
-from .fri_usage import describe_usage, usage_requested
+from .fri_usage import describe_usage, usage_query, usage_requested, window_applied
 from .panels import defer_panel
 from .privacy import clean
 from .reviews import owner_dm_component
@@ -224,9 +224,10 @@ class Fri(discord.Client):
         self.agent = Agent(self)
         await patiently(self, self.agent.start)
         self.add_view(HomeView(self))
+        from .fri_fixes import TellReporter
         from .fri_social import SocialButton
         from .fri_workspace import PostButton
-        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton)
+        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton, TellReporter)
 
         @self.tree.command(name='fri', description='Chat, request a feature or fix, and follow development.',
                            guild=discord.Object(id=self.guild_id))
@@ -262,7 +263,9 @@ class Fri(discord.Client):
             from .fri_social import component as social_component
             if social_component(interaction, getattr(self.user, 'id', None)):
                 allowed = True
+            from .fri_fixes import tell_component
             if (not allowed and not owner_dm_component(interaction, getattr(self.user, 'id', None), self.owner_id)
+                    and not tell_component(interaction, getattr(self.user, 'id', None), self.owner_id)
                     and not report_component(interaction, getattr(self.user, 'id', None), self.owner_id)
                     and not request_dm_component(interaction, getattr(self.user, 'id', None))):
                 return
@@ -405,6 +408,7 @@ class Fri(discord.Client):
             await self.api('POST', '/chat/memory/control', {**scope, 'action': intent})
             if self.agent:
                 self.agent.forget(user_id, erased=intent == 'disable')
+                self.agent.carried_out(user_id, event, intent)
             text = ('done. i erased our saved chats and personal notes, and turned memory off. '
                     'say “remember me again” if you change your mind. discord messages and backups are separate.'
                     if intent == 'disable' else 'memory’s back on. i’ll pick up small preferences as we talk.')
@@ -460,9 +464,13 @@ class Fri(discord.Client):
                     await self.api('POST', '/chat/turn/check', result.turn)  # Fence even a reaction.
                     return result
                 if user_id == self.owner_id and guild_id == self.guild_id and usage_requested(text):
+                    window, label, windowless = usage_query(text, self.capabilities, time.time())
                     usage = await self.api('POST', '/agent/usage',
-                                           {'guild_id': str(guild_id), 'user_id': str(user_id)})
-                    report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()))
+                                           {'guild_id': str(guild_id), 'user_id': str(user_id), **window})
+                    if label and not window_applied(usage, window):
+                        label, windowless = None, True  # The controller didn't apply it, so these are all-time.
+                    report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()),
+                                            window=label, windowless=windowless)
                     result = self.stage_turn(scope, source, text, context, ChatResult(reply=report, status='completed'),
                                              model='local-usage-report', derived=False)
                     await self.api('POST', '/chat/turn/check', result.turn)  # An erasure mid-turn stops it.
@@ -559,10 +567,8 @@ class Fri(discord.Client):
                                     'actions': actions, 'shown': set()}
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
                     async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
-                        if not await self.agent.member(user_id, fresh=True):
-                            raise GateClosed('not a member')
-                        if not self.agent.config['support_dms']:
-                            raise GateClosed('dms off')
+                        if closed := await self.agent.dm_closed(user_id):
+                            raise GateClosed(closed)
                     context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
                 result = await self.chat_once(text, context)
                 if invitation:
