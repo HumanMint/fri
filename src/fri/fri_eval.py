@@ -92,8 +92,14 @@ def control_cases():
 def catch_up_cases():
     from .fri_actions import CATCH_UP
     read = {'read_recent': {'channels': [{'channel_id': '555', 'name': 'general'}], 'default_channel_id': '555',
-        'limit': 20, 'max_age_days': 7, 'description': 'Read one small recent text batch when asked. No images.',
+        'limit': 20, 'max_age_days': 7, 'description': 'Read one small recent batch when asked: text, what each post '
+        'carries (image, gif, video, file), and a look at up to four of the newest still images.',
         'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
+    nearby = {'read_recent': {**read['read_recent'], 'limit': 12, 'max_age_days': 0.25,
+        'description': 'Read up to twelve preceding same-channel messages from the last six hours when this mention '
+        'needs nearby conversation, memes or images. Looks at up to four of the newest nearby still images.'}}
+    memes = [{'user_id': user, 'name': name, 'text': '', 'attachments': ['image'], 'at': at}
+             for user, name, at in (('202', 'Ash', 1792900000), ('303', 'Bo', 1792900300))]
     def row(user, name, at, text):
         return {'user_id': user, 'name': name, 'at': f'2026-10-19T{at}+00:00', 'text': text}
     missed = {'kind': 'read_recent', 'window': 'since_my_last_message', 'channel_id': '555', 'channel_name': 'general',
@@ -115,6 +121,11 @@ def catch_up_cases():
         {'name': 'catch_up_partial', 'text': 'fri what did i miss',
          'action_result': {**missed, 'stopped_at': 'message_limit', 'your_last_message_at': None},
          'expect': 'Short recap that says it only covers the latest stretch.'},
+        {'name': 'memes_above_reads_first', 'text': 'whats ur favorite meme out of the memes above',
+         'actions': nearby, 'recent': memes, 'expected_action': 'read_recent',
+         # Unset fields mean this channel and the recent read; a catch-up never looks at images.
+         'expected_arguments': {'channel_id': ('555', '', None), 'window': ('recent', '', None)}, 'banned': RESEND,
+         'expect': 'read_recent to look at the memes, unasked. Never asks for a resend.'},
     ]
 
 
@@ -234,6 +245,7 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
             'source': source(name=name)}
         context['acknowledgments_enabled'] = suite == 'endings'
         context['images'] = case.get('images', [])
+        context['inspected_images'] = case.get('inspected_images', [])
         result = await chat.respond(case['text'], context)
         if 'expected_modes' in case:
             case['passed'] = result.status == 'completed' and result.response_kind in case['expected_modes']
@@ -247,12 +259,17 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
                               not mentions(prose(reply), CHEER) and not mentions(reply, case.get('banned', ())) and
                               (not case.get('needs') or mentions(reply, case['needs'])))
         if 'expected_action' in case:
-            case['passed'] = result.status == 'completed' and (result.action or {}).get('kind') == case['expected_action']
+            action, reply = result.action or {}, (result.reply or '').casefold().replace('’', "'")
+            case['passed'] = (result.status == 'completed' and action.get('kind') == case['expected_action'] and
+                              all(action.get(key) in allowed for key, allowed in case.get('expected_arguments', {}).items()) and
+                              not mentions(reply, case.get('banned', ())))
         yield case, result
         if suite == 'sass' and result.status == 'completed':
             yield await grade(chat, model, effort, case, result)
 
 
+# Asking for a resend of something Fri could have read itself.
+RESEND = ('resend', 're-send', 'send them again', 'reupload', 're-upload', "can't see", 'cannot see', "don't see")
 # Assistant cheer and sign-offs the casual voice never uses.
 CHEER = ('!', 'let me know', 'lmk', 'hope this helps', 'hope that helps', 'great question',
          'happy to help', 'glad i could help')
@@ -279,7 +296,8 @@ GRADE = obj({'verdict': {'type': 'string', 'enum': ['pass', 'fail']}, 'reason': 
 
 async def grade(chat, model, effort, case, result):
     """Model-graded verdict for a sass case: phrase checks can't judge consent, distress, truth or help."""
-    situation = {key: case[key] for key in ('turns', 'recent', 'action_result', 'web_research') if key in case}
+    situation = {key: case[key] for key in ('turns', 'recent', 'action_result', 'web_research',
+                                            'inspected_images', 'image_notes') if key in case}
     verdict, counters, status = await analyze(chat, GRADER, {
         'situation': {**situation, 'available_actions': case.get('actions', {}), 'message': case['text']},
         'expectation': case['expect'], 'fri_reply': result.reply, 'fri_action': result.action,
@@ -369,7 +387,30 @@ def sass_cases():
          'requester_is_owner': True, 'max_chars': 700, 'needs': ('queue', 'time', 'timer', 'left', 'remaining', 'eta'),
          'expect': 'Help mode: one concrete design call and a next step '
          '(a request draft is fine). Attitude turned down, no header or sign-off.'},
+        memes_above(),
     ]
+
+
+def memes_above():
+    """The #meme-spam ask: three memes Fri can see right above, newest first, each with its poster."""
+    from .fri_image_eval import shape
+    posters = [('203', 'Sam', 'triangle', (0, 160, 0)), ('202', 'Jo', 'square', (0, 0, 255)),
+               ('201', 'Kev', 'circle', (255, 0, 0))]
+    def posted(user, name, number):
+        mid = str(100000000000000000-number)
+        return {**source(user, name), 'id': mid, 'url': 'https://discord.com/channels/444/555/'+mid}
+    inspected = [{'images': [number], 'source': posted(user, name, number)}
+                 for number, (user, name, _, _) in enumerate(posters, 1)]
+    return {'name': 'pick_from_many_memes', 'text': 'whats ur favorite meme out of the memes above', 'max_chars': 160,
+            'images': [shape(kind, color) for _, _, kind, color in posters], 'inspected_images': inspected,
+            'recent': [{'user_id': user, 'name': name, 'text': '', 'attachments': ['image']}
+                       for user, name, _, _ in reversed(posters)],
+            'banned': (*RESEND, '?'),
+            'needs': ('kev', 'jo', 'sam', 'circle', 'square', 'triangle', 'red', 'blue', 'green'),
+            'image_notes': 'Fri was shown three images: 1 a green triangle posted by Sam, 2 a blue square '
+                           'posted by Jo, 3 a red circle posted by Kev.',
+            'expect': 'Picks one of the three images it was shown, naming it by poster or what is in it, with a '
+                      'few-word reason. No resend request, no claim it cannot see them, no question back.'}
 
 
 def settings_cases():
