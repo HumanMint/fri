@@ -512,8 +512,10 @@ class Agent:
             try:
                 current = await event.channel.fetch_message(event.id)
             except discord.HTTPException:
+                self.withdraw(event)
                 return self.missed(events, 'reply withheld: message changed')
             if getattr(current, 'edited_at', None) is not None or current.content != arrived:
+                self.withdraw(event)
                 return self.missed(events, 'reply withheld: message changed')
             if (getattr(event, 'guild', None) and event.guild.id == self.fri.guild_id and
                     token.search(visible_content(arrived or ''))):
@@ -644,11 +646,20 @@ class Agent:
             recheck = True  # E.g. they erased while a panel or ambient reply kept this one waiting.
 
     async def unedited(self, events):
-        """Every message of a burst that waited is still there and never edited (see still_addressed)."""
+        """Every message of a burst that waited is still there and never edited (see still_addressed).
+        One that isn't also leaves the live view, so a later turn can't show the model what was taken back."""
+        unchanged = True
         for event in events:
             if not await self.still_addressed(event, answering=True):
-                return False
-        return True
+                self.withdraw(event)
+                unchanged = False
+        return unchanged
+
+    def withdraw(self, message):
+        """Drop a message its author edited or deleted from the live view (an edit's new text isn't fetched)."""
+        rows = self.recent.get(message.channel.id)
+        if rows is not None:
+            self.recent[message.channel.id] = deque((r for r in rows if r['id'] != str(message.id)), maxlen=30)
 
     async def excluded(self, message, dm, invitation=None, privacy=None, text=''):
         """Why a message that waited (its turn, or another control) is no longer one Fri answers, by
@@ -1282,6 +1293,30 @@ class Agent:
             LOG.warning('Learning completed; owner report delivery is pending')
         return receipt
 
+    async def unwithdrawn(self, channel, records):
+        """Every row of `records` is still in the live view and each author it draws on still allows it,
+        at the revision it was collected under (the check context_messages ran, rerun after a wait)."""
+        live = {r['id'] for r in self.recent.get(channel, ())}
+        source = self.fri.get_channel(channel)
+        parent = getattr(source, 'parent_id', None) or channel
+        authors = set()
+        for row in records:
+            if row['id'] not in live:
+                return False
+            if row['gene_error']:
+                continue
+            if row.get('fri'):
+                authors.update((item['user_id'], item['revision']) for item in row['provenance'])
+            else:
+                authors.add((row['user_id'], row.get('revision', 0)))
+        profiles = {}
+        for user, revision in authors:
+            if user not in profiles:
+                profiles[user] = await self.profile(parent, user)
+            if not profiles[user]['enabled'] or profiles[user]['revision'] != revision:
+                return False
+        return True
+
     async def attend(self):
         now = time.time()
         for channel_id in list(self.recent):
@@ -1299,12 +1334,15 @@ class Agent:
             plausible = any(r['gene_error'] or '?' in r['text'] or re.search(r'(?i)\b(help|fri|broken|error)\b', r['text']) for r in fresh)
             if not plausible:
                 continue
+            async def withdrawn(records=records, channel_id=channel_id):
+                """An author opted out, or a row left the live view, while attention waited for a slot or sign-in."""
+                return not await self.unwithdrawn(channel_id, records)
             result, _, status = await self.run('attention',
                 'Decide whether Fri should join. Default quiet. Reply only with clear evidence people want Fri/help, '
                 'no human has already answered, and the latest conversation still needs it. A question alone is not enough. '
                 'Investigate only an actual Gene bot error marked gene_error in trusted metadata. '
                 'source_id must identify a supplied fresh message. Owner attention preference: '+self.config['attention_notes'],
-                {'recent': records, 'fresh_ids': [r['id'] for r in fresh]}, ATTENTION)
+                {'recent': records, 'fresh_ids': [r['id'] for r in fresh]}, ATTENTION, erased=withdrawn)
             if status != 'completed':
                 continue
             selected = next((r for r in fresh if r['id'] == result.get('source_id')), None)

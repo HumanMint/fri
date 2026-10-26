@@ -118,9 +118,14 @@ class Invitation:
                 return self.refuse('clock skew')
             if not await self.access(control=control):
                 return False
-            current = await self.event.channel.fetch_message(self.event.id)
+            try:
+                current = await self.event.channel.fetch_message(self.event.id)
+            except discord.NotFound:
+                self.agent.withdraw(self.event)  # Deleted: out of the live view, as for an edit below.
+                raise
             if (current.id != self.event.id or current.author.bot or current.webhook_id or
                     fingerprint(current) != self.original or not explicit_mention(current, self.fri.user.id)):
+                self.agent.withdraw(self.event)  # Out of the live view too, for later turns.
                 return self.refuse('message changed')
             if check_evidence and self.grant:
                 profiles = await self.profile_sources(list(self.events.values()))
