@@ -212,6 +212,29 @@ empty or unavailable lists aren't guessed, an open request isn't drafted again, 
 leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
 on the same model grades it.
 
+## Open loops
+
+Each turn's chat context also carries the speaker's own unfinished things that belong to that
+conversation (`your_open_loops` for the model), so Fri knows them without a tool call:
+
+- **Reminders**, only in the member's DM with Fri: upcoming ones and any due in the last day, with
+  their delivery state. A confirmed reminder that a later privacy change will stop at delivery shows as
+  `will_not_send`, not `scheduled`. The controller sends an empty list for any private conversation,
+  and Fri nulls it unless the turn came from a DM message, since the `/fri` panel is private too.
+- **Saved work**, only in the conversation it was saved in: open items' titles and last update.
+- **Game nights**, only in the card's channel: cards the member organized that haven't happened yet,
+  with the card's own counts and never who chose what.
+
+Each item already shows to the member in that same place through `reminder_list`, `work_list` or the
+posted card, so nothing reaches a new audience. A kind the conversation can never show is null, so
+an empty list there doesn't read as "none". Memory off sends none. Fri uses them when the member asks
+what's coming up or about one of them, and before preparing a duplicate, and doesn't bring them up
+unprompted. An older controller sends no `loops`, which the model reads as unavailable.
+`python -m fri.fri_eval --suite loops` checks these answers with the real model and a rubric judge:
+an existing reminder isn't set again, pending, `will_not_send` and uncertain aren't promised, a
+game night's time comes from the card without naming who's going, banter leaves loops alone, and
+reminders outside DMs aren't called none.
+
 ## Member profiles
 
 With a controller that advertises `member-profiles`, Fri asks for profiles on its context and memory

@@ -217,6 +217,11 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
         async for case, result in requests(chat, model, effort, voice_notes):
             yield case, result
         return
+    if suite == 'loops':
+        from .fri_loops_eval import evaluate as loops
+        async for case, result in loops(chat, model, effort, voice_notes):
+            yield case, result
+        return
     for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': image_cases, 'sass': sass_cases}[suite]():
         name = case.get('display_name', 'Mint')
         context = {'model': model, 'effort': effort, 'facts': [],
@@ -425,5 +430,5 @@ async def main(suite='voice'):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'sass'), default='voice')
+    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'loops', 'sass'), default='voice')
     asyncio.run(main(parser.parse_args().suite))
