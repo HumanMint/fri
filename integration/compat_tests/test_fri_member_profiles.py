@@ -913,3 +913,33 @@ def test_no_move_buttons_in_public_or_against_an_older_controller(monkeypatch, t
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_projects_note_is_shared_with_the_share_button(monkeypatch, tmp_path):
+    """The member can still share a projects note server-wide with the two-press Share button."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        shown = AsyncMock()
+        monkeypatch.setattr('fri.fri_panel.reply', shown)
+        monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+        w.fri.agent.forget = Mock()
+        press = lambda: Mock(spec=discord.Interaction, id=int(dm_control()['id']), guild_id=None, channel_id=DM,  # noqa: E731
+                             user=SimpleNamespace(id=20, display_name='friend'))
+        try:
+            project = "I'm working on a pixel art game"
+            await w.say(GENERAL, 'fri '+project, 'noted', note(project, 'projects'))
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            view = MemoryView(w.fri, scope, state, selected=state['entries'][0]['id'])
+            assert view.children[3].label == 'Share server-wide'
+            await view.children[3].callback(press())
+            await shown.await_args.kwargs['view'].children[3].callback(press())  # Yes, share server-wide.
+            assert 'Shared that preference across the server.' in shown.await_args.kwargs['embed'].description
+            for where in (GAMING, THREAD, DM):
+                await w.say(where, 'fri what should i do tonight')
+                assert model_context(w)['personal_memory']['notes'] == [
+                    {'category': 'projects', 'evidence': project, 'scope': 'server', 'provenance': []}]
+        finally:
+            await w.fri.close()
+    run(scenario)
