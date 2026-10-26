@@ -49,3 +49,32 @@ class Turns:
         finally:
             for wait in waits:
                 wait.cancel()
+
+
+class Arrivals:
+    """A member's messages of one kind still coming in, so a later one can let the earlier ones go first."""
+
+    def __init__(self):
+        self.arrived = defaultdict(set)  # member: IDs of their messages still coming in.
+        self.wakers = {}  # member: set when one of those leaves.
+
+    def arrive(self, user, message_id):
+        self.arrived[user].add(message_id)
+
+    def leave(self, user, message_id):
+        if message_id not in self.arrived.get(user, ()):
+            return
+        self.arrived[user].discard(message_id)
+        if not self.arrived[user]:
+            del self.arrived[user]
+        if user in self.wakers:
+            self.wakers.pop(user).set()
+
+    async def first(self, user, message_id, timeout):
+        """Wait until none of their earlier ones is still coming in, for at most `timeout` seconds."""
+        try:
+            async with asyncio.timeout(timeout):
+                while any(other < message_id for other in self.arrived.get(user, ())):
+                    await self.wakers.setdefault(user, asyncio.Event()).wait()
+        except TimeoutError:
+            pass  # Stuck somewhere: it goes now, and the earlier one can't undo it (see Agent.take_turn).
