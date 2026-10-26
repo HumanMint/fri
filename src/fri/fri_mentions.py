@@ -174,6 +174,10 @@ class Invitation:
                 # The ping again, as an edit during the privacy read would otherwise go unseen.
                 if not await self.ping_unchanged():
                     return self.refuse('message changed')
+                # Their privacy once more, a controller read, so an opt-out during the refetches above counts too.
+                profiles = await self.profile_sources(list(self.events.values()))
+                if any(profiles.get(user) != before for user, before in self.profiles.items()):
+                    return self.refuse('nearby privacy changed')
             return True
         except ControllerUnavailable:
             raise  # Nothing changed; the controller is down, and the caller's outage handling says so.

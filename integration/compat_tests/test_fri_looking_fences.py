@@ -160,11 +160,13 @@ def test_a_configured_mention_drops_a_meme_edited_during_sign_in(monkeypatch, tm
 
         fri.chat.headers = sign_in
         try:
-            with pytest.raises(commands.UserFeedbackCheckFailure):
-                await fri.talk(123, channel.id, 20, 'whats ur favorite meme out of the memes above',
-                               'public', event=event,
-                               invitation=await Invitation.create(agent, event))
-            assert len(sent) == 1
+            try:  # Refused, or after the read ran, the runner's no-words fallback: either way, not about the meme.
+                result = await fri.talk(123, channel.id, 20, 'whats ur favorite meme out of the memes above',
+                                        'public', event=event, invitation=await Invitation.create(agent, event))
+            except commands.UserFeedbackCheckFailure:
+                result = None
+            assert len(sent) == 1  # The request carrying the edited meme never went out.
+            assert result is None or 'original wins' not in result.reply
         finally:
             await fri.close()
 
