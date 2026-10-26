@@ -378,6 +378,11 @@ def test_a_message_deleted_while_typing_starts_never_reaches_the_model(monkeypat
             async def __aexit__(self, *exc):
                 pass
         channel.typing = Typing
+        def fetch(mid):  # As Discord answers for a deleted message.
+            if mid not in rows:
+                raise GONE
+            return rows[mid]
+        channel.fetch_message.side_effect = fetch
         try:
             await asyncio.wait_for(agent.handle(trigger), 10)
             assert not asked  # A ping's invitation already refetches it before the request; a name has this.

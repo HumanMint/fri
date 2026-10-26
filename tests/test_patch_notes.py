@@ -35,9 +35,17 @@ class FakeDM:
             raise RuntimeError('reply lost')
         return message
 
-    async def history(self, *, limit, after, oldest_first):
-        assert oldest_first and after is not None
-        for message in [m for m in self.messages if m.created_at > after][:limit]:
+    async def history(self, *, limit, after=None, oldest_first=None):
+        if after is None and oldest_first is None:  # Discord's default: newest first.
+            for message in sorted(self.messages, key=lambda m: m.id, reverse=True)[:limit]:
+                yield message
+            return
+        assert oldest_first
+        if isinstance(after, discord.Object):
+            found = sorted((m for m in self.messages if m.id > after.id), key=lambda m: m.id)
+        else:
+            found = [m for m in self.messages if after is None or m.created_at > after]
+        for message in found[:limit]:
             yield message
 
 
@@ -220,6 +228,141 @@ def test_recovery_searches_from_now_when_the_attempt_time_is_ahead(dm, tmp_path)
     assert len(dm.sends) == 1
 
 
+def test_recovery_reads_from_discords_clock_not_the_hosts(dm, tmp_path, monkeypatch):
+    """A part sent while the host clock ran an hour fast, then rerun after the clock was corrected."""
+    text = paragraph(1500, 'a')
+    dm.messages.append(said(900, 'earlier dm', BOT))
+    real = notes.time.time
+    monkeypatch.setattr(notes.time, 'time', lambda: real() + 3600)
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert record['anchors']['0.4.0']['1']['after'] == '900'
+    monkeypatch.setattr(notes.time, 'time', lambda: real() + 7200)  # Corrected, then the rerun hours later.
+    run(text, tmp_path)
+    assert len(dm.sends) == 1 and [m.content for m in dm.messages] == ['earlier dm', text]
+
+
+def test_recovery_in_a_dm_that_was_empty_reads_it_all(dm, tmp_path):
+    text = paragraph(1500, 'a')
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert record['anchors']['0.4.0']['1']['after'] == ''
+    run(text, tmp_path)
+    assert len(dm.sends) == 1
+
+
+@pytest.mark.parametrize('damage', ['dropped', 'other-attempt', 'bad-id', 'not-a-dict'])
+def test_a_part_without_a_usable_anchor_still_recovers_by_time(dm, tmp_path, damage):
+    """Records written before anchors existed, or rewritten by that older code, find their part by time."""
+    text = paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b')
+    dm.lost.add(2)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    path = tmp_path / 'patch-notes.json'
+    record = json.loads(path.read_text())
+    if damage == 'dropped':
+        del record['anchors']
+    elif damage == 'other-attempt':
+        record['anchors']['0.4.0']['2'] = {'attempted_at': T, 'after': '1001'}  # Taken for an earlier try.
+    elif damage == 'bad-id':
+        record['anchors']['0.4.0']['2']['after'] = '0'
+    else:
+        record['anchors'] = []
+    path.write_text(json.dumps(record))
+    run(text, tmp_path)
+    assert len(dm.sends) == 2
+    assert [p['message_id'] for p in json.loads(path.read_text())['versions']['0.4.0']['parts']] == ['1001', '1002']
+
+
+@pytest.mark.parametrize('bad', [{'id': 0}, {'id': 'x'}, {'dm': 0}], ids=['zero-id', 'text-id', 'zero-dm'])
+def test_a_malformed_id_in_discords_reply_is_not_recorded(dm, tmp_path, monkeypatch, bad):
+    """Recording it would make every later send refuse the record; the send fails and the part stays tried."""
+    sent = dm.send
+    async def odd(*args, **kwargs):
+        message = await sent(*args, **kwargs)
+        return types.SimpleNamespace(**{**vars(message), 'id': bad.get('id', message.id)})
+    monkeypatch.setattr(dm, 'send', odd)
+    if 'dm' in bad:
+        monkeypatch.setattr(dm, 'id', bad['dm'], raising=False)
+    with pytest.raises(notes.SendFailed, match='message id'):
+        run(paragraph(10, 'a'), tmp_path)
+    state = notes.load(tmp_path / 'patch-notes.json')  # Still a sound record.
+    assert set(state['versions']['0.4.0']['parts'][0]) == notes.TRIED
+
+
+def test_cli_reports_a_malformed_reply_with_exit_1(monkeypatch, capsys, tmp_path, dm):
+    sent = dm.send
+    async def odd(*args, **kwargs):
+        message = await sent(*args, **kwargs)
+        return types.SimpleNamespace(**{**vars(message), 'id': '0'})
+    monkeypatch.setattr(dm, 'send', odd)
+    monkeypatch.setenv('DISCORD_TOKEN', 'secret-token')
+    monkeypatch.setenv('GENE_OWNER_ID', str(OWNER))
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'notes')))
+    assert notes.main(['send', '0.4.0']) == 1
+    assert 'SendFailed' in capsys.readouterr().err
+
+
+def test_records_stay_readable_by_the_code_before_anchors(dm, tmp_path):
+    """Rollback keeps patch-notes.json: parts keep the older field sets, and anchors sit beside versions."""
+    text = paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b')
+    dm.lost.add(2)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert [set(p) for p in record['versions']['0.4.0']['parts']] == [notes.SENT, notes.TRIED]
+    assert set(record) == {'versions', 'anchors'} and list(record['anchors']['0.4.0']) == ['2']
+    run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert [set(p) for p in record['versions']['0.4.0']['parts']] == [notes.SENT] * 2
+    assert record['anchors'] == {}  # Confirmed parts keep no anchor.
+
+
+def test_an_untrustworthy_newest_id_is_not_kept_as_an_anchor(dm, tmp_path):
+    dm.messages.append(said(0, 'earlier message', BOT))
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(paragraph(10, 'a'), tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert record['anchors'] == {}
+    run(paragraph(10, 'a'), tmp_path)  # Found by time, not resent; the record still loads.
+    assert len(dm.sends) == 1
+
+
+def test_a_retry_keeps_the_first_attempts_boundary(dm, tmp_path, monkeypatch):
+    """The first send's outcome is unknown and it shows up only after the rerun's search: a later rerun still finds it."""
+    dm.messages.append(said(900, 'earlier dm', BOT))
+    dm.lost.add(1)
+    hidden = []
+    sent = dm.send
+    async def unseen(*args, **kwargs):
+        try:
+            return await sent(*args, **kwargs)
+        finally:
+            if len(dm.sends) == 1:
+                hidden.append(dm.messages.pop())  # Not visible in history yet.
+    monkeypatch.setattr(dm, 'send', unseen)
+    with pytest.raises(RuntimeError, match='lost'):
+        run('notes', tmp_path)
+    search = dm.history
+    def late(**kwargs):
+        if kwargs.get('limit') == 1 and hidden:
+            dm.messages.append(hidden.pop())  # Lands between the rerun's search and its anchor read.
+        return search(**kwargs)
+    monkeypatch.setattr(dm, 'history', late)
+    dm.refused.add(2)
+    with pytest.raises(RuntimeError, match='refused'):
+        run('notes', tmp_path)
+    assert json.loads((tmp_path / 'patch-notes.json').read_text())['anchors']['0.4.0']['1']['after'] == '900'
+    run('notes', tmp_path)
+    assert len(dm.sends) == 2 and [m.content for m in dm.messages] == ['earlier dm', 'notes']
+
+
 def test_two_unfinished_releases_with_the_same_text_are_refused_not_guessed(dm, tmp_path):
     """0.3.9's part never reached Discord and 0.4.0's identical part did: the DM can't say whose it is."""
     text = paragraph(1500, 's')
@@ -309,6 +452,9 @@ def record(*parts, more=None):
     pytest.param(record(TRIED, SENT), id='sent-after-tried'),
     pytest.param(record(TRIED, TRIED), id='two-tried'),
     pytest.param(record(SENT, more={'0.3.1': {'sha256': H, 'parts': [SENT]}}), id='one-message-two-parts'),
+    pytest.param(record({}), id='nothing-tried'),
+    pytest.param(record({}, {}), id='nothing-tried-two-parts'),
+    pytest.param(record({**TRIED, 'after': '4'}), id='after-in-part'),
 ])
 def test_a_damaged_entry_is_refused_with_exit_2_before_login(monkeypatch, capsys, tmp_path, dm, record):
     """Truncated or nested JSON, a malformed entry or part, or a state send() never writes, anywhere in the record."""

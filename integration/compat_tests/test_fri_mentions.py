@@ -257,12 +257,12 @@ def test_a_discord_refusal_names_the_mention_it_dropped(monkeypatch, tmp_path, c
         async def typing():
             raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
             yield
-        channel.typing = typing
+        channel.typing = typing  # Only cosmetic: the reply itself is what Discord refuses.
         event = message('<@99> you there?')
+        event.reply.side_effect = discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await fri.on_message(event)
-            event.reply.assert_not_awaited()
             assert f'Mention {channel.id}/{event.id} not answered: Forbidden' in caplog.messages
             assert not any('Missing Permissions' in line or 'you there' in line for line in caplog.messages)
         finally:
@@ -1043,10 +1043,21 @@ def test_a_controller_that_goes_down_while_a_ping_waits_says_so(monkeypatch, tmp
 @pytest.mark.parametrize('queued', [False, True])
 @pytest.mark.parametrize('channel_id', [1, 8])
 def test_an_erasure_during_the_typing_call_stops_the_reply(monkeypatch, tmp_path, caplog, channel_id, queued):
-    # Before Fri reads the context its reply is fenced against, queued or not.
+    # Typing starts once the turn is admitted, queued or not; the request never goes out after it.
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, store, _, channel, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        from fri.fri import Fri
+        asked = []
+        async def signed_in(text, context, ready=None):  # Only the model is replaced: Fri's last checks run.
+            await ready()
+            asked.append(text)
+            return ChatResult(status='completed', reply='the marker is blue')
+        async def model(text, context):
+            return await Fri.chat_once(fri, text, context)
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()
+        fri.chat = SimpleNamespace(respond=signed_in)
+        fri.chat_once = AsyncMock(side_effect=model)
         event = message('<@99> remember the private marker?')
         event.reply.return_value = SimpleNamespace(delete=AsyncMock())
         @asynccontextmanager
@@ -1063,10 +1074,11 @@ def test_an_erasure_during_the_typing_call_stops_the_reply(monkeypatch, tmp_path
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
-            fri.chat_once.assert_not_awaited()
+            assert typing.erased and not asked
             assert not any(path == '/chat/turn' for path, _ in calls)
             assert all(item.args[0] == str(ReplyInProgress()) for item in event.reply.await_args_list)
-            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+            assert [line.split(': ', 1)[0] for line in mention_lines(caplog)] == [
+                f'Mention {channel_id}/{event.id} not answered']  # Gene's fence on the erasure, never its content.
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -2350,8 +2362,9 @@ def test_a_burst_that_fails_names_its_earlier_mention(monkeypatch, tmp_path, cap
         async def typing():
             raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
             yield
-        channel.typing = typing
+        channel.typing = typing  # Only cosmetic: the reply itself is what Discord refuses.
         first, second = message('<@99> hey', age=1), message('you around?')
+        second.reply.side_effect = discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
         try:
             task = asyncio.create_task(agent.handle(first))
             while not agent.bursts.has(1, 20):
@@ -2898,6 +2911,38 @@ def test_new_chat_stays_socially_bounded_after_operational_bypass_fix(monkeypatc
             paths = [path for path, _ in calls]
             assert ('/chat/mentions/admit' if prefix == '<@99>' else '/agent/admit') in paths
             assert '/chat/operations/admit' not in paths
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('paused', [False, True])
+@pytest.mark.parametrize('text,path,logged', [
+    ('<@99> forget me', '/agent/context', 'check failed: ControllerRejected'),  # Its arrival read.
+    ('<@99> forget me', '/chat/memory/control', 'check failed: ControllerRejected'),  # The control itself.
+    ('<@99> show my memory', '/chat/context', 'check failed: ControllerRejected'),
+])
+def test_a_privacy_control_ping_refused_by_the_controller_hears_why_even_if_fri_pauses(monkeypatch, tmp_path, caplog,
+                                                                                     paused, text, path, logged):
+    # fri #64: a privacy control works with Fri paused, so its notice must not stop at the pause either.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message(text)
+        api = fri.api
+        async def refused(method, called, payload=None):
+            if called == path:
+                if paused:  # The owner pauses Fri while that call is out.
+                    agent.config['enabled'] = False
+                raise ControllerRejected('nope', 400)
+            return await api(method, called, payload)
+        fri.api = refused
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            # The same notice either way: what it says doesn't depend on the pause.
+            assert [item.args[0] for item in event.reply.await_args_list] == [CONTEXT_CHANGED]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: {logged}']
         finally:
             await fri.close()
     asyncio.run(scenario())

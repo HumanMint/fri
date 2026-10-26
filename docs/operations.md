@@ -59,6 +59,20 @@ being handled. Separately, it remembers each event ID for an hour from its first
 delivery answers or explains for every copy. A ping is logged at most once while it is among the last
 10,000 pings watched.
 
+A message to Fri waits 1.5 s for the rest of a burst before Fri answers. A message that is only
+Fri's name or a hello ("fri", "yo fri", "fri?", a bare ping) waits up to 8 s instead, because the
+question usually comes next, and in a channel that next message gets in without "fri". If it comes
+within the 5 s burst span, one reply answers both. If it comes later, it is answered on its own with
+the bare line in Fri's view, and a bare ping is logged as `rest came separately`. A reply to another
+message, or one with an image or sticker, doesn't wait.
+
+Fri shows typing only once words are coming: for a message addressed to it (its name, a ping, a
+reply to Fri, a DM), once the turn is admitted, so never before a cooldown, a privacy or music
+control, or the local closing reaction; for anything else (a follow-up without "fri", ambient
+attention), only once an action starts. A refused typing request never stops the reply. An ambient
+reply is dropped, unsaid and unsaved (`room moved on`), if anyone other than the member it answers
+spoke in the channel while Fri composed, or the channel can't be read to check.
+
 Fri's live view of a configured channel is its last 15 minutes (at most 30 messages). A deleted
 message leaves it, and so does a reply of Fri's that someone deletes. Gene's error posts stay until
 they expire, so a quick delete can't hide one from the repair investigation. A deleted message
@@ -197,6 +211,29 @@ controller doesn't mark a request a later rollback reverted), withdrawn isn't a 
 empty or unavailable lists aren't guessed, an open request isn't drafted again, and public banter
 leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
 on the same model grades it.
+
+## Open loops
+
+Each turn's chat context also carries the speaker's own unfinished things that belong to that
+conversation (`your_open_loops` for the model), so Fri knows them without a tool call:
+
+- **Reminders**, only in the member's DM with Fri: upcoming ones and any due in the last day, with
+  their delivery state. A confirmed reminder that a later privacy change will stop at delivery shows as
+  `will_not_send`, not `scheduled`. The controller sends an empty list for any private conversation,
+  and Fri nulls it unless the turn came from a DM message, since the `/fri` panel is private too.
+- **Saved work**, only in the conversation it was saved in: open items' titles and last update.
+- **Game nights**, only in the card's channel: cards the member organized that haven't happened yet,
+  with the card's own counts and never who chose what.
+
+Each item already shows to the member in that same place through `reminder_list`, `work_list` or the
+posted card, so nothing reaches a new audience. A kind the conversation can never show is null, so
+an empty list there doesn't read as "none". Memory off sends none. Fri uses them when the member asks
+what's coming up or about one of them, and before preparing a duplicate, and doesn't bring them up
+unprompted. An older controller sends no `loops`, which the model reads as unavailable.
+`python -m fri.fri_eval --suite loops` checks these answers with the real model and a rubric judge:
+an existing reminder isn't set again, pending, `will_not_send` and uncertain aren't promised, a
+game night's time comes from the card without naming who's going, banter leaves loops alone, and
+reminders outside DMs aren't called none.
 
 ## Member profiles
 
@@ -406,12 +443,23 @@ Fri can't restart anything. It only notices and says so.
   heartbeat waits on that same pass.
 - **Tell reporter.** The owner's deployed DM for a repair a member reported (including one the owner
   finished after its checks handed it over) gets a **Tell reporter** button, when the controller
-  offers `requester-notices` and the report is still on record. A tap claims the controller's mark,
-  checks the report again (still there, still the member's, in a configured channel Fri can post in
-  and not an archived thread, or their DM while they're still in the server), and replies to it once
-  with a fixed line, mentions off and no request text. A send Discord refused (a 4xx, rate limits
-  included) can be tapped again. One that may have posted is never retried. The owner sees the
-  outcome privately, and the button goes away once the reply is sent.
+  offers `requester-notices` and the report is still on record. A tap first reads Discord: Fri must
+  be on with proactive posts on, the member still in the server, and the report still there and
+  still theirs, in a configured channel Fri can post in and not an archived thread, or in their DM
+  while support DMs are on. A thread Fri had to fetch is read again after the report, since no
+  archive update reaches an uncached copy, and the member is checked last of all. Fri then checks
+  the live release itself, and that no other release is going out (an older controller checks
+  neither), and claims the controller's mark, which refuses an erased report, a rollback
+  since the repair, any newer release now live, or another release still going out. It checks the
+  config and channel once more with nothing awaited before the send. Controller data of the wrong
+  shape, or a thread whose channel was deleted, gets the owner a plain "didn't send it" and frees
+  any claim. So a change while Discord answered stops
+  the reply. It replies to the report once with a fixed line, mentions off and no request text, and
+  records the outcome as the owner. A send Discord refused (a 4xx, rate limits included) can be
+  tapped again. One that may have posted is never retried. The owner sees the outcome privately, and
+  the button goes away once the reply is sent.
+- **The 👀.** Filing a Gene error waits up to 5 s on the reaction, then lets attention move on. A
+  reaction stuck in a Discord rate limit finishes on its own and is never cancelled.
 
 ## Existing installation migration
 

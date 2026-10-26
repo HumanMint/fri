@@ -5,7 +5,7 @@ import datetime as dt
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import discord
 import httpx
@@ -367,8 +367,8 @@ def test_nothing_posts_when_the_report_is_not_reachable_now(world, change):
         assert not offers_tell(world.fri, notice)
     text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
     assert not sent and text.startswith('didn’t send it') and not world.sent
-    with world.store.connection() as db:
-        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
+    with world.store.connection() as db:  # Read before the claim, so nothing is held: a later tap can still try.
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone() is None
 
 
 def test_no_button_without_the_capability_or_for_a_bot_or_unshipped_job(world):
@@ -412,6 +412,296 @@ def test_tell_buttons_are_the_owners_on_fris_own_dms_only(monkeypatch):
         await button.callback(event)
         told.assert_not_awaited()
     asyncio.run(scenario())
+
+
+def released(store, sha='c'*40):
+    """An ordinary request shipped after the repair, so the repair isn't the live release anymore."""
+    job = store.request('123', '30', 'message-later', 'https://discord.com/channels/123/456/1', 'Add a vote command')
+    ship(store, job['id'], sha)
+
+
+def rolled_back(store):
+    rollback = store.rollback('123', 'owner')
+    deploying = store.claim_deploy()
+    assert deploying['id'] == rollback['id']
+    store.finish_deploy(deploying['id'], deploying['lease'], True, 'Rolled back.')
+
+
+@pytest.mark.parametrize('change', ['rolled_back', 'erased', 'released', 'archived', 'not_allowed', 'proactive_off'])
+def test_a_change_while_discord_reads_the_report_still_stops_the_reply(world, change):
+    report, job_id, _ = reported(world)
+
+    def meanwhile(id):
+        if change == 'rolled_back':
+            rolled_back(world.store)
+        if change == 'erased':
+            world.store.erase_user(str(MEMBER))
+        if change == 'released':
+            released(world.store)
+        if change == 'archived':
+            world.room.archived = True
+        if change == 'not_allowed':
+            world.agent.state['channels'] = []
+            world.fri.workshop_id = 1
+        if change == 'proactive_off':
+            world.agent.state['config']['proactive'] = False
+        return report
+
+    world.room.fetch_message = AsyncMock(side_effect=meanwhile)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent
+    with world.store.connection() as db:
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone() is None
+
+
+def test_a_newer_release_before_the_tap_stops_the_reply(world):
+    report, job_id, _ = reported(world)
+    released(world.store)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'newer release' in text
+
+
+@pytest.mark.parametrize('change', ['proactive_off', 'not_allowed', 'archived'])
+def test_a_change_while_the_claim_is_out_stops_the_reply_and_frees_it(world, change):
+    report, job_id, _ = reported(world)
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        result = await api(method, path, body)
+        if path.endswith('/requester-notice'):
+            if change == 'proactive_off':
+                world.agent.state['config']['proactive'] = False
+            if change == 'not_allowed':
+                world.agent.state['channels'] = []
+                world.fri.workshop_id = 1
+            if change == 'archived':
+                world.room.archived = True
+        return result
+
+    world.fri.api.side_effect = meanwhile
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and text.startswith('didn’t send it')
+    with world.store.connection() as db:  # Recorded as refused, so a later tap may try again.
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
+
+
+def test_the_outcome_is_recorded_as_the_owner_on_this_server(world):
+    _, job_id, _ = reported(world)
+    asyncio.run(tell(world.fri, job_id, OWNER))
+    [finish] = [c.args for c in world.fri.api.await_args_list if c.args[1].endswith('/finish')]
+    assert finish[2]['guild_id'] == '123' and finish[2]['user_id'] == str(OWNER) and finish[2]['state'] == 'sent'
+
+
+@pytest.mark.parametrize('change', ['left', 'disabled', 'proactive_off'])
+def test_a_public_report_needs_the_member_still_here_and_fri_posting(world, change):
+    report, job_id, _ = reported(world)
+    if change == 'left':
+        world.agent.member = AsyncMock(return_value=None)
+    if change == 'disabled':
+        world.agent.state['config']['enabled'] = False
+    if change == 'proactive_off':
+        world.agent.state['config']['proactive'] = False
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and text.startswith('didn’t send it')
+    if change == 'left':
+        world.agent.member.assert_awaited_once_with(MEMBER, fresh=True)
+
+
+def test_a_dm_report_waits_for_support_dms(world):
+    report, job_id, _ = reported(world)
+    dm = Mock(spec=discord.DMChannel, id=777, recipient=SimpleNamespace(id=MEMBER), fetch_message=AsyncMock(return_value=report))
+    with world.store.connection() as db:
+        db.execute('UPDATE jobs SET source_url=? WHERE id=?', (f'https://discord.com/channels/@me/777/{report.id}', job_id))
+    world.fri.fetch_channel = AsyncMock(return_value=dm)
+    world.agent.state['config']['support_dms'] = False
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'support dms are off' in text
+    world.agent.state['config']['support_dms'] = True
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert sent and world.sent[0]['target_id'] == '777'
+
+
+def owner_tap(fri, job_id):
+    return SimpleNamespace(guild_id=None, type=discord.InteractionType.component, user=SimpleNamespace(id=OWNER),
+                           client=fri, message=SimpleNamespace(author=SimpleNamespace(id=FRI)),
+                           data={'custom_id': 'fri:tell:'+job_id}, response=SimpleNamespace(defer=AsyncMock()),
+                           edit_original_response=AsyncMock(), followup=SimpleNamespace(send=AsyncMock()))
+
+
+def report_thread(world, report, job_id):
+    """A real discord.py guild with the report in a thread under the configured channel."""
+    client = discord.Client(intents=discord.Intents.none())
+    state = client._connection
+    state.user = SimpleNamespace(id=FRI)
+    guild = discord.Guild(state=state, data={
+        'id': '123', 'name': 'synthetic', 'owner_id': str(OWNER),
+        'roles': [{'id': '123', 'name': '@everyone', 'permissions': str(discord.Permissions.all().value),
+                   'position': 0, 'color': 0, 'hoist': False, 'managed': False, 'mentionable': False}],
+        'members': [{'user': {'id': str(FRI), 'username': 'fri', 'discriminator': '0', 'avatar': None, 'bot': True},
+                     'roles': [], 'flags': 0, 'joined_at': '2026-10-01T00:00:00+00:00'}],
+        'channels': [{'id': '456', 'type': 0, 'name': 'room', 'position': 0, 'permission_overwrites': []}]})
+    state._guilds[guild.id] = guild
+    payload = {'id': '789', 'guild_id': '123', 'parent_id': '456', 'owner_id': str(MEMBER), 'name': 'report',
+               'type': 11, 'message_count': 1, 'member_count': 1,
+               'thread_metadata': {'archived': False, 'auto_archive_duration': 60,
+                                   'archive_timestamp': '2026-10-25T00:00:00+00:00', 'locked': False}}
+    world.fri.get_channel = guild.get_channel_or_thread
+    with world.store.connection() as db:
+        db.execute('UPDATE jobs SET source_url=? WHERE id=?', (f'https://discord.com/channels/123/789/{report.id}', job_id))
+    return client, state, guild, payload
+
+
+@pytest.mark.parametrize('when', ['read', 'claim'])
+def test_a_thread_whose_channel_was_deleted_gets_an_answer_and_frees_the_claim(world, monkeypatch, when):
+    report, job_id, _ = reported(world)
+    client, state, guild, payload = report_thread(world, report, job_id)
+    guild._add_thread(discord.Thread(guild=guild, state=state, data=payload))
+    deleted = lambda: state.parse_channel_delete({'guild_id': '123', 'id': '456'})  # noqa: E731
+
+    async def fetch(*args):
+        if when == 'read':
+            deleted()
+        return report
+
+    monkeypatch.setattr(discord.Thread, 'fetch_message', fetch)
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        result = await api(method, path, body)
+        if when == 'claim' and path.endswith('/requester-notice'):
+            deleted()
+        return result
+
+    world.fri.api.side_effect = meanwhile
+    event = owner_tap(world.fri, job_id)
+    asyncio.run(TellReporter(job_id).callback(event))
+    assert not world.sent and event.followup.send.await_args.args[0].startswith('didn’t send it')
+    with world.store.connection() as db:
+        row = db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()
+    assert (row[0] if row else None) == ('failed' if when == 'claim' else None)  # Either way a later tap can try.
+
+
+def test_an_uncached_thread_archived_while_discord_reads_gets_no_reply(world, monkeypatch):
+    report, job_id, _ = reported(world)
+    client, state, guild, payload = report_thread(world, report, job_id)
+    archived = {**payload, 'thread_metadata': {**payload['thread_metadata'], 'archived': True}}
+    state.http.get_channel = AsyncMock(side_effect=[payload, archived])  # Discord's answer before and after.
+    world.fri.fetch_channel = client.fetch_channel
+
+    async def fetch(*args):
+        state.parse_thread_update(archived)  # Never reaches the fetched copy: it isn't in the cache.
+        return report
+
+    monkeypatch.setattr(discord.Thread, 'fetch_message', fetch)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'archived' in text
+
+
+@pytest.mark.parametrize('bad', [None, [], 'job', {'source_url': 123, 'state': 'deployed', 'approved_sha': 'b'*40,
+                                                   'user_id': str(MEMBER)}])
+def test_a_malformed_job_from_the_controller_gets_an_answer(world, bad):
+    _, job_id, _ = reported(world)
+    api = world.fri.api.side_effect
+
+    async def malformed(method, path, body=None):
+        return bad if (method, path) == ('GET', '/requests/'+job_id) else await api(method, path, body)
+
+    world.fri.api.side_effect = malformed
+    event = owner_tap(world.fri, job_id)
+    asyncio.run(TellReporter(job_id).callback(event))
+    assert not world.sent and event.followup.send.await_args.args[0].startswith('didn’t send it')
+
+
+def test_a_malformed_claim_is_still_finished(world):
+    _, job_id, _ = reported(world)
+    api = world.fri.api.side_effect
+
+    async def malformed(method, path, body=None):
+        result = await api(method, path, body)
+        return {**result, 'job': None} if path.endswith('/requester-notice') else result
+
+    world.fri.api.side_effect = malformed
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent
+    with world.store.connection() as db:
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
+
+
+def test_fri_checks_the_live_release_itself_before_claiming(world):
+    """An older controller (gene #40) claims for a repair a newer release replaced; Fri doesn't ask it to."""
+    _, job_id, _ = reported(world)
+    released(world.store)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'newer release' in text
+    assert not [c for c in world.fri.api.await_args_list if c.args[1].endswith('/requester-notice')]
+
+
+def test_a_claim_without_a_lease_sends_nothing(world):
+    _, job_id, _ = reported(world)
+    api = world.fri.api.side_effect
+
+    async def leaseless(method, path, body=None):
+        result = await api(method, path, body)
+        return {'job': result['job']} if path.endswith('/requester-notice') else result
+
+    world.fri.api.side_effect = leaseless
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and text == 'didn’t send it. tap again later.'
+
+
+def test_a_finish_answer_fri_cant_read_still_gets_the_owner_an_answer(world):
+    _, job_id, _ = reported(world)
+    api = world.fri.api.side_effect
+
+    async def garbled(method, path, body=None):
+        result = await api(method, path, body)
+        if path.endswith('/finish'):
+            raise json.JSONDecodeError('Expecting value', '{"ok":', 6)  # What aiohttp's json() raises on a cut-off body.
+        return result
+
+    world.fri.api.side_effect = garbled
+    event = owner_tap(world.fri, job_id)
+    asyncio.run(TellReporter(job_id).callback(event))
+    assert len(world.sent) == 1 and event.followup.send.await_args.args[0].startswith('told them: ')
+
+
+@pytest.mark.parametrize('dm', [False, True])
+def test_a_member_who_leaves_while_discord_reads_gets_no_reply(world, dm):
+    report, job_id, _ = reported(world)
+    gone = []
+    if dm:
+        dm_channel = Mock(spec=discord.DMChannel, id=777, recipient=SimpleNamespace(id=MEMBER))
+        with world.store.connection() as db:
+            db.execute('UPDATE jobs SET source_url=? WHERE id=?', (f'https://discord.com/channels/@me/777/{report.id}', job_id))
+        world.fri.fetch_channel = AsyncMock(return_value=dm_channel)
+        room = dm_channel
+    else:
+        room = world.room
+
+    async def fetch(id):
+        gone.append(True)  # They leave while Discord answers.
+        return report
+
+    room.fetch_message = AsyncMock(side_effect=fetch)
+    world.agent.member = AsyncMock(side_effect=lambda *a, **k: None if gone else SimpleNamespace(id=MEMBER))
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'not in the server' in text
+
+
+def test_fri_waits_out_another_release_going_out_even_if_the_controller_would_claim(world):
+    """Gene #40 claims during a deploy; Fri reads /status and doesn't ask it to."""
+    _, job_id, _ = reported(world)
+    job = world.store.request('123', '30', 'message-later', 'https://discord.com/channels/123/456/1', 'Add a vote command')
+    world.store.review_decision(job['id'], 'intake', request_reference(world.store.get(job['id'])), 'approve', 'owner')
+    built = world.store.claim()
+    world.store.finish_build(built['id'], built['lease'], {'sha': 'c'*40, 'base_sha': built['base_sha'],
+                             'branch': 'codex/vote', 'tests_passed': True, 'summary': 'Vote'})
+    if world.store.get(built['id'])['state'] == 'review':
+        world.store.approve(built['id'], 'c'*40, 'owner')
+    assert world.store.claim_deploy()['id'] == built['id']  # Going out, not recorded yet.
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'going out' in text
+    assert not [c for c in world.fri.api.await_args_list if c.args[1].endswith('/requester-notice')]
 
 
 def test_a_hung_mark_never_holds_up_the_heartbeat(world, monkeypatch):

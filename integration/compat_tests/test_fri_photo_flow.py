@@ -133,6 +133,10 @@ def test_proactive_reply_keeps_photos_out_of_background_inference(monkeypatch, t
         event.guild = SimpleNamespace(id=123)
         event.channel = channels[456]
         event.channel.typing = Mock(return_value=AsyncMock())
+        async def quiet(**kwargs):  # Nobody else spoke, so the ambient reply still fits.
+            return
+            yield
+        event.channel.history = quiet
         event.reply = AsyncMock()
         fri.talk = AsyncMock(return_value=ChatResult(status='completed', reply='hey'))
         try:
@@ -176,15 +180,16 @@ def test_ambient_attention_does_not_race_a_direct_reply(monkeypatch, tmp_path, p
 
 @pytest.mark.parametrize('phase', ['answered', 'busy'])
 def test_ambient_yields_to_direct_reply_during_typing(monkeypatch, tmp_path, phase):
+    # Ambient attention no longer types before its reply, so the last wait it can race a direct reply
+    # through is its own fetch of the message.
     async def scenario():
         fri, agent, channels, _ = harness(monkeypatch, tmp_path)
         channel = channels[1]
         entered, resume, direct_started, direct_finish = (asyncio.Event() for _ in range(4))
+        typed = []
         class Typing:
             async def __aenter__(self):
-                if not entered.is_set():
-                    entered.set()
-                    await resume.wait()
+                typed.append(True)
             async def __aexit__(self, *args):
                 return False
         channel.typing = Typing
@@ -193,7 +198,12 @@ def test_ambient_yields_to_direct_reply_during_typing(monkeypatch, tmp_path, pha
             reply=AsyncMock(return_value=SimpleNamespace(delete=AsyncMock())))
         record = {'id': '100', 'user_id': '20', 'name': 'Member', 'text': message.content,
                   'gene_error': False, 'at': time.time()}
-        channel.fetch_message = AsyncMock(return_value=message)
+        async def fetch(mid):
+            if not entered.is_set():  # Attention's own fetch: the direct reply starts meanwhile.
+                entered.set()
+                await resume.wait()
+            return message
+        channel.fetch_message = AsyncMock(side_effect=fetch)
         agent.config['proactive'] = True
         agent.recent[1].append(record)
         agent.context_messages = AsyncMock(return_value=[record])
@@ -213,7 +223,7 @@ def test_ambient_yields_to_direct_reply_during_typing(monkeypatch, tmp_path, pha
         ambient = asyncio.create_task(agent.attend())
         direct = None
         try:
-            await entered.wait()  # Attention passed its fence, typing HTTP is in flight.
+            await entered.wait()  # Attention picked the message and is fetching it.
             direct = asyncio.create_task(agent.respond(message, message.content))
             await direct_started.wait()
             if phase == 'answered':
@@ -225,6 +235,7 @@ def test_ambient_yields_to_direct_reply_during_typing(monkeypatch, tmp_path, pha
                 assert message.reply.await_count == 1, 'ambient posted a duplicate answer after direct completion'
             else:
                 assert message.reply.await_count == 0, 'ambient posted a busy notice while direct work was active'
+            assert not typed
         finally:
             resume.set()
             direct_finish.set()
