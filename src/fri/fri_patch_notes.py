@@ -77,8 +77,9 @@ def parts(text):
     return chunks
 
 
-def nonce(version, digest, index):
-    seed = f'patch-notes/{version}/{digest}/{index}'.encode()
+def nonce(version, digest, index, place=''):
+    """Fixed per part and place: Discord dedupes nonces per author, not per channel, so a channel's are its own."""
+    seed = f'patch-notes/{version}/{digest}/{index}{place}'.encode()
     return int.from_bytes(hashlib.sha256(seed).digest()[:7], 'big')
 
 
@@ -256,7 +257,7 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
                     set_anchor(state, version, index, mark)
                     part.update(attempted_at=attempted_at, sha256=hashes[index - 1])
                     private_json(path, state)
-                    message = await dm.send(chunk, nonce=nonce(version, digest, index),
+                    message = await dm.send(chunk, nonce=nonce(version, digest, index, '' if channel is None else f'#{dm.id}'),
                                             allowed_mentions=NO_MENTIONS, suppress_embeds=True)
                     if str(message.id) in taken:
                         raise NotesRefused(f'Discord answered part {index} with message {message.id}, which '
@@ -324,8 +325,11 @@ async def draft_from_controller(version, facts):
                                            effort=status['chat_effort'], voice_notes=config.get('voice_notes') or '')
         report = {'attempt_id': uuid.uuid4().hex, 'model': status['chat_model'], 'effort': status['chat_effort'],
                   'status': done, 'counters': counters, 'role': 'evaluation'}
+        path = Path(os.getenv('FRI_DATA', '/data'))/'usage'/(report['attempt_id']+'.json')
+        private_json(path, report)  # Kept until the controller has it; the live outbox delivers it otherwise.
         posted = await client.post(url+'/chat/usage/report', json=report)
         posted.raise_for_status()
+        path.unlink(missing_ok=True)
     return drafted(text, done)
 
 

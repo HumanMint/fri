@@ -620,3 +620,37 @@ def test_channel_is_a_plain_name_and_only_for_send(argv):
     with pytest.raises(SystemExit) as raised:
         notes.main(argv)
     assert raised.value.code == 2
+
+
+def test_a_channel_posts_nonces_differ_from_the_dms_for_the_same_text(dm, tmp_path):
+    """Discord dedupes nonces per author, so the same version and text in the DM must not confirm the channel."""
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    run('fri 0.7.0', tmp_path, version='0.7.0')
+    post('fri 0.7.0', tmp_path)
+    assert dm.sends[0]['nonce'] == notes.nonce('0.7.0', notes.hashlib.sha256(json.dumps(['fri 0.7.0']).encode()).hexdigest(), 1)
+    assert chat.sends[0]['nonce'] != dm.sends[0]['nonce']
+
+
+def test_a_drafts_usage_survives_a_failed_report(monkeypatch, tmp_path):
+    import httpx
+
+    async def analyze(*args, **kwargs):
+        return {'notes': 'fri 0.7.0'}, {'input_tokens': 9}, 'completed'
+    monkeypatch.setattr('fri.fri_agent_model.analyze', analyze)
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    monkeypatch.setenv('GENE_FRI_TOKEN', 'synthetic')
+    monkeypatch.setattr('fri.subscription.Subscription', lambda path: None)
+
+    def controller(request):
+        if request.url.path == '/status':
+            return httpx.Response(200, json={'chat_model': 'm', 'chat_effort': 'e'})
+        if request.url.path == '/agent/state':
+            return httpx.Response(200, json={'config': {'voice_notes': ''}})
+        raise httpx.ConnectError('controller went away')
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: real(transport=httpx.MockTransport(controller), **kw))
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(notes.draft_from_controller('0.7.0', '- facts'))
+    [receipt] = (tmp_path/'usage').iterdir()
+    assert json.loads(receipt.read_text())['counters'] == {'input_tokens': 9}
