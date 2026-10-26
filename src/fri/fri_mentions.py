@@ -131,10 +131,19 @@ class Invitation:
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
+                changed = False  # Every one is checked, so each edited or deleted leaves the live view.
                 for mid, event in self.events.items():
-                    current = await self.event.channel.fetch_message(mid)
+                    try:
+                        current = await self.event.channel.fetch_message(mid)
+                    except discord.NotFound:
+                        self.agent.withdraw(event)
+                        changed = True
+                        continue
                     if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
-                        return self.refuse('nearby message changed')
+                        self.agent.withdraw(event)
+                        changed = True
+                if changed:
+                    return self.refuse('nearby message changed')
             return True
         except ControllerUnavailable:
             raise  # Nothing changed; the controller is down, and the caller's outage handling says so.

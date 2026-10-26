@@ -17,7 +17,7 @@ from compat_tests.test_fri_chat import response_event
 from compat_tests.test_fri_mentions import environment
 from fri.feedback import UserFeedbackCheckFailure
 from fri.fri_agent import Agent
-from fri.fri_chat import Chat
+from fri.fri_chat import Chat, ChatResult
 from fri.fri_errors import ControllerUnavailable
 from fri.fri_mentions import Invitation
 
@@ -442,6 +442,52 @@ def test_a_transient_discord_error_does_not_withdraw_an_unchanged_message(monkey
             fri.chat_once = type(fri).chat_once.__get__(fri)
             await fri.talk(123, 1, 30, later.content, 'public', event=later)
             assert len(requests) == 1
+        finally:
+            await fri.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+def test_a_nearby_source_withdrawn_during_a_mention_reply_leaves_the_live_view(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        source = message('here is ' + MARKER, user=20)
+        cache(agent, channel, source)
+        ping = message('<@99> explain this?', user=30)
+        ping.reference = SimpleNamespace(message_id=source.id, channel_id=1)
+        invitation = await Invitation.create(agent, ping)
+
+        async def initial_response(*args):
+            assert str(source.id) in {r['source']['id'] for r in invitation.rows}
+            if change == 'edited':
+                current = copy.copy(source)
+                current.content = 'never mind'
+                current.edited_at = dt.datetime.now(dt.timezone.utc)
+                rows[source.id] = current
+            else:
+                original_fetch = channel.fetch_message.side_effect
+
+                def deleted(mid):
+                    if mid == source.id:
+                        raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                    return original_fetch(mid)
+
+                channel.fetch_message.side_effect = deleted
+            return ChatResult(status='completed', reply='initial response')
+
+        fri.chat_once.side_effect = initial_response
+        try:
+            await agent.respond(ping, 'explain this?', invitation=invitation, forgotten=0, revision=0)
+            assert invitation.refusal == 'nearby message changed'
+            assert not any(r['id'] == str(source.id) for r in agent.recent[1])
+            requests = []
+            model(fri, requests)
+            fri.chat_once = type(fri).chat_once.__get__(fri)
+            later = message('fri what is up?', user=40)
+            await fri.talk(123, 1, 40, later.content, 'public', event=later)
+            assert len(requests) == 1 and MARKER not in json.dumps(requests[0])
         finally:
             await fri.close()
 
