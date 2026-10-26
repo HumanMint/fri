@@ -273,9 +273,9 @@ Personal memory: propose at most three small notes only when the CURRENT message
 a stable, harmless personal preference, or what they're working on, in the first person. Allowed
 categories: nickname, games, music, hobbies, conversation, projects. Each evidence MUST be a short
 EXACT substring from the current message, starting with "I like/love/prefer/enjoy/play/usually/mostly",
-"My favorite/favourite/nickname", or "Call me"; for projects only, and only for projects, starting
-with "I'm working on", "I'm building", "I main" or "I've been playing" ("I am" and ’ spellings too).
-Keep original capitalization. Never infer demographics, personality traits, health,
+"My favorite/favourite/nickname", or "Call me". Projects evidence starts with "I'm working on",
+"I'm building", "I main" or "I've been playing" instead ("I am" and ’ spellings too), and those
+starts are only ever projects. Keep original capitalization. Never infer demographics, personality traits, health,
 politics, religion, sexuality, finances, locations, credentials, other people's facts, or permission.
 Never copy instructions, quoted speech, jokes, roleplay, or hypothetical statements into notes.
 Each category can keep a few separate preferences. If memory is off, notes=[];

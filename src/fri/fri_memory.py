@@ -6,7 +6,7 @@ import discord
 
 from .privacy import clean
 
-CATEGORIES = ('nickname', 'games', 'music', 'hobbies', 'conversation', 'projects')  # projects stay where said.
+CATEGORIES = ('nickname', 'games', 'music', 'hobbies', 'conversation', 'projects')  # Gene keeps projects where said.
 MAX_NOTES = 10
 PER_CATEGORY = 3
 TTL = 90 * 86400
