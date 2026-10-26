@@ -123,6 +123,19 @@ class Invitation:
         return (current.id == self.event.id and not current.author.bot and not current.webhook_id and
                 fingerprint(current) == self.original and explicit_mention(current, self.fri.user.id))
 
+    async def ping_unchanged(self):
+        """The ping refetched is unchanged (see unchanged). Edited or deleted, it leaves the live view too, for
+        later turns; a delete still raises NotFound for the caller."""
+        try:
+            current = await self.event.channel.fetch_message(self.event.id)
+        except discord.NotFound:
+            self.agent.withdraw(self.event)
+            raise
+        if not self.unchanged(current):
+            self.agent.withdraw(self.event)
+            return False
+        return True
+
     async def current(self, *, check_evidence=True, control=False):
         try:
             age = time.time()-discord.utils.snowflake_time(self.event.id).timestamp()
@@ -138,19 +151,27 @@ class Invitation:
                     return self.refuse('image changed')
             if not await self.access(control=control):
                 return False
-            current = await self.event.channel.fetch_message(self.event.id)
-            if not self.unchanged(current):
+            if not await self.ping_unchanged():
                 return self.refuse('message changed')
             if check_evidence and self.grant:
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
+                changed = False  # Every one is checked, so each edited or deleted leaves the live view.
                 for mid, event in self.events.items():
-                    current = await self.event.channel.fetch_message(mid)
+                    try:
+                        current = await self.event.channel.fetch_message(mid)
+                    except discord.NotFound:
+                        self.agent.withdraw(event)
+                        changed = True
+                        continue
                     if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
-                        return self.refuse('nearby message changed')
+                        self.agent.withdraw(event)
+                        changed = True
+                if changed:
+                    return self.refuse('nearby message changed')
                 # The ping again, as an edit during the privacy read would otherwise go unseen.
-                if not self.unchanged(await self.event.channel.fetch_message(self.event.id)):
+                if not await self.ping_unchanged():
                     return self.refuse('message changed')
             return True
         except ControllerUnavailable:
