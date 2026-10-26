@@ -6,7 +6,8 @@
 The only recipient is GENE_OWNER_ID; nothing names anyone else. It logs in over REST only, with no
 gateway session, so the running Fri is untouched. Each version reaches the owner once: every part
 has a fixed nonce, FRI_DATA/patch-notes.json lists the parts Discord confirmed, and a part whose
-send was attempted but never confirmed is looked for in the DM before it is sent again.
+send was attempted but never confirmed is looked for in the DM, after the newest message from before
+that attempt, before it is sent again.
 Exit codes: 0 sent (or already sent), 2 refused (fix the notes or the record), 1 Discord or the
 network failed (a rerun is safe)."""
 
@@ -33,13 +34,20 @@ EARLIEST = 1767225600  # 2026-01-01 UTC. No real attempt is older; an older atte
 VERSION = re.compile(r'(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})')
 ID = re.compile(r'[1-9]\d{0,19}')  # A Discord snowflake.
 HASH = re.compile(r'[0-9a-f]{64}')
-TRIED = {'attempted_at', 'sha256'}  # A part's states: {} before its send, then TRIED, then SENT.
+# A part's states: {} before its send, then TRIED, then SENT. `after` is the DM's newest message id
+# before the attempt (None for an empty DM), so recovery reads from Discord's clock, not the host's.
+TRIED = {'attempted_at', 'sha256', 'after'}
 SENT = TRIED | {'message_id', 'channel_id'}
+OLD_TRIED, OLD_SENT = TRIED - {'after'}, SENT - {'after'}  # Written before `after` existed; still read.
 NO_MENTIONS = discord.AllowedMentions.none()
 
 
 class NotesRefused(Exception):
     """Notes that shouldn't reach the owner as given."""
+
+
+class SendFailed(Exception):
+    """Discord answered a send with something that can't be recorded; the part stays tried."""
 
 
 def length(text):
@@ -92,23 +100,30 @@ def text_hash(chunk):
 
 def recorded(part):
     """One part as send() writes it: when it was tried and its text's hash, then the message Discord confirmed."""
-    if not isinstance(part, dict) or set(part) not in (set(), TRIED, SENT):
+    if not isinstance(part, dict) or set(part) not in (set(), TRIED, SENT, OLD_TRIED, OLD_SENT):
         return False
     attempted = part.get('attempted_at', EARLIEST)
     patterns = {'sha256': HASH, 'message_id': ID, 'channel_id': ID}
     return (isinstance(attempted, (int, float)) and not isinstance(attempted, bool) and
             EARLIEST <= attempted <= time.time() + 86400 and  # A real past attempt: no NaN, no 0, no far future.
-            all(isinstance(part[key], str) and pattern.fullmatch(part[key]) for key, pattern in patterns.items() if key in part))
+            all(isinstance(part[key], str) and pattern.fullmatch(part[key]) for key, pattern in patterns.items() if key in part) and
+            (part.get('after') is None or isinstance(part['after'], str) and ID.fullmatch(part['after'])))
+
+
+def stage(part):
+    """0 before its send, 1 tried, 2 confirmed."""
+    return 2 if 'message_id' in part else 1 if part else 0
 
 
 def entry_ok(entry):
-    """A version's notes hash and parts: sends go in order, so sent parts come first, then at most one tried."""
+    """A version's notes hash and parts: sends go in order, so sent parts come first, then at most one tried.
+    send() first saves a version with its first part tried, so a saved version with nothing tried is damage."""
     states = entry.get('parts') if isinstance(entry, dict) else None
     if not (isinstance(states, list) and 1 <= len(states) <= MAX_PARTS and all(recorded(part) for part in states) and
             isinstance(entry.get('sha256'), str) and HASH.fullmatch(entry['sha256'])):
         return False
-    sizes = [len(part) for part in states]
-    return sizes == sorted(sizes, reverse=True) and sizes.count(len(TRIED)) <= 1
+    stages = [stage(part) for part in states]
+    return stages == sorted(stages, reverse=True) and stages.count(1) <= 1 and stages[0] > 0
 
 
 def sent_ids(state):
@@ -137,12 +152,25 @@ def load(path):
     return state
 
 
-async def landed(dm, me, chunk, attempted_at, taken):
+async def newest(dm):
+    """The DM's newest message id as a string, or None for an empty DM."""
+    async for message in dm.history(limit=1):
+        return str(message.id)
+    return None
+
+
+async def landed(dm, me, chunk, part, taken):
     """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
-    Every message since a minute before the attempt (or before now, if the clock has stepped back) is
-    read. Only Fri's own messages with exactly this text count, and never one the record already gives
-    a part: Discord keeps no nonce in history, so that is what tells identical parts and releases apart."""
-    after = dt.datetime.fromtimestamp(min(attempted_at, time.time()) - 60, dt.timezone.utc)
+    Every message after the DM's newest one from before the attempt is read. That id is Discord's own
+    clock, so a host clock that was fast, or was corrected since, can't start the search past the part.
+    A part saved before `after` existed falls back to a minute before the attempt (or before now, if the
+    clock has stepped back). Only Fri's own messages with exactly this text count, and never one the
+    record already gives a part: Discord keeps no nonce in history, so that is what tells identical
+    parts and releases apart."""
+    if 'after' in part:
+        after = discord.Object(id=int(part['after'])) if part['after'] else None
+    else:
+        after = dt.datetime.fromtimestamp(min(part['attempted_at'], time.time()) - 60, dt.timezone.utc)
     async for message in dm.history(limit=None, after=after, oldest_first=True):
         if message.author.id == me and message.content == chunk and str(message.id) not in taken:
             return message
@@ -166,9 +194,9 @@ async def send(version, text, *, token, owner_id, data, out=print):
         if all(part.get('message_id') for part in entry['parts']):
             out(f'{version}: all {len(chunks)} parts were already sent')
             return
-        tried = next((part['sha256'] for part in entry['parts'] if set(part) == TRIED), None)
+        tried = next((part['sha256'] for part in entry['parts'] if stage(part) == 1), None)
         twins = sorted(other for other, e in state['versions'].items() if other != version
-                       for part in e['parts'] if set(part) == TRIED and part['sha256'] == tried)
+                       for part in e['parts'] if stage(part) == 1 and part['sha256'] == tried)
         if twins:
             raise NotesRefused(f'{version} and {", ".join(twins)} each have a part with this text that was tried but '
                                f'never confirmed, and the DM can\'t say whose a message is; check it, then fix {path.name}')
@@ -182,15 +210,18 @@ async def send(version, text, *, token, owner_id, data, out=print):
                     out(f'part {index}/{len(chunks)}: already sent')
                     continue
                 taken = set(sent_ids(state))
-                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, part['attempted_at'], taken)
+                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, part, taken)
                 if not message:
-                    part.update(attempted_at=time.time(), sha256=hashes[index - 1])
+                    part.update(attempted_at=time.time(), sha256=hashes[index - 1], after=await newest(dm))
                     private_json(path, state)
                     message = await dm.send(chunk, nonce=nonce(version, digest, index),
                                             allowed_mentions=NO_MENTIONS, suppress_embeds=True)
                     if str(message.id) in taken:
                         raise NotesRefused(f'Discord answered part {index} with message {message.id}, which '
                                            f'{path.name} already gives another part')
+                if not (ID.fullmatch(str(message.id)) and ID.fullmatch(str(dm.id))):
+                    # Recording it would make load() refuse every later send; a rerun looks for it instead.
+                    raise SendFailed(f'Discord answered part {index} with message id {message.id!r} in DM {dm.id!r}')
                 part.update(message_id=str(message.id), channel_id=str(dm.id))
                 private_json(path, state)
                 out(f'part {index}/{len(chunks)}: sent as message {message.id} ({length(chunk)} chars)')
