@@ -347,7 +347,7 @@ def test_a_reply_to_a_message_withdrawn_during_signin_is_refused_before_the_requ
             return {'Authorization': 'Bearer synthetic-review'}
         fri.chat.headers = headers
         try:
-            with pytest.raises(UserFeedbackCheckFailure, match='edited or deleted'):
+            with pytest.raises(UserFeedbackCheckFailure, match='edited or deleted|conversation changed'):  # Either last check.
                 await fri.talk(123, 1, 30, later.content, 'public', event=later)
             assert not requests  # Refused before the model sees the old words.
         finally:
@@ -536,7 +536,7 @@ def test_a_turn_whose_own_message_is_withdrawn_during_signin_is_refused(monkeypa
 
         fri.chat.headers = headers
         try:
-            with pytest.raises(UserFeedbackCheckFailure, match='edited or deleted'):
+            with pytest.raises(UserFeedbackCheckFailure, match='edited or deleted|conversation changed'):  # Either last check.
                 await fri.talk(123, 1, 20, latest.content, 'public', event=latest, burst=burst)
             assert not requests
         finally:

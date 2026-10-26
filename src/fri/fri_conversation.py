@@ -366,14 +366,19 @@ async def unchanged(agent, message, context):
     async def withdrawn(row, limit):
         """Whether Discord confirms the row's message deleted or edited; if so it leaves the live view too."""
         from types import SimpleNamespace
+        # From its own channel: a linked post can sit in another one.
+        where = str(row['source'].get('channel_id') or message.channel.id)
+        channel = message.channel if where == str(message.channel.id) else agent.fri.get_channel(int(where))
+        if channel is None:
+            return False  # Unconfirmed: refused, but not withdrawn.
         try:
-            current = await message.channel.fetch_message(int(row['source']['id']))
+            current = await channel.fetch_message(int(row['source']['id']))
         except discord.NotFound:
             current = None
         except (discord.HTTPException, ValueError):
             return False  # Unconfirmed: refused, but not withdrawn.
         if current is None or getattr(current, 'edited_at', None) is not None or clean(current.content, limit) != row['text']:
-            agent.withdraw(SimpleNamespace(id=int(row['source']['id']), channel=message.channel))
+            agent.withdraw(SimpleNamespace(id=int(row['source']['id']), channel=channel))
             return True
         return False
 
