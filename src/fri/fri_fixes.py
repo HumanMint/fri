@@ -28,13 +28,18 @@ FILE = 'gene-fixes.json'
 WATCHING = 3*86400  # After this a "fixed" line under Gene's error reads as necro-posting, so the watch just ends.
 QUIET = 60  # Someone spoke this recently: wait for a lull instead of talking over them.
 PASS = 10  # How long a heartbeat waits on a pass over the watch list before moving on. It never cancels it.
+MARK = 5  # How long filing an error waits on its 👀 before the attention stage moves on. It never cancels it.
 RUNNING = weakref.WeakKeyDictionary()  # Each agent's pass, so a slow one is waited on again instead of doubled.
+MARKING = set()  # 👀 still on their way after attention moved on, kept so none is dropped unfinished.
 SETTLED = frozenset({'deployed', 'rejected', 'failed', 'needs_attention'})
 CAPABILITY = 'requester-notices'
 JOB = re.compile(r'[a-f0-9]{12}')
 TELL_ID = re.compile(r'^fri:tell:(?P<job_id>[a-f0-9]{12})$')
 SOURCE = re.compile(r'https://discord\.com/channels/(?P<guild>[0-9]{1,25}|@me)/(?P<channel>[0-9]{1,25})/(?P<message>[0-9]{1,25})')
 MALFORMED = (KeyError, TypeError, ValueError, OverflowError)
+# What a tap can hit besides a definite refusal: controller data of the wrong shape, a Discord object
+# that changed under it, a transport that gave up. The owner still gets an answer and a claim is finished.
+TAP_FAILURES = (ValueError, KeyError, TypeError, AttributeError, TimeoutError, OSError, discord.DiscordException)
 
 
 def fixed_line(sha):
@@ -91,7 +96,12 @@ async def follow(agent, channel_id, message_id, job):
         private_json(agent.fri.data/FILE, entries)
     except OSError as exc:
         LOG.warning('Gene fix watch not saved: %s', type(exc).__name__)
-    await mark(agent, channel_id, message_id)
+    # The 👀 runs as its own task, waited on for MARK and never cancelled (see check): attention calls this
+    # from the heartbeat, which a Discord read held up by a rate limit must not stall.
+    task = asyncio.create_task(mark(agent, channel_id, message_id))
+    MARKING.add(task)
+    task.add_done_callback(marked)
+    await asyncio.wait({task}, timeout=MARK)
 
 
 async def mark(agent, channel_id, message_id):
@@ -110,8 +120,17 @@ async def mark(agent, channel_id, message_id):
         LOG.info('Gene error mark was not confirmed')
 
 
+def marked(task):
+    MARKING.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        LOG.info('Gene error mark ended: %s', type(task.exception()).__name__)
+
+
 def can_send(channel):
-    permissions = channel.permissions_for(channel.guild.me)
+    try:
+        permissions = channel.permissions_for(channel.guild.me)
+    except discord.ClientException:  # A thread whose parent channel was deleted.
+        return False
     return (permissions.view_channel and permissions.read_message_history and
             (permissions.send_messages_in_threads if isinstance(channel, discord.Thread) else permissions.send_messages))
 
@@ -130,7 +149,7 @@ async def due(agent, job_id, entry):
     fri = agent.fri
     if expired(entry):
         return 'drop'
-    if not agent.config['proactive'] or room(agent, entry) is None:
+    if not (agent.config['enabled'] and agent.config['proactive']) or room(agent, entry) is None:
         return 'keep'  # No reads while Fri couldn't post anyway; the three days still run.
     try:
         job = await fri.api('GET', '/requests/'+job_id)
@@ -157,8 +176,8 @@ async def due(agent, job_id, entry):
     if (await fri.api('GET', '/status')).get('active_sha') != sha:
         return 'drop'  # A rollback or a newer release came first, so "fixed" might not hold.
     channel = room(agent, entry)
-    if not agent.config['proactive'] or channel is None:
-        return 'keep'
+    if not (agent.config['enabled'] and agent.config['proactive']) or channel is None:
+        return 'keep'  # Paused, or proactive posts off, while Discord answered.
     last = channel.last_message_id
     if last and time.time()-discord.utils.snowflake_time(last).timestamp() < QUIET:
         return 'keep'
@@ -244,47 +263,96 @@ class Unreachable(Exception):
     pass
 
 
+def postable(fri, channel):
+    """Every gate that needs no await, so it runs again with nothing awaited before the send."""
+    config = fri.agent.config
+    if not config['enabled']:
+        raise Unreachable('i’m switched off right now')
+    if not config['proactive']:
+        raise Unreachable('proactive posts are off')
+    if channel is None:
+        return
+    if isinstance(channel, discord.DMChannel):
+        if not config['support_dms']:
+            raise Unreachable('support dms are off')
+        return
+    if getattr(channel, 'guild', None) is None or not fri.agent.allowed(channel) or not can_send(channel):
+        raise Unreachable('i can’t post where they reported it anymore')
+    if getattr(channel, 'archived', False):
+        raise Unreachable('their thread’s archived, and i’m not reopening it for this')
+
+
 async def report(fri, job):
-    """The reporter's message and where it is, checked again now: nothing has been sent yet."""
-    match = SOURCE.fullmatch(job.get('source_url') or '')
-    user = str(job.get('user_id', ''))
-    if not match or not user.isdigit() or user in {str(fri.user.id), str(fri.agent.gene_id)}:
+    """The reporter's message and where it is, read before the claim: nothing has been sent yet."""
+    source = job.get('source_url') if isinstance(job, dict) else None
+    match = SOURCE.fullmatch(source) if isinstance(source, str) else None
+    user = str(job.get('user_id', '')) if match else ''
+    if (not match or job.get('state') != 'deployed' or not job.get('approved_sha') or not user.isdigit() or
+            user in {str(fri.user.id), str(fri.agent.gene_id)}):
         raise Unreachable('there’s no member report on record to reply to')
+    postable(fri, None)
     try:
         if match['guild'] == '@me':
-            if not await fri.agent.member(int(user), fresh=True):
-                raise Unreachable('they’re not in the server anymore')
             channel = await fri.fetch_channel(int(match['channel']))
             if not isinstance(channel, discord.DMChannel) or not channel.recipient or str(channel.recipient.id) != user:
                 raise Unreachable('that dm isn’t theirs anymore')
         else:
-            channel = fri.get_channel(int(match['channel'])) or await fri.fetch_channel(int(match['channel']))
-            if (int(match['guild']) != fri.guild_id or getattr(channel, 'guild', None) is None or
-                    not fri.agent.allowed(channel) or not can_send(channel)):
+            cached = fri.get_channel(int(match['channel']))
+            channel = cached or await fri.fetch_channel(int(match['channel']))
+            if int(match['guild']) != fri.guild_id or getattr(channel, 'guild', None) is None:
                 raise Unreachable('i can’t post where they reported it anymore')
-            if getattr(channel, 'archived', False):
-                raise Unreachable('their thread’s archived, and i’m not reopening it for this')
+        postable(fri, channel)
         message = await channel.fetch_message(int(match['message']))
+        if match['guild'] != '@me' and cached is None and isinstance(channel, discord.Thread):
+            # A fetched thread isn't in the cache, so no archive update reaches it: read it again last.
+            channel = await fri.fetch_channel(channel.id)
+        # Last of the Discord reads: no members intent tells Fri someone left while the others ran.
+        if not await fri.agent.member(int(user), fresh=True):
+            raise Unreachable('they’re not in the server anymore')
     except discord.NotFound:
         raise Unreachable('their report is gone') from None
     except discord.HTTPException:
         raise Unreachable('discord wouldn’t let me read their report') from None
     if str(message.author.id) != user or message.author.bot or message.webhook_id:
         raise Unreachable('that report isn’t theirs anymore')
+    postable(fri, channel)  # Again after the last read, so a change while Discord answered claims nothing.
     return channel, message
 
 
 async def tell(fri, job_id, actor):
-    """Claim the controller's mark, reply once, record what happened. What the owner sees, and whether it posted."""
+    """Read Discord, then claim the controller's mark, reply once and record what happened.
+
+    The claim is the last await before the send, and it checks erasure, rollbacks and the live release,
+    so nothing that changed while Discord answered can slip through. What the owner sees, and whether it posted."""
     from .fri_workspace import send_once
+    scope = {'guild_id': str(fri.guild_id), 'user_id': str(actor)}
     try:
-        claimed = await fri.api('POST', f'/requests/{job_id}/requester-notice',
-                                {'guild_id': str(fri.guild_id), 'user_id': str(actor)})
+        job = await fri.api('GET', '/requests/'+job_id)
+        channel, message = await report(fri, job)
+        # The controller checks this too; an older one (gene #40) doesn't, so Fri reads the live release itself.
+        status = await fri.api('GET', '/status')
+        if status.get('active_sha') != job['approved_sha']:
+            raise Unreachable('a newer release is live now, so "fixed" might not hold')
+        if (status.get('jobs') or {}).get('deploying'):
+            raise Unreachable('another release is going out right now. tap again once it lands')
+        postable(fri, channel)
+        claimed = await fri.api('POST', f'/requests/{job_id}/requester-notice', scope)
+    except Unreachable as exc:
+        return f'didn’t send it: {exc}.', False
     except commands.UserFeedbackCheckFailure as exc:
         return notice_text(str(exc)), False
-    job, state, message_id, sending = claimed['job'], 'failed', '', False
+    except TAP_FAILURES:
+        return 'didn’t send it. tap again later.', False  # Nothing claimed yet, so there's nothing to record.
+    lease = claimed.get('lease') if isinstance(claimed, dict) else None
+    if not isinstance(lease, str) or not lease:
+        LOG.warning('Requester notice claim for %s came back without a lease; nothing sent', job_id)
+        return 'didn’t send it. tap again later.', False
+    state, message_id, sending = 'failed', '', False
     try:
-        channel, message = await report(fri, job)
+        if not isinstance(claimed.get('job'), dict) or any(
+                str(claimed['job'].get(key)) != str(job.get(key)) for key in ('user_id', 'source_url', 'approved_sha')):
+            raise Unreachable('their report changed while i looked. tap again')
+        postable(fri, channel)  # Config or the channel may have changed while the claim was out.
         sending = True
         result = await send_once(fri, {'id': job_id, 'target_id': str(channel.id),
                                        'body': told_line(job['approved_sha'])}, reply_to=message.id)
@@ -297,14 +365,14 @@ async def tell(fri, job_id, actor):
         state = 'uncertain' if exc.response.status_code >= 500 else 'failed'
         text = (f'discord refused the reply (HTTP {exc.response.status_code}). tap again later.' if state == 'failed'
                 else 'discord didn’t confirm the reply, so it might have posted. not sending it twice.')
-    except (httpx.HTTPError, ValueError, KeyError, TimeoutError, OSError):
+    except (httpx.HTTPError, *TAP_FAILURES):
         state = 'uncertain' if sending else 'failed'
         text = ('discord didn’t confirm the reply, so it might have posted. not sending it twice.' if sending
                 else 'didn’t send it. tap again later.')
     try:
         await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
-                      {'lease': claimed['lease'], 'state': state, 'message_id': message_id})
-    except commands.UserFeedbackCheckFailure:
+                      {**scope, 'lease': lease, 'state': state, 'message_id': message_id})
+    except (commands.UserFeedbackCheckFailure, *TAP_FAILURES):  # An answer Fri can't read is still unconfirmed.
         LOG.warning('Requester notice outcome for %s not recorded; it stays unretried', job_id)
     return text, state == 'sent'
 

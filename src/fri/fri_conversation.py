@@ -161,6 +161,26 @@ class Bursts:
                 self.rows[key] = kept
             self.dropped([row[1] for rows in groups if not rows.alone for row in rows], 'author privacy changed')
 
+    def unsend(self, channel, ids):
+        """Deleted messages leave their burst, and its newest message answers for the rest. A burst
+        whose newest message went is dropped whole: the rest were waiting on what was taken back.
+        So is a privacy control's: deleting it may be taking it back, and an erasure can't be undone."""
+        for key in [key for key in self.rows if key[0] == channel]:
+            groups = []
+            for rows in self.rows[key]:
+                gone = [row[1] for row in rows if row[1].id in ids]
+                if gone and rows[-1][1].id in ids:
+                    self.dropped([row[1] for row in rows], 'message deleted')
+                    continue
+                if gone:
+                    rows[:] = [row for row in rows if row[1].id not in ids]
+                    self.dropped(gone, 'message deleted')
+                groups.append(rows)
+            if groups:
+                self.rows[key] = groups
+            else:
+                del self.rows[key]
+
 
 async def live_rows(agent, message, burst):
     """Refetch each source so cached/resolved messages cannot smuggle edits or authors."""
