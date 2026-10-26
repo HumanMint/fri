@@ -7,7 +7,7 @@ The only recipient is GENE_OWNER_ID; nothing names anyone else. It logs in over 
 gateway session, so the running Fri is untouched. Each version reaches the owner once: every part
 has a fixed nonce, FRI_DATA/patch-notes.json lists the parts Discord confirmed, and a part whose
 send was attempted but never confirmed is looked for in the DM, after the newest message from before
-that attempt, before it is sent again.
+that attempt (kept under `anchors`), before it is sent again.
 Exit codes: 0 sent (or already sent), 2 refused (fix the notes or the record), 1 Discord or the
 network failed (a rerun is safe)."""
 
@@ -34,11 +34,8 @@ EARLIEST = 1767225600  # 2026-01-01 UTC. No real attempt is older; an older atte
 VERSION = re.compile(r'(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})')
 ID = re.compile(r'[1-9]\d{0,19}')  # A Discord snowflake.
 HASH = re.compile(r'[0-9a-f]{64}')
-# A part's states: {} before its send, then TRIED, then SENT. `after` is the DM's newest message id
-# before the attempt (None for an empty DM), so recovery reads from Discord's clock, not the host's.
-TRIED = {'attempted_at', 'sha256', 'after'}
+TRIED = {'attempted_at', 'sha256'}  # A part's states: {} before its send, then TRIED, then SENT.
 SENT = TRIED | {'message_id', 'channel_id'}
-OLD_TRIED, OLD_SENT = TRIED - {'after'}, SENT - {'after'}  # Written before `after` existed; still read.
 NO_MENTIONS = discord.AllowedMentions.none()
 
 
@@ -100,14 +97,13 @@ def text_hash(chunk):
 
 def recorded(part):
     """One part as send() writes it: when it was tried and its text's hash, then the message Discord confirmed."""
-    if not isinstance(part, dict) or set(part) not in (set(), TRIED, SENT, OLD_TRIED, OLD_SENT):
+    if not isinstance(part, dict) or set(part) not in (set(), TRIED, SENT):
         return False
     attempted = part.get('attempted_at', EARLIEST)
     patterns = {'sha256': HASH, 'message_id': ID, 'channel_id': ID}
     return (isinstance(attempted, (int, float)) and not isinstance(attempted, bool) and
             EARLIEST <= attempted <= time.time() + 86400 and  # A real past attempt: no NaN, no 0, no far future.
-            all(isinstance(part[key], str) and pattern.fullmatch(part[key]) for key, pattern in patterns.items() if key in part) and
-            (part.get('after') is None or isinstance(part['after'], str) and ID.fullmatch(part['after'])))
+            all(isinstance(part[key], str) and pattern.fullmatch(part[key]) for key, pattern in patterns.items() if key in part))
 
 
 def stage(part):
@@ -152,25 +148,48 @@ def load(path):
     return state
 
 
-async def newest(dm):
-    """The DM's newest message id as a string, or None for an empty DM."""
+async def anchor(dm, attempted_at):
+    """Where recovery of this attempt starts reading: the DM's newest message id before it ('' for an
+    empty DM), or None when Discord gave one the record couldn't trust, so recovery falls back to time."""
     async for message in dm.history(limit=1):
-        return str(message.id)
-    return None
+        after = str(message.id)
+        return {'attempted_at': attempted_at, 'after': after} if ID.fullmatch(after) else None
+    return {'attempted_at': attempted_at, 'after': ''}
 
 
-async def landed(dm, me, chunk, part, taken):
-    """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
-    Every message after the DM's newest one from before the attempt is read. That id is Discord's own
-    clock, so a host clock that was fast, or was corrected since, can't start the search past the part.
-    A part saved before `after` existed falls back to a minute before the attempt (or before now, if the
-    clock has stepped back). Only Fri's own messages with exactly this text count, and never one the
-    record already gives a part: Discord keeps no nonce in history, so that is what tells identical
-    parts and releases apart."""
-    if 'after' in part:
-        after = discord.Object(id=int(part['after'])) if part['after'] else None
+def search_from(state, version, index, part):
+    """The message after which an attempt's own message would be: its anchor, which is Discord's clock,
+    so a host clock that was fast or was corrected since can't start the search past the part. Anchors
+    sit beside `versions`, which older code ignores and keeps, and count only for the attempt they were
+    taken for. Without one, a minute before the attempt (or before now, if the clock stepped back)."""
+    anchors = state.get('anchors')
+    mark = anchors.get(version, {}).get(str(index)) if isinstance(anchors, dict) and isinstance(anchors.get(version), dict) else None
+    if (isinstance(mark, dict) and mark.get('attempted_at') == part['attempted_at'] and
+            isinstance(mark.get('after'), str) and (mark['after'] == '' or ID.fullmatch(mark['after']))):
+        return discord.Object(id=int(mark['after'])) if mark['after'] else None
+    return dt.datetime.fromtimestamp(min(part['attempted_at'], time.time()) - 60, dt.timezone.utc)
+
+
+def set_anchor(state, version, index, mark):
+    """Keeps one anchor per tried part, and none once it's confirmed or Discord's id was untrustworthy."""
+    if not isinstance(state.get('anchors'), dict):
+        state['anchors'] = {}
+    marks = state['anchors'].setdefault(version, {})
+    if not isinstance(marks, dict):
+        marks = state['anchors'][version] = {}
+    if mark:
+        marks[str(index)] = mark
     else:
-        after = dt.datetime.fromtimestamp(min(part['attempted_at'], time.time()) - 60, dt.timezone.utc)
+        marks.pop(str(index), None)
+    if not marks:
+        del state['anchors'][version]
+
+
+async def landed(dm, me, chunk, after, taken):
+    """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
+    Every message after `after` is read (the whole DM if it was empty). Only Fri's own messages with
+    exactly this text count, and never one the record already gives a part: Discord keeps no nonce in
+    history, so that is what tells identical parts and releases apart."""
     async for message in dm.history(limit=None, after=after, oldest_first=True):
         if message.author.id == me and message.content == chunk and str(message.id) not in taken:
             return message
@@ -210,9 +229,12 @@ async def send(version, text, *, token, owner_id, data, out=print):
                     out(f'part {index}/{len(chunks)}: already sent')
                     continue
                 taken = set(sent_ids(state))
-                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, part, taken)
+                message = 'attempted_at' in part and await landed(
+                    dm, client.user.id, chunk, search_from(state, version, index, part), taken)
                 if not message:
-                    part.update(attempted_at=time.time(), sha256=hashes[index - 1], after=await newest(dm))
+                    attempted_at = time.time()
+                    set_anchor(state, version, index, await anchor(dm, attempted_at))
+                    part.update(attempted_at=attempted_at, sha256=hashes[index - 1])
                     private_json(path, state)
                     message = await dm.send(chunk, nonce=nonce(version, digest, index),
                                             allowed_mentions=NO_MENTIONS, suppress_embeds=True)
@@ -223,6 +245,7 @@ async def send(version, text, *, token, owner_id, data, out=print):
                     # Recording it would make load() refuse every later send; a rerun looks for it instead.
                     raise SendFailed(f'Discord answered part {index} with message id {message.id!r} in DM {dm.id!r}')
                 part.update(message_id=str(message.id), channel_id=str(dm.id))
+                set_anchor(state, version, index, None)
                 private_json(path, state)
                 out(f'part {index}/{len(chunks)}: sent as message {message.id} ({length(chunk)} chars)')
         finally:

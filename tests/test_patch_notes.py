@@ -237,8 +237,8 @@ def test_recovery_reads_from_discords_clock_not_the_hosts(dm, tmp_path, monkeypa
     dm.lost.add(1)
     with pytest.raises(RuntimeError, match='lost'):
         run(text, tmp_path)
-    part = json.loads((tmp_path / 'patch-notes.json').read_text())['versions']['0.4.0']['parts'][0]
-    assert part['after'] == '900'
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert record['anchors']['0.4.0']['1']['after'] == '900'
     monkeypatch.setattr(notes.time, 'time', lambda: real() + 7200)  # Corrected, then the rerun hours later.
     run(text, tmp_path)
     assert len(dm.sends) == 1 and [m.content for m in dm.messages] == ['earlier dm', text]
@@ -249,22 +249,29 @@ def test_recovery_in_a_dm_that_was_empty_reads_it_all(dm, tmp_path):
     dm.lost.add(1)
     with pytest.raises(RuntimeError, match='lost'):
         run(text, tmp_path)
-    part = json.loads((tmp_path / 'patch-notes.json').read_text())['versions']['0.4.0']['parts'][0]
-    assert part['after'] is None
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert record['anchors']['0.4.0']['1']['after'] == ''
     run(text, tmp_path)
     assert len(dm.sends) == 1
 
 
-def test_a_part_saved_before_the_discord_anchor_still_recovers(dm, tmp_path):
-    """Records written before `after` existed load, and their tried part is found by time."""
+@pytest.mark.parametrize('damage', ['dropped', 'other-attempt', 'bad-id', 'not-a-dict'])
+def test_a_part_without_a_usable_anchor_still_recovers_by_time(dm, tmp_path, damage):
+    """Records written before anchors existed, or rewritten by that older code, find their part by time."""
     text = paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b')
     dm.lost.add(2)
     with pytest.raises(RuntimeError, match='lost'):
         run(text, tmp_path)
     path = tmp_path / 'patch-notes.json'
     record = json.loads(path.read_text())
-    for part in record['versions']['0.4.0']['parts']:
-        del part['after']
+    if damage == 'dropped':
+        del record['anchors']
+    elif damage == 'other-attempt':
+        record['anchors']['0.4.0']['2'] = {'attempted_at': T, 'after': '1001'}  # Taken for an earlier try.
+    elif damage == 'bad-id':
+        record['anchors']['0.4.0']['2']['after'] = '0'
+    else:
+        record['anchors'] = []
     path.write_text(json.dumps(record))
     run(text, tmp_path)
     assert len(dm.sends) == 2
@@ -299,6 +306,32 @@ def test_cli_reports_a_malformed_reply_with_exit_1(monkeypatch, capsys, tmp_path
     monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'notes')))
     assert notes.main(['send', '0.4.0']) == 1
     assert 'SendFailed' in capsys.readouterr().err
+
+
+def test_records_stay_readable_by_the_code_before_anchors(dm, tmp_path):
+    """Rollback keeps patch-notes.json: parts keep the older field sets, and anchors sit beside versions."""
+    text = paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b')
+    dm.lost.add(2)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert [set(p) for p in record['versions']['0.4.0']['parts']] == [notes.SENT, notes.TRIED]
+    assert set(record) == {'versions', 'anchors'} and list(record['anchors']['0.4.0']) == ['2']
+    run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert [set(p) for p in record['versions']['0.4.0']['parts']] == [notes.SENT] * 2
+    assert record['anchors'] == {}  # Confirmed parts keep no anchor.
+
+
+def test_an_untrustworthy_newest_id_is_not_kept_as_an_anchor(dm, tmp_path):
+    dm.messages.append(said(0, 'earlier message', BOT))
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(paragraph(10, 'a'), tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert record['anchors'] == {}
+    run(paragraph(10, 'a'), tmp_path)  # Found by time, not resent; the record still loads.
+    assert len(dm.sends) == 1
 
 
 def test_two_unfinished_releases_with_the_same_text_are_refused_not_guessed(dm, tmp_path):
@@ -354,7 +387,7 @@ def test_a_damaged_record_or_a_concurrent_send_is_refused(dm, tmp_path):
 
 H = '0' * 64
 T = 1790000000  # A real past attempt time.
-TRIED = {'attempted_at': T, 'sha256': H, 'after': '4'}
+TRIED = {'attempted_at': T, 'sha256': H}
 SENT = {**TRIED, 'message_id': '5', 'channel_id': '777'}
 
 
@@ -392,9 +425,7 @@ def record(*parts, more=None):
     pytest.param(record(SENT, more={'0.3.1': {'sha256': H, 'parts': [SENT]}}), id='one-message-two-parts'),
     pytest.param(record({}), id='nothing-tried'),
     pytest.param(record({}, {}), id='nothing-tried-two-parts'),
-    pytest.param(record({**TRIED, 'after': '0'}), id='zero-after'),
-    pytest.param(record({**TRIED, 'after': 4}), id='number-after'),
-    pytest.param(record({'attempted_at': T, 'after': '4'}), id='after-no-hash'),
+    pytest.param(record({**TRIED, 'after': '4'}), id='after-in-part'),
 ])
 def test_a_damaged_entry_is_refused_with_exit_2_before_login(monkeypatch, capsys, tmp_path, dm, record):
     """Truncated or nested JSON, a malformed entry or part, or a state send() never writes, anywhere in the record."""
