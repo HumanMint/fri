@@ -214,6 +214,16 @@ advertises it, so the controller must be released first.
   speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
+- **Attention's last check.** After its model slot and sign-in, attention checks that every row it's
+  about to send is still in the live view, and that each author it draws on (provenance included)
+  still has memory on at the revision it was read under, then checks the live view again. With a
+  controller that offers `author-fence`, the authors are one `/agent/authors/check` call that the
+  controller reads under its lock, so an erasure through Gene or Red can't land between two authors'
+  reads (fri #84). Any refusal (a stale author, a channel out of scope, a malformed check) keeps the
+  batch quiet, and so do more than 200 author revisions; it's offered again on the next heartbeat
+  window, rebuilt from the live view. An unreachable controller fails the attention stage, as before.
+  An older controller gets the per-author profile reads, which an erasure through Gene during them
+  can still slip past.
 - **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
   research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
   an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead
