@@ -24,7 +24,7 @@ from compat_tests.test_fri_member_profiles import (
     world,
 )
 from fri import feedback as commands
-from fri.fri import Fri
+from fri.fri import SUMMARIZED, Fri
 from fri.fri_agent import Agent
 from fri.fri_chat import INSTRUCTIONS, Chat, ChatResult
 from fri.fri_errors import ControllerRejected
@@ -391,6 +391,101 @@ def test_a_destination_closed_mid_turn_drops_the_summary_or_keeps_its_reply_unsa
                     await w.say(GAMING, 'fri what were we on about')
                 assert SUMMARY in sent[-1]['your_summary_of_speaker_untrusted']  # It was readable when sent.
                 assert len(turns(w)) == saved  # Nothing built on it is said or kept.
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('closed', [GENERAL, GAMING])
+def test_a_reply_built_on_a_summary_from_another_channel_is_saved_as_a_breadcrumb(monkeypatch, tmp_path, closed):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await summarize(monkeypatch, w, 13*3600)  # From #general.
+
+            async def first(text, context):
+                return recalls(context)
+            model(w, first)
+            result, saved, _ = await w.say(GAMING, 'fri what were we on about')
+            assert result.reply == CONTINUATION and saved  # The member still gets the answer.
+            assert turns(w)[-1]['reply'] == SUMMARIZED
+            w.readable[closed] = False  # Where it came from, or where it was said, restricted since.
+            carried = []
+
+            async def followup(text, context):
+                assert context.get('member_summary') is None
+                carried.extend(turn['reply'] for turn in context['turns'])
+                return ChatResult(status='completed', reply='sure')
+            model(w, followup)
+            await w.say(GAMING, 'fri remind me again')
+            assert carried and CONTINUATION not in carried
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_reply_built_on_a_summary_from_another_channel_never_reaches_the_live_view(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await summarize(monkeypatch, w, 13*3600)
+
+            async def first(text, context):
+                return recalls(context)
+            model(w, first)
+            result, saved, _ = await w.say(GAMING, 'fri what were we on about')
+            assert result.reply == CONTINUATION and saved
+            assert result.echo is None  # So Agent.reply_once leaves it out of every other member's view.
+            w.readable[GENERAL] = False
+            recent = []
+
+            async def followup(text, context):
+                recent.extend(row['text'] for row in context.get('recent', []))
+                return ChatResult(status='completed', reply='sure')
+            model(w, followup)
+            await w.say(GAMING, 'fri what is going on', user=30)
+            assert CONTINUATION not in recent
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('where', [GENERAL, DM])
+def test_a_reply_built_on_a_summary_from_the_same_channel_or_in_private_is_kept_as_said(monkeypatch, tmp_path, where):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await summarize(monkeypatch, w, 13*3600)  # From #general.
+
+            async def respond(text, context):
+                return recalls(context)
+            model(w, respond)
+            result, saved, _ = await w.say(where, 'fri what were we on about')
+            assert result.reply == CONTINUATION and saved and turns(w)[-1]['reply'] == CONTINUATION
+            # Where it was said, its own audience; in private, only the member, as for their notes.
+            assert (result.echo or {}).get('text') == (CONTINUATION if where == GENERAL else None)
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_reply_after_a_tool_built_on_a_summary_from_another_channel_is_a_breadcrumb(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await summarize(monkeypatch, w, 13*3600)
+
+            async def respond(text, context):
+                if 'work_list' in context['actions']:
+                    return ChatResult(status='completed', action={'kind': 'work_list', 'work_id': ''})
+                return recalls(context)
+            model(w, respond)
+            text = 'fri anything saved from what we were on about'
+            event = w.message(GAMING, text)
+            w.channels[GAMING].fetch_message = AsyncMock(return_value=event)  # The tool rereads it, unchanged.
+            result, saved, _ = await w.say(GAMING, text, event=event)
+            assert result.reply == CONTINUATION and saved
+            assert turns(w)[-1]['reply'] == SUMMARIZED and result.echo is None
         finally:
             await w.fri.close()
     run(scenario)

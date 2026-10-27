@@ -313,9 +313,11 @@ member of what they talked about with it lately, so a topic that fell out of the
 can come back. It is Fri's own text, the only model-written thing the controller keeps about a member,
 and the reply model sees it as `your_summary_of_speaker_untrusted`: Fri's earlier note, never the
 member's words or instructions. Fri adds it only to the member's own turns, in their DMs or /fri panel
-and in channels everyone in the server can read, and only while every channel it came from still is
-(checked again right before each model call and before delivery). A reply built on it inherits its
-provenance, so it goes when anyone the summary drew on erases.
+and in channels everyone in the server can read, and only while that channel and every channel it came
+from still are (checked again right before each model call and before delivery). A reply built on it
+inherits its provenance, so it goes when anyone the summary drew on erases. In a public channel, a reply
+that had a summary from another channel in view is saved as a neutral breadcrumb and kept out of the live
+view, like a read of another channel; the member still gets the answer itself.
 
 The `member_summaries` heartbeat stage builds them while background work and learning are on. It
 claims one member at a time once the model slot is free and Fri is signed in

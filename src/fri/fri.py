@@ -71,6 +71,7 @@ UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for
 UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
 LINKED = ('Earlier answer about a post linked from another channel. Open the link again for details; '
           'nothing from it is retained here.')
+SUMMARIZED = 'Earlier answer drawing on what they talked about in other channels. Nothing from it is retained here.'
 LEGACY = '[an earlier fri reply from before fri tracked its sources]'
 CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
 CONVERSATION_CHANGED = 'the conversation changed while i was typing. ask again and i’ll catch up.'
@@ -86,6 +87,15 @@ def linked_elsewhere(context, source):
     channel's access, so it stays a neutral breadcrumb, like a read of another channel."""
     return any(row.get('linked') and row['source'].get('channel_id') != source.channel_id
                for row in context.get('reply_target', []))
+
+
+def summarized_elsewhere(context):
+    """The public answer had Fri's summary of the member from another channel in view. Its saved text and
+    its copy in the live view couldn't carry that channel's access, so it stays a neutral breadcrumb, like a
+    read of another channel. In the member's private chat, as for their notes, only they ever see it."""
+    fence = context.get('fence') or {}
+    here = (fence.get('turn') or {}).get('conversation_id', '')
+    return here.startswith('public:') and any(origin != here for origin in fence.get('summarized', ()))
 
 
 async def noop(stage):
@@ -747,7 +757,7 @@ class Fri(discord.Client):
                     if action_kind == 'image_search' and receipt.get('image_status') == 'prepared':
                         result.media = actions.image_share.prepared
                     stored, private = result.reply, private_read(receipts)
-                    crossed = linked_elsewhere(context, source)
+                    crossed, recalled = linked_elsewhere(context, source), summarized_elsewhere(context)
                     if private and not (result.clarification or result.settings_preview or result.post_preview):
                         # Other channels' messages, archives and reports never become saved chat text.
                         checked_channel = receipt.get('channel_id', '')
@@ -755,6 +765,8 @@ class Fri(discord.Client):
                         stored += '. Fetch current evidence for follow-up details; no findings are retained here.'
                     elif crossed and not (result.clarification or result.settings_preview or result.post_preview):
                         stored = LINKED
+                    elif recalled and not (result.clarification or result.settings_preview or result.post_preview):
+                        stored = SUMMARIZED
                     try:  # A fixed harness question over referenced evidence derives nothing from it.
                         provenance = ([] if result.clarification and actions.private_evidence
                                       else turn_provenance(context, user_id, actions))
@@ -774,7 +786,7 @@ class Fri(discord.Client):
                                                            'track safely.'), status='completed')
                     if context.get('unattributed_reference'):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
-                    elif not private and not crossed:
+                    elif not private and not crossed and not recalled:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored)
                     await looked(result)
                     try:  # The save's privacy fence, applied before anything is shown.
@@ -811,10 +823,13 @@ class Fri(discord.Client):
                                                     'of safely. ask again in a bit.')
         reply, unattributed = result.reply, derived and context.get('unattributed_reference')
         crossed = derived and linked_elsewhere(context, source)
+        recalled = derived and summarized_elsewhere(context)
         if unattributed:  # A referenced Fri message whose sources are unknown is never retained.
             reply, result.notes = UNATTRIBUTED, []
         elif crossed:
             reply = LINKED
+        elif recalled:
+            reply = SUMMARIZED
         result.turn = {**scope, 'revision': context['revision'], 'source': source.model_dump(), 'input': text,
             'reply': reply, 'response_kind': result.response_kind, 'reaction': result.reaction,
             'allow_closing': result.allow_closing, 'burst': context.get('message_burst', []),
@@ -823,7 +838,7 @@ class Fri(discord.Client):
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
             **({'audience': context['audience']} if context.get('audience') else {})}
-        if derived and result.response_kind == 'reply' and not unattributed and not crossed:
+        if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
             result.echo = self.echo(scope, context, provenance, reply)
         return result
 
