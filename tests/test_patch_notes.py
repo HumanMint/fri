@@ -331,8 +331,9 @@ def test_records_stay_readable_by_the_code_before_anchors(dm, tmp_path):
     assert record['anchors'] == {}  # Confirmed parts keep no anchor.
 
 
-def test_an_untrustworthy_newest_id_is_not_kept_as_an_anchor(dm, tmp_path):
-    dm.messages.append(said(0, 'earlier message', BOT))
+@pytest.mark.parametrize('newest', [0, 2**64], ids=['zero', 'past-64-bits'])
+def test_an_untrustworthy_newest_id_is_not_kept_as_an_anchor(dm, tmp_path, newest):
+    dm.messages.append(said(newest, 'earlier message', BOT))
     dm.lost.add(1)
     with pytest.raises(RuntimeError, match='lost'):
         run(paragraph(10, 'a'), tmp_path)
@@ -654,3 +655,84 @@ def test_a_drafts_usage_survives_a_failed_report(monkeypatch, tmp_path):
         asyncio.run(notes.draft_from_controller('0.7.0', '- facts'))
     [receipt] = (tmp_path/'usage').iterdir()
     assert json.loads(receipt.read_text())['counters'] == {'input_tokens': 9}
+
+
+def test_an_anchor_past_discords_64_bit_ids_recovers_by_time(dm, tmp_path, monkeypatch):
+    """Discord refuses a read after an id it could never have made: that anchor is unusable, not a failure every rerun."""
+    text = paragraph(1500, 'a')
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    path = tmp_path / 'patch-notes.json'
+    record = json.loads(path.read_text())
+    record['anchors']['0.4.0']['1']['after'] = str(2**64)
+    path.write_text(json.dumps(record))
+    search = dm.history
+    def strict(**kwargs):
+        if isinstance(kwargs.get('after'), discord.Object) and kwargs['after'].id >= 2**64:
+            raise RuntimeError('400 Bad Request: Value is not snowflake.')
+        return search(**kwargs)
+    monkeypatch.setattr(dm, 'history', strict)
+    run(text, tmp_path)
+    assert len(dm.sends) == 1
+    assert json.loads(path.read_text())['versions']['0.4.0']['parts'][0]['message_id'] == str(dm.messages[0].id)
+
+
+class ClockDM(FakeDM):
+    """Ids from Discord's clock, as real ones are: a time boundary and an id boundary pick the same messages."""
+
+    async def send(self, content, *, nonce, allowed_mentions, suppress_embeds):
+        self.sends.append({'content': content, 'nonce': nonce})
+        index = len(self.sends)
+        if index in self.refused:
+            raise RuntimeError('discord refused')
+        message = said(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)) + index, content, BOT)
+        self.messages.append(message)
+        if index in self.lost:
+            raise RuntimeError('reply lost')
+        return message
+
+
+def test_a_retry_of_a_part_older_code_tried_keeps_its_time_boundary(dm, tmp_path, monkeypatch):
+    """Code before anchors left a part tried with only its time. Its message shows up between a rerun's search and the
+    anchor read, and that send fails: a later rerun still searches from the old time and finds it."""
+    room = FakeClient.dm = ClockDM()
+    room.messages.append(said(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)),
+                              'earlier dm', BOT))
+    room.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run('notes', tmp_path)
+    path = tmp_path / 'patch-notes.json'
+    record = json.loads(path.read_text())
+    del record['anchors']  # As the code before anchors wrote it.
+    path.write_text(json.dumps(record))
+    hidden = [room.messages.pop()]  # Not visible in history yet.
+    search = room.history
+    def late(**kwargs):
+        if kwargs.get('limit') == 1 and hidden:
+            room.messages.append(hidden.pop())  # Lands between the rerun's search and its anchor read.
+        return search(**kwargs)
+    monkeypatch.setattr(room, 'history', late)
+    room.refused.add(2)
+    with pytest.raises(RuntimeError, match='refused'):
+        run('notes', tmp_path)
+    run('notes', tmp_path)
+    assert len(room.sends) == 2 and [m.content for m in room.messages] == ['earlier dm', 'notes']
+
+
+def test_a_part_discord_stored_without_its_outer_whitespace_is_still_found(dm, tmp_path, monkeypatch):
+    """Discord trims a message's leading and trailing whitespace, so a part opening with an indented line lands trimmed."""
+    text = paragraph(1500, 'a') + '\n\n  - ' + paragraph(1000, 'b')
+    assert notes.parts(text)[1].startswith('  - ')
+    sent = dm.send
+    async def trimmed(content, **kwargs):
+        try:
+            return await sent(content, **kwargs)
+        finally:
+            dm.messages[-1].content = dm.messages[-1].content.strip()
+    monkeypatch.setattr(dm, 'send', trimmed)
+    dm.lost.add(2)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    run(text, tmp_path)
+    assert len(dm.sends) == 2 and len(dm.messages) == 2

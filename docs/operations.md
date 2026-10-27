@@ -533,8 +533,10 @@ Fri can't restart anything. It only notices and says so.
   archive update reaches an uncached copy, and the member is checked last of all. Fri then checks
   the live release itself, and that no other release is going out (an older controller checks
   neither), and claims the controller's mark, which refuses an erased report, a rollback
-  since the repair, any newer release now live, or another release still going out. It checks the
-  config and channel once more with nothing awaited before the send. Controller data of the wrong
+  since the repair, any newer release now live, or another release still going out. With the claim
+  held it reads the live release again (a newer one, a rollback or one going out frees the claim and
+  stops the reply) and fetches a thread it had to fetch once more, then checks the config and channel
+  with nothing awaited before the send. Controller data of the wrong
   shape, or a thread whose channel was deleted, gets the owner a plain "didn't send it" and frees
   any claim. So a change while Discord answered stops
   the reply. It replies to the report once with a fixed line, mentions off and no request text, and
@@ -542,7 +544,8 @@ Fri can't restart anything. It only notices and says so.
   tapped again. One that may have posted is never retried. The owner sees the outcome privately, and
   the button goes away once the reply is sent.
 - **The 👀.** Filing a Gene error waits up to 5 s on the reaction, then lets attention move on. A
-  reaction stuck in a Discord rate limit finishes on its own and is never cancelled.
+  reaction stuck in a Discord rate limit finishes on its own and is never cancelled. A 👀 a shutdown
+  cut off is added by the next pass while the watch is open; one Discord refused is not retried.
 
 ## Existing installation migration
 
@@ -657,7 +660,8 @@ sends with mentions and link embeds off. Notes are split at blank lines into at 
 `/data/patch-notes-server.json` (the channel) and `/data/patch-notes.json` (the DM) record each
 version's confirmed parts, so a rerun finishes a partial send and never repeats a part: a part whose
 send was attempted but never confirmed is looked for there first (Fri's own messages since the attempt
-with exactly that text, skipping any the record already gives another part), and every part carries a
+with that text, ignoring leading and trailing whitespace, skipping any the record already gives
+another part), and every part carries a
 fixed nonce. If two versions each have an unconfirmed part with the same text, the history can't say
 whose a message is, so both are refused until someone checks and fixes the record by hand.
 
