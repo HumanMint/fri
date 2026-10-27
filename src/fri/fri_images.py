@@ -6,7 +6,7 @@ import discord
 import httpx
 
 from . import feedback as commands
-from .fri_meme_media import load_image, sources
+from .fri_meme_media import gif_previews, load_image, sources
 
 CHANGED = ('The image request changed while I was checking it. Any earlier tool actions keep '
            'their recorded outcomes; check their status before retrying. Ask again with the current attachment.')
@@ -33,7 +33,38 @@ def media(message):
             kinds.append('linked video')
         elif kind == 'image' or getattr(embed, 'image', None):
             kinds.append('linked image')
+    stickers = getattr(message, 'stickers', None)
+    kinds += ['sticker' for _ in stickers] if isinstance(stickers, (list, tuple)) else []
     return kinds[:10]
+
+
+def details(message):
+    """What a reader sees around a post's text: what it carries, its reactions, the post it answers,
+    whether it's pinned.
+
+    Reaction counts only, never who reacted; Fri's own reaction is marked so it can own it."""
+    extra = {}
+    if media(message):
+        extra['attachments'] = media(message)
+    reactions = getattr(message, 'reactions', None)
+    if isinstance(reactions, (list, tuple)) and reactions:
+        extra['reactions'] = [{'emoji': label(r.emoji), 'count': r.count, **({'fri': True} if r.me is True else {})}
+                              for r in reactions[:6] if isinstance(getattr(r, 'count', None), int)]
+    reference = getattr(message, 'reference', None)
+    channel = getattr(message, 'channel', None)
+    if (isinstance(getattr(reference, 'message_id', None), int) and channel is not None and
+            getattr(reference, 'channel_id', None) == channel.id):
+        guild = getattr(getattr(message, 'guild', None), 'id', None)
+        extra['reply_to'] = f'https://discord.com/channels/{guild or "@me"}/{channel.id}/{reference.message_id}'
+    if getattr(message, 'pinned', None) is True:
+        extra['pinned'] = True
+    return extra
+
+
+def label(emoji):
+    """A unicode emoji as itself, a server emoji by its name."""
+    from .privacy import clean
+    return clean(emoji, 16) if isinstance(emoji, str) else ':'+clean(str(getattr(emoji, 'name', None) or 'emoji'), 32)+':'
 
 
 def image_context(context):
@@ -44,8 +75,8 @@ def image_context(context):
 async def look(context, posts, *, invitation=None):
     """Look at still images that a read turned up, newest first, within this call's image budget.
 
-    Other people's posts count only through their own attachments, never embeds or pasted links,
-    which could point anywhere. A post that won't load is just not inspected and the next older one
+    Other people's posts count only through their own attachments, or the still preview Discord's
+    proxy made of a GIF link they sent, never other embeds or pasted links, which could point anywhere. A post that won't load is just not inspected and the next older one
     gets its slot; the model is told which posts it saw and how many it didn't."""
     from .fri_context import discord_source
     images = list(context.get('images', []))
@@ -59,8 +90,8 @@ async def look(context, posts, *, invitation=None):
         if post.id in seen:
             continue
         seen.add(post.id)
-        urls = sources(post)
-        if not urls or urls != [str(a.url) for a in post.attachments] or len(urls) > budget:
+        urls = sources(post, MAX_IMAGES, gifs=True)
+        if not urls or urls != [str(a.url) for a in post.attachments]+gif_previews(post) or len(urls) > budget:
             skipped += 1
             continue
         queue.append((post, urls))
@@ -76,7 +107,8 @@ async def look(context, posts, *, invitation=None):
         if not picked:
             break
         tried += sum(len(urls) for _, urls in picked)
-        loads = await asyncio.gather(*(load_image(url, post.channel.id) for post, urls in picked for url in urls),
+        loads = await asyncio.gather(*(load_image(url, post.channel.id, previews=True) for post, urls in picked
+                                       for url in urls),
                                      return_exceptions=True)
         for value in loads:
             if isinstance(value, BaseException) and not isinstance(value, (httpx.HTTPError, TimeoutError, ValueError)):
@@ -88,7 +120,8 @@ async def look(context, posts, *, invitation=None):
                 continue
             size += sum(map(len, loaded))
             inspected.append({'images': list(range(len(images)+1, len(images)+len(loaded)+1)),
-                              'source': discord_source(post).evidence()})
+                              'source': discord_source(post).evidence(),
+                              **({'still': 'gif preview'} if gif_previews(post) else {})})
             images += loaded
             reads.append({'event': post, 'sources': urls, 'invitation': invitation})
             budget -= len(urls)
@@ -195,9 +228,10 @@ async def looked_unchanged(context):
                     invitations.append(invitation)
                 continue
             current = await post.channel.fetch_message(post.id)
-            if (current.id != post.id or current.author.id != post.author.id or getattr(current.author, 'bot', False) or
+            # The same author as when read: the reads that call look() admit no bot but Fri itself.
+            if (current.id != post.id or current.author.id != post.author.id or
                     current.webhook_id or current.channel.id != post.channel.id or current.content != post.content or
-                    current.edited_at != post.edited_at or sources(current) != read['sources']):
+                    current.edited_at != post.edited_at or sources(current, MAX_IMAGES, gifs=True) != read['sources']):
                 return False
         return True
     except discord.HTTPException:

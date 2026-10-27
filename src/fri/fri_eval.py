@@ -91,11 +91,11 @@ def control_cases():
 
 
 def catch_up_cases():
-    from .fri_actions import CATCH_UP
+    from .fri_actions import CATCH_UP, PINNED
     read = {'read_recent': {'channels': [{'channel_id': '555', 'name': 'general'}], 'default_channel_id': '555',
         'limit': 20, 'max_age_days': 7, 'description': 'Read one small recent batch when asked: text, what each post '
         'carries (image, gif, video, file), and a look at up to four of the newest still images.',
-        'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
+        'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP, 'pins': PINNED}}}
     nearby = {'read_recent': {**read['read_recent'], 'limit': 12, 'max_age_days': 0.25,
         'description': 'Read up to twelve preceding same-channel messages from the last six hours when this mention '
         'needs nearby conversation, memes or images. Looks at up to four of the newest nearby still images.'}}

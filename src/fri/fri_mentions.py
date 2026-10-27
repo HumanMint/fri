@@ -10,8 +10,9 @@ from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import AuthorErased, ControllerUnavailable
-from .fri_images import media
-from .fri_meme_media import sources
+from .fri_images import details
+from .fri_meme_media import gif_previews, sources
+from .fri_memes import reacted
 from .privacy import clean
 
 NEARBY_SECONDS = 6 * 3600  # "The memes above" in a slow channel can be hours old; MAX_MESSAGES still bounds it.
@@ -37,6 +38,12 @@ def fingerprint(message):
     return (source_identity(discord_source(message)), message.content, message.edited_at,
             tuple((str(a.url), a.content_type, a.size, a.width, a.height, a.is_spoiler())
                   for a in message.attachments))
+
+
+def snapshot(message):
+    """A nearby post as read: its fingerprint, and the GIF link previews look() may have inspected,
+    which live in the embeds (a poster can swap or remove them without an edit time)."""
+    return fingerprint(message), tuple(gif_previews(message))
 
 
 class Invitation:
@@ -166,7 +173,7 @@ class Invitation:
                         self.agent.withdraw(event)
                         changed = True
                         continue
-                    if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
+                    if current.webhook_id or current.author.bot or snapshot(current) != self.snapshots[mid]:
                         self.agent.withdraw(event)
                         changed = True
                 if changed:
@@ -269,6 +276,7 @@ class Invitation:
                 continue
             accepted.append(item)
         profiles = await self.profile_sources(accepted)
+        notes, stale = self.agent.ensure_memes().notes(), []
         for item in sorted(accepted, key=lambda m: m.id):
             user = str(item.author.id)
             profile = profiles.get(user)
@@ -276,13 +284,12 @@ class Invitation:
                 continue
             self.profiles[user] = profile
             self.events[item.id] = item
-            self.snapshots[item.id] = fingerprint(item)
+            self.snapshots[item.id] = snapshot(item)
             self.rows = [row for row in self.rows if row['source']['id'] != str(item.id)]
-            row = {'source': discord_source(item).evidence(), 'text': clean(item.content, 500),
-                   'privacy_revision': profile['revision'], 'referenced': item.id == reference_id}
-            if media(item):
-                row['attachments'] = media(item)
-            self.rows.append(row)
+            self.rows.append({'source': discord_source(item).evidence(), 'text': clean(item.content, 500),
+                              'privacy_revision': profile['revision'], 'referenced': item.id == reference_id,
+                              **details(item), **reacted(notes, item, profile, stale)})
+        self.agent.ensure_memes().drop(stale)
         self.rows.sort(key=lambda row: int(row['source']['id']))
         own = event if event.attachments else None
         referenced = self.events.get(reference_id)
@@ -291,8 +298,8 @@ class Invitation:
         elif referenced and referenced.attachments:
             self.image = referenced
         # Without one image the ping points at, "which of these" needs all of them; look() keeps the newest that fit.
-        self.images = [] if self.image else [m for m in self.events.values() if m.attachments]
-        # Contextual images use attachments only. Never follow embeds or pasted URLs.
+        self.images = [] if self.image else [m for m in self.events.values() if m.attachments or gif_previews(m)]
+        # Contextual images use attachments, or a GIF link's Discord-made preview. Never other embeds or URLs.
         if self.image and sources(self.image) != [str(a.url) for a in self.image.attachments]:
             self.image = None
         await self.require_current()

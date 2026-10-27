@@ -90,10 +90,12 @@ def harness(monkeypatch, tmp_path):
     agent.member = AsyncMock(return_value=SimpleNamespace(id=10))
     agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'summary': ''})
     reads = []
+    ids = iter(range(1, 10**6))
     def message(user=20, text='I love trance', bot=False, age=60):
-        return SimpleNamespace(author=SimpleNamespace(id=user, bot=bot, display_name='friend'),
-            webhook_id=None, content=text, jump_url='https://discord.com/channels/123/1/100',
-            created_at=dt.datetime.fromtimestamp(time.time()-age, dt.timezone.utc))
+        at = dt.datetime.fromtimestamp(time.time()-age, dt.timezone.utc)
+        return SimpleNamespace(id=discord.utils.time_snowflake(at)+next(ids), edited_at=None,
+            author=SimpleNamespace(id=user, bot=bot, display_name='friend'),
+            webhook_id=None, content=text, jump_url='https://discord.com/channels/123/1/100', created_at=at)
     rows = [message(), message(bot=True, text='Old bot personality'), message(user=30, text='opted out')]
     async def history(**kwargs):
         reads.append(kwargs)
@@ -418,7 +420,7 @@ def test_read_recent_schema_always_names_a_window():
     branches = [branch for branch in SCHEMA['properties']['action']['anyOf']
                 if 'read_recent' in branch.get('properties', {}).get('kind', {}).get('enum', [])]
     assert len(branches) == 1 and branches[0]['required'] == ['kind', 'channel_id', 'window']
-    assert branches[0]['properties']['window']['enum'] == ['recent', 'since_my_last_message']
+    assert branches[0]['properties']['window']['enum'] == ['recent', 'since_my_last_message', 'pins']
 
 
 @pytest.mark.parametrize('outcome', ['completed', 'failed', 'second_action', 'erased'])

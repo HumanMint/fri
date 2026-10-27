@@ -68,12 +68,23 @@ HEARD_SECONDS = 1800  # Longer than any message waits for its reply; ambient att
 UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for follow-up details; '
                 'no quoted findings are retained here.')
 UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
+LINKED = ('Earlier answer about a post linked from another channel. Open the link again for details; '
+          'nothing from it is retained here.')
 LEGACY = '[an earlier fri reply from before fri tracked its sources]'
 CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
+CONVERSATION_CHANGED = 'the conversation changed while i was typing. ask again and i’ll catch up.'
+READ_CHANGED = 'that chat changed while i was reading it. ask again.'
 WITHDRAWN = 'the message i was answering got edited or deleted while i was on it. ask again if you still want it.'
 CLOSED = 'a channel i was pulling from just went private while i was replying, so that stays unsaid. ask again.'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
+
+
+def linked_elsewhere(context, source):
+    """The answer drew on a post linked from another channel. Its saved text couldn't carry that
+    channel's access, so it stays a neutral breadcrumb, like a read of another channel."""
+    return any(row.get('linked') and row['source'].get('channel_id') != source.channel_id
+               for row in context.get('reply_target', []))
 
 
 async def noop(stage):
@@ -355,12 +366,20 @@ class Fri(discord.Client):
                 # receipts, a learning report) never reaches the request either. Delivery checks it again.
                 # First, so nothing waits between the privacy check below and the request.
                 actions = fence['actions']
-                if actions and actions.sources and not actions.sources <= set(await actions.channels(fresh=True)):
+                if actions and actions.sources and not actions.sources <= set(await actions.channels(fresh=True, around=True)):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
                 # Every post Fri looked at is still there as it was read: an edit or delete while Fri signed
                 # in, or while the access check above waited on Discord, never reaches the model.
                 if actions and not await images_unchanged(actions.image_context, actions.event):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+                if actions and not await actions.reads_unchanged():  # And every post a read showed.
+                    raise commands.UserFeedbackCheckFailure(READ_CHANGED)
+                # So is the post they replied to or linked, and the rest of their burst.
+                evidence = actions.conversation if actions else {}
+                if evidence and (evidence.get('message_burst') or evidence.get('reply_target')):
+                    from .fri_conversation import unchanged as conversation_unchanged
+                    if not await conversation_unchanged(self.agent, actions.event, evidence):
+                        raise commands.UserFeedbackCheckFailure(CONVERSATION_CHANGED)
                 # A DM's own gates after those Discord waits, so a member who left during them is caught.
                 if fence.get('gate'):
                     await fence['gate']()
@@ -481,11 +500,11 @@ class Fri(discord.Client):
                     context['elsewhere'] = self.elsewhere(context.get('elsewhere', []), guild_id)
                 else:
                     context['elsewhere'] = []
-                conversation = {}
+                conversation, targets = {}, []
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence
                     try:
-                        conversation = await evidence(self.agent, event, burst)
+                        conversation = await evidence(self.agent, event, burst, targets)
                     except ValueError as exc:
                         raise commands.UserFeedbackCheckFailure(str(exc)) from None
                     context.update(conversation)
@@ -612,6 +631,11 @@ class Fri(discord.Client):
                 from .fri_images import attach as attach_images
                 if inspect_images:
                     await attach_images(context, event, text, source=image_source, invitation=invitation)
+                    if targets and not context.get('unattributed_reference'):
+                        # The meme they replied to or linked, when it's a still image or a GIF link's preview.
+                        from .fri_images import look
+                        from .fri_meme_media import gif_previews
+                        await look(context, [post for post in targets if post.attachments or gif_previews(post)])
                 if actions:
                     from .fri_images import image_context
                     actions.image_context = image_context(context)
@@ -639,7 +663,7 @@ class Fri(discord.Client):
                 if conversation and (conversation.get('message_burst') or conversation.get('reply_target')):
                     from .fri_conversation import unchanged
                     if not await unchanged(self.agent, event, conversation):
-                        raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
+                        raise commands.UserFeedbackCheckFailure(CONVERSATION_CHANGED)
                 from .fri_images import require_current as require_current_images
                 if not invitation:
                     await require_current_images(context, event)
@@ -688,11 +712,14 @@ class Fri(discord.Client):
                     if action_kind == 'image_search' and receipt.get('image_status') == 'prepared':
                         result.media = actions.image_share.prepared
                     stored, private = result.reply, private_read(receipts)
+                    crossed = linked_elsewhere(context, source)
                     if private and not (result.clarification or result.settings_preview or result.post_preview):
                         # Other channels' messages, archives and reports never become saved chat text.
                         checked_channel = receipt.get('channel_id', '')
                         stored = f'Earlier check: {action_kind}' + (f' in channel {checked_channel}' if checked_channel else '')
                         stored += '. Fetch current evidence for follow-up details; no findings are retained here.'
+                    elif crossed and not (result.clarification or result.settings_preview or result.post_preview):
+                        stored = LINKED
                     try:  # A fixed harness question over referenced evidence derives nothing from it.
                         provenance = ([] if result.clarification and actions.private_evidence
                                       else turn_provenance(context, user_id, actions))
@@ -712,7 +739,7 @@ class Fri(discord.Client):
                                                            'track safely.'), status='completed')
                     if context.get('unattributed_reference'):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
-                    elif not private:
+                    elif not private and not crossed:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored)
                     await looked(result)
                     try:  # The save's privacy fence, applied before anything is shown.
@@ -748,8 +775,11 @@ class Fri(discord.Client):
             raise commands.UserFeedbackCheckFailure('too many people were in that context for me to keep track '
                                                     'of safely. ask again in a bit.')
         reply, unattributed = result.reply, derived and context.get('unattributed_reference')
+        crossed = derived and linked_elsewhere(context, source)
         if unattributed:  # A referenced Fri message whose sources are unknown is never retained.
             reply, result.notes = UNATTRIBUTED, []
+        elif crossed:
+            reply = LINKED
         result.turn = {**scope, 'revision': context['revision'], 'source': source.model_dump(), 'input': text,
             'reply': reply, 'response_kind': result.response_kind, 'reaction': result.reaction,
             'allow_closing': result.allow_closing, 'burst': context.get('message_burst', []),
@@ -758,7 +788,7 @@ class Fri(discord.Client):
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
             **({'audience': context['audience']} if context.get('audience') else {})}
-        if derived and result.response_kind == 'reply' and not unattributed:
+        if derived and result.response_kind == 'reply' and not unattributed and not crossed:
             result.echo = self.echo(scope, context, provenance, reply)
         return result
 

@@ -20,7 +20,7 @@ from fri.fri_runner import run
 
 def query(**changes):
     return {'kind': 'history_search', 'channel_id': '1', 'query': 'played', 'author': '',
-            'after': '', 'before': '', 'cursor': '', **changes}
+            'after': '', 'before': '', 'has': '', 'cursor': '', **changes}
 
 
 def setup(monkeypatch, tmp_path, *, public=True, text='find old messages about what we played'):
@@ -63,14 +63,22 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'find messages before 2026-01-01', 'look through history for Minecraft',
                  'what did Dipper recommend?', 'what did I say about Minecraft?',
                  'find that game Dipper recommended last month', 'who recommended Minecraft?',
-                 'what did we talk about?', 'what did Dipper mention in chat?'):
+                 'what did we talk about?', 'what did Dipper mention in chat?',
+                 'what was that song kev mentioned', 'whats that game jo recommended',
+                 'what’s the link sam dropped', 'which was the meme you posted'):
         assert requested(text)
     for text in ('hey fri', 'play Sad Machine', 'do not search chat', '> find old messages',
                  'what do you recommend?', 'what should I say to a friend who is upset?',
                  'which game would you recommend?', 'what do I have to say?',
                  'find recommended movies', 'look up recommended games',
                  'what are the recommended settings for this game?',
-                 'what is the recommended way to learn Python?'):
+                 'what is the recommended way to learn Python?', 'whats the most posted meme format',
+                 'what is the most commonly recommended gaming laptop?',
+                 'which is the most widely recommended Python tutorial?',
+                 'what is the difference between shared and dedicated hosting?',
+                 'what is the best dermatologist recommended sunscreen?',
+                 'what is the average doctor recommended dose of vitamin D?',
+                 'what was that'):
         assert not requested(text)
     assert valid_action(query())
     assert not valid_action(query(cursor='invented'))

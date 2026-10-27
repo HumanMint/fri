@@ -217,32 +217,124 @@ async def live_rows(agent, message, burst):
         raise ValueError('A message in that burst is no longer available. Send a fresh request.') from None
 
 
-async def reply_target(agent, message):
-    """Read only the directly referenced, currently readable message in this audience."""
+LINK = re.compile(r'\bhttps://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/(\d{1,25})/(\d{1,25})/(\d{1,25})\b')
+MAX_LINKS = 2
+
+
+def links(message):
+    """Message links the speaker pasted, outside code, in order: (guild, channel, message) ids."""
+    visible = re.sub(r'```[\s\S]*?```|`[^`]*`', '', getattr(message, 'content', '') or '')
+    found = []
+    for match in LINK.finditer(visible):
+        ids = tuple(int(part) for part in match.groups())
+        if ids not in found:
+            found.append(ids)
+    return found[:MAX_LINKS]
+
+
+async def reply_target(agent, message, posts=None):
+    """The message they replied to, and up to two they linked, when this audience may read them.
+
+    posts, when given, collects each target's Discord message, for the images look() may inspect."""
+    from .fri_memory import open_to_everyone
+
+    rows = []
+    reference = getattr(message, 'reference', None)
+    channel = message.channel
+    if reference and reference.message_id and getattr(reference, 'channel_id', channel.id) in (None, channel.id):
+        if not message.guild or await readable(agent, message, channel):
+            rows += await target_row(agent, channel, reference.message_id,
+                                     str(message.guild.id) if message.guild else None, posts)
+    home = message.guild.id if message.guild else agent.fri.guild_id
+    for guild_id, channel_id, message_id in links(message):
+        if message_id == message.id or any(row['source']['id'] == str(message_id) for row in rows):
+            continue
+        linked = agent.fri.get_channel(channel_id)
+        if (guild_id != home or linked is None or getattr(getattr(linked, 'guild', None), 'id', None) != home or
+                not callable(getattr(linked, 'fetch_message', None))):  # A forum or a category holds no posts.
+            continue
+        if not in_scope(agent, linked):
+            continue
+        now = await fetched(linked)
+        # Said in a server channel, it must be one everyone in the server can read anyway, or this one.
+        if now is None or age_restricted(now) or (message.guild and linked.id != channel.id and
+                                                  not open_to_everyone(now)):
+            continue
+        if not await readable(agent, message, linked, now):
+            continue
+        rows += [{**row, 'linked': True} for row in await target_row(agent, linked, message_id, str(home), posts)]
+    return rows
+
+
+def in_scope(agent, channel):
+    """A channel Fri already reads for chat or learning, not age-restricted or a private thread."""
     import discord
 
-    reference = getattr(message, 'reference', None)
-    if not reference or not reference.message_id:
-        return []
-    channel = message.channel
-    if getattr(reference, 'channel_id', channel.id) not in (None, channel.id):
-        return []
-    if message.guild:
-        if not agent.allowed(channel):
-            return []
-        member = await agent.member(message.author.id, fresh=True, guild_id=message.guild.id)
-        if not member:
-            return []
-        for who in (member, message.guild.me):
-            permissions = channel.permissions_for(who)
-            if not permissions.view_channel or not permissions.read_message_history:
-                return []
+    parent = channel.parent if isinstance(channel, discord.Thread) else channel
+    if isinstance(channel, discord.Thread) and channel.is_private():
+        return False
+    if parent is None or age_restricted(parent):
+        return False
+    return agent.allowed(channel) or str(parent.id) in agent.state.get('history_channels', [])
+
+
+def age_restricted(channel):
+    is_nsfw = getattr(channel, 'is_nsfw', None)
+    return bool(getattr(channel, 'nsfw', False) or (callable(is_nsfw) and is_nsfw()))
+
+
+async def readable(agent, message, channel, now=None):
+    """The speaker, now, and Fri can both read that channel's history.
+
+    now, from fetched(), judges it as Discord has it rather than from the cache."""
+    guild = channel.guild
+    if message.guild and not agent.allowed(message.channel):
+        return False
+    member = await agent.member(message.author.id, fresh=True, guild_id=guild.id)
+    if not member:
+        return False
+    for who in (member, guild.me):
+        permissions = (now or channel).permissions_for(who)
+        if not permissions.view_channel or not permissions.read_message_history:
+            return False
+    return True
+
+
+async def fetched(channel):
+    """A linked channel (a thread's parent) with its fetched overwrites and the server's fetched roles.
+
+    The cache can lag a revoke, and a link crosses channels (see Invitation.access). None if gone."""
+    import copy
+
+    import discord
+
+    guild = channel.guild
     try:
-        target = await channel.fetch_message(reference.message_id)
+        current = await guild.fetch_channel(channel.id)
+        parent = await guild.fetch_channel(current.parent_id) if isinstance(current, discord.Thread) else current
+        roles = await guild.fetch_roles()
+    except discord.HTTPException:
+        return None
+    if current.id != channel.id or parent.guild.id != guild.id:
+        return None
+    fresh_guild = copy.copy(guild)
+    fresh_guild._roles = {role.id: role for role in roles}
+    parent = copy.copy(parent)
+    parent.guild = fresh_guild
+    return parent
+
+
+async def target_row(agent, channel, message_id, guild_id, posts):
+    """One referenced message as evidence: recent, by a member who allows it, or Fri itself."""
+    import discord
+
+    from .fri_images import media
+    try:
+        target = await channel.fetch_message(message_id)
         source = discord_source(target)
-        if (target.id != reference.message_id or target.channel.id != channel.id or target.webhook_id or
-                source.guild_id != (str(message.guild.id) if message.guild else None) or
-                not 0 <= time.time()-source.timestamp().timestamp() <= REPLY_SECONDS or not target.content.strip()):
+        if (target.id != message_id or target.channel.id != channel.id or target.webhook_id or
+                source.guild_id != guild_id or not 0 <= time.time()-source.timestamp().timestamp() <= REPLY_SECONDS or
+                not (target.content.strip() or media(target))):
             return []
         if target.author.id != agent.fri.user.id:
             if target.author.bot:
@@ -250,15 +342,20 @@ async def reply_target(agent, message):
             profile = await agent.profile(getattr(channel, 'parent_id', None) or channel.id, target.author.id)
             if not profile['enabled']:
                 return []
-        return [{'source': source.model_dump(), 'text': clean(target.content, 1800),
-                 'privacy_revision': profile['revision'] if target.author.id != agent.fri.user.id else None}]
+        row = {'source': source.model_dump(), 'text': clean(target.content, 1800),
+               'privacy_revision': profile['revision'] if target.author.id != agent.fri.user.id else None}
+        if media(target):
+            row['attachments'] = media(target)
+        if posts is not None:
+            posts.append(target)
+        return [row]
     except discord.HTTPException:
         return []
 
 
-async def evidence(agent, message, burst):
+async def evidence(agent, message, burst, posts=None):
     rows = await live_rows(agent, message, burst) if len(burst) > 1 else []
-    target = await reply_target(agent, message)
+    target = await reply_target(agent, message, posts)
     return {'message_burst': rows, 'reply_target': target}
 
 
@@ -269,14 +366,19 @@ async def unchanged(agent, message, context):
     async def withdrawn(row, limit):
         """Whether Discord confirms the row's message deleted or edited; if so it leaves the live view too."""
         from types import SimpleNamespace
+        # From its own channel: a linked post can sit in another one.
+        where = str(row['source'].get('channel_id') or message.channel.id)
+        channel = message.channel if where == str(message.channel.id) else agent.fri.get_channel(int(where))
+        if channel is None:
+            return False  # Unconfirmed: refused, but not withdrawn.
         try:
-            current = await message.channel.fetch_message(int(row['source']['id']))
+            current = await channel.fetch_message(int(row['source']['id']))
         except discord.NotFound:
             current = None
         except (discord.HTTPException, ValueError):
             return False  # Unconfirmed: refused, but not withdrawn.
         if current is None or getattr(current, 'edited_at', None) is not None or clean(current.content, limit) != row['text']:
-            agent.withdraw(SimpleNamespace(id=int(row['source']['id']), channel=message.channel))
+            agent.withdraw(SimpleNamespace(id=int(row['source']['id']), channel=channel))
             return True
         return False
 

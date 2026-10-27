@@ -24,12 +24,21 @@ New conversation and on-demand surrounding context still need normal chat admiss
 an outside mention always keeps its separate one-event social admission.
 
 Each invitation can use at most twelve preceding messages from the same channel in
-the last thirty minutes and a direct reference up to seven days old. A catch-up in a
-configured channel uses its own read instead (see "Catching up"). At most one
-image post is inspected, preferring the current attachments, then the reference,
-then a single nearby candidate. Multiple candidates need clarification. Existing
-limits remain two non-spoiler PNG/JPEG/WebP attachments, 4 MB each, twenty million
-pixels; external embeds, GIFs and videos are not inspected by this path. Captions
+the last six hours and a direct reference up to seven days old. A catch-up in a
+configured channel uses its own read instead (see "Catching up"). Up to four still
+images are inspected in one model call, the current attachments and the reference
+first, then the newest nearby posts' own attachments; Fri picks among several instead
+of asking which one. A speaker's own post keeps the two-image limit; a nearby gallery
+post can use the whole budget. Each image stays a non-spoiler PNG/JPEG/WebP, 4 MB,
+twenty million pixels. A GIF link (Tenor, Giphy) counts as one image through the still preview
+Discord's own proxy made of it; nothing decodes an animation, so an uploaded GIF or an animated
+preview is not inspected. Other external embeds and videos are not inspected by this path.
+A pasted message link or a replied-to post is opened only when the speaker and Fri can
+read it now (fetched overwrites and roles); from a server channel, only when it is this
+channel or one that keeps no role or member out. Every post a read or a link showed is
+found again unchanged before each later model request and before delivery. Asked what's
+pinned, Fri reads up to twenty of a channel's pins, any age, with the same channel, audience
+and author checks as any read; each must still be pinned and unchanged before the next request. Captions
 and filenames are never visual evidence. Public research only exports an exact
 public question from the current request, never surrounding chat or image captions.
 
@@ -354,6 +363,13 @@ Calls whose result can't change what members see are skipped before inference.
   is skipped, since the normal path can't answer then.
 - Meme checks are unchanged: an inspection still runs while the reaction budget is closed, because
   the budget can reopen (or the owner can raise it) before the model answers.
+- When a meme check reacts, Fri keeps in memory, never on disk, the emoji, the post's author ID, their
+  privacy revision, the post's edit time and up to 200 characters of what the model saw (never the
+  caption), for up to three days or until Fri restarts; a rollback leaves nothing behind. A read or a
+  mention's nearby rows show it as `fri_reacted` on that post only while the author's revision and the
+  edit time still match, and drop it when they don't. Forgetting a member drops theirs; every heartbeat
+  expires old ones (before it waits on the controller) and, every ten minutes, drops those whose
+  author changed privacy outside Fri, whether or not meme checks are on.
 
 ## Deployment boundary
 

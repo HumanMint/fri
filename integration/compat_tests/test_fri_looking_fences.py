@@ -182,7 +182,7 @@ def test_an_outside_mention_poster_who_opts_out_during_the_last_refetch_never_re
         memes = [message('caption '+str(user), user=user, age=user, attachments=[picture(channel.id, str(user)+'.png')])
                  for user in (30, 40)[:posts]]
         event = message('<@99> pick the best meme above')
-        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(side_effect=lambda url, channel: 'data:image/png;base64,'+url[-6:]))
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(side_effect=lambda url, channel, **_: 'data:image/png;base64,'+url[-6:]))
         fri.chat_once = MethodType(Fri.chat_once, fri)
         sent = []
         def handler(request):
@@ -220,7 +220,7 @@ def test_a_download_that_fails_leaves_its_slot_to_an_older_meme(monkeypatch, tmp
         memes = [message('', user=30, age=age, attachments=[picture(channel.id, f'{age}.png')]) for age in range(10, 130, 10)]
         tried = []
 
-        async def load(url, channel):
+        async def load(url, channel, **_):
             tried.append(url.rsplit('/', 1)[1])
             if url.rsplit('/', 1)[1] not in ('50.png', '120.png'):
                 raise httpx.ConnectError('cdn down')
