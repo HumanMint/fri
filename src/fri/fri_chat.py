@@ -16,8 +16,8 @@ from .fri_memory import CATEGORIES
 from .fri_responses import KINDS, REACTIONS, acknowledgment_allowed, validate_response
 from .fri_social import SOCIAL_ACTIONS
 from .fri_times import ASK as TIME_ASK
-from .fri_times import render as render_times
 from .fri_times import PROSE, render_tree, said_at
+from .fri_times import render as render_times
 from .privacy import clean, model_json
 from .subscription import RESOURCE, SubscriptionError
 
