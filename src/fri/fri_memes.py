@@ -189,6 +189,7 @@ class Memes:
                     # On a timer, a line of chat is noise: there it waits for laughs instead (see heard).
                     if urls is None or (not urls and (chat or not message.content.strip())):
                         continue
+                    forgotten = self.agent.forgotten.get(message.author.id, 0)  # Before its privacy read (last_look).
                     profile = await self.eligible(message)
                     if not profile:
                         continue
@@ -201,7 +202,7 @@ class Memes:
                         state['entries'][str(message.id)] = {'at': time.time(), 'channel': channel_id,
                                                              'status': 'reserved'}
                     remaining -= 1
-                    await self.inspect(message, urls, profile)
+                    await self.inspect(message, urls, profile, withdrawn=self.last_look(message, urls, profile, forgotten))
             except (discord.HTTPException, httpx.HTTPError, commands.UserFeedbackCheckFailure,
                     TimeoutError, ValueError):
                 with self.state() as state:
@@ -303,6 +304,36 @@ class Memes:
             state['channels'][str(channel_id)] = {**state['channels'].get(str(channel_id), {}),
                                                   'name': clean(channel.name, 60)}
         await self.inspect(message, [], profile, before, withdrawn)
+
+    def last_look(self, message, urls, profile, forgotten):
+        """A timed check's withdrawn (see inspect), lurk's in shape: after the model slot and sign-in, right
+        before the model sees the post, it's still on Discord as it was read, its author still allows it at
+        that revision, and no delete or forget through Fri, nor an edit Fri's live view shows (a chat meme
+        channel's), landed during those reads.
+
+        forgotten: the author's erasures through Fri when their privacy was first read."""
+        def viewed():  # Its row in Fri's live view, if any: never indexed, which would add a channel (see heard).
+            return next((dict(row) for row in self.agent.recent.get(message.channel.id, ())
+                         if row['id'] == str(message.id)), None)
+
+        async def withdrawn():
+            self.agent.saw([message.id])  # From here a delete is marked (see Agent.unsend), for the last check.
+            row = viewed()
+            try:  # The controller or Discord down here means no model call, and a receipt that says so.
+                # The whole post first, not a cached copy: an edit anywhere in a long caption counts.
+                current = await message.channel.fetch_message(message.id)
+                if (current.edited_at != message.edited_at or current.content != message.content or
+                        unsigned(sources(current)) != unsigned(urls)):
+                    return True
+                latest = await self.agent.profile(message.channel.id, message.author.id)
+                if not latest['enabled'] or latest['revision'] != profile['revision']:
+                    return True
+                # Last, with nothing awaited after it: a delete, forget or edit during the reads above shows here.
+                return (message.id in self.agent.unsent or viewed() != row or
+                        self.agent.forgotten.get(message.author.id, 0) != forgotten)
+            except (ControllerUnavailable, ControllerRejected, discord.HTTPException):
+                return True
+        return withdrawn
 
     def remember(self, message, reaction, observation, revision):
         """What Fri reacted with and saw, so a later chat can own it. Only while the author's privacy
