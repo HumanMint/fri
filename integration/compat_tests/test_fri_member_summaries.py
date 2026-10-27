@@ -490,3 +490,26 @@ def test_a_reply_after_a_tool_built_on_a_summary_from_another_channel_is_a_bread
             await w.fri.close()
     run(scenario)
 
+
+def test_an_edited_summary_fences_delivery_on_where_it_shows(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await summarize(monkeypatch, w)
+            await w.fri.api('POST', '/chat/memory/summary', {
+                'guild_id': '123', 'user_id': '20', 'channel_id': '456', 'conversation_id': 'private:900',
+                'source': dm_control(), 'revision': 0, 'action': 'replace', 'text': 'mostly raids'})
+            assert summarized(w)['origins'] == []  # In their own words: it came from nowhere.
+            saved = len(turns(w))
+
+            async def respond(text, context):
+                assert context['member_summary']['text'] == 'mostly raids'
+                w.readable[GAMING] = False  # Where it shows, restricted while Fri thinks.
+                return ChatResult(status='completed', reply='still mostly raids?')
+            model(w, respond)
+            with pytest.raises(commands.UserFeedbackCheckFailure, match='went private'):
+                await w.say(GAMING, 'fri what were we on about')
+            assert len(turns(w)) == saved
+        finally:
+            await w.fri.close()
+    run(scenario)
