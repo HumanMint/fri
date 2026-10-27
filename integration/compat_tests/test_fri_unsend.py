@@ -1,6 +1,7 @@
 """Deleted and edited messages in Fri's live view, offline and against the real controller."""
 
 import asyncio
+import json
 import logging
 import time
 from collections import Counter
@@ -455,6 +456,108 @@ def test_deleted_messages_never_come_back_into_the_live_view(monkeypatch, tmp_pa
             await asyncio.wait_for(agent.handle(trigger), 10)
             trigger.reply.assert_awaited_once()
             assert {r['id'] for r in agent.recent[1]} == {str(trigger.id)}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_message_the_model_saw_then_pushed_out_of_the_live_view_still_withholds_the_reply(monkeypatch, tmp_path):
+    """fri #67, #88: the live view keeps 30 rows; a row the request carried is marked when deleted even once it's gone."""
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        regret = message('my landlord is ezra kim on 5th street lol', user=21)
+        trigger = message('<@99> what did she just say')
+        async def respond(context, ready):
+            await ready()
+            assert any('ezra' in r['text'] for r in context.get('recent', []))
+            for n in range(30):  # A busy channel pushes it out of the live view while the model writes.
+                agent.recent[1].append(row(10**6+n, user='22'))
+            assert not any(r['id'] == str(regret.id) for r in agent.recent[1])
+            await delete(fri, rows, regret)
+            return ChatResult(status='completed', reply='she said her landlord is ezra kim')
+        model(fri, tmp_path, respond)
+        try:
+            await heard(agent, regret)
+            await asyncio.wait_for(agent.handle(trigger), 10)
+            trigger.reply.assert_awaited_once()
+            assert 'ezra' not in trigger.reply.await_args.args[0]
+            assert not store.chat_context('123', 'public:1', '20')['turns']
+            assert regret.id in agent.unsent
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_reply_target_deleted_during_the_last_checks_never_reaches_the_model(monkeypatch, tmp_path):
+    """fri #48: what a turn replies to is carried like the live view's rows, so a delete while Gene's check
+    runs (after the reply target was refetched) is marked and stops the request."""
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        fetch = channel.fetch_message.side_effect
+        async def fetch_or_gone(mid):
+            if mid not in rows:
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+            return await fetch(mid) if asyncio.iscoroutinefunction(fetch) else fetch(mid)
+        channel.fetch_message.side_effect = fetch_or_gone
+        regret = message('my landlord is ezra kim on 5th street lol', user=21, age=3000)  # Never in the live view.
+        trigger = message('<@99> what does this say')
+        trigger.reference = SimpleNamespace(message_id=regret.id, channel_id=1)
+        api, seen = fri.api, []
+        async def delete_during_check(method, path, payload=None):
+            result = await api(method, path, payload)
+            if path == '/chat/turn/check' and regret.id in rows and not seen:
+                await delete(fri, rows, regret)
+            return result
+        fri.api = delete_during_check
+        async def respond(context, ready):
+            await ready()
+            seen.append(json.dumps(context, default=str))
+            return ChatResult(status='completed', reply='it says her landlord is ezra kim')
+        model(fri, tmp_path, respond)
+        try:
+            await asyncio.wait_for(agent.handle(trigger), 10)
+            assert not seen  # The request carrying it never went out.
+            assert all('ezra' not in str(call) for call in trigger.reply.await_args_list)
+            assert regret.id not in rows and regret.id in agent.unsent
+            assert not store.chat_context('123', 'public:1', '20')['turns']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('address', ['fri', '<@99>'])
+@pytest.mark.parametrize('deleted_at', ['before_ready', 'turn_check'])
+def test_a_nearby_row_dropped_before_the_request_doesnt_withhold_an_unrelated_answer(monkeypatch, tmp_path, address, deleted_at):
+    """Only what a request carries counts at delivery: a row deleted before it went out was never shown."""
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        regret = message('unrelated nearby chatter', user=21)
+        trigger = message(address + ' what is 2 plus 2?')
+        requests, deleted = [], []
+        api = fri.api
+        async def delete_during_check(method, path, payload=None):
+            result = await api(method, path, payload)
+            if deleted_at == 'turn_check' and path == '/chat/turn/check' and not deleted:
+                deleted.append(True)
+                await delete(fri, rows, regret)
+            return result
+        fri.api = delete_during_check
+        async def respond(context, ready):
+            if deleted_at == 'before_ready' and not deleted:
+                deleted.append(True)
+                await delete(fri, rows, regret)
+            await ready()
+            requests.append([r['id'] for r in context.get('recent', [])])
+            return ChatResult(status='completed', reply='2 plus 2 is 4')
+        model(fri, tmp_path, respond)
+        try:
+            await heard(agent, regret)
+            await asyncio.wait_for(agent.handle(trigger), 10)
+            assert requests and str(regret.id) not in requests[-1] and regret.id in agent.unsent
+            assert [call.args[0] for call in trigger.reply.await_args_list] == ['2 plus 2 is 4']
         finally:
             await fri.close()
     asyncio.run(scenario())

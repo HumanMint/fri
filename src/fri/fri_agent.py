@@ -166,7 +166,7 @@ class Agent:
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
-        self.looked = {}  # Posts a turn looked at (look()) -> when (monotonic), oldest first: see unsend.
+        self.looked = {}  # Messages a turn's model request carried -> when (monotonic), oldest first: see unsend.
         self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
 
@@ -332,8 +332,9 @@ class Agent:
         self.bursts.unsend(channel, ids)
 
     def saw(self, ids):
-        """Posts a turn looked at, outside the live view: a delete is marked for an hour, past any reply
-        still running, so the turn's last checks and its delivery notice it (see unsend)."""
+        """Messages a turn's model request carries, wherever they came from (the live view, a reply target, a
+        read, a look): a delete is marked for an hour, past any reply still running, even once one leaves the
+        live view, so the turn's last checks and its delivery notice it (see unsend)."""
         now = time.monotonic()
         for i in ids:
             self.looked.pop(i, None)

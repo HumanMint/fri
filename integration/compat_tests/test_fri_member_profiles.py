@@ -943,3 +943,87 @@ def test_a_projects_note_is_shared_with_the_share_button(monkeypatch, tmp_path):
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_profile_note_said_where_not_everyone_reads_now_stays_out_of_public(monkeypatch, tmp_path):
+    # fri #98: a note already in the profile from a channel that no longer counts as server-wide.
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like private jazz', 'noted', note('I like private jazz', 'music'))
+            await w.say(GAMING, 'fri I like chess', 'noted', note('I like chess'))
+            w.readable[GENERAL] = False
+            await w.say(GAMING, 'fri what should i play')
+            notes = model_context(w)['personal_memory']['notes']
+            assert [row['evidence'] for row in notes] == ['I like chess']
+            sent = json.dumps(model_context(w), default=str)
+            assert 'private jazz' not in sent
+            overview, _, _ = await w.say(GAMING, 'fri what do you remember about me')
+            assert 'private jazz' not in overview.reply and 'chess' in overview.reply
+            await w.say(DM, 'fri what should i listen to')  # Their own DM still has all of it.
+            assert {row['evidence'] for row in model_context(w)['personal_memory']['notes']} == {
+                'I like private jazz', 'I like chess'}
+            w.readable[GENERAL] = True
+            await w.say(GAMING, 'fri what should i play')
+            assert {row['evidence'] for row in model_context(w)['personal_memory']['notes']} == {
+                'I like private jazz', 'I like chess'}
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('origins', [None, ['public:1', None], ['public:1'], 'junk'])
+def test_placing_notes_fails_closed_on_a_mismatch(origins):
+    from fri.fri_memory import place_notes
+    notes = [{'scope': 'server', 'evidence': 'a'}, {'scope': 'here', 'evidence': 'b'}]
+    channels = {1: None}  # Gone, or never cached: can't tell, so restricted.
+    context = place_notes(channels.get, {'personal_memory': {'notes': notes}, 'profile_origins': origins}, 'public:2')
+    assert [row['evidence'] for row in context['personal_memory']['notes']] == (['a', 'b'] if origins is None else ['b'])
+    private = place_notes(channels.get, {'personal_memory': {'notes': list(notes)}, 'profile_origins': origins},
+                          'private:9')
+    assert len(private['personal_memory']['notes']) == 2 and 'profile_origins' not in private
+
+
+def test_a_note_the_member_shared_keeps_showing_after_its_channel_closes(monkeypatch, tmp_path):
+    """Shared from My memory by their own press: its origin is that DM, so a closed channel doesn't hide it."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            w.readable[GENERAL] = False  # Said where not everyone can read: it stays there.
+            await w.say(GENERAL, 'fri I like private jazz', 'noted', note('I like private jazz', 'music'))
+            await w.say(GAMING, 'fri what should i play')
+            assert model_context(w)['personal_memory']['notes'] == []
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            await w.fri.api('POST', f"/chat/memory/notes/{state['entries'][0]['id']}", {
+                **scope, 'source': dm_control(), 'revision': state['revision'], 'action': 'share'})
+            await w.say(GAMING, 'fri what should i play')
+            assert [row['evidence'] for row in model_context(w)['personal_memory']['notes']] == ['I like private jazz']
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_reply_drawn_from_a_profile_note_is_withheld_if_its_channel_closes_meanwhile(monkeypatch, tmp_path):
+    """Where a profile note shown in public was said joins the delivery fence, like elsewhere rows."""
+    import time
+
+    from gene.fri_memory_store import save
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            with w.store.connection() as db:  # A profile note older than any elsewhere row.
+                assert save(db, '123', 'server', '20', ('music', 'I like private jazz'), time.time(), 'public:1', ())
+            async def respond(text, context):
+                assert context['personal_memory']['notes'][0]['evidence'] == 'I like private jazz'
+                w.readable[GENERAL] = False  # Closed while the model writes.
+                return ChatResult(status='completed', reply='private jazz, obviously')
+            model(w, respond)
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await w.say(GAMING, 'fri what should i listen to')
+            assert not any('private jazz' in (turn['reply'] or '') for turn in turns(w))
+        finally:
+            await w.fri.close()
+    run(scenario)
