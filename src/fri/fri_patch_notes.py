@@ -207,10 +207,10 @@ def set_anchor(state, version, index, mark):
 async def landed(dm, me, chunk, after, taken):
     """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
     Every message after `after` is read (the whole DM if it was empty). Only Fri's own messages with
-    exactly this text count, and never one the record already gives a part: Discord keeps no nonce in
-    history, so that is what tells identical parts and releases apart."""
+    exactly this text count (Discord trims the ends it stores), and never one the record already gives a
+    part: Discord keeps no nonce in history, so that is what tells identical parts and releases apart."""
     async for message in dm.history(limit=None, after=after, oldest_first=True):
-        if message.author.id == me and message.content == chunk and str(message.id) not in taken:
+        if message.author.id == me and message.content.strip() == chunk.strip() and str(message.id) not in taken:
             return message
     return None
 

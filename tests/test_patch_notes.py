@@ -719,3 +719,20 @@ def test_a_retry_of_a_part_older_code_tried_keeps_its_time_boundary(dm, tmp_path
     run('notes', tmp_path)
     assert len(room.sends) == 2 and [m.content for m in room.messages] == ['earlier dm', 'notes']
 
+
+def test_a_part_discord_stored_without_its_outer_whitespace_is_still_found(dm, tmp_path, monkeypatch):
+    """Discord trims a message's leading and trailing whitespace, so a part opening with an indented line lands trimmed."""
+    text = paragraph(1500, 'a') + '\n\n  - ' + paragraph(1000, 'b')
+    assert notes.parts(text)[1].startswith('  - ')
+    sent = dm.send
+    async def trimmed(content, **kwargs):
+        try:
+            return await sent(content, **kwargs)
+        finally:
+            dm.messages[-1].content = dm.messages[-1].content.strip()
+    monkeypatch.setattr(dm, 'send', trimmed)
+    dm.lost.add(2)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    run(text, tmp_path)
+    assert len(dm.sends) == 2 and len(dm.messages) == 2
