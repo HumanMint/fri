@@ -509,6 +509,29 @@ def test_the_last_look_lets_an_unchanged_line_through(chat, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_no_model_call_once_the_reactions_are_spent_while_a_check_waits(chat, monkeypatch):
+    async def scenario():
+        h = chat
+        analyze = model(h, monkeypatch)
+        configure(h, 2, meme_daily_reactions=1)
+        await h.agent.slots.acquire()  # Another model call is running while four lines get their laughs.
+        lines = []
+        for i in range(4):
+            lines.append(await h.say(200+10*i, 12, f'the toaster has a lawyer {i}', settle=False))
+            await h.say(201+10*i, 30, 'lol', settle=False)
+            await h.say(202+10*i, 31, 'lmao', settle=False)
+            await asyncio.sleep(0)
+        await waiting(h, 200)
+        with h.agent.memes.state() as state:  # The timer's meme check reacted meanwhile: today's one reaction.
+            state['reactions'].append(time.time())
+        h.agent.slots.release()
+        await settled(h)
+        analyze.assert_not_awaited()
+        for line in lines:
+            line.add_reaction.assert_not_awaited()
+    asyncio.run(scenario())
+
+
 # The pattern laughter() replaced: the same laughs, matched with backtracking that could take seconds.
 OLD_LAUGH = r"(?:lo+l|lmf?ao+|ha(?:ha)+h?|ㅋ{2,}|i['’]?m\s+dead|crying|😂|🤣|💀|😭)"
 OLD_LAUGHTER = re.compile(OLD_LAUGH + r'(?:\s*' + OLD_LAUGH + r')*[\s.!]*', re.I)

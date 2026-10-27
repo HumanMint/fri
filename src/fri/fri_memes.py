@@ -273,11 +273,13 @@ class Memes:
         async def withdrawn():
             """After the model slot and sign-in, right before the model sees them: each line shown, this one
             too, is still in Fri's live view as it was, from authors who still allow it at that revision (a
-            forget or delete takes their rows out of the view)."""
+            forget or delete takes their rows out of the view), and a reaction could still follow."""
             if not await self.agent.unwithdrawn(channel_id, shown):
                 return True
             live = {row['id']: row for row in self.agent.recent.get(channel_id, ())}
-            return any(live[row['id']]['text'] != row['text'] for row in shown)
+            with self.state(write=False) as state:
+                return (full(state, self.agent.config, time.time()) or
+                        any(live[row['id']]['text'] != row['text'] for row in shown))
 
         message = await channel.fetch_message(int(post_id))
         if message.edited_at is not None or sources(message) != [] or not message.content.strip():
