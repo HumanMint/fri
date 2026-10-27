@@ -1,5 +1,6 @@
 """Bounded live conversation evidence. Evidence never supplies general tool authority."""
 
+import hashlib
 import re
 import time
 
@@ -358,10 +359,17 @@ async def target_row(agent, channel, message_id, guild_id, posts, gone=None):
         return []
 
 
+def versions(posts):
+    """Each target's whole text, fingerprinted: its row keeps only the start the model is shown, so an edit
+    past that would otherwise pass unchanged(). Kept beside the rows, never in what the model reads."""
+    return {str(post.id): hashlib.sha256((post.content or '').encode()).hexdigest() for post in posts}
+
+
 async def evidence(agent, message, burst, posts=None):
     rows = await live_rows(agent, message, burst) if len(burst) > 1 else []
+    posts = [] if posts is None else posts
     target = await reply_target(agent, message, posts)
-    return {'message_burst': rows, 'reply_target': target}
+    return {'message_burst': rows, 'reply_target': target, 'target_versions': versions(posts)}
 
 
 async def unchanged(agent, message, context):
@@ -394,7 +402,8 @@ async def unchanged(agent, message, context):
 
     try:
         unchanged, posts, gone = True, [], set()
-        if context.get('reply_target') != await reply_target(agent, message, posts, gone):
+        if (context.get('reply_target') != await reply_target(agent, message, posts, gone) or
+                context.get('target_versions', versions(posts)) != versions(posts)):
             fetched = {post.id: post for post in posts}
             for row in context.get('reply_target', []):
                 mid = int(row['source']['id'])
