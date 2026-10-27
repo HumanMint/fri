@@ -51,6 +51,7 @@ BUSY = object()  # A panel or ambient reply to the member started first; wait fo
 QUEUE_SECONDS = 240  # How long after it was sent a message may wait behind an earlier reply.
 REST_SECONDS = 8  # How long a bare "fri" waits for the question that usually follows it.
 MOVED_ON_SCAN = 20  # Messages after an ambient pick read for someone else speaking; a full page counts as moved on.
+ATTENTION_WAIT = 5  # How long attention waits on its own Discord work before moving on. It never cancels it.
 # Just the name, a hello, or both: "fri", "yo fri", "fri?", "hey fri", a bare ping (read as "hey").
 GREETING = r'(?:hey+|hi+|hello|yo+|oi+|ayo?|sup|psst|ok(?:ay)?|bro|um+|uh+)'
 SUMMONS = re.compile(rf'(?i)(?:{GREETING}\b[\s,.!?~-]*)*(?:fri\b[\s,.!?~-]*)?(?:{GREETING}\b[\s,.!?~-]*)*')
@@ -153,6 +154,8 @@ class Agent:
         self.last_reaction = {}
         self.reaction_lock = asyncio.Lock()
         self.last_investigated = {}
+        self.attending = set()  # Attention's Discord work still going after attention moved on (see bounded).
+        self.ambient_replies = {}  # channel: its ambient reply still going after attention moved on.
         self.members = {}
         self.gene_id = int(os.getenv('GENE_BOT_ID', '0'))
         self.dedicated = int(os.getenv('FRI_CHAT_CHANNEL_ID', '0'))
@@ -1635,9 +1638,31 @@ class Agent:
             else:
                 self.seen[channel] = before
 
+    async def bounded(self, work, channel=None):
+        """Attention's Discord work as its own task, waited on for ATTENTION_WAIT and never cancelled: attention
+        runs in the heartbeat, which a read held up in Discord's global rate-limit wait must not stall, and
+        discord.py can't recover from a cancel inside that wait (see fri_fixes.check). The task once it's done,
+        or None once attention moved on without it. `channel`: an ambient reply there, still going until done."""
+        task = asyncio.ensure_future(work)
+        self.attending.add(task)
+        if channel is not None:
+            self.ambient_replies[channel] = task
+
+        def ended(task):  # A failure after attention moved on is still logged, not left unretrieved.
+            self.attending.discard(task)
+            if channel is not None and self.ambient_replies.get(channel) is task:
+                del self.ambient_replies[channel]
+            if not task.cancelled() and task.exception() is not None:
+                LOG.info('Attention work ended: %s', type(task.exception()).__name__)
+        task.add_done_callback(ended)
+        done, _ = await asyncio.wait({task}, timeout=ATTENTION_WAIT)
+        return task if done else None
+
     async def attend(self):
         now = time.time()
         for channel_id in list(self.recent):
+            if (running := self.ambient_replies.get(channel_id)) and not running.done():
+                continue  # Its last reply is still waiting on Discord; its fresh messages wait for the next pass.
             records = await self.context_messages(channel_id, raw_errors=True)
             # Messages the direct path answers stay in records as context but aren't decided again here.
             # A bare image is context for a reply, never something ambient attention answers by itself.
@@ -1685,16 +1710,21 @@ class Agent:
                 current = await self.context_messages(channel_id)
                 if not current or current[-1]['id'] != records[-1]['id']:
                     continue
-                try:
-                    message = await channel.fetch_message(int(selected['id']))
-                except discord.HTTPException:  # Deleted since, say: the other channels still get their turn.
-                    continue
-                profile = await self.profile(getattr(channel, 'parent_id', None) or channel_id, message.author.id)
-                # A direct reply can start or finish while Luna/fetch/profile awaits.
-                # Background attention yields instead of producing a second reply or busy notice.
-                if (profile['enabled'] and selected['id'] not in self.direct and
-                        self.ambient_ready(channel_id, message.author.id)):
-                    await self.respond(message, message.content[:4000], ambient=True)
+                if done := await self.bounded(self.ambient_reply(channel, selected), channel_id):
+                    done.result()  # Raised as if run inline; still going, it finishes on its own.
+
+    async def ambient_reply(self, channel, selected):
+        """Attention's pick, answered unprompted, aside from the heartbeat (see bounded)."""
+        try:
+            message = await channel.fetch_message(int(selected['id']))
+        except discord.HTTPException:  # Deleted since, say: the other channels still get their turn.
+            return
+        profile = await self.profile(getattr(channel, 'parent_id', None) or channel.id, message.author.id)
+        # A direct reply can start or finish while Luna/fetch/profile awaits.
+        # Background attention yields instead of producing a second reply or busy notice.
+        if (profile['enabled'] and selected['id'] not in self.direct and
+                self.ambient_ready(channel.id, message.author.id)):
+            await self.respond(message, message.content[:4000], ambient=True)
 
     async def investigate(self, channel, record):
         # Watches what it files, so a shipped fix gets one line under the error.
@@ -1717,9 +1747,12 @@ class Agent:
         body = clean('Fri noticed a Gene error (untrusted evidence).\n'+record['text']+
             '\n\nRead-only assessment (gpt-6.1-sol, xhigh):\n'+result.get('summary', '')+
             '\n\nProposed repair:\n'+result['proposed_request'], 5500)
-        if self.state.get('auto_repairs_enabled'):
+        # An automatic repair needs Gene's message as Discord has it now. Held up past ATTENTION_WAIT, the owner
+        # reviews it instead: the read isn't cancelled (see bounded), and its late answer is left unused.
+        if self.state.get('auto_repairs_enabled') and (
+                fetched := await self.bounded(source_channel.fetch_message(int(record['id'])))):
             from .fri_context import discord_source
-            message = await source_channel.fetch_message(int(record['id']))
+            message = fetched.result()
             if message.author.id != self.gene_id or message.webhook_id or not self.allowed(source_channel):
                 return
             scope = {**self.identity(self.gene_id), 'channel_id': str(parent), 'conversation_id': 'public:'+str(channel)}

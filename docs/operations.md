@@ -680,6 +680,13 @@ the stage and exception class only, and never skips the stages after it. `fri-he
 `agent_heartbeat.running/failed/status` for the release coordinator and adds
 `agent_heartbeat.stages`, one `{at, last_ok, error}` entry per enabled stage.
 
+Attention waits up to 5 s on its own Discord work, then moves on and never cancels it, since
+discord.py can't recover from a cancel inside its global rate-limit wait. That covers an ambient
+reply (reading its pick, the reply itself) and, before an automatic repair, the read of Gene's error.
+An ambient reply still going holds back its channel's next attention pass until it finishes. A
+Gene error whose read is still going is filed for the owner's review instead of as an automatic
+repair.
+
 A usage receipt the controller refuses as invalid (HTTP 400 or 422), or one that
 can't be parsed, moves to `usage/rejected/` and stops blocking later receipts.
 `rejected_usage` in the health file counts them. Credential or contract refusals
