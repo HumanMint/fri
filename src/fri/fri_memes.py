@@ -265,9 +265,20 @@ class Memes:
         # Still here too, as a meme post's author must be (see eligible).
         if len([user for user in laughers(rows, replies, at) if await self.agent.member(int(user), fresh=True)]) < LAUGHERS:
             return
+        # Copies, as they were read: each keeps its message ID, author and privacy revision (Fri's its provenance).
+        shown = [dict(row) for row in rows[:at] if not row.get('gene_error')][-CONTEXT_LINES:] + [dict(rows[at])]
         before = [{'name': row['name'], 'text': row['text'],
-                   **({'attachments': row['attachments']} if row.get('attachments') else {})}
-                  for row in rows[:at] if not row.get('gene_error')][-CONTEXT_LINES:]
+                   **({'attachments': row['attachments']} if row.get('attachments') else {})} for row in shown[:-1]]
+
+        async def withdrawn():
+            """After the model slot and sign-in, right before the model sees them: each line shown, this one
+            too, is still in Fri's live view as it was, from authors who still allow it at that revision (a
+            forget or delete takes their rows out of the view)."""
+            if not await self.agent.unwithdrawn(channel_id, shown):
+                return True
+            live = {row['id']: row for row in self.agent.recent.get(channel_id, ())}
+            return any(live[row['id']]['text'] != row['text'] for row in shown)
+
         message = await channel.fetch_message(int(post_id))
         if message.edited_at is not None or sources(message) != [] or not message.content.strip():
             return  # Edited since, maybe to take it back, or no longer just a line of text.
@@ -281,7 +292,7 @@ class Memes:
             state['entries'][post_id] = {'at': now, 'channel': str(channel_id), 'status': 'reserved'}
             state['channels'][str(channel_id)] = {**state['channels'].get(str(channel_id), {}),
                                                   'name': clean(channel.name, 60)}
-        await self.inspect(message, [], profile, before)
+        await self.inspect(message, [], profile, before, withdrawn)
 
     def remember(self, message, reaction, observation, revision):
         """What Fri reacted with and saw, so a later chat can own it. Only while the author's privacy
@@ -339,16 +350,17 @@ class Memes:
             if status == 'reacted':
                 channel['last_reaction'] = time.time()
 
-    async def inspect(self, message, urls, profile, before=None):
-        """before: for a line of chat (see lurk), the lines ahead of it; None for a meme post."""
+    async def inspect(self, message, urls, profile, before=None, withdrawn=None):
+        """before: for a line of chat (see lurk), the lines ahead of it; None for a meme post. withdrawn: its
+        last look before the model sees them (see Agent.run's erased)."""
         forgotten = self.agent.forgotten.get(message.author.id, 0)  # Their erasures through Fri so far.
         images = [await load_image(url, message.channel.id) for url in urls]
         result, _, status = await self.agent.run('meme', INSTRUCTION + (CHAT_LINE if before is not None else ''),
             {'caption': clean(message.content, 1000), 'image_count': len(images),
              **({'preceding_lines': before} if before is not None else {}),
-             'owner_voice_preferences': self.agent.config['voice_notes']}, SCHEMA, images=images)
+             'owner_voice_preferences': self.agent.config['voice_notes']}, SCHEMA, images=images, erased=withdrawn)
         if status != 'completed':
-            self.receipt(message, 'model_failed')
+            self.receipt(message, 'skipped' if status == 'erased' else 'model_failed')  # erased: Agent.run's ERASED.
             return
         self.receipt(message, 'quiet', len(images))
         if result.get('confidence') != 'high' or result.get('reaction') not in EMOJIS:

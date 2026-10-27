@@ -7,6 +7,7 @@ import random
 import re
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import discord
 import pytest
@@ -14,6 +15,7 @@ import pytest
 from compat_tests.test_fri_learning import learning as learning  # noqa: F401
 from compat_tests.test_fri_memes import attachment, build
 from compat_tests.test_fri_memes import harness as harness  # noqa: F401
+from fri.fri_agent import Agent
 
 BIT = [(90, 12, 'who left the oven on'), (91, 13, 'not me'), (92, 12, 'the smoke alarm says otherwise'),
        (93, 13, 'that alarm lies'), (94, 14, 'it lied about the toast too'), (95, 12, 'ok but who')]
@@ -56,6 +58,28 @@ async def settled(h):
 
 def reply_to(mid):
     return SimpleNamespace(message_id=mid, resolved=None)
+
+
+def model(h, monkeypatch):
+    """Agent.run as it runs: one model slot, sign-in, its erased check, then the model, mocked and returned."""
+    analyze = AsyncMock(return_value=({'reaction': '💀', 'confidence': 'high', 'observation': 'A joke'}, {}, 'completed'))
+    monkeypatch.setattr('fri.fri_agent.analyze', analyze)
+    h.fri.chat = SimpleNamespace(headers=AsyncMock(return_value={}))
+    h.agent.record = AsyncMock()
+    h.agent.run = Agent.run.__get__(h.agent, Agent)
+    return analyze
+
+
+async def waiting(h, mid):
+    """Until the check of message mid has reserved its turn and waits on the model slot."""
+    for _ in range(100):
+        with h.agent.memes.state(write=False) as state:
+            if str(mid) in state['entries']:
+                break
+        await asyncio.sleep(0)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert h.agent.slots.locked()
 
 
 def configure(h, version, **changes):
@@ -426,6 +450,62 @@ def test_a_spent_budget_stops_a_laugh_check_before_it_reads_anything(chat, spent
         assert not reads and h.channel.fetch_message.await_count == fetched
         h.agent.run.assert_not_awaited()
         line.add_reaction.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['opted_out', 'forgotten', 'deleted', 'edited', 'line_deleted', 'line_edited',
+                                    'author_opted_out', 'during_fetch'])
+def test_every_line_the_model_would_see_is_checked_again_after_the_slot_and_sign_in(chat, monkeypatch, change):
+    async def scenario():
+        h = chat
+        analyze = model(h, monkeypatch)
+        line = await h.bit()
+        await h.say(101, 30, 'lol')
+        message = {m.id: m for m in h.rows}
+
+        def edit(mid):
+            message[mid].content = 'nvm'
+            message[mid].edited_at = dt.datetime.fromtimestamp(h.clock[0], dt.timezone.utc)
+            h.agent.edit(3, message[mid])
+        changes = {'opted_out': lambda: h.store.personal_control('14', 'disable'),  # Line 94's author.
+                   'forgotten': lambda: h.agent.forget(14), 'deleted': lambda: h.agent.unsend(3, [94]),
+                   'edited': lambda: edit(94), 'line_deleted': lambda: h.agent.unsend(3, [100]),
+                   'line_edited': lambda: edit(100), 'author_opted_out': lambda: h.store.personal_control('11', 'disable')}
+        if change == 'during_fetch':  # After the lines were read, while the line itself is fetched.
+            async def fetch(mid):
+                h.store.personal_control('14', 'disable')
+                return message[mid]
+            h.channel.fetch_message.side_effect = fetch
+            await h.say(102, 31, 'lmao')
+        else:
+            await h.agent.slots.acquire()  # Another model call is running.
+            await h.say(102, 31, 'lmao', settle=False)
+            await waiting(h, 100)
+            changes[change]()
+            h.agent.slots.release()
+            await settled(h)
+        analyze.assert_not_awaited()
+        line.add_reaction.assert_not_awaited()
+        with h.agent.memes.state(write=False) as state:
+            assert state['entries']['100']['status'] == 'skipped'  # Considered, so not judged again later.
+    asyncio.run(scenario())
+
+
+def test_the_last_look_lets_an_unchanged_line_through(chat, monkeypatch):
+    async def scenario():
+        h = chat
+        analyze = model(h, monkeypatch)
+        line = await h.bit()
+        await h.say(101, 30, 'lol')
+        await h.agent.slots.acquire()
+        await h.say(102, 31, 'lmao', settle=False)
+        await waiting(h, 100)
+        h.agent.slots.release()
+        await settled(h)
+        analyze.assert_awaited_once()
+        data = analyze.await_args.args[2]
+        assert data['caption'] == LINE and [row['text'] for row in data['preceding_lines']] == [t for _, _, t in BIT[-5:]]
+        line.add_reaction.assert_awaited_once_with('💀')
     asyncio.run(scenario())
 
 
