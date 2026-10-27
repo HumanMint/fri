@@ -581,8 +581,8 @@ def test_a_channel_post_goes_to_the_named_text_channel_once(dm, tmp_path):
     assert chat.sends[0]['mentions'] == notes.NO_MENTIONS
     assert json.loads((tmp_path/'patch-notes-server.json').read_text())['versions']['0.7.0']['parts'][0]['channel_id'] == '888'
     assert not (tmp_path/'patch-notes.json').exists()
-    assert post('fri 0.7.0\n\n**added**\n- things', tmp_path) == ['0.7.0: all 1 parts were already sent and pinned']
-    assert len(chat.sends) == 1
+    assert post('fri 0.7.0\n\n**added**\n- things', tmp_path) == ['part 1/1: already sent', '0.7.0: message 1001 is pinned in #fri-chat']
+    assert len(chat.sends) == 1 and len(chat.pin_calls) == 1
 
 
 def test_the_owners_dm_and_the_channel_each_get_a_version_once(dm, tmp_path):
@@ -772,8 +772,9 @@ def test_a_channel_post_pins_its_first_part_and_leaves_other_pins_alone(dm, tmp_
     assert len(chat.sends) == 2 and chat.pin_calls == [(1001, 'Fri patch notes 0.7.0')]
     assert chat.pinned == {5, 1001} and server_record(tmp_path)['0.7.0']['pinned'] == '1001'
     assert lines[-1] == '0.7.0: message 1001 is pinned in #fri-chat'
-    assert post(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), tmp_path) == ['0.7.0: all 2 parts were already sent and pinned']
-    assert len(chat.sends) == 2 and len(chat.pin_calls) == 1
+    assert post(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), tmp_path) == [
+        'part 1/2: already sent', 'part 2/2: already sent', '0.7.0: message 1001 is pinned in #fri-chat']
+    assert len(chat.sends) == 2 and len(chat.pin_calls) == 1  # checked with Discord, not pinned twice
 
 
 def test_the_owners_dm_is_never_pinned(dm, tmp_path):
@@ -850,7 +851,8 @@ def test_pin_pins_a_version_posted_before_pins_from_its_record_alone(monkeypatch
     assert chat.pin_calls == [(1564587767155925144, 'Fri patch notes 1.0.0')] and not chat.sends
     assert server_record(tmp_path)['1.0.0']['pinned'] == '1564587767155925144'
     assert pin_cli(monkeypatch, tmp_path, '1.0.0', '--channel', 'fri-chat') == 0
-    assert '1.0.0: already pinned' in capsys.readouterr().out and len(chat.pin_calls) == 1
+    assert '1.0.0: message 1564587767155925144 is pinned in #fri-chat' in capsys.readouterr().out
+    assert len(chat.pin_calls) == 1
     chat.pin_error = discord_error(discord.Forbidden, 403, 50013, 'Missing Permissions')
     assert pin_cli(monkeypatch, tmp_path, '0.9.0', '--channel', 'fri-chat') == 2  # never posted
     assert 'refused: 0.9.0 is not fully posted' in capsys.readouterr().err
@@ -910,3 +912,46 @@ def test_an_unfinished_part_beside_one_older_code_recorded_is_refused(dm, tmp_pa
     with pytest.raises(notes.NotesRefused, match='recorded by older code'):
         run('fri 0.7.0', tmp_path, version='0.7.0')
     assert len(dm.sends) == 1
+
+
+def test_a_pin_on_record_is_checked_with_discord_before_it_is_reported(monkeypatch, capsys, dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    post('fri 0.7.0', tmp_path)
+    chat.pinned.discard(1001)  # someone unpinned it since
+    assert pin_cli(monkeypatch, tmp_path, '0.7.0', '--channel', 'fri-chat') == 0
+    assert len(chat.pin_calls) == 2 and 1001 in chat.pinned and len(chat.sends) == 1
+    chat.messages = []  # and then deleted it
+    assert pin_cli(monkeypatch, tmp_path, '0.7.0', '--channel', 'fri-chat') == 3
+    assert 'no longer in #fri-chat; it was not posted again' in capsys.readouterr().err and len(chat.sends) == 1
+
+
+def test_two_releases_older_code_left_unfinished_each_finish_after_the_upgrade(dm, tmp_path):
+    def legacy(text):
+        chunks = notes.parts(text)
+        return {'sha256': notes.hashlib.sha256(json.dumps(chunks).encode()).hexdigest(),
+                'parts': [{'attempted_at': 1793095990.0, 'sha256': notes.text_hash(chunks[0])}]}
+    (tmp_path/'patch-notes.json').write_text(json.dumps({'versions': {
+        '0.7.0': legacy('fri 0.7.0'), '0.8.0': legacy('fri 0.8.0')}}))
+    with pytest.raises(notes.NotesRefused, match='recorded by older code'):
+        run('fri 0.7.0', tmp_path, version='0.7.0')
+    run('fri 0.8.0', tmp_path, version='0.8.0')  # 0.7.0's trimmed text is on record now: they differ
+    run('fri 0.7.0', tmp_path, version='0.7.0')
+    assert [m.content for m in dm.messages] == ['fri 0.8.0', 'fri 0.7.0']
+
+
+def test_an_unreadable_channel_after_posting_reports_posted_not_pinned(monkeypatch, capsys, dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    chat.pin_error = discord_error(discord.Forbidden, 403, 50013, 'Missing Permissions')
+    with pytest.raises(notes.PinFailed):
+        post('fri 0.7.0', tmp_path)
+
+    async def no_guild(self, guild_id):
+        raise discord_error(discord.Forbidden, 403, 50001, 'Missing Access')
+    monkeypatch.setattr(FakeClient, 'fetch_guild', no_guild)
+    assert pin_cli(monkeypatch, tmp_path, '0.7.0', '--channel', 'fri-chat') == 3
+    assert 'posted, not pinned: #fri-chat could not be read' in capsys.readouterr().err
+    with pytest.raises(notes.PinFailed, match='could not be read'):
+        post('fri 0.7.0', tmp_path)
+    assert len(chat.sends) == 1

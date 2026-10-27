@@ -670,7 +670,8 @@ trimmed text, counts as possibly the same.
 
 Once every part of a channel post is confirmed, Fri pins its first part in that channel (owner request,
 2026-10-27); the DM is never pinned. The record keeps the pinned message's id under `pinned`, so a rerun
-after a failed pin only pins and never posts again, and a message already pinned counts. `pin <version>
+after a failed pin only pins and never posts again, and a message already pinned counts. Every rerun asks
+Discord rather than trusting the record, and pins again a post someone unpinned. `pin <version>
 --channel <name>` pins a version already posted, from the record alone and without the notes. Fri never
 unpins, deletes or reposts anything: missing Pin Messages or Read Message History, Discord's 250-pin
 limit (error 30003), a deleted post or a recreated channel leave the post as it is and are reported.

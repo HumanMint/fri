@@ -247,7 +247,7 @@ async def pin(room, entry, version, out):
     if str(room.id) != channel_id:
         raise PinFailed(f'{version} was posted in channel {channel_id}, not {where} ({room.id}); nothing was pinned')
     try:
-        message = await room.fetch_message(int(message_id))
+        message = await room.fetch_message(int(message_id))  # Even when on record: someone may have unpinned it.
         if not message.pinned:
             try:
                 await message.pin(reason=f'Fri patch notes {version}')
@@ -276,13 +276,14 @@ async def pin_posted(version, *, token, data, guild_id, channel, out=print):
         entry = state['versions'].get(version)
         if not entry or not all(part.get('message_id') for part in entry['parts']):
             raise NotesRefused(f'{version} is not fully posted in a channel; send it first')
-        if entry.get('pinned'):
-            out(f'{version}: already pinned (message {entry["pinned"]})')
-            return
         client = discord.Client(intents=discord.Intents.none())
         try:
             await client.login(token)
-            await pin(await destination(client, owner_id=None, guild_id=guild_id, channel=channel), entry, version, out)
+            try:
+                room = await destination(client, owner_id=None, guild_id=guild_id, channel=channel)
+            except Exception as exc:
+                raise PinFailed(f'#{channel} could not be read ({type(exc).__name__}: {exc})') from None
+            await pin(room, entry, version, out)
             private_json(path, state)
         finally:
             await client.close()
@@ -302,8 +303,9 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
             entry = state['versions'][version] = {'sha256': digest, 'parts': [{} for _ in chunks]}
         if any(part.get('sha256', h) != h for part, h in zip(entry['parts'], hashes)):
             raise NotesRefused(f'{path.name} is not a patch-notes record')
-        if all(part.get('message_id') for part in entry['parts']) and (channel is None or entry.get('pinned')):
-            out(f'{version}: all {len(chunks)} parts were already sent' + ('' if channel is None else ' and pinned'))
+        posted = all(part.get('message_id') for part in entry['parts'])
+        if posted and channel is None:
+            out(f'{version}: all {len(chunks)} parts were already sent')
             return
         # Recovery matches text with its ends trimmed, as Discord stores it, so twins are told by trimmed text.
         entry.setdefault('trimmed', [text_hash(chunk.strip()) for chunk in chunks])
@@ -324,12 +326,18 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
             raise NotesRefused(f'{version} and {", ".join(sorted(twins))} each have a part with this text that was tried but '
                                f'never confirmed, and the history can\'t say whose a message is; check it, then fix {path.name}')
         if unknown:
+            private_json(path, state)  # Keeps this version's trimmed text, so the other's retry can tell them apart.
             raise NotesRefused(f'{version} has a part that was tried but never confirmed, and so does {", ".join(sorted(unknown))}, '
                                f'recorded by older code that kept no trimmed text; check them, then fix {path.name}')
         client = discord.Client(intents=discord.Intents.none())
         try:
             await client.login(token)
-            dm = await destination(client, owner_id=owner_id, guild_id=guild_id, channel=channel)
+            try:
+                dm = await destination(client, owner_id=owner_id, guild_id=guild_id, channel=channel)
+            except Exception as exc:
+                if not posted:
+                    raise
+                raise PinFailed(f'#{channel} could not be read ({type(exc).__name__}: {exc})') from None  # Only the pin was left.
             for index, (chunk, part) in enumerate(zip(chunks, entry['parts']), 1):
                 if part.get('message_id'):
                     out(f'part {index}/{len(chunks)}: already sent')
