@@ -331,8 +331,9 @@ def test_records_stay_readable_by_the_code_before_anchors(dm, tmp_path):
     assert record['anchors'] == {}  # Confirmed parts keep no anchor.
 
 
-def test_an_untrustworthy_newest_id_is_not_kept_as_an_anchor(dm, tmp_path):
-    dm.messages.append(said(0, 'earlier message', BOT))
+@pytest.mark.parametrize('newest', [0, 2**64], ids=['zero', 'past-64-bits'])
+def test_an_untrustworthy_newest_id_is_not_kept_as_an_anchor(dm, tmp_path, newest):
+    dm.messages.append(said(newest, 'earlier message', BOT))
     dm.lost.add(1)
     with pytest.raises(RuntimeError, match='lost'):
         run(paragraph(10, 'a'), tmp_path)
@@ -654,3 +655,25 @@ def test_a_drafts_usage_survives_a_failed_report(monkeypatch, tmp_path):
         asyncio.run(notes.draft_from_controller('0.7.0', '- facts'))
     [receipt] = (tmp_path/'usage').iterdir()
     assert json.loads(receipt.read_text())['counters'] == {'input_tokens': 9}
+
+
+def test_an_anchor_past_discords_64_bit_ids_recovers_by_time(dm, tmp_path, monkeypatch):
+    """Discord refuses a read after an id it could never have made: that anchor is unusable, not a failure every rerun."""
+    text = paragraph(1500, 'a')
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    path = tmp_path / 'patch-notes.json'
+    record = json.loads(path.read_text())
+    record['anchors']['0.4.0']['1']['after'] = str(2**64)
+    path.write_text(json.dumps(record))
+    search = dm.history
+    def strict(**kwargs):
+        if isinstance(kwargs.get('after'), discord.Object) and kwargs['after'].id >= 2**64:
+            raise RuntimeError('400 Bad Request: Value is not snowflake.')
+        return search(**kwargs)
+    monkeypatch.setattr(dm, 'history', strict)
+    run(text, tmp_path)
+    assert len(dm.sends) == 1
+    assert json.loads(path.read_text())['versions']['0.4.0']['parts'][0]['message_id'] == str(dm.messages[0].id)
+

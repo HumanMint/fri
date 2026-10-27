@@ -154,12 +154,17 @@ def load(path):
     return state
 
 
+def snowflake(text):
+    """An id Discord could have made: a read after one past its unsigned 64 bits is refused outright."""
+    return ID.fullmatch(text) is not None and int(text) < 2**64
+
+
 async def anchor(dm, attempted_at):
     """Where recovery of this attempt starts reading: the DM's newest message id before it ('' for an
     empty DM), or None when Discord gave one the record couldn't trust, so recovery falls back to time."""
     async for message in dm.history(limit=1):
         after = str(message.id)
-        return {'attempted_at': attempted_at, 'after': after} if ID.fullmatch(after) else None
+        return {'attempted_at': attempted_at, 'after': after} if snowflake(after) else None
     return {'attempted_at': attempted_at, 'after': ''}
 
 
@@ -171,7 +176,7 @@ def search_from(state, version, index, part):
     anchors = state.get('anchors')
     mark = anchors.get(version, {}).get(str(index)) if isinstance(anchors, dict) and isinstance(anchors.get(version), dict) else None
     if (isinstance(mark, dict) and mark.get('attempted_at') == part['attempted_at'] and
-            isinstance(mark.get('after'), str) and (mark['after'] == '' or ID.fullmatch(mark['after']))):
+            isinstance(mark.get('after'), str) and (mark['after'] == '' or snowflake(mark['after']))):
         return discord.Object(id=int(mark['after'])) if mark['after'] else None
     return dt.datetime.fromtimestamp(min(part['attempted_at'], time.time()) - 60, dt.timezone.utc)
 
