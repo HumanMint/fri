@@ -212,3 +212,24 @@ def test_details_never_name_who_reacted_and_media_counts_stickers():
     assert details(message) == {'attachments': ['sticker'], 'reactions': [{'emoji': '😭', 'count': 2}]}
     assert media(SimpleNamespace(stickers=Mock())) == []
     assert details(Mock(spec=discord.Message)) == {}
+
+
+def test_a_linked_gif_post_is_looked_at_through_its_preview(monkeypatch, tmp_path):
+    """A pasted link to a GIF post: Fri looks at Discord's still preview of it, as for a reply."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        gif = message('https://tenor.com/view/dance-123', user=30, age=120)
+        gif.embeds = [discord.Embed.from_dict({'type': 'gifv', 'url': gif.content,
+            'video': {'url': 'https://media.tenor.com/x/dance.mp4'},
+            'thumbnail': {'url': 'https://media.tenor.com/x/dance.png',
+                          'proxy_url': 'https://images-ext-1.discordapp.net/external/abc/https/media.tenor.com/x/dance.png'}})]
+        event = message(f'fri describe this https://discord.com/channels/123/1/{gif.id}')
+        loader = loads(monkeypatch)
+        try:
+            await fri.talk(123, 1, 20, event.content, 'public', event=event)
+            context = fri.chat_once.await_args.args[1]
+            assert context['reply_target'][0]['attachments'] == ['linked gif']
+            assert len(context['images']) == 1 and loader.await_count == 1
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

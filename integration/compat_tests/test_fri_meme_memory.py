@@ -227,3 +227,32 @@ def test_one_channel_gene_refuses_never_stops_the_other_notes_privacy_check(tmp_
         # Refused for good: dropped. Opted out: dropped. Unreachable for now: kept for next time. Fine: kept.
         assert set(memes.noted) == {3, 4}
     asyncio.run(scenario())
+
+
+def test_a_note_on_a_meme_whose_image_is_gone_stays_out(monkeypatch, tmp_path):
+    """An embed can be suppressed without an edit time: what Fri saw in it doesn't reach the model after."""
+    import copy
+
+    import discord
+
+    from compat_tests.test_fri_member_profiles import DM
+    from compat_tests.test_fri_read_fences import read_world
+    seen = 'a handwritten phone number in the old image'
+
+    async def scenario():
+        w, posts, rows, sent, _, _ = read_world(monkeypatch, tmp_path, ['https://example.test/meme.png'])
+        post = posts[0]
+        post.embeds = [discord.Embed.from_dict({'type': 'image', 'image': {
+            'proxy_url': 'https://media.discordapp.net/external/abc/https/example.test/meme.png'}})]
+        w.fri.agent.ensure_memes().remember(post, '🗿', seen, 0)
+        changed = copy.copy(post)
+        changed.embeds = []  # Same text and edit time; the image is gone.
+        rows[post.id] = changed
+        text = 'fri what is in general'
+        try:
+            await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert len(sent) == 2 and seen not in json.dumps(sent[-1])
+            assert post.id not in w.fri.agent.ensure_memes().notes()
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())

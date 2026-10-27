@@ -625,9 +625,10 @@ class Fri(discord.Client):
                 if inspect_images:
                     await attach_images(context, event, text, source=image_source, invitation=invitation)
                     if targets and not context.get('unattributed_reference'):
-                        # The meme they replied to or linked, when it's a still image.
+                        # The meme they replied to or linked, when it's a still image or a GIF link's preview.
                         from .fri_images import look
-                        await look(context, [post for post in targets if post.attachments])
+                        from .fri_meme_media import gif_previews
+                        await look(context, [post for post in targets if post.attachments or gif_previews(post)])
                 if actions:
                     from .fri_images import image_context
                     actions.image_context = image_context(context)
