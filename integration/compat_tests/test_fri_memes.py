@@ -31,8 +31,13 @@ IMAGE = 'data:image/png;base64,' + base64.b64encode(PNG).decode()
 
 @pytest.fixture
 def harness(learning, tmp_path, monkeypatch):
+    return build(learning, tmp_path, monkeypatch)
+
+
+def build(learning, tmp_path, monkeypatch, **changes):
+    """changes: controller settings on top of channel 3 as the only meme channel."""
     clock, store, settings, _ = learning
-    settings = replace(settings, meme_channel_ids='3')
+    settings = replace(settings, meme_channel_ids='3', **changes)
     scheduler = AgentStore(store, settings)
     scheduler.update({'meme_enabled': True}, 1, '10')
     client = TestClient(create_app(settings))
