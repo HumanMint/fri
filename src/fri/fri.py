@@ -406,7 +406,8 @@ class Fri(discord.Client):
                     from .fri_conversation import unchanged as conversation_unchanged
                     if not await conversation_unchanged(self.agent, actions.event, evidence):
                         raise commands.UserFeedbackCheckFailure(CONVERSATION_CHANGED)
-                # A DM's own gates after those Discord waits, so a member who left during them is caught.
+                # The turn's own gates after those Discord waits, so a member who left or lost the channel
+                # during them is caught (see talk).
                 if fence.get('gate'):
                     await fence['gate']()
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
@@ -703,6 +704,14 @@ class Fri(discord.Client):
                             raise GateClosed(closed)
                     context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
                     context['fence']['dms'] = lambda: self.agent.config['support_dms']
+                elif self.agent and source.kind == 'discord_message' and not invitation:
+                    async def gate():
+                        """A channel message's own gate: its author can still read the channel, from fetched
+                        overwrites and roles, not the cache (fri #31). A ping's own check reads that itself."""
+                        member = await self.agent.member(user_id, fresh=True, guild_id=guild_id)
+                        if not member or not await self.agent.can_read(event, member):
+                            raise GateClosed('member changed')
+                    context['fence']['gate'] = gate
                 result = await self.chat_once(text, context)
                 # A ping's last check before sending (Agent.reply_once) covers it and its image, and a tool
                 # checks it again before acting, so nothing here repeats that.
