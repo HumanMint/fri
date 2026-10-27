@@ -43,8 +43,10 @@ def requested(text):
         r"|\b(?:what(?:'s|’s|s)?|which)\s+(?:(?:was|were|is)\s+)?(?:that|the|those)\s+\w+(?:\s+\w+){0,3}?\s+"
         r'(?!(?:\w+ly|most|more|least|between|and|or|of|for|with|in|on|to|by|than|as|being|been)\b)\w+\s+'
         # The verb ends the clause, as in recall; "doctor recommended dose" uses it as an adjective.
+        # Only a channel may follow "in": "the file size shared on discord" is passive, not a speaker.
         r'(said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
-        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|in|on|here|there|again|lol|lmao|rn)\b))', visible))
+        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn)\b'
+        r'|in\s+[#<]))', visible))
 
 
 def valid_action(action):
