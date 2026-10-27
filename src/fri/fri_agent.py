@@ -1604,6 +1604,16 @@ class Agent:
         live = {r['id'] for r in self.recent.get(channel, ())}
         return all(row['id'] in live for row in records)
 
+    def unsee(self, channel, before, newest):
+        """An attention call that didn't decide: its batch is offered again (a Gene error still gets its
+        investigation), though not before the next heartbeat window, since last_attention stays. It's rebuilt
+        from the live view and rechecked after its waits like any batch, so nothing taken back since goes out."""
+        if self.seen.get(channel) == newest:
+            if before is None:
+                del self.seen[channel]
+            else:
+                self.seen[channel] = before
+
     async def attend(self):
         now = time.time()
         for channel_id in list(self.recent):
@@ -1614,7 +1624,8 @@ class Agent:
                      int(r['id']) > self.seen.get(channel_id, 0)]
             if not fresh or now-self.last_attention.get(channel_id, 0) < self.config['heartbeat_seconds']:
                 continue
-            self.seen[channel_id] = max(int(r['id']) for r in fresh)
+            before = self.seen.get(channel_id)
+            self.seen[channel_id] = newest = max(int(r['id']) for r in fresh)
             self.last_attention[channel_id] = now
             errors = any(r['gene_error'] for r in fresh)
             if now-self.last_spoke.get(channel_id, 0) < 600 and not errors:
@@ -1625,13 +1636,18 @@ class Agent:
             async def withdrawn(records=records, channel_id=channel_id):
                 """An author opted out, or a row left the live view, while attention waited for a slot or sign-in."""
                 return not await self.unwithdrawn(channel_id, records)
-            result, _, status = await self.run('attention',
-                'Decide whether Fri should join. Default quiet. Reply only with clear evidence people want Fri/help, '
-                'no human has already answered, and the latest conversation still needs it. A question alone is not enough. '
-                'Investigate only an actual Gene bot error marked gene_error in trusted metadata. '
-                'source_id must identify a supplied fresh message. Owner attention preference: '+self.config['attention_notes'],
-                {'recent': records, 'fresh_ids': [r['id'] for r in fresh]}, ATTENTION, erased=withdrawn)
+            try:
+                result, _, status = await self.run('attention',
+                    'Decide whether Fri should join. Default quiet. Reply only with clear evidence people want Fri/help, '
+                    'no human has already answered, and the latest conversation still needs it. A question alone is not enough. '
+                    'Investigate only an actual Gene bot error marked gene_error in trusted metadata. '
+                    'source_id must identify a supplied fresh message. Owner attention preference: '+self.config['attention_notes'],
+                    {'recent': records, 'fresh_ids': [r['id'] for r in fresh]}, ATTENTION, erased=withdrawn)
+            except BaseException:
+                self.unsee(channel_id, before, newest)
+                raise
             if status != 'completed':
+                self.unsee(channel_id, before, newest)
                 continue
             selected = next((r for r in fresh if r['id'] == result.get('source_id')), None)
             if not selected:

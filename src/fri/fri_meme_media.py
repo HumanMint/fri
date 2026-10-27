@@ -51,6 +51,13 @@ def sources(message, most=2, *, gifs=False):
     return result
 
 
+def unsigned(urls):
+    """sources() as the uploads they name, to tell whether a post still shows what was read: Discord renews a
+    CDN link's signature (its ex, is and hm query) on refetch, while an attachment's path keeps its own ID, so
+    a replaced one still differs."""
+    return None if urls is None else [str(url).split('?')[0] for url in urls]
+
+
 def allowed_url(url, channel, *, previews=False):
     """previews: also Discord's images-ext embed proxy, which serves a GIF link's still preview. Only
     the look path asks for it, so the meme reactions keep their old reach."""
