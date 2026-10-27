@@ -292,7 +292,8 @@ async def live(fri, job):
 
 
 async def report(fri, job):
-    """The reporter's message and where it is, read before the claim: nothing has been sent yet."""
+    """The reporter's message and where it is, read before the claim: nothing has been sent yet.
+    Also whether it's a thread Fri had to fetch, which no archive update reaches."""
     source = job.get('source_url') if isinstance(job, dict) else None
     match = SOURCE.fullmatch(source) if isinstance(source, str) else None
     user = str(job.get('user_id', '')) if match else ''
@@ -312,8 +313,8 @@ async def report(fri, job):
                 raise Unreachable('i can’t post where they reported it anymore')
         postable(fri, channel)
         message = await channel.fetch_message(int(match['message']))
-        if match['guild'] != '@me' and cached is None and isinstance(channel, discord.Thread):
-            # A fetched thread isn't in the cache, so no archive update reaches it: read it again last.
+        fetched = match['guild'] != '@me' and cached is None and isinstance(channel, discord.Thread)
+        if fetched:  # Not in the cache, so read it again last.
             channel = await fri.fetch_channel(channel.id)
         # Last of the Discord reads: no members intent tells Fri someone left while the others ran.
         if not await fri.agent.member(int(user), fresh=True):
@@ -325,20 +326,20 @@ async def report(fri, job):
     if str(message.author.id) != user or message.author.bot or message.webhook_id:
         raise Unreachable('that report isn’t theirs anymore')
     postable(fri, channel)  # Again after the last read, so a change while Discord answered claims nothing.
-    return channel, message
+    return channel, message, fetched
 
 
 async def tell(fri, job_id, actor):
     """Read Discord, then claim the controller's mark, reply once and record what happened.
 
     The claim checks erasure, rollbacks and the live release, so nothing that changed while Discord answered
-    can slip through. With it held, Fri reads the live release once more, so a release while the claim was
-    out stops the reply too. What the owner sees, and whether it posted."""
+    can slip through. With it held, Fri reads the live release and a thread it had to fetch once more, so a
+    release or an archive while the claim was out stops the reply too. What the owner sees, and whether it posted."""
     from .fri_workspace import send_once
     scope = {'guild_id': str(fri.guild_id), 'user_id': str(actor)}
     try:
         job = await fri.api('GET', '/requests/'+job_id)
-        channel, message = await report(fri, job)
+        channel, message, fetched = await report(fri, job)
         await live(fri, job)
         postable(fri, channel)
         claimed = await fri.api('POST', f'/requests/{job_id}/requester-notice', scope)
@@ -358,6 +359,8 @@ async def tell(fri, job_id, actor):
                 str(claimed['job'].get(key)) != str(job.get(key)) for key in ('user_id', 'source_url', 'approved_sha')):
             raise Unreachable('their report changed while i looked. tap again')
         await live(fri, job)
+        if fetched:
+            channel = await fri.fetch_channel(channel.id)
         postable(fri, channel)  # Config or the channel may have changed while the claim was out.
         sending = True
         result = await send_once(fri, {'id': job_id, 'target_id': str(channel.id),

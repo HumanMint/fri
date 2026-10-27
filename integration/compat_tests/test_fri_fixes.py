@@ -783,3 +783,32 @@ def test_a_release_landing_while_the_claim_is_out_stops_the_reply(world, change)
     assert not sent and not world.sent and 'newer release' in text
     with world.store.connection() as db:  # Recorded as refused, so a later tap may try again.
         assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
+
+
+@pytest.mark.parametrize('when', ['status', 'claim'])
+def test_an_uncached_thread_archived_during_the_release_read_or_the_claim_gets_no_reply(world, monkeypatch, when):
+    report, job_id, _ = reported(world)
+    client, state, guild, payload = report_thread(world, report, job_id)
+    archived = {**payload, 'thread_metadata': {**payload['thread_metadata'], 'archived': True}}
+    now = {'thread': payload}
+    state.http.get_channel = AsyncMock(side_effect=lambda id: now['thread'])  # Discord's answer at the time.
+    world.fri.fetch_channel = client.fetch_channel
+
+    async def fetch(*args):
+        return report
+
+    monkeypatch.setattr(discord.Thread, 'fetch_message', fetch)
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        result = await api(method, path, body)
+        if path == ('/status' if when == 'status' else f'/requests/{job_id}/requester-notice'):
+            now['thread'] = archived
+            state.parse_thread_update(archived)  # Never reaches the fetched copy: it isn't in the cache.
+        return result
+
+    world.fri.api.side_effect = meanwhile
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'archived' in text
+    with world.store.connection() as db:
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
