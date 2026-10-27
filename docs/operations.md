@@ -306,6 +306,34 @@ never fill, and the server's channel permissions are the thing to look at.
 Without the capability (an older controller), Fri sends no audience and doesn't ask for profiles,
 and memory stays per conversation as before.
 
+## Member summaries
+
+With a controller that advertises `member-summaries` (and profiles), Fri keeps one short summary per
+member of what they talked about with it lately, so a topic that fell out of the six recent exchanges
+can come back. It is Fri's own text, the only model-written thing the controller keeps about a member,
+and the reply model sees it as `your_summary_of_speaker_untrusted`: Fri's earlier note, never the
+member's words or instructions. Fri adds it only to the member's own turns, in their DMs or /fri panel
+and in channels everyone in the server can read, and only while that channel and every channel it came
+from still are (checked again right before each model call and before delivery). A reply built on it
+inherits its provenance, so it goes when anyone the summary drew on erases. In a public channel, a reply
+that had a summary from another channel in view is saved as a neutral breadcrumb and kept out of the live
+view, like a read of another channel; the member still gets the answer itself.
+
+The `member_summaries` heartbeat stage builds them while background work and learning are on. It
+claims one member at a time once the model slot is free and Fri is signed in
+(`/agent/member-summary/claim`): their own recent messages from channels everyone could read, never
+Fri's replies, DMs, the panel or restricted channels, plus the earlier summary. Fri drops anything from a
+channel that isn't readable by everyone now, sends the rest to the summary model (`summary_model` /
+`summary_effort`, Luna at medium by default) and reports the result, recorded as `summary` usage. The
+controller allows one call per member a day and 50 a day in all, and keeps the result only if nobody's
+privacy changed since the claim. A summary lasts 30 days after its last update. "What do you remember"
+shows it in a DM and, in a public channel everyone can read, only says one exists. My memory shows it
+with Edit summary and Clear summary; either clears the member's saved chats across the server, like a
+server-wide note edit. "Forget me", memory off and Forget my chats wipe it.
+
+Without the capability (an older controller), Fri doesn't ask for summaries, runs no builder and
+adds nothing to the model's input.
+
 ## Reply checks
 
 Needs a controller that advertises the optional `reply-checks` capability at startup; against an
@@ -586,6 +614,12 @@ and doesn't ask for profiles, so the controller gives it only each conversation'
 limits it was built for. Profile notes stay stored, unseen, until a newer Fri returns or they expire, and
 "forget me" still erases them.
 
+Before rolling the controller back past member summaries, stop it and run
+`python -m gene.fri_member_summary purge <controller database>` (`batch-release.sh` records and runs it
+as a downgrade). A Fri-only rollback needs nothing: an older Fri doesn't ask for summaries, so it never
+gets one and builds none. Stored summaries stay unseen until a newer Fri returns, they expire after 30
+days, or "forget me", memory off or Forget my chats removes them; run the purge too if they should go now.
+
 Rollback changes the image/configuration against **current** data. It never restores
 an old controller database, reminder/post receipt, erased memory or subscription
 session. Data snapshots are disaster-recovery evidence, not automatic rollback inputs.
@@ -636,7 +670,7 @@ dropped. Every confirmed part is on record, so rerunning the same command after 
 
 The 30-second heartbeat fetches controller state first, and defers the whole tick
 when that fails. Every later stage (presence, posts, reminders, owner reports,
-learning, attention, gene fixes, memes, reply checks) runs on its own: a failure is logged with
+learning, attention, gene fixes, memes, reply checks, member summaries) runs on its own: a failure is logged with
 the stage and exception class only, and never skips the stages after it. `fri-health.json` keeps
 `agent_heartbeat.running/failed/status` for the release coordinator and adds
 `agent_heartbeat.stages`, one `{at, last_ok, error}` entry per enabled stage.

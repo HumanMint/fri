@@ -1747,6 +1747,8 @@ class Agent:
             LOG.warning('Fri heartbeat deferred: %s; no authority or approval inferred', type(exc).__name__)
         else:
             from .fri_fixes import check as check_fixes
+            from .fri_member_summary import CAPABILITY as SUMMARIES
+            from .fri_member_summary import build as build_summary
             from .fri_reply_checks import CAPABILITY
             from .fri_reply_checks import check as check_replies
             from .fri_social import deliver_one as deliver_reminder
@@ -1765,7 +1767,9 @@ class Agent:
                        await self.stage('fixes', lambda: check_fixes(self), 'enabled'),
                        await self.stage('memes', self.check_memes, 'enabled', 'meme_enabled'),
                        await self.stage('reply_checks', lambda: check_replies(self), 'enabled', 'reply_check_enabled',
-                                        when=lambda: CAPABILITY in self.fri.capabilities)]
+                                        when=lambda: CAPABILITY in self.fri.capabilities),
+                       await self.stage('member_summaries', lambda: build_summary(self), 'enabled', 'learning_enabled',
+                                        when=lambda: SUMMARIES in getattr(self.fri, 'capabilities', ()))]
             self.heartbeat_status = 'ok' if all(results) else 'deferred'
         finally:
             self.heartbeat_finished = time.time()

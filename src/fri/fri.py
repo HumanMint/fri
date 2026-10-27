@@ -29,6 +29,7 @@ from .fri_images import CHANGED as IMAGES_CHANGED
 from .fri_images import unchanged as images_unchanged
 from .fri_memory import (
     PROFILES,
+    SUMMARIES,
     describe_memory,
     describe_profile,
     drop_unheard,
@@ -70,6 +71,8 @@ UNATTRIBUTED = ('Earlier reply-context check. Fetch current Discord evidence for
 UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
 LINKED = ('Earlier answer about a post linked from another channel. Open the link again for details; '
           'nothing from it is retained here.')
+SUMMARIZED = 'Earlier answer drawing on what they talked about in other channels. Nothing from it is retained here.'
+SUMMARIZED_QUESTION = 'an earlier question drawing on other channels; nothing from it is kept here. ask what they meant.'
 LEGACY = '[an earlier fri reply from before fri tracked its sources]'
 CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
 CONVERSATION_CHANGED = 'the conversation changed while i was typing. ask again and i’ll catch up.'
@@ -85,6 +88,15 @@ def linked_elsewhere(context, source):
     channel's access, so it stays a neutral breadcrumb, like a read of another channel."""
     return any(row.get('linked') and row['source'].get('channel_id') != source.channel_id
                for row in context.get('reply_target', []))
+
+
+def summarized_elsewhere(context):
+    """The public answer had Fri's summary of the member from another channel in view. Its saved text and
+    its copy in the live view couldn't carry that channel's access, so it stays a neutral breadcrumb, like a
+    read of another channel. In the member's private chat, as for their notes, only they ever see it."""
+    fence = context.get('fence') or {}
+    here = (fence.get('turn') or {}).get('conversation_id', '')
+    return here.startswith('public:') and any(origin != here for origin in fence.get('summarized', ()))
 
 
 async def noop(stage):
@@ -130,6 +142,8 @@ def turn_provenance(context, speaker, actions=None):
     # So can a note: it was learned while other members' words were in view.
     inherited += [item for note in (context.get('personal_memory') or {}).get('notes', [])
                   for item in note.get('provenance', [])]
+    # And Fri's own summary of the member, built from their words, which can repeat someone else's.
+    inherited += (context.get('member_summary') or {}).get('provenance', [])
     for item in inherited:
         add(item['user_id'], item['revision'])
     for row in context.get('recent', []):
@@ -209,6 +223,10 @@ class Fri(discord.Client):
     @property
     def profiles(self):
         return PROFILES in self.capabilities
+
+    @property
+    def summaries(self):
+        return SUMMARIES in self.capabilities and self.profiles
 
     def hear(self, message):
         """Whether everyone could read this message where it was sent, decided once, when Fri first sees it.
@@ -406,10 +424,21 @@ class Fri(discord.Client):
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
             drop_unheard(self.get_channel, context)  # Nor a profile note said there (fri #98).
+            # Fri's summary of the member, while it may still show here (their private chat, or a channel everyone
+            # can still read) and every channel it came from is still one everyone can read.
+            destination = (fence or {}).get('turn') or {}
+            here, guild_id = destination.get('conversation_id', ''), destination.get('guild_id', 0)
+            if context.get('member_summary'):
+                context['member_summary'] = self.member_summary(context['member_summary'], guild_id, here.startswith(
+                    'private:') or self.readable(here, guild_id) is not None)
             if fence:  # Checked again before delivery, with where each profile note shown in public was said.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
                 fence['shown'].update(origin for origin in (context.get('profile_origins') or {}).values()
                                       if str(origin).startswith('public:') and str(origin)[7:].isdigit())
+                if context.get('member_summary'):  # Where it came from and, in public, where it shows.
+                    origins = context['member_summary'].get('origins', [])
+                    fence['shown'].update([*origins, *([here] if here.startswith('public:') else [])])
+                    fence.setdefault('summarized', set()).update(origins)  # What the reply drew on (see stage_turn).
             if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
                 source = context.get('source') or {}
                 asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),
@@ -468,9 +497,10 @@ class Fri(discord.Client):
         # Privacy controls must work while inference is busy or the subscription is down.
         intent = memory_intent(text)
         if intent == 'show' and self.profiles:
-            profile = place_notes(self.get_channel, await self.api('POST', '/chat/context', profiled(self, scope)),
-                                  scope['conversation_id'])['personal_memory']
-            return ChatResult(reply=await self.memory_overview(scope, profile, visibility == 'private'),
+            context = place_notes(self.get_channel, await self.api('POST', '/chat/context', profiled(self, scope)),
+                                  scope['conversation_id'])
+            return ChatResult(reply=await self.memory_overview(scope, context['personal_memory'], visibility == 'private',
+                                                               context.get('member_summary')),
                               status='completed', memory_scope=scope)
         if intent == 'show':
             context = await self.api('POST', '/chat/context', scope)
@@ -511,6 +541,9 @@ class Fri(discord.Client):
                     context['audience'] = ('server' if visibility == 'public' and heard and all(heard) and
                                            server_wide(getattr(event, 'channel', None) or channel) else 'conversation')
                     context['elsewhere'] = self.elsewhere(context.get('elsewhere', []), guild_id)
+                    if self.summaries:  # Fri's own summary of the member: their private chats and readable channels only.
+                        context['member_summary'] = self.member_summary(
+                            context.get('member_summary'), guild_id, visibility == 'private' or context['audience'] == 'server')
                 else:
                     context['elsewhere'] = []
                 conversation, targets = {}, []
@@ -725,7 +758,7 @@ class Fri(discord.Client):
                     if action_kind == 'image_search' and receipt.get('image_status') == 'prepared':
                         result.media = actions.image_share.prepared
                     stored, private = result.reply, private_read(receipts)
-                    crossed = linked_elsewhere(context, source)
+                    crossed, recalled = linked_elsewhere(context, source), summarized_elsewhere(context)
                     if private and not (result.clarification or result.settings_preview or result.post_preview):
                         # Other channels' messages, archives and reports never become saved chat text.
                         checked_channel = receipt.get('channel_id', '')
@@ -733,6 +766,13 @@ class Fri(discord.Client):
                         stored += '. Fetch current evidence for follow-up details; no findings are retained here.'
                     elif crossed and not (result.clarification or result.settings_preview or result.post_preview):
                         stored = LINKED
+                    elif recalled and not (result.clarification and actions.private_evidence or
+                                           result.settings_preview or result.post_preview):
+                        # Only the harness's fixed question (private evidence) derives nothing; a model-written
+                        # clarification can carry the summary, so its saved and pending copies go neutral too.
+                        stored = SUMMARIZED
+                        if result.clarification:
+                            result.clarification = {**result.clarification, 'question': SUMMARIZED_QUESTION}
                     try:  # A fixed harness question over referenced evidence derives nothing from it.
                         provenance = ([] if result.clarification and actions.private_evidence
                                       else turn_provenance(context, user_id, actions))
@@ -752,7 +792,7 @@ class Fri(discord.Client):
                                                            'track safely.'), status='completed')
                     if context.get('unattributed_reference'):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
-                    elif not private and not crossed:
+                    elif not private and not crossed and not recalled:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored)
                     await looked(result)
                     try:  # The save's privacy fence, applied before anything is shown.
@@ -789,10 +829,13 @@ class Fri(discord.Client):
                                                     'of safely. ask again in a bit.')
         reply, unattributed = result.reply, derived and context.get('unattributed_reference')
         crossed = derived and linked_elsewhere(context, source)
+        recalled = derived and summarized_elsewhere(context)
         if unattributed:  # A referenced Fri message whose sources are unknown is never retained.
             reply, result.notes = UNATTRIBUTED, []
         elif crossed:
             reply = LINKED
+        elif recalled:
+            reply = SUMMARIZED
         result.turn = {**scope, 'revision': context['revision'], 'source': source.model_dump(), 'input': text,
             'reply': reply, 'response_kind': result.response_kind, 'reaction': result.reaction,
             'allow_closing': result.allow_closing, 'burst': context.get('message_burst', []),
@@ -801,7 +844,7 @@ class Fri(discord.Client):
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
             **({'audience': context['audience']} if context.get('audience') else {})}
-        if derived and result.response_kind == 'reply' and not unattributed and not crossed:
+        if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
             result.echo = self.echo(scope, context, provenance, reply)
         return result
 
@@ -811,31 +854,47 @@ class Fri(discord.Client):
             if not server_wide(self.get_channel(int(conversation.split(':', 1)[1]))):
                 raise commands.UserFeedbackCheckFailure(CLOSED)
 
+    def readable(self, conversation, guild_id):
+        """The channel of a public conversation in this server, if everyone in it can still read it."""
+        kind, _, channel_id = str(conversation).partition(':')
+        channel = self.get_channel(int(channel_id)) if kind == 'public' and channel_id.isdigit() else None
+        if (channel is None or getattr(getattr(channel, 'guild', None), 'id', None) != int(guild_id)
+                or not server_wide(channel)):
+            return None  # Gone, moved, or restricted since: what was said there stays there.
+        return channel
+
     def elsewhere(self, rows, guild_id):
         """What the member said lately in other channels that everyone in this server can still read."""
         kept = []
         for row in rows:
-            kind, _, channel_id = str(row.get('conversation_id', '')).partition(':')
-            channel = self.get_channel(int(channel_id)) if kind == 'public' and channel_id.isdigit() else None
-            if (channel is None or getattr(getattr(channel, 'guild', None), 'id', None) != int(guild_id)
-                    or not server_wide(channel)):
-                continue  # Gone, moved, or restricted since: it stays where it was said.
-            kept.append({**row, 'channel': '#'+channel.name, 'minutes_ago': max(0, int((time.time()-row['at'])//60))})
+            channel = self.readable(row.get('conversation_id', ''), guild_id)
+            if channel is not None:
+                kept.append({**row, 'channel': '#'+channel.name, 'minutes_ago': max(0, int((time.time()-row['at'])//60))})
         return kept
 
-    async def memory_overview(self, scope, profile, private):
+    def member_summary(self, summary, guild_id, shown):
+        """Fri's own summary of the member where it may show, while every channel it came from is still readable."""
+        if not summary or not shown or not all(self.readable(origin, guild_id) for origin in summary.get('origins', [])):
+            return None
+        return summary
+
+    async def memory_overview(self, scope, profile, private, summary=None):
         """Everything for the member's own eyes in private; in public, only what that channel can see."""
         escape = discord.utils.escape_markdown
         if private:
             state = await self.api('POST', '/chat/memory/notes', profiled(self, scope))
             enabled, rows = state['enabled'], state['entries']
+            summary = escape(state['summary']['text']) if state.get('summary') else None
         else:
             enabled, rows = profile['enabled'], profile['notes']
+            # Its words stay out of a public channel; that it exists may show where it would itself.
+            summary = bool(self.member_summary(summary, scope['guild_id'], self.readable(
+                scope['conversation_id'], scope['guild_id']) is not None))
         groups = {}
         for row in rows:
             where = note_place(self.get_channel, row['scope'], scope['conversation_id'], public=not private)
             groups.setdefault(where, []).append(escape(row['evidence']))
-        return describe_profile(enabled, list(groups.items()), private)
+        return describe_profile(enabled, list(groups.items()), private, summary)
 
     async def resolve_references(self, scope, context):
         """Replace Fri-authored reply targets with the members those replies drew on."""

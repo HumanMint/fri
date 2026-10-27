@@ -11,7 +11,8 @@ from .fri_memory import MOVES, clip, note_place, profiled, units
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
-COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit|share|confirm|keep):[a-f0-9]{32}$')
+COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit|share|confirm|keep|summary|clear|rewrite):'
+                       r'[a-f0-9]{32}$')
 
 
 def memory_component(interaction, bot_id):
@@ -60,6 +61,11 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
               'you’re working on always starts there. '
               'At most three per category. Each expires after 90 days.' if profiles else
               'Up to ten preferences here, at most three per category. Each expires after 90 days.']
+    summary = state.get('summary')
+    if summary:  # Fri's own words, kept apart from the member's: it's the one thing here a model wrote.
+        lines.append(f"**My summary of what we’ve talked about lately** (from channels everyone in the server can "
+                     f"read; updated <t:{int(summary['refreshed'])}:d>, expires <t:{int(summary['expires_at'])}:d>)\n"
+                     + discord.utils.escape_markdown(summary['text']))
     listed = []
     for entry in state['entries'][:SHOWN]:
         where = f" · {place(cog, scope, entry)}" if profiles and 'scope' in entry else ''
@@ -74,7 +80,8 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
     if not state['entries']:
         lines.append('No saved preferences.' if profiles else 'No saved preferences in this conversation.')
     lines.append('Editing or removing one clears recent saved chats where it showed, everywhere in the server for a '
-                 'server-wide one. Discord posts and backups are separate.' if profiles else
+                 'server-wide one'+(' or the summary' if summary else '')+'. Discord posts and backups are separate.'
+                 if profiles else
                  'Editing or removing a preference clears recent saved context here. Discord posts and backups are separate.')
     from .fri_panel import card, reply
     await reply(cog, interaction, embed=card('My memory', '\n\n'.join(lines)),
@@ -126,6 +133,14 @@ class MemoryView(MemoryLauncher):
                     await show(cog, interaction, scope, selected=int(choose.values[0]))
             choose.callback = choose_entry
             self.add_item(choose)
+        if state.get('summary') and scope['conversation_id'].startswith('private:'):
+            rewrite = discord.ui.Button(label='Edit summary', custom_id='fri:memory:summary:'+uuid.uuid4().hex)
+            rewrite.callback = self.rewrite_summary
+            self.add_item(rewrite)
+            clear = discord.ui.Button(label='Clear summary', style=discord.ButtonStyle.danger,
+                                      custom_id='fri:memory:clear:'+uuid.uuid4().hex)
+            clear.callback = self.clear_summary
+            self.add_item(clear)
         if self.selected:
             remove = discord.ui.Button(label='Remove selected', style=discord.ButtonStyle.danger,
                 custom_id='fri:memory:remove:'+uuid.uuid4().hex)
@@ -187,6 +202,42 @@ class MemoryView(MemoryLauncher):
     async def replace(self, interaction):
         if await self.interaction_check(interaction):
             await interaction.response.send_modal(EditMemory(self))
+
+    async def rewrite_summary(self, interaction):
+        if await self.interaction_check(interaction):
+            await interaction.response.send_modal(EditSummary(self))
+
+    async def clear_summary(self, interaction):
+        if await self.interaction_check(interaction):
+            await summarized(self, interaction, 'remove', '', 'Cleared my summary.')
+
+
+async def summarized(view, interaction, action, text, notice):
+    """The member's edit or clear of Fri's summary; like a server-wide note's, it clears their saved chats."""
+    try:
+        state = await view.cog.api('POST', '/chat/memory/summary', {
+            **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
+            'action': action, 'text': text})
+        view.cog.agent.forget(interaction.user.id)
+        await show(view.cog, interaction, view.scope, state=state, notice=notice)
+    except commands.UserFeedbackCheckFailure as exc:
+        await show(view.cog, interaction, view.scope, notice=str(exc))
+
+
+class EditSummary(discord.ui.Modal):
+    def __init__(self, view):
+        super().__init__(title='Edit my summary', custom_id='fri:memory:rewrite:'+uuid.uuid4().hex, timeout=600)
+        self.view = view
+        self.summary = discord.ui.TextInput(label='What we’ve talked about lately', style=discord.TextStyle.paragraph,
+                                            default=view.state['summary']['text'], min_length=5, max_length=500)
+        self.add_item(self.summary)
+
+    async def interaction_check(self, interaction):
+        return await allowed(self.view.cog, interaction, self.view.scope, message=False)
+
+    async def on_submit(self, interaction):
+        if await self.interaction_check(interaction):
+            await summarized(self.view, interaction, 'replace', self.summary.value, 'Updated my summary.')
 
 
 class EditMemory(discord.ui.Modal):
