@@ -562,7 +562,12 @@ class Agent:
                     'The owner must still click Apply. json_value is a JSON-encoded scalar. Do not claim the change is saved.',
                     {'request': text[:4000], 'current': dict(state['config']), 'ranges': RANGES}, SETTINGS,
                     model='gpt-6.1-sol', effort='high', erased=erased, deliver=False)
-            if status == ERASED or await erased():
+            if status == ERASED:
+                return ERASED
+            # A DM's own gates after that call, as any DM reply's: the owner still a member, and DMs on.
+            if message.guild is None and (closed := await self.dm_closed(user)):
+                return closed
+            if await erased():
                 return ERASED
             changes = {r['key']: json.loads(r['json_value']) for r in result.get('changes', [])}
             if status != 'completed' or set(changes)-set(DEFAULTS):
@@ -1106,6 +1111,8 @@ class Agent:
                    await self.owner_control(message, directed or text, erasures))
         if control == ERASED:
             return self.miss(message, 'author privacy changed')
+        if control in ('not a member', 'dms off'):  # See dm_closed: a settings preview found its DM closed.
+            return self.miss(message, control)
         if control:
             return self.answered([message])
         privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
@@ -1477,6 +1484,11 @@ class Agent:
                 return
             else:
                 missed('reaction withheld' if result.response_kind == 'react' else 'chose quiet')
+            if (dm and result.response_kind == 'react' and memory_intent(text) not in MEMORY_CONTROLS and
+                    (closed := await self.dm_closed(message.author.id))):
+                missed(closed)  # Left, or DMs went off, while the reaction went out: it stays, but isn't saved.
+                await self.fri.waiting_notices.clear(message.author.id)
+                return
             if not taken_back():  # Deleted while the reaction went out: it stays, but isn't saved.
                 await self.fri.record_turn(result)  # Records the decision, never claimed reaction delivery.
             # Neither outcome renews active attention or the ambient reply timer.
@@ -1575,12 +1587,12 @@ class Agent:
                         permissions.add_reactions and (permissions.send_messages_in_threads
                         if isinstance(channel, discord.Thread) else permissions.send_messages)):
                     return
-            elif not self.config['support_dms'] or not await self.member(user.id, fresh=True):
-                return
             try:
                 current = await channel.fetch_message(message.id)
                 if (current.author.id != user.id or current.author.bot or current.webhook_id or
                         current.content != message.content or any(r.me for r in current.reactions)):
+                    return
+                if not message.guild and await self.dm_closed(user.id):  # A DM's own gates, after that read.
                     return
                 if erased and await erased():
                     return

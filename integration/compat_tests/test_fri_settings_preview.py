@@ -542,3 +542,35 @@ def test_apply_requires_full_preview_and_exact_settings_version(setup_agent, sta
         if stale:
             assert 'fresh preview' in interaction.edit_original_response.await_args.kwargs['content']
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['stays', 'left', 'dms off'])
+def test_a_dm_settings_preview_needs_the_owner_still_there_when_it_posts(monkeypatch, tmp_path, change):
+    """fri #55: the preview comes from its own model call, after the DM's arrival gate. The owner left, or DMs
+    went off, during it: nothing posts."""
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True, 'support_dms': True},
+                                          'version': 3})
+        gate(monkeypatch)
+        agent.record = AsyncMock()
+        present = {'member': SimpleNamespace(id=10)}
+        agent.member = AsyncMock(side_effect=lambda *_, **__: present['member'])
+        async def preparing(*args, **kwargs):  # While Sol prepares the preview.
+            if change == 'left':
+                present['member'] = None
+            elif change == 'dms off':
+                agent.state['config']['support_dms'] = False
+            return {'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'
+        agent.run = AsyncMock(side_effect=preparing)
+        message = owner_message()
+        handled = await agent.owner_control(message, 'set heartbeat to 10 minutes')
+        assert agent.run.await_count == 1
+        if change == 'stays':
+            assert handled is True
+            assert message.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
+        else:
+            message.reply.assert_not_awaited()
+            assert handled == ('not a member' if change == 'left' else 'dms off')
+        await fri.close()
+    asyncio.run(scenario())

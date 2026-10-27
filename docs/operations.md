@@ -164,7 +164,9 @@ advertises it, so the controller must be released first.
   again if they still mean it.
 - **DMs at delivery.** A DM reply, reaction or quiet decision is neither sent nor saved once its author
   has left the server (read fresh from Discord) or DMs were turned off while Fri wrote it, as before
-  the model request. A memory control that already went through still says so.
+  the model request. A memory control that already went through still says so. A reaction checks again
+  after its own refetch of the message, and a DM reaction isn't saved if the gate closed while it went out.
+  The owner's settings preview checks after its own model call too.
 - **Saved only after delivery.** A turn is staged while Fri composes the reply. Just before
   delivery, `/chat/turn/check` runs the save's privacy fence without writing: the speaker's
   revision, plus every referenced member's revision and memory setting. Only after Discord
