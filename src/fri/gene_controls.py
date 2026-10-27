@@ -148,6 +148,31 @@ def quick_control(text, *, music_context=False):
 
 
 
+CORRECTION = re.compile(r"\b(?:not (?:that|this|the) (?:one|song|track)|wrong (?:one|song|track)|i meant|"
+                        r"that'?s not (?:it|the one|the song|the track))\b")
+CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
+
+
+def correction(text, argument):
+    """A member putting right a song Gene just played for them ("not that one, X", "i meant X"), with the
+    right one in their own words. Gene's control store holds the same rule and checks there was such a play."""
+    visible = request_text(text).replace('\u2019', "'")
+    if not argument or not CORRECTION.search(visible):
+        return False
+    if re.search(r"\b(for example|hypothetically|if i|used to|dont|don't|do not)\b", visible):
+        return False
+    said = text.casefold()
+    return argument.casefold() in said or set(re.findall(r"[\w']+", argument.casefold())) <= set(re.findall(r"[\w']+", said))
+
+
+def just_played(receipts):
+    """A play Gene finished for this member in this conversation within the correction window, by the
+    controller's own receipts (never Fri's claims)."""
+    import time
+    return any(row.get('action') == 'play' and row.get('state') == 'finished' and
+               -5 <= time.time()-row.get('at', 0) <= CORRECTION_SECONDS for row in receipts)
+
+
 def current_music_context(receipts):
     """Use only controller-supplied same-conversation receipts, never assistant claims."""
     import time

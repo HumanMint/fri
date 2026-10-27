@@ -711,6 +711,7 @@ class Fri(discord.Client):
                     context['gene_receipts'] = grounded([r for r in recent.get('receipts', []) if r['channel_id'] in readable])
                     actions.sources.update(r['channel_id'] for r in context['gene_receipts'])
                     actions.music_context = current_music_context(context['gene_receipts'])
+                    actions.music_receipts = context['gene_receipts']
                 text = clean(text, 4000)
                 context['fence'] = {'turn': {**scope, 'revision': context['revision'], 'source': source.model_dump(),
                                              'input': text, 'reply': '', 'model': context['model'],
