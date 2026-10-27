@@ -16,7 +16,7 @@ from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
 from .fri_images import details, image_context, look, media
-from .fri_memes import reacted
+from .fri_memes import carried, reacted
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
 from .gene_controls import COMMANDS, arguments, grounded, music_control_intent, own_words, requested
@@ -484,11 +484,11 @@ class Actions:
                     full = True
                     break
                 self.observe(scope, user, profile['revision'])
-                shown[message.id] = (user, message.content, message.edited_at)
+                shown[message.id] = (user, message.content, message.edited_at, carried(message))
                 records.append(row)
                 continue
             self.observe(scope, user, profile['revision'])
-            shown[message.id] = (user, message.content, message.edited_at)
+            shown[message.id] = (user, message.content, message.edited_at, carried(message))
             records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
                             'at': message.created_at.isoformat(), 'text': clean(message.content, 500), **details(message),
                             **reacted(notes, message, profile, stale)})
@@ -525,7 +525,7 @@ class Actions:
             for read in self.reads:
                 shown, channel = read['shown'], read['channel']
                 found = channel.pins(limit=read['pins']) if 'pins' in read else channel.history(**read['options'])
-                latest = {message.id: (message.author.id, message.content, message.edited_at)
+                latest = {message.id: (message.author.id, message.content, message.edited_at, carried(message))
                           async for message in found if message.id in shown}
                 if latest != shown:
                     return False

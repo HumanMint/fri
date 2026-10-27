@@ -279,3 +279,41 @@ def test_heartbeat_records_actual_tick_outcome(learning, failure, monkeypatch):
         assert agent.stages['learning']['error'] == ('ValueError' if failure else None)
         agent.attend.assert_awaited_once()  # A failed stage no longer skips the ones after it.
     asyncio.run(scenario())
+
+
+def test_learning_keeps_what_a_member_is_working_on_in_its_channel(learning):
+    clock, store, settings, scheduler = learning
+    settings = replace(settings, agent_history_channels='1')
+    scheduler = AgentStore(store, settings)
+    channel = HistoryChannel()
+    channel.add(clock[0]-100, text="I'm building a Factorio mod")
+    client = TestClient(create_app(settings))
+    asked = []
+
+    async def api(method, path, payload=None):
+        response = client.request(method, path, json=payload, headers=headers('fri'))
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    async def model(role, instructions, context, schema, model, effort):
+        asked.append((instructions, schema))
+        return {'summary': 'Modding chat.', 'notes': [{'source_id': context['messages'][0]['id'], 'category': 'projects',
+                                                       'evidence': "I'm building a Factorio mod"}]}, {}, 'completed'
+
+    async def scenario():
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api,
+            get_channel=lambda _: channel, get_user=lambda _: SimpleNamespace(send=AsyncMock()))
+        agent = Agent(fri)
+        agent.state = scheduler.state()
+        agent.member = AsyncMock(return_value=SimpleNamespace(roles=[SimpleNamespace(id=90)]))
+        agent.profile = AsyncMock(side_effect=lambda channel, user: scheduler.context(str(channel), str(user)))
+        agent.run = model
+        assert (await agent.learn())['saved'] == 1
+
+    asyncio.run(scenario())
+    instructions, schema = asked[0]
+    assert "projects (what they are doing) only and always with I'm working on" in instructions
+    assert 'projects' in schema['properties']['notes']['items']['properties']['category']['enum']
+    assert [(n['scope'], n['category'], n['evidence']) for n in store.chat_context(
+        '123', 'public:1', '11', True)['personal_memory']['notes']] == [('here', 'projects', "I'm building a Factorio mod")]
+    assert store.chat_context('123', 'public:2', '11', True)['personal_memory']['notes'] == []

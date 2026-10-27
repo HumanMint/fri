@@ -288,7 +288,8 @@ class Memes:
         revision and the post stay as they were; forget() drops it with the rest of a member's words."""
         self.noted[message.id] = {'at': time.time(), 'channel': message.channel.id, 'author': str(message.author.id),
                                   'revision': revision, 'emoji': reaction, 'note': clean(observation, NOTE),
-                                  'edited': message.edited_at.isoformat() if message.edited_at else None}
+                                  'edited': message.edited_at.isoformat() if message.edited_at else None,
+                                  'media': carried(message)}
 
     def notes(self):
         """{message id: note} for the memes Fri reacted to in the last three days."""
@@ -384,6 +385,21 @@ class Memes:
                 self.remember(current, result['reaction'], result['observation'], profile['revision'])
 
 
+def carried(message):
+    """What a post shows besides its text: its attachments, and each embed's image, thumbnail or video.
+    An embed can be suppressed without an edit time, so a note on what Fri saw checks this too."""
+    # Attachment IDs, or URLs without their query: Discord renews a CDN link's signature on refetch.
+    attachments, embeds = getattr(message, 'attachments', None), getattr(message, 'embeds', None)
+    shown = [str(getattr(a, 'id', None) or str(a.url).split('?')[0]) for a in attachments] \
+        if isinstance(attachments, (list, tuple)) else []
+    for embed in embeds if isinstance(embeds, (list, tuple)) else ():
+        for part in (getattr(embed, 'image', None), getattr(embed, 'thumbnail', None), getattr(embed, 'video', None)):
+            url = getattr(part, 'proxy_url', None) or getattr(part, 'url', None)
+            if url:
+                shown.append(str(url).split('?')[0])
+    return shown
+
+
 def reacted(notes, message, profile, stale=None):
     """Fri's own earlier reaction to this post and what it saw, while author and post are unchanged.
 
@@ -393,7 +409,7 @@ def reacted(notes, message, profile, stale=None):
         return {}
     edited = getattr(message, 'edited_at', None)
     if (note['author'] != str(message.author.id) or note['revision'] != profile['revision'] or
-            note['at'] <= time.time()-KEEP or
+            note['at'] <= time.time()-KEEP or note.get('media') != carried(message) or
             note['edited'] != (edited.isoformat() if isinstance(edited, dt.datetime) else None)):
         if stale is not None:
             stale.append(message.id)

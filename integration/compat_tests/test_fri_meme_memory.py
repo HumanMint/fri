@@ -11,7 +11,7 @@ from compat_tests.test_fri_memes import attachment
 from compat_tests.test_fri_memes import harness as harness  # noqa: F401
 from fri.fri_actions import Actions
 from fri.fri_chat import INSTRUCTIONS
-from fri.fri_memes import INSTRUCTION, NOTE, Memes, reacted
+from fri.fri_memes import INSTRUCTION, NOTE, Memes, carried, reacted
 
 
 def test_a_reaction_keeps_what_fri_saw_with_whose_post_it_was(harness):  # noqa: F811
@@ -61,8 +61,10 @@ def test_forgetting_a_member_drops_what_fri_saw_in_their_memes(harness):  # noqa
 def test_a_note_shows_only_while_the_author_and_the_post_are_as_they_were():
     edited = dt.datetime(2026, 10, 25, tzinfo=dt.timezone.utc)
     now = __import__('time').time()
-    notes = {5: {'author': '30', 'revision': 2, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None, 'at': now},
-             6: {'author': '30', 'revision': 2, 'emoji': '💀', 'note': 'a cat', 'edited': edited.isoformat(), 'at': now}}
+    notes = {5: {'author': '30', 'revision': 2, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None, 'at': now,
+                 'media': []},
+             6: {'author': '30', 'revision': 2, 'emoji': '💀', 'note': 'a cat', 'edited': edited.isoformat(), 'at': now,
+                 'media': []}}
     post = SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=None)
     assert reacted(notes, post, {'revision': 2}) == {'fri_reacted': {'emoji': '🗿', 'saw': 'gigachad at a desk'}}
     assert reacted(notes, SimpleNamespace(id=6, author=SimpleNamespace(id=30), edited_at=edited), {'revision': 2})
@@ -70,6 +72,22 @@ def test_a_note_shows_only_while_the_author_and_the_post_are_as_they_were():
     assert not reacted(notes, SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=edited), {'revision': 2})
     assert not reacted(notes, SimpleNamespace(id=5, author=SimpleNamespace(id=31), edited_at=None), {'revision': 2})
     assert not reacted(notes, SimpleNamespace(id=7, author=SimpleNamespace(id=30), edited_at=None), {'revision': 2})
+    assert not reacted(notes, SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=None,  # Its image changed.
+                                              attachments=[SimpleNamespace(url='https://cdn.test/new.png')]), {'revision': 2})
+
+
+def test_a_renewed_cdn_signature_keeps_a_meme_note():
+    """Discord renews an attachment link's signature on refetch; the same image keeps its note."""
+    now = __import__('time').time()
+    url = 'https://cdn.discordapp.com/attachments/1/2/meme.png?ex=1&is=2&hm=aa'
+    post = SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=None,
+                           attachments=[SimpleNamespace(id=2, url=url)])
+    notes = {5: {'author': '30', 'revision': 2, 'emoji': '🗿', 'note': 'a cat', 'edited': None, 'at': now,
+                 'media': carried(post)}}
+    renewed = SimpleNamespace(**{**vars(post), 'attachments': [SimpleNamespace(id=2, url=url.replace('hm=aa', 'hm=bb'))]})
+    assert reacted(notes, renewed, {'revision': 2})
+    replaced = SimpleNamespace(**{**vars(post), 'attachments': [SimpleNamespace(id=3, url=url)]})
+    assert not reacted(notes, replaced, {'revision': 2})
 
 
 def test_a_read_shows_fris_own_reaction_and_what_it_saw(monkeypatch, tmp_path):
@@ -79,7 +97,7 @@ def test_a_read_shows_fris_own_reaction_and_what_it_saw(monkeypatch, tmp_path):
         other = post('lol', user=40, age=300)
         agent.ensure_memes = lambda: SimpleNamespace(notes=lambda: {meme.id: {
             'author': '30', 'revision': 0, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None,
-            'at': __import__('time').time()}})
+            'at': __import__('time').time(), 'media': carried(meme)}})
         actions = Actions(agent, 20, 999, False)
         actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
         try:
@@ -226,4 +244,33 @@ def test_one_channel_gene_refuses_never_stops_the_other_notes_privacy_check(tmp_
         await memes.verify(now=now+601)
         # Refused for good: dropped. Opted out: dropped. Unreachable for now: kept for next time. Fine: kept.
         assert set(memes.noted) == {3, 4}
+    asyncio.run(scenario())
+
+
+def test_a_note_on_a_meme_whose_image_is_gone_stays_out(monkeypatch, tmp_path):
+    """An embed can be suppressed without an edit time: what Fri saw in it doesn't reach the model after."""
+    import copy
+
+    import discord
+
+    from compat_tests.test_fri_member_profiles import DM
+    from compat_tests.test_fri_read_fences import read_world
+    seen = 'a handwritten phone number in the old image'
+
+    async def scenario():
+        w, posts, rows, sent, _, _ = read_world(monkeypatch, tmp_path, ['https://example.test/meme.png'])
+        post = posts[0]
+        post.embeds = [discord.Embed.from_dict({'type': 'image', 'image': {
+            'proxy_url': 'https://media.discordapp.net/external/abc/https/example.test/meme.png'}})]
+        w.fri.agent.ensure_memes().remember(post, '🗿', seen, 0)
+        changed = copy.copy(post)
+        changed.embeds = []  # Same text and edit time; the image is gone.
+        rows[post.id] = changed
+        text = 'fri what is in general'
+        try:
+            await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+            assert len(sent) == 2 and seen not in json.dumps(sent[-1])
+            assert post.id not in w.fri.agent.ensure_memes().notes()
+        finally:
+            await w.fri.close()
     asyncio.run(scenario())
