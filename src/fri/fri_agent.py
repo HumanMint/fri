@@ -172,9 +172,10 @@ class Agent:
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
         self.looked = {}  # Messages a turn's model request carried -> when (monotonic), oldest first: see unsend.
-        # (channel, member): (bare "fri" message ID, set once the rest of it comes in, the follow-up window it
-        # opened as (until, the one it replaced) or None in a DM).
-        self.summons = {}
+        self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
+        # Bare "fri" message ID -> ((channel, member), the follow-up window it opened, the one it replaced), oldest
+        # first. Kept past its wait: a message that came in during it is let in by when it arrived (see receive).
+        self.windows = {}
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
 
     @property
@@ -336,14 +337,18 @@ class Agent:
             self.recent[channel] = deque((r for r in rows if r['gene_error'] or r['id'] not in gone), maxlen=30)
         for key in [key for key, latest in self.pending.items() if key[0] == channel and latest in ids]:
             del self.pending[key]  # Its burst is dropped below; nothing is pending for that member now.
-        for key in [key for key, (summoned, *_) in self.summons.items() if key[0] == channel and summoned in ids]:
-            # A bare "fri" taken back: what's said next isn't let in through it. A window it didn't open stays.
-            _, _, opened = self.summons.pop(key)
-            if opened and self.active.get(key) == opened[0]:
-                if opened[1] is None:
+        for summoned in [i for i in ids if self.windows.get(i, ((None,),))[0][0] == channel]:
+            # A bare "fri" taken back: what's said next isn't let in through it, even once its wait is over, as a
+            # message that came in during it may still be coming in. A window it didn't open stays.
+            key, until, replaced = self.windows.pop(summoned)
+            for later, (other, opened, kept) in self.windows.items():
+                if other == key and kept == until:  # A later bare "fri" kept this one's window: not any more.
+                    self.windows[later] = (key, opened, replaced)
+            if self.active.get(key) == until:
+                if replaced is None:
                     del self.active[key]
                 else:
-                    self.active[key] = opened[1]
+                    self.active[key] = replaced
         self.bursts.unsend(channel, ids)
 
     def saw(self, ids):
@@ -1220,12 +1225,14 @@ class Agent:
     async def rest_of(self, key, message):
         """Wait up to REST_SECONDS for the member's next message here, letting it in without "fri". True
         if it came."""
-        came, opened = asyncio.Event(), None
+        came = asyncio.Event()
         if message.guild:  # In a DM every message is already to Fri.
             earlier = self.active.get(key)
             self.active[key] = max(earlier or 0, time.time()+REST_SECONDS)
-            opened = (self.active[key], earlier)
-        self.summons[key] = (message.id, came, opened)
+            self.windows[message.id] = (key, self.active[key], earlier)
+            while time.time()-next(iter(self.windows.values()))[1] > REDELIVERY_SECONDS:
+                del self.windows[next(iter(self.windows))]  # Long over: nothing still coming in came during it.
+        self.summons[key] = (message.id, came)
         waits = [asyncio.ensure_future(asyncio.sleep(REST_SECONDS)), asyncio.ensure_future(came.wait())]
         try:
             await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)

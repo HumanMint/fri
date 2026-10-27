@@ -326,6 +326,80 @@ def test_deleting_a_bare_ping_ends_the_window_it_opened(monkeypatch, tmp_path, w
     asyncio.run(scenario())
 
 
+def test_deleting_a_bare_ping_after_its_wait_ends_its_window_for_a_message_still_coming_in(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        rest(monkeypatch, 0.2)
+        def fetch(mid):
+            if mid not in rows:
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'deleted')
+            return rows[mid]
+        channel.fetch_message.side_effect = fetch
+        asked = []
+        async def answer(text, context):
+            asked.append(text)
+            return ChatResult(status='completed', reply='under spawn')
+        fri.chat_once.side_effect = answer
+        bare = message('<@99>')
+        question = message('is the end portal under spawn')  # No "fri" in it, sent inside the wait.
+        reading, release, composing, parked = (asyncio.Event() for _ in range(4))
+        incoming = agent.incoming
+        async def held(event, *args, **kwargs):  # The question's profile read outlasts the wait.
+            if event is question:
+                reading.set()
+                await release.wait()
+            return await incoming(event, *args, **kwargs)
+        agent.incoming = held
+        reply_once = agent.reply_once
+        async def unanswered(event, *args, **kwargs):  # The ping's own reply is still on its way.
+            if event is bare:
+                composing.set()
+                await parked.wait()
+            return await reply_once(event, *args, **kwargs)
+        agent.reply_once = unanswered
+        tasks = [asyncio.create_task(agent.handle(bare))]
+        try:
+            async with asyncio.timeout(2):
+                while (1, 20) not in agent.summons:
+                    await asyncio.sleep(0)
+                tasks.append(asyncio.create_task(agent.handle(question)))
+                await reading.wait()
+                await composing.wait()  # The wait is over, with nothing after it yet.
+            assert (1, 20) not in agent.summons
+            del rows[bare.id]
+            await fri.on_raw_message_delete(SimpleNamespace(channel_id=1, message_id=bare.id))
+            parked.set()
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            bare.reply.assert_not_awaited()
+            question.reply.assert_not_awaited()  # Taken back: not let in through it, though it came in during it.
+            assert question.content not in asked
+        finally:
+            parked.set()
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_deleting_two_bare_pings_leaves_neither_window(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        rest(monkeypatch, 0.05)
+        first, second = message('<@99>'), message('<@99>')
+        try:
+            await agent.rest_of((1, 20), first)  # Its wait ends with nothing after it.
+            waiting = asyncio.create_task(agent.rest_of((1, 20), second))  # Opened on top of the first's window.
+            await asyncio.sleep(0)
+            agent.unsend(1, [first.id])
+            agent.unsend(1, [second.id])
+            await waiting
+            assert (1, 20) not in agent.active  # Not the first's window back, either.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_bare_fri_with_nothing_after_it_is_answered_after_the_wait(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
