@@ -82,8 +82,7 @@ class Memes:
         self.noted = {}
         self.verified = 0
         self.replies = {}  # A reply's message ID -> (ID of the message it replies to, when), for LAUGH_SECONDS.
-        self.lurking = set()  # Chat lines whose laugh-started check is running (see heard).
-        self.tasks = set()
+        self.tasks = set()  # The laugh-started check running, if any: one at a time (see heard).
 
     @property
     def path(self):
@@ -230,12 +229,13 @@ class Memes:
             return
         replies = {key: value[0] for key, value in self.replies.items()}
         post = laughed_at(rows, replies, at)
-        if post is None or not said(rows[post]) or rows[post]['id'] in self.lurking:
+        if post is None or not said(rows[post]):
             return
         who = laughers(rows[:at+1], replies, post)
         if rows[at]['user_id'] in laughers(rows[:at], replies, post) or rows[at]['user_id'] not in who or len(who) < LAUGHERS:
             return
-        self.lurking.add(rows[post]['id'])
+        if any(not task.done() for task in self.tasks):
+            return  # One check at a time, and none waits for it: a third member laughing can still start one.
         task = asyncio.create_task(self.lurk(channel, rows[post]['id']))
         self.tasks.add(task)
         task.add_done_callback(self.lurked)
@@ -248,45 +248,40 @@ class Memes:
     async def lurk(self, channel_id, post_id):
         """One check of a line other members laughed at, through inspect() like a meme post's, with the lines
         before it from Fri's live view as context. Its budgets are the meme checks', and it's considered once."""
-        try:
-            config, channel = self.agent.config, self.fri.get_channel(channel_id)
-            if not config['enabled'] or not config['meme_enabled'] or not self.readable(channel) or not self.chat(channel_id):
+        config, channel = self.agent.config, self.fri.get_channel(channel_id)
+        if not config['enabled'] or not config['meme_enabled'] or not self.readable(channel) or not self.chat(channel_id):
+            return
+        with self.state(write=False) as state:
+            # Considered once: later laughs change nothing. Unlike a meme check's, skipped while no reaction
+            # could follow, since it's this line's only chance: before reading anything from Gene or Discord.
+            if post_id in state['entries'] or capped(state, config, time.time()) or full(state, config, time.time()):
                 return
-            with self.state(write=False) as state:
-                if post_id in state['entries']:
-                    return  # Considered once: later laughs change nothing.
-            # Privacy-fenced: rows of members who opted out or changed their privacy since are gone, laughs too.
-            rows = await self.agent.context_messages(channel_id)
-            at = next((i for i, row in enumerate(rows) if row['id'] == post_id), None)
-            replies = {key: value[0] for key, value in self.replies.items()}
-            if at is None or not said(rows[at]):
+        # Privacy-fenced: rows of members who opted out or changed their privacy since are gone, laughs too.
+        rows = await self.agent.context_messages(channel_id)
+        at = next((i for i, row in enumerate(rows) if row['id'] == post_id), None)
+        replies = {key: value[0] for key, value in self.replies.items()}
+        if at is None or not said(rows[at]):
+            return
+        # Still here too, as a meme post's author must be (see eligible).
+        if len([user for user in laughers(rows, replies, at) if await self.agent.member(int(user), fresh=True)]) < LAUGHERS:
+            return
+        before = [{'name': row['name'], 'text': row['text'],
+                   **({'attachments': row['attachments']} if row.get('attachments') else {})}
+                  for row in rows[:at] if not row.get('gene_error')][-CONTEXT_LINES:]
+        message = await channel.fetch_message(int(post_id))
+        if message.edited_at is not None or sources(message) != [] or not message.content.strip():
+            return  # Edited since, maybe to take it back, or no longer just a line of text.
+        profile = await self.eligible(message)
+        if not profile or profile.get('revision', 0) != rows[at].get('revision', 0):
+            return
+        now = time.time()
+        with self.state() as state:
+            if post_id in state['entries'] or capped(state, config, now) or full(state, config, now):
                 return
-            # Still here too, as a meme post's author must be (see eligible).
-            if len([user for user in laughers(rows, replies, at) if await self.agent.member(int(user), fresh=True)]) < LAUGHERS:
-                return
-            before = [{'name': row['name'], 'text': row['text'],
-                       **({'attachments': row['attachments']} if row.get('attachments') else {})}
-                      for row in rows[:at] if not row.get('gene_error')][-CONTEXT_LINES:]
-            message = await channel.fetch_message(int(post_id))
-            if message.edited_at is not None or sources(message) != [] or not message.content.strip():
-                return  # Edited since, maybe to take it back, or no longer just a line of text.
-            profile = await self.eligible(message)
-            if not profile or profile.get('revision', 0) != rows[at].get('revision', 0):
-                return
-            now = time.time()
-            with self.state() as state:
-                recent = [when for when in state['reactions'] if when > now-86400]
-                # Unlike a meme check's, skipped while no reaction could follow: it's this line's only chance.
-                if (post_id in state['entries'] or
-                        sum(e['at'] > now-86400 for e in state['entries'].values()) >= config['meme_daily_checks'] or
-                        len(recent) >= config['meme_daily_reactions'] or (recent and now-max(recent) < 3600)):
-                    return
-                state['entries'][post_id] = {'at': now, 'channel': str(channel_id), 'status': 'reserved'}
-                state['channels'][str(channel_id)] = {**state['channels'].get(str(channel_id), {}),
-                                                      'name': clean(channel.name, 60)}
-            await self.inspect(message, [], profile, before)
-        finally:
-            self.lurking.discard(post_id)
+            state['entries'][post_id] = {'at': now, 'channel': str(channel_id), 'status': 'reserved'}
+            state['channels'][str(channel_id)] = {**state['channels'].get(str(channel_id), {}),
+                                                  'name': clean(channel.name, 60)}
+        await self.inspect(message, [], profile, before)
 
     def remember(self, message, reaction, observation, revision):
         """What Fri reacted with and saw, so a later chat can own it. Only while the author's privacy
@@ -427,6 +422,12 @@ def reacted(notes, message, profile, stale=None):
 def capped(state, config, now):
     """Today's meme checks are used up, the timer's and laugh-started ones together."""
     return sum(e['at'] > now-86400 for e in state['entries'].values()) >= config['meme_daily_checks']
+
+
+def full(state, config, now):
+    """No reaction could follow now: today's are used up, or the last one is under an hour old."""
+    recent = [when for when in state['reactions'] if when > now-86400]
+    return len(recent) >= config['meme_daily_reactions'] or bool(recent and now-max(recent) < 3600)
 
 
 def laughter(text):

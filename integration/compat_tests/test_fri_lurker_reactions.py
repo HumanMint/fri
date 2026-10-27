@@ -27,14 +27,15 @@ def chat(learning, tmp_path, monkeypatch):  # noqa: F811
     h.fri.user = SimpleNamespace(id=99)
     h.fri.hear = lambda message: None
 
-    async def say(mid, user, text, *, bot=False, **kwargs):
-        """A message as Discord delivers it, through Fri's live handling."""
+    async def say(mid, user, text, *, bot=False, settle=True, **kwargs):
+        """A message as Discord delivers it, through Fri's live handling. settle: wait for the checks it starts."""
         h.clock[0] += 1
         message = h.add(mid, at=h.clock[0], content=text, guild=SimpleNamespace(id=123), mentions=[],
                         role_mentions=[], stickers=[], reference=kwargs.pop('reference', None),
                         author=SimpleNamespace(id=user, bot=bot, display_name=f'member{user}'), **kwargs)
         await h.agent.handle(message)
-        await settled(h)
+        if settle:
+            await settled(h)
         return message
 
     async def bit():
@@ -366,6 +367,65 @@ def test_the_timer_checks_the_daily_cap_again_where_it_reserves(chat):
         meme.add_reaction.assert_not_awaited()
         with h.agent.memes.state(write=False) as state:
             assert set(state['entries']) == {'70', '100'}
+    asyncio.run(scenario())
+
+
+def test_one_laugh_check_runs_at_a_time_and_laughs_meanwhile_start_nothing(chat):
+    async def scenario():
+        h = chat
+        configure(h, 2, meme_daily_checks=2)
+        h.agent.run.return_value = ({'reaction': 'quiet', 'confidence': 'high', 'observation': ''}, {}, 'completed')
+        gate, reads, read = asyncio.Event(), [], h.agent.context_messages
+
+        async def stalled(*args, **kwargs):  # A slow controller: profile reads stall.
+            reads.append(args)
+            await gate.wait()
+            return await read(*args, **kwargs)
+        h.agent.context_messages = stalled
+        lines, most = [], 0
+        for i in range(6):
+            lines.append(await h.say(200+10*i, 12, f'the toaster has a lawyer {i}', settle=False))
+            await h.say(201+10*i, 30, 'lol', settle=False)
+            await h.say(202+10*i, 31, 'lmao', settle=False)
+            await asyncio.sleep(0)
+            most = max(most, len(h.agent.memes.tasks))
+        assert most == 1 and len(reads) == 1  # Dropped, not queued behind it.
+        gate.set()
+        await settled(h)
+        assert h.agent.run.await_count == 1 and h.agent.run.await_args.args[2]['caption'] == lines[0].content
+        await h.say(260, 32, 'lmao')  # Once it's done, a third member laughing at a line can start one.
+        assert len(reads) == 2 and h.agent.run.await_args.args[2]['caption'] == lines[-1].content
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('spent', ['checks', 'reactions', 'gap'])
+def test_a_spent_budget_stops_a_laugh_check_before_it_reads_anything(chat, spent):
+    async def scenario():
+        h = chat
+        now = time.time()
+        if spent == 'checks':
+            configure(h, 2, meme_daily_checks=2)
+        elif spent == 'reactions':
+            configure(h, 2, meme_daily_reactions=1)
+        with h.agent.memes.state() as state:
+            if spent == 'checks':
+                state['entries'] = {'70': {'at': now, 'channel': '3', 'status': 'quiet'},
+                                    '71': {'at': now, 'channel': '3', 'status': 'quiet'}}
+            else:  # A reaction two hours ago uses up a daily budget of one; ten minutes ago, the hourly gap.
+                state['reactions'] = [now-7200 if spent == 'reactions' else now-600]
+        reads, read = [], h.agent.context_messages
+
+        async def counted(*args, **kwargs):
+            reads.append(args)
+            return await read(*args, **kwargs)
+        h.agent.context_messages = counted
+        line = await h.bit()
+        await h.say(101, 30, 'lol')
+        fetched = h.channel.fetch_message.await_count
+        await h.say(102, 31, 'lmao')
+        assert not reads and h.channel.fetch_message.await_count == fetched
+        h.agent.run.assert_not_awaited()
+        line.add_reaction.assert_not_awaited()
     asyncio.run(scenario())
 
 
