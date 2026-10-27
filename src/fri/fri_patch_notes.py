@@ -3,6 +3,7 @@
     docker exec -i fri-runtime-1 python -m fri.fri_patch_notes draft 0.7.0 < facts.md > notes.md
     python -m fri.fri_patch_notes preview 0.7.0 < notes.md
     docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 --channel fri-chat < notes.md
+    docker exec -i fri-runtime-1 python -m fri.fri_patch_notes pin 0.7.0 --channel fri-chat   # the pin alone
     docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md   # the owner's DM
 
 `draft` has Fri's own model write the post from the maintainer's facts, in Fri's voice, to the server.
@@ -12,8 +13,12 @@ Each version reaches each place once: every part has a fixed nonce, FRI_DATA/pat
 or patch-notes-server.json (the channel) lists the parts Discord confirmed, and a part whose send was
 attempted but never confirmed is looked for there, after the newest message from before that attempt
 (kept under `anchors`), before it is sent again.
-Exit codes: 0 sent (or already sent), 2 refused (fix the notes or the record), 1 Discord or the
-network failed (a rerun is safe)."""
+A channel post is then pinned there: its first part, the one a member finds in the channel's pins. The
+record keeps the pinned message's id, so a rerun after a failed pin only pins, never posts again, and
+`pin` pins a version already posted from the record alone. Fri never unpins or removes anything.
+Exit codes: 0 sent (or already sent) and, in a channel, pinned; 2 refused (fix the notes or the record);
+1 Discord or the network failed (a rerun is safe); 3 posted but not pinned (the post stands; a rerun
+only tries the pin)."""
 
 import argparse
 import asyncio
@@ -50,6 +55,10 @@ class NotesRefused(Exception):
 
 class SendFailed(Exception):
     """Discord answered a send with something that can't be recorded; the part stays tried."""
+
+
+class PinFailed(Exception):
+    """The notes are posted, but Discord didn't pin them; a rerun only tries the pin again."""
 
 
 def length(text):
@@ -125,7 +134,10 @@ def entry_ok(entry):
             isinstance(entry.get('sha256'), str) and HASH.fullmatch(entry['sha256'])):
         return False
     stages = [stage(part) for part in states]
-    return stages == sorted(stages, reverse=True) and stages.count(1) <= 1 and stages[0] > 0
+    pinned = 'pinned' not in entry or (set(stages) == {2} and entry['pinned'] == states[0]['message_id'])
+    trimmed = 'trimmed' not in entry or (isinstance(entry['trimmed'], list) and len(entry['trimmed']) == len(states) and
+                                         all(isinstance(h, str) and HASH.fullmatch(h) for h in entry['trimmed']))
+    return stages == sorted(stages, reverse=True) and stages.count(1) <= 1 and stages[0] > 0 and pinned and trimmed
 
 
 def sent_ids(state):
@@ -227,6 +239,56 @@ async def destination(client, *, owner_id, guild_id, channel):
     return found[0]
 
 
+async def pin(room, entry, version, out):
+    """Pin a channel post's first part, the one members find in the pins. Nothing in the channel is ever
+    unpinned, removed or reposted, so a permission or pin-limit refusal leaves the post as it is."""
+    message_id, channel_id = entry['parts'][0]['message_id'], entry['parts'][0]['channel_id']
+    where = f'#{getattr(room, "name", room.id)}'
+    if str(room.id) != channel_id:
+        raise PinFailed(f'{version} was posted in channel {channel_id}, not {where} ({room.id}); nothing was pinned')
+    try:
+        message = await room.fetch_message(int(message_id))  # Even when on record: someone may have unpinned it.
+        if not message.pinned:
+            try:
+                await message.pin(reason=f'Fri patch notes {version}')
+            except discord.HTTPException:
+                if not (await room.fetch_message(int(message_id))).pinned:  # A pin whose answer was lost still counts.
+                    raise
+    except discord.NotFound:
+        raise PinFailed(f'message {message_id} is no longer in {where}; it was not posted again') from None
+    except discord.Forbidden as exc:
+        raise PinFailed(f'Fri may not pin in {where}; it needs Pin Messages and Read Message History ({exc})') from None
+    except discord.HTTPException as exc:
+        if exc.code == 30003:
+            raise PinFailed(f'{where} has Discord\'s maximum of 250 pins; none was removed to make room') from None
+        raise PinFailed(f'Discord failed the pin ({exc})') from None
+    except Exception as exc:  # The network, or a reply Discord shouldn't send.
+        raise PinFailed(f'{type(exc).__name__}: {exc}') from None
+    entry['pinned'] = message_id
+    out(f'{version}: message {message_id} is pinned in {where}')
+
+
+async def pin_posted(version, *, token, data, guild_id, channel, out=print):
+    """Pin a version already posted in the channel, from the record alone: nothing is sent."""
+    path = data / 'patch-notes-server.json'
+    with locked(data):
+        state = load(path)
+        entry = state['versions'].get(version)
+        if not entry or not all(part.get('message_id') for part in entry['parts']):
+            raise NotesRefused(f'{version} is not fully posted in a channel; send it first')
+        client = discord.Client(intents=discord.Intents.none())
+        try:
+            await client.login(token)
+            try:
+                room = await destination(client, owner_id=None, guild_id=guild_id, channel=channel)
+            except Exception as exc:
+                raise PinFailed(f'#{channel} could not be read ({type(exc).__name__}: {exc})') from None
+            await pin(room, entry, version, out)
+            private_json(path, state)
+        finally:
+            await client.close()
+
+
 async def send(version, text, *, token, owner_id, data, out=print, guild_id=None, channel=None):
     chunks = parts(text)
     digest = hashlib.sha256(json.dumps(chunks).encode()).hexdigest()  # The split, not just the text.
@@ -241,19 +303,41 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
             entry = state['versions'][version] = {'sha256': digest, 'parts': [{} for _ in chunks]}
         if any(part.get('sha256', h) != h for part, h in zip(entry['parts'], hashes)):
             raise NotesRefused(f'{path.name} is not a patch-notes record')
-        if all(part.get('message_id') for part in entry['parts']):
+        posted = all(part.get('message_id') for part in entry['parts'])
+        if posted and channel is None:
             out(f'{version}: all {len(chunks)} parts were already sent')
             return
-        tried = next((part['sha256'] for part in entry['parts'] if stage(part) == 1), None)
-        twins = sorted(other for other, e in state['versions'].items() if other != version
-                       for part in e['parts'] if stage(part) == 1 and part['sha256'] == tried)
+        # Recovery matches text with its ends trimmed, as Discord stores it, so twins are told by trimmed text.
+        entry.setdefault('trimmed', [text_hash(chunk.strip()) for chunk in chunks])
+        tried = next((index for index, part in enumerate(entry['parts']) if stage(part) == 1), None)
+        twins, unknown = set(), set()
+        for other, e in state['versions'].items():
+            for at, part in enumerate(e['parts'] if other != version and tried is not None else []):
+                if stage(part) != 1:
+                    continue
+                if 'trimmed' in e:
+                    if e['trimmed'][at] == entry['trimmed'][tried]:
+                        twins.add(other)
+                elif part['sha256'] == entry['parts'][tried]['sha256']:
+                    twins.add(other)
+                else:
+                    unknown.add(other)  # Older code kept no trimmed text: it could still be the same words.
         if twins:
-            raise NotesRefused(f'{version} and {", ".join(twins)} each have a part with this text that was tried but '
+            raise NotesRefused(f'{version} and {", ".join(sorted(twins))} each have a part with this text that was tried but '
                                f'never confirmed, and the history can\'t say whose a message is; check it, then fix {path.name}')
+        if unknown:
+            private_json(path, state)  # Keeps this version's trimmed text, so the other's retry can tell them apart.
+            raise NotesRefused(f'{version} has a part that was tried but never confirmed, and so does {", ".join(sorted(unknown))}, '
+                               f'recorded by older code that kept no trimmed text; check them, then fix {path.name}')
         client = discord.Client(intents=discord.Intents.none())
         try:
             await client.login(token)
-            dm = await destination(client, owner_id=owner_id, guild_id=guild_id, channel=channel)
+            try:
+                dm = await destination(client, owner_id=owner_id, guild_id=guild_id, channel=channel)
+            except Exception as exc:
+                if not posted:
+                    raise
+                raise PinFailed(f'#{channel} could not be read ({type(exc).__name__}: {exc})') from None  # Only the pin was left.
             for index, (chunk, part) in enumerate(zip(chunks, entry['parts']), 1):
                 if part.get('message_id'):
                     out(f'part {index}/{len(chunks)}: already sent')
@@ -281,6 +365,9 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
                 set_anchor(state, version, index, None)
                 private_json(path, state)
                 out(f'part {index}/{len(chunks)}: sent as message {message.id} ({length(chunk)} chars)')
+            if channel is not None:
+                await pin(dm, entry, version, out)
+                private_json(path, state)
         finally:
             await client.close()
 
@@ -348,16 +435,25 @@ async def draft_from_controller(version, facts):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='python -m fri.fri_patch_notes',
                                      description='Draft, preview or send one release\'s patch notes, read from stdin.')
-    parser.add_argument('command', choices=('draft', 'send', 'preview'))
+    parser.add_argument('command', choices=('draft', 'send', 'preview', 'pin'))
     parser.add_argument('version', help='the release version, like 0.4.0')
     parser.add_argument('--channel', help='post in this text channel of the server (like fri-chat) instead of '
                                           'the owner\'s DM')
     args = parser.parse_args(argv)
     if not VERSION.fullmatch(args.version):
         parser.error('version must look like 0.4.0')
-    if args.channel is not None and (args.command != 'send' or not re.fullmatch(r'[a-z0-9_-]{1,100}', args.channel)):
-        parser.error('--channel takes a channel name like fri-chat, with send')
+    if args.channel is not None and (args.command not in ('send', 'pin') or not re.fullmatch(r'[a-z0-9_-]{1,100}', args.channel)):
+        parser.error('--channel takes a channel name like fri-chat, with send or pin')
+    if args.command == 'pin' and args.channel is None:
+        parser.error('pin takes --channel: only channel posts are pinned')
     try:
+        if args.command == 'pin':
+            token, guild = os.getenv('DISCORD_TOKEN', ''), os.getenv('GENE_GUILD_ID', '')
+            if not token or not ID.fullmatch(guild):
+                raise NotesRefused('DISCORD_TOKEN and GENE_GUILD_ID must be set')
+            asyncio.run(pin_posted(args.version, token=token, data=Path(os.getenv('FRI_DATA', '/data')),
+                                   guild_id=int(guild), channel=args.channel))
+            return 0
         try:
             text = sys.stdin.buffer.read().decode('utf-8')
         except UnicodeDecodeError:
@@ -381,6 +477,9 @@ def main(argv=None):
     except NotesRefused as exc:
         print(f'refused: {exc}', file=sys.stderr)
         return 2
+    except PinFailed as exc:
+        print(f'posted, not pinned: {exc}', file=sys.stderr)
+        return 3
     except Exception as exc:  # Discord, the network or the host failed mid-send, in whatever form.
         # The record is written before each send and after each confirmation, so a rerun is safe.
         print(f'failed: {type(exc).__name__}: {exc}', file=sys.stderr)

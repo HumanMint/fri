@@ -648,6 +648,7 @@ today, a rollback).
 docker exec -i fri-runtime-1 python -m fri.fri_patch_notes draft 0.7.0 < facts.md > notes.md
 docker exec -i fri-runtime-1 python -m fri.fri_patch_notes preview 0.7.0 < notes.md  # no send
 docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 --channel fri-chat < notes.md
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes pin 0.7.0 --channel fri-chat  # the pin alone
 docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md  # the owner's DM
 ```
 
@@ -666,13 +667,25 @@ version's confirmed parts, so a rerun finishes a partial send and never repeats 
 send was attempted but never confirmed is looked for there first (Fri's own messages since the attempt
 with that text, ignoring leading and trailing whitespace, skipping any the record already gives
 another part), and every part carries a
-fixed nonce. If two versions each have an unconfirmed part with the same text, the history can't say
-whose a message is, so both are refused until someone checks and fixes the record by hand.
+fixed nonce. If two versions each have an unconfirmed part with the same text once its ends are
+trimmed (kept per version under `trimmed`), the history can't say whose a message is, so both are refused
+until someone checks and fixes the record by hand; an unconfirmed part older code recorded, without
+trimmed text, counts as possibly the same.
+
+Once every part of a channel post is confirmed, Fri pins its first part in that channel (owner request,
+2026-10-27); the DM is never pinned. The record keeps the pinned message's id under `pinned`, so a rerun
+after a failed pin only pins and never posts again, and a message already pinned counts. Every rerun asks
+Discord rather than trusting the record, and pins again a post someone unpinned. `pin <version>
+--channel <name>` pins a version already posted, from the record alone and without the notes. Fri never
+unpins, deletes or reposts anything: missing Pin Messages or Read Message History, Discord's 250-pin
+limit (error 30003), a deleted post or a recreated channel leave the post as it is and are reported.
+Pinning uses `PUT /channels/{id}/messages/pins/{message}` (discord.py 2.7's `Message.pin`).
 
 Exit codes: 0 sent (or already sent) or drafted; 2 refused: the same version with different notes
 (send a correction as a new version), notes that don't fit, a damaged record, a missing or doubled
 channel, or missing settings; 1 failed: Discord or the model refused, answered badly or the connection
-dropped. Every confirmed part is on record, so rerunning the same command after a 1 is safe.
+dropped. Every confirmed part is on record, so rerunning the same command after a 1 is safe; 3 posted
+but not pinned, with Discord's reason (the post stands, and a rerun only tries the pin).
 
 ## Background work and health
 
