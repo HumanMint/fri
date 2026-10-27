@@ -152,6 +152,45 @@ def test_the_open_loop_evaluation_fails_wrong_answers():
     assert judged[0]['open_loops']['reminders'][0]['state'] == 'scheduled'
 
 
+def test_the_open_loop_evaluation_offers_the_dm_reminder_tools_so_a_duplicate_fails():
+    """A model that prepares a reminder whenever the tool is there must fail the duplicate case."""
+    from unittest.mock import Mock
+
+    import discord
+
+    from fri.fri_loops_eval import cases
+    from fri.fri_social import available
+    offered = {}
+
+    async def judge(data):
+        return {'verdict': 'pass', 'reason': ''}, {'input_tokens': 1}, 'completed'
+
+    async def eager(text, context):
+        offered[text] = context['actions']
+        if 'reminder_prepare' in context['actions']:
+            return ChatResult(status='completed', action={'kind': 'reminder_prepare', 'body': 'update the mods',
+                                                          'local_time': '2026-10-20T09:00',
+                                                          'timezone': 'America/Los_Angeles'})
+        return ChatResult(status='completed', reply=careful_answer(text, context['loops']))
+
+    async def run():
+        return {case['name']: case async for case, _ in evaluate_loops(SimpleNamespace(respond=eager), 'gpt-6.1-sol',
+                                                                        'high', '', judge=judge)}
+    verdicts = asyncio.run(run())
+    assert not verdicts['existing_reminder_is_not_duplicated']['passed']
+    assert verdicts['game_night_time_from_the_card']['passed']  # Nothing offered outside the DM.
+    for case in cases():
+        # What the runtime offers there: in the DM, the reminder tools without cancel (nobody asks to cancel).
+        dm = SimpleNamespace(event=Mock(spec=discord.Message, content=case['text'], channel=Mock(spec=discord.DMChannel)),
+                             guild=123, public=False, private_evidence=False,
+                             agent=SimpleNamespace(config={'support_dms': True}), fri=SimpleNamespace(guild_id=123, user=None))
+        runtime = available(dm) if case.get('dm') else {}
+        assert offered[case['text']].keys() == runtime.keys()
+        for name, tool in runtime.items():  # The eval's own clock: the fictional message's time.
+            assert offered[case['text']][name] == {**tool, **({'utc_now': '2026-10-19T14:02:00+00:00'}
+                                                              if 'utc_now' in tool else {})}
+
+
 @pytest.mark.parametrize('loops', [
     {'reminders': None, 'saved_work': None, 'game_nights': None},
     {'reminders': 'x', 'saved_work': {'title': 'x'}, 'game_nights': 3},

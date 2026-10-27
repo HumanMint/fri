@@ -268,7 +268,8 @@ posted card, so nothing reaches a new audience. A kind the conversation can neve
 an empty list there doesn't read as "none". Memory off sends none. Fri uses them when the member asks
 what's coming up or about one of them, and before preparing a duplicate, and doesn't bring them up
 unprompted. An older controller sends no `loops`, which the model reads as unavailable.
-`python -m fri.fri_eval --suite loops` checks these answers with the real model and a rubric judge:
+`python -m fri.fri_eval --suite loops` checks these answers with the real model and a rubric judge,
+offering the DM cases the reminder tools a DM offers, and fails any tool call or draft:
 an existing reminder isn't set again, pending, `will_not_send` and uncertain aren't promised, a
 game night's time comes from the card without naming who's going, banter leaves loops alone, and
 reminders outside DMs aren't called none.
@@ -405,8 +406,14 @@ Calls whose result can't change what members see are skipped before inference.
   caption), for up to three days or until Fri restarts; a rollback leaves nothing behind. A read or a
   mention's nearby rows show it as `fri_reacted` on that post only while the author's revision and the
   edit time still match, and drop it when they don't. Forgetting a member drops theirs; every heartbeat
-  expires old ones (before it waits on the controller) and, every ten minutes, drops those whose
-  author changed privacy outside Fri, whether or not meme checks are on.
+  expires old ones (before it waits on the controller) and, every ten minutes, refetches each noted
+  post and drops those whose post was deleted or edited or whose author changed privacy outside Fri,
+  whether or not meme checks are on. Every note's privacy is read from Gene before any post is
+  refetched, so an opt-out goes whatever Discord does; a post Discord can't show right now (refused,
+  rate-limited, connection failed) keeps its note until a later check. The heartbeat waits up to 10 s
+  on the refetches, then moves on to its stages without cancelling them, since discord.py can't recover
+  from a cancel inside its global rate-limit wait; a pass still running at the next check is left to
+  finish rather than doubled, and that check's privacy reads don't wait on it.
 - **Chat meme channels.** In a meme channel that's also one of Fri's chat channels (like #fri-chat),
   the meme check still judges posts with images but never a post that's only text. A line of text is
   judged only once two other members laugh at it. A laugh is a whole message from a short fixed list
