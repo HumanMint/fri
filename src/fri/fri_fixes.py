@@ -282,6 +282,15 @@ def postable(fri, channel):
         raise Unreachable('their thread’s archived, and i’m not reopening it for this')
 
 
+async def live(fri, job):
+    """The controller checks this in its claim too; an older one (gene #40) doesn't, so Fri reads the live release."""
+    status = await fri.api('GET', '/status')
+    if status.get('active_sha') != job['approved_sha']:
+        raise Unreachable('a newer release is live now, so "fixed" might not hold')
+    if (status.get('jobs') or {}).get('deploying'):
+        raise Unreachable('another release is going out right now. tap again once it lands')
+
+
 async def report(fri, job):
     """The reporter's message and where it is, read before the claim: nothing has been sent yet."""
     source = job.get('source_url') if isinstance(job, dict) else None
@@ -322,19 +331,15 @@ async def report(fri, job):
 async def tell(fri, job_id, actor):
     """Read Discord, then claim the controller's mark, reply once and record what happened.
 
-    The claim is the last await before the send, and it checks erasure, rollbacks and the live release,
-    so nothing that changed while Discord answered can slip through. What the owner sees, and whether it posted."""
+    The claim checks erasure, rollbacks and the live release, so nothing that changed while Discord answered
+    can slip through. With it held, Fri reads the live release once more, so a release while the claim was
+    out stops the reply too. What the owner sees, and whether it posted."""
     from .fri_workspace import send_once
     scope = {'guild_id': str(fri.guild_id), 'user_id': str(actor)}
     try:
         job = await fri.api('GET', '/requests/'+job_id)
         channel, message = await report(fri, job)
-        # The controller checks this too; an older one (gene #40) doesn't, so Fri reads the live release itself.
-        status = await fri.api('GET', '/status')
-        if status.get('active_sha') != job['approved_sha']:
-            raise Unreachable('a newer release is live now, so "fixed" might not hold')
-        if (status.get('jobs') or {}).get('deploying'):
-            raise Unreachable('another release is going out right now. tap again once it lands')
+        await live(fri, job)
         postable(fri, channel)
         claimed = await fri.api('POST', f'/requests/{job_id}/requester-notice', scope)
     except Unreachable as exc:
@@ -352,6 +357,7 @@ async def tell(fri, job_id, actor):
         if not isinstance(claimed.get('job'), dict) or any(
                 str(claimed['job'].get(key)) != str(job.get(key)) for key in ('user_id', 'source_url', 'approved_sha')):
             raise Unreachable('their report changed while i looked. tap again')
+        await live(fri, job)
         postable(fri, channel)  # Config or the channel may have changed while the claim was out.
         sending = True
         result = await send_once(fri, {'id': job_id, 'target_id': str(channel.id),
@@ -360,6 +366,8 @@ async def tell(fri, job_id, actor):
         text = f'told them: {message.jump_url}'
     except Unreachable as exc:
         text = f'didn’t send it: {exc}.'
+    except commands.UserFeedbackCheckFailure as exc:  # The controller's answer to the release read; nothing sent.
+        text = notice_text(str(exc))
     except httpx.HTTPStatusError as exc:
         # Discord refused it, so nothing posted and a later tap may try again. A 5xx may have posted.
         state = 'uncertain' if exc.response.status_code >= 500 else 'failed'

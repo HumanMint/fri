@@ -763,3 +763,23 @@ def test_a_pass_still_running_posts_nothing_once_fri_is_paused(world, monkeypatc
         await asyncio.wait_for(fri_fixes.RUNNING[world.agent], 2)
         assert world.sent == []
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['released', 'rolled_back'])
+def test_a_release_landing_while_the_claim_is_out_stops_the_reply(world, change):
+    """An older controller (gene #40) grants a claim a release that landed after Fri's /status read made stale,
+    and a checking one can't see a release that lands after its claim: Fri reads the release again with the claim held."""
+    _, job_id, _ = reported(world)
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        result = await api(method, path, body)
+        if path.endswith('/requester-notice'):
+            released(world.store) if change == 'released' else rolled_back(world.store)
+        return result
+
+    world.fri.api.side_effect = meanwhile
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'newer release' in text
+    with world.store.connection() as db:  # Recorded as refused, so a later tap may try again.
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
