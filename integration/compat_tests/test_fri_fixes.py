@@ -3,6 +3,7 @@
 import asyncio
 import datetime as dt
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -104,6 +105,16 @@ def ship(store, job_id, sha='b'*40):
     assert store.get(job_id)['state'] == 'deployed'
 
 
+def unknown(store):
+    """An owner rollback stopped Red and failed, and putting the fix back never proved healthy either (gene #48):
+    active_sha still names the fix, but nothing says it's what's running."""
+    rollback = store.rollback('123', 'owner')
+    deploying = store.claim_deploy()
+    assert deploying['id'] == rollback['id']
+    store.finish_deploy(deploying['id'], deploying['lease'], False, 'Red did not come back.', runtime_unknown=True)
+    assert store.status()['active_sha'] == 'b'*40 and store.status()['runtime_unknown']
+
+
 def filed(world):
     error = message(GENE)
     world.found[error.id] = error
@@ -170,6 +181,39 @@ def test_nothing_but_a_live_fix_is_announced(world, ending):
         assert job_id in remaining
     else:
         assert remaining == {}
+
+
+def test_no_fixed_line_while_genes_runtime_is_unknown_until_a_maintainer_clears_it(world, tmp_path):
+    from gene.runtime_state import main as runtime_state
+    error, job_id = filed(world)
+    ship(world.store, job_id)
+    unknown(world.store)
+    asyncio.run(check(world.agent))
+    assert not world.sent and job_id in json.loads((world.fri.data/'gene-fixes.json').read_text())  # Still watched.
+    health = tmp_path/'gene-health.json'  # Checked by hand: the fix is what's running after all.
+    health.write_text(json.dumps({'sha': 'b'*40, 'guild_connected': True, 'controls_running': True, 'at': time.time()}))
+    assert runtime_state(['clear', str(world.store.path), '--sha', 'b'*40, '--actor', 'maintainer:test',
+                          '--reason', 'red is up on the fix', '--health', str(health)]) == 0
+    asyncio.run(check(world.agent))
+    [line] = world.sent
+    assert line['reply_to'] == error.id and line['body'] == fri_fixes.fixed_line('b'*40)
+
+
+def test_an_older_controller_without_the_runtime_key_still_gets_its_line(world):
+    error, job_id = filed(world)
+    ship(world.store, job_id)
+    current = world.fri.api.side_effect
+
+    async def older(method, path, body=None):
+        result = await current(method, path, body)
+        if path == '/status':
+            assert 'runtime_unknown' in result
+            result = {k: v for k, v in result.items() if k != 'runtime_unknown'}  # Before gene #64.
+        return result
+    world.fri.api.side_effect = older
+    asyncio.run(check(world.agent))
+    [line] = world.sent
+    assert line['reply_to'] == error.id
 
 
 def test_a_line_discord_did_not_confirm_is_never_repeated(world, monkeypatch):
@@ -250,7 +294,7 @@ def test_a_stalled_discord_read_holds_up_one_heartbeat_stage_and_is_never_cancel
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('change', ['rolled_back', 'proactive_off', 'not_allowed', 'archived'])
+@pytest.mark.parametrize('change', ['rolled_back', 'proactive_off', 'not_allowed', 'archived', 'runtime_unknown'])
 def test_a_change_while_discord_answers_still_stops_the_line(world, change):
     error, job_id = filed(world)
     ship(world.store, job_id)
@@ -267,6 +311,8 @@ def test_a_change_while_discord_answers_still_stops_the_line(world, change):
             world.fri.workshop_id = 1
         if change == 'archived':
             world.room.archived = True
+        if change == 'runtime_unknown':
+            unknown(world.store)
         return error
 
     world.room.fetch_message = AsyncMock(side_effect=meanwhile)

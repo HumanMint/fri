@@ -538,7 +538,10 @@ Fri can't restart anything. It only notices and says so.
   to Gene's message with one dry line, but only while proactive posts are on, the channel is still
   configured and sendable (an archived thread isn't reopened), nobody spoke there in the last
   60 s, and Gene's message still exists. The release and these gates are checked again after
-  Discord returns Gene's message, so a rollback or a config change meanwhile still stops it. A job
+  Discord returns Gene's message, so a rollback or a config change meanwhile still stops it. While
+  the controller reports Gene's runtime as unknown (`runtime_unknown`: a failed restore never proved
+  healthy, so the live release may not be running), the line waits, and goes out if a maintainer or
+  a healthy release makes it known again within the 3 days. An older controller doesn't report it. A job
   that's rejected, failed or needs attention, and one a rollback or newer release beat to it, just
   stop being watched. A hand-off to the owner isn't announced, and neither are failures. The job is
   marked done before the send, so a line Discord didn't confirm is never sent twice. It goes
@@ -554,7 +557,8 @@ Fri can't restart anything. It only notices and says so.
   archive update reaches an uncached copy, and the member is checked last of all. Fri then checks
   the live release itself, and that no other release is going out (an older controller checks
   neither), and claims the controller's mark, which refuses an erased report, a rollback
-  since the repair, any newer release now live, or another release still going out. With the claim
+  since the repair, any newer release now live, or another release still going out (and, from
+  gene #64, an unknown runtime). With the claim
   held it reads the live release again (a newer one, a rollback or one going out frees the claim and
   stops the reply) and fetches a thread it had to fetch once more, then checks the config and channel
   with nothing awaited before the send. Controller data of the wrong
