@@ -12,6 +12,7 @@ PER_CATEGORY = 3
 TTL = 90 * 86400
 PROFILES = 'member-profiles'  # The controller keeps one profile per member across readable channels.
 MOVES = 'memory-moves'  # The controller moves a note into or out of the profile on the member's press.
+SUMMARIES = 'member-summaries'  # The controller keeps Fri's own short summary of each member's readable chats.
 PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_thread)
 
 
@@ -111,8 +112,10 @@ def clip(text, limit):
 
 
 def profiled(fri, scope):
-    """Ask for the member's profile when the controller keeps them; otherwise the request is unchanged."""
-    return {**scope, 'profiles': True} if getattr(fri, 'profiles', False) else scope
+    """Ask for the member's profile (and summary) when the controller keeps them; otherwise the request is unchanged."""
+    if not getattr(fri, 'profiles', False):
+        return scope
+    return {**scope, 'profiles': True, **({'summaries': True} if getattr(fri, 'summaries', False) else {})}
 
 
 def note_place(get_channel, scope, conversation, *, public=False):
@@ -128,11 +131,12 @@ def note_place(get_channel, scope, conversation, *, public=False):
     return 'only in a channel i can’t see anymore' if kind == 'public' else 'only in another private chat'
 
 
-def describe_profile(enabled, groups, private):
+def describe_profile(enabled, groups, private, summary=None):
     """What the member's notes look like from here, grouped by where each one shows.
 
     groups: [(heading, [evidence, ...])], already escaped. Public lists only what this channel can
-    see; a private conversation, seen only by the member, lists everything.
+    see; a private conversation, seen only by the member, lists everything. summary: Fri's own summary,
+    already escaped, in private; in public only that one exists, never its words.
     """
     if not enabled:
         return 'memory’s off, so i’m not keeping anything. say “remember me again” to turn it back on.'
@@ -144,6 +148,10 @@ def describe_profile(enabled, groups, private):
               'except what you’re working on. '
               'DMs, the /fri panel and restricted channels stay where they were said. ask in DMs or /fri for the full list. '
               '“forget me” wipes all of it and turns memory off.')
+    if summary:
+        footer = ('\n\n**what we’ve talked about lately** (my own summary, from channels everyone here can read, '
+                  'gone 30 days after i last update it)\n'+summary if private else
+                  '\n\ni also keep a short summary of what we’ve talked about lately. see it in DMs.')+footer
     if not any(notes for _, notes in groups):
         return ('memory’s on. nothing kept about you yet.' if private else
                 'memory’s on. nothing kept that this channel can see yet.') + footer

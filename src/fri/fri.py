@@ -27,6 +27,7 @@ from .fri_errors import (
 )
 from .fri_memory import (
     PROFILES,
+    SUMMARIES,
     describe_memory,
     describe_profile,
     memory_intent,
@@ -115,6 +116,8 @@ def turn_provenance(context, speaker, actions=None):
     # So can a note: it was learned while other members' words were in view.
     inherited += [item for note in (context.get('personal_memory') or {}).get('notes', [])
                   for item in note.get('provenance', [])]
+    # And Fri's own summary of the member, built from their words, which can repeat someone else's.
+    inherited += (context.get('member_summary') or {}).get('provenance', [])
     for item in inherited:
         add(item['user_id'], item['revision'])
     for row in context.get('recent', []):
@@ -194,6 +197,10 @@ class Fri(discord.Client):
     @property
     def profiles(self):
         return PROFILES in self.capabilities
+
+    @property
+    def summaries(self):
+        return SUMMARIES in self.capabilities and self.profiles
 
     def hear(self, message):
         """Whether everyone could read this message where it was sent, decided once, when Fri first sees it.
@@ -358,8 +365,12 @@ class Fri(discord.Client):
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
+            if context.get('member_summary') and not all(server_wide(self.get_channel(int(origin.split(':', 1)[1])))
+                                                         for origin in context['member_summary']['origins']):
+                context['member_summary'] = None
             if fence:  # Checked again before delivery.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
+                fence['shown'].update((context.get('member_summary') or {}).get('origins', []))
             if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
                 source = context.get('source') or {}
                 asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),
@@ -405,8 +416,9 @@ class Fri(discord.Client):
         # Privacy controls must work while inference is busy or the subscription is down.
         intent = memory_intent(text)
         if intent == 'show' and self.profiles:
-            profile = (await self.api('POST', '/chat/context', profiled(self, scope)))['personal_memory']
-            return ChatResult(reply=await self.memory_overview(scope, profile, visibility == 'private'),
+            context = await self.api('POST', '/chat/context', profiled(self, scope))
+            return ChatResult(reply=await self.memory_overview(scope, context['personal_memory'], visibility == 'private',
+                                                               context.get('member_summary')),
                               status='completed', memory_scope=scope)
         if intent == 'show':
             context = await self.api('POST', '/chat/context', scope)
@@ -446,6 +458,9 @@ class Fri(discord.Client):
                     context['audience'] = ('server' if visibility == 'public' and heard and all(heard) and
                                            server_wide(getattr(event, 'channel', None) or channel) else 'conversation')
                     context['elsewhere'] = self.elsewhere(context.get('elsewhere', []), guild_id)
+                    if self.summaries:  # Fri's own summary of the member: their private chats and readable channels only.
+                        context['member_summary'] = self.member_summary(
+                            context.get('member_summary'), guild_id, visibility == 'private' or context['audience'] == 'server')
                 else:
                     context['elsewhere'] = []
                 conversation = {}
@@ -733,31 +748,47 @@ class Fri(discord.Client):
             if not server_wide(self.get_channel(int(conversation.split(':', 1)[1]))):
                 raise commands.UserFeedbackCheckFailure(CLOSED)
 
+    def readable(self, conversation, guild_id):
+        """The channel of a public conversation in this server, if everyone in it can still read it."""
+        kind, _, channel_id = str(conversation).partition(':')
+        channel = self.get_channel(int(channel_id)) if kind == 'public' and channel_id.isdigit() else None
+        if (channel is None or getattr(getattr(channel, 'guild', None), 'id', None) != int(guild_id)
+                or not server_wide(channel)):
+            return None  # Gone, moved, or restricted since: what was said there stays there.
+        return channel
+
     def elsewhere(self, rows, guild_id):
         """What the member said lately in other channels that everyone in this server can still read."""
         kept = []
         for row in rows:
-            kind, _, channel_id = str(row.get('conversation_id', '')).partition(':')
-            channel = self.get_channel(int(channel_id)) if kind == 'public' and channel_id.isdigit() else None
-            if (channel is None or getattr(getattr(channel, 'guild', None), 'id', None) != int(guild_id)
-                    or not server_wide(channel)):
-                continue  # Gone, moved, or restricted since: it stays where it was said.
-            kept.append({**row, 'channel': '#'+channel.name, 'minutes_ago': max(0, int((time.time()-row['at'])//60))})
+            channel = self.readable(row.get('conversation_id', ''), guild_id)
+            if channel is not None:
+                kept.append({**row, 'channel': '#'+channel.name, 'minutes_ago': max(0, int((time.time()-row['at'])//60))})
         return kept
 
-    async def memory_overview(self, scope, profile, private):
+    def member_summary(self, summary, guild_id, shown):
+        """Fri's own summary of the member where it may show, while every channel it came from is still readable."""
+        if not summary or not shown or not all(self.readable(origin, guild_id) for origin in summary.get('origins', [])):
+            return None
+        return summary
+
+    async def memory_overview(self, scope, profile, private, summary=None):
         """Everything for the member's own eyes in private; in public, only what that channel can see."""
         escape = discord.utils.escape_markdown
         if private:
             state = await self.api('POST', '/chat/memory/notes', profiled(self, scope))
             enabled, rows = state['enabled'], state['entries']
+            summary = escape(state['summary']['text']) if state.get('summary') else None
         else:
             enabled, rows = profile['enabled'], profile['notes']
+            # Its words stay out of a public channel; that it exists may show where it would itself.
+            summary = bool(self.member_summary(summary, scope['guild_id'], self.readable(
+                scope['conversation_id'], scope['guild_id']) is not None))
         groups = {}
         for row in rows:
             where = note_place(self.get_channel, row['scope'], scope['conversation_id'], public=not private)
             groups.setdefault(where, []).append(escape(row['evidence']))
-        return describe_profile(enabled, list(groups.items()), private)
+        return describe_profile(enabled, list(groups.items()), private, summary)
 
     async def resolve_references(self, scope, context):
         """Replace Fri-authored reply targets with the members those replies drew on."""
