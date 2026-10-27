@@ -520,7 +520,8 @@ Fri can't restart anything. It only notices and says so.
   fetches the message as Discord has it now: it must still exist and never have been edited, since
   discord.py updates its cached copy in place. Before a reply has started, a channel message must
   also still be addressed, and an @mention must pass its channel and access checks with Fri
-  enabled. A posted notice counts as Fri's answer to a ping. A notice that
+  enabled, except a privacy control ("forget me", "show my memory"): it goes on with Fri paused, so
+  its notice does too, before or while replying. A posted notice counts as Fri's answer to a ping. A notice that
   fails to post, for any reason, doesn't use up those 5 minutes, and they count from when Discord
   took the notice, not from when Fri started sending it (a slow send under a rate limit would
   otherwise leave a second notice due moments after the first appeared). Ambient chimes stay quiet, and so

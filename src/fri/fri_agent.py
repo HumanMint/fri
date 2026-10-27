@@ -691,8 +691,8 @@ class Agent:
                 gates.append(Invitation(self, event))
         if changed:
             return self.missed(events, 'reply withheld: message changed')
-        for gate in gates:
-            if not await gate.current(check_evidence=False):
+        for gate in gates:  # A privacy control's notice goes on with Fri paused, as the control does (fri #64).
+            if not await gate.current(check_evidence=False, control=since is None):
                 return self.missed(events, f'reply withheld: {gate.refusal}')
         standing = (lambda: self.forgotten.get(message.author.id, 0) == since[0]) if since else None
         if not ambient and await self.unreachable(message, answering=True, standing=standing):
@@ -838,11 +838,12 @@ class Agent:
         if event is not None and event.id > self.controlled.get(user, (0, None))[0]:
             self.controlled[user] = (event.id, action)
 
-    def memory_control(self, message):
-        """Whether a message reads as a memory control (see receive), known before anything awaits."""
+    def memory_control(self, message, intents=MEMORY_CONTROLS):
+        """Whether a message reads as a memory control (see receive), known before anything awaits. `intents`:
+        which ones count; None for any privacy control ("show my memory" too)."""
         content = getattr(message, 'content', None)
         return (isinstance(content, str) and not getattr(message.author, 'bot', False) and
-                any(memory_intent(text) in MEMORY_CONTROLS for text in (
+                any(memory_intent(text) and (intents is None or memory_intent(text) in intents) for text in (
                     clean(content, 4000), addressed_content(content, getattr(self.fri.user, 'id', 0)))))
 
     async def dm_closed(self, user):
@@ -1004,13 +1005,14 @@ class Agent:
 
         discord.py updates its cached copy in place on an edit, so only a fresh fetch can show one."""
         if message.guild and not answering:
+            control = self.memory_control(message, None)  # A privacy control goes on with Fri paused (fri #64).
             if explicit_mention(message, self.fri.user.id):
                 # The checks its invitation passed: channel, access, Fri enabled, still a mention.
                 from .fri_mentions import Invitation
                 if (message.guild.id != self.fri.guild_id or
-                        not await Invitation(self, message).current(check_evidence=False)):
+                        not await Invitation(self, message).current(check_evidence=False, control=control)):
                     return False
-            elif not self.config['enabled']:
+            elif not self.config['enabled'] and not control:
                 return False
         try:
             current = await message.channel.fetch_message(message.id)
