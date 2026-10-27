@@ -379,8 +379,10 @@ class Fri(discord.Client):
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
             drop_unheard(self.get_channel, context)  # Nor a profile note said there (fri #98).
-            if fence:  # Checked again before delivery.
+            if fence:  # Checked again before delivery, with where each profile note shown in public was said.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
+                fence['shown'].update(origin for origin in (context.get('profile_origins') or {}).values()
+                                      if str(origin).startswith('public:') and str(origin)[7:].isdigit())
             if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
                 source = context.get('source') or {}
                 asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),

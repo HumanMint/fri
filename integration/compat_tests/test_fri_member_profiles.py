@@ -1003,3 +1003,27 @@ def test_a_note_the_member_shared_keeps_showing_after_its_channel_closes(monkeyp
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_reply_drawn_from_a_profile_note_is_withheld_if_its_channel_closes_meanwhile(monkeypatch, tmp_path):
+    """Where a profile note shown in public was said joins the delivery fence, like elsewhere rows."""
+    import time
+
+    from gene.fri_memory_store import save
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            with w.store.connection() as db:  # A profile note older than any elsewhere row.
+                assert save(db, '123', 'server', '20', ('music', 'I like private jazz'), time.time(), 'public:1', ())
+            async def respond(text, context):
+                assert context['personal_memory']['notes'][0]['evidence'] == 'I like private jazz'
+                w.readable[GENERAL] = False  # Closed while the model writes.
+                return ChatResult(status='completed', reply='private jazz, obviously')
+            model(w, respond)
+            with pytest.raises(commands.UserFeedbackCheckFailure):
+                await w.say(GAMING, 'fri what should i listen to')
+            assert not any('private jazz' in (turn['reply'] or '') for turn in turns(w))
+        finally:
+            await w.fri.close()
+    run(scenario)
