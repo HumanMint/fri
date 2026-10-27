@@ -100,7 +100,9 @@ coming in; a follow-up window from an earlier reply stays open. A deleted "forge
 isn't carried out: deleting it may be taking it back, and an erasure can't be undone. A reply
 still being composed for a deleted
 message is neither sent nor saved (`message deleted`), and one deleted before the model is
-asked never reaches it. Another member's message deleted before then is left out of what the
+asked never reaches it. Delivery checks again after each of its own waits (an image's last check,
+a reaction's turn): a message it answers, or one the model saw, deleted meanwhile stops it, and
+one deleted while the reply, reaction or card goes out leaves it delivered but unsaved. Another member's message deleted before then is left out of what the
 model sees; deleted after, the reply is withheld (`nearby message deleted`), with the "things
 changed while i was typing" notice when someone addressed Fri; a reaction or quiet decision is
 dropped too, unsaved and without a notice. An edit replaces a member's row
