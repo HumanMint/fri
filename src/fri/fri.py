@@ -429,16 +429,11 @@ class Fri(discord.Client):
             if self.agent and context.get('recent'):
                 context['recent'] = [row for row in context['recent'] if row.get('id') not in self.agent.withdrawn]
             # One this turn quotes or replies to refuses it instead: the answer would be about words taken back.
-            # So does one the turn itself answers: its own message, or one of its burst. A post it replies to that
-            # was withdrawn before the turn read it is shown as it is now, so that one stands.
-            if self.agent:
-                withdrawn, since = self.agent.withdrawn, (fence or {}).get('targets_read', float('-inf'))
-                if (any(str(row.get('source', {}).get('id')) in withdrawn for row in
-                        context.get('invited_context', []) + context.get('message_burst', []) +
-                        ([fence['turn']] if fence and 'turn' in fence else [])) or
-                        any(withdrawn.get(str(row.get('source', {}).get('id')), float('-inf')) >= since
-                            for row in context.get('reply_target', []))):
-                    raise commands.UserFeedbackCheckFailure(WITHDRAWN)
+            # So does one the turn itself answers: its own message, or one of its burst.
+            if self.agent and any(str(row.get('source', {}).get('id')) in self.agent.withdrawn for row in
+                                  context.get('reply_target', []) + context.get('invited_context', []) +
+                                  context.get('message_burst', []) + ([fence['turn']] if fence and 'turn' in fence else [])):
+                raise commands.UserFeedbackCheckFailure(WITHDRAWN)
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
@@ -570,7 +565,6 @@ class Fri(discord.Client):
                 else:
                     context['elsewhere'] = []
                 conversation, targets = {}, []
-                targets_read = time.time()  # A reply target withdrawn before this is read as it is now (see chat_once).
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence
                     try:
@@ -720,7 +714,7 @@ class Fri(discord.Client):
                 context['fence'] = {'turn': {**scope, 'revision': context['revision'], 'source': source.model_dump(),
                                              'input': text, 'reply': '', 'model': context['model'],
                                              'effort': context['effort']},
-                                    'actions': actions, 'shown': set(), 'targets_read': targets_read}
+                                    'actions': actions, 'shown': set()}
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
                     async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
                         if closed := await self.agent.dm_closed(user_id):
