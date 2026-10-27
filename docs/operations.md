@@ -77,21 +77,26 @@ A message to Fri waits 1.5 s for the rest of a burst before Fri answers. A messa
 Fri's name or a hello ("fri", "yo fri", "fri?", a bare ping) waits up to 8 s instead, because the
 question usually comes next, and in a channel that next message gets in without "fri". If it comes
 within the 5 s burst span, one reply answers both. If it comes later, it is answered on its own with
-the bare line in Fri's view, and a bare ping is logged as `rest came separately`. A reply to another
-message, or one with an image or sticker, doesn't wait.
+the bare line in Fri's view, and a bare ping is logged as `rest came separately`. One sent within
+the 8 s whose checks end after them still gets in, answered after Fri's reply to the bare line: a
+follow-up window counts as of when the message came in. A reply to another message, or one with an
+image or sticker, doesn't wait.
 
 Fri shows typing only once words are coming: for a message addressed to it (its name, a ping, a
 reply to Fri, a DM), once the turn is admitted, so never before a cooldown, a privacy or music
 control, or the local closing reaction; for anything else (a follow-up without "fri", ambient
 attention), only once an action starts. A refused typing request never stops the reply. An ambient
 reply is dropped, unsaid and unsaved (`room moved on`), if anyone other than the member it answers
-spoke in the channel while Fri composed, or the channel can't be read to check.
+spoke in the channel while Fri composed, or the channel can't be read to check. Fri reads the next
+20 messages for that; when all 20 are bot posts or the member's own, it counts as moved on too.
 
 Fri's live view of a configured channel is its last 15 minutes (at most 30 messages). A deleted
 message leaves it, and so does a reply of Fri's that someone deletes. Gene's error posts stay until
 they expire, so a quick delete can't hide one from the repair investigation. A deleted message
 also leaves a burst that is still gathering, and the burst's last message answers for the rest; if
-the last one is deleted, the whole burst is dropped. A deleted "forget me" or other privacy control
+the last one is deleted, the whole burst is dropped. A bare "fri" deleted during its 8 s wait stops
+letting the member's next message in without "fri"; a follow-up window from an earlier reply stays
+open. A deleted "forget me" or other privacy control
 isn't carried out: deleting it may be taking it back, and an erasure can't be undone. A reply
 still being composed for a deleted
 message is neither sent nor saved (`message deleted`), and one deleted before the model is
@@ -695,6 +700,13 @@ learning, attention, gene fixes, memes, reply checks, member summaries) runs on 
 the stage and exception class only, and never skips the stages after it. `fri-health.json` keeps
 `agent_heartbeat.running/failed/status` for the release coordinator and adds
 `agent_heartbeat.stages`, one `{at, last_ok, error}` entry per enabled stage.
+
+Attention waits up to 5 s on its own Discord work, then moves on and never cancels it, since
+discord.py can't recover from a cancel inside its global rate-limit wait. That covers an ambient
+reply (reading its pick, the reply itself) and, before an automatic repair, the read of Gene's error.
+An ambient reply still going holds back its channel's next attention pass until it finishes. A
+Gene error whose read is still going is filed for the owner's review instead of as an automatic
+repair.
 
 A usage receipt the controller refuses as invalid (HTTP 400 or 422), or one that
 can't be parsed, moves to `usage/rejected/` and stops blocking later receipts.

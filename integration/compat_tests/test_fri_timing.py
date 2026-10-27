@@ -2,10 +2,12 @@
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import aiohttp
 import discord
 import pytest
 
@@ -146,7 +148,8 @@ def history_of(channel, rows):
     channel.history = history
 
 
-@pytest.mark.parametrize('later', [None, 'same author', 'bot', 'someone else', 'unreadable'])
+@pytest.mark.parametrize('later', [None, 'same author', 'bot', 'someone else', 'someone else after 20 bot posts',
+                                   'unreadable', 'disconnected'])
 def test_an_ambient_reply_is_dropped_once_someone_else_spoke(monkeypatch, tmp_path, later):
     async def scenario():
         fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
@@ -162,12 +165,18 @@ def test_an_ambient_reply_is_dropped_once_someone_else_spoke(monkeypatch, tmp_pa
                 message('[Gene] now playing', user=55).author.bot = True
             elif later == 'someone else':
                 message('yeah it is down, give it a minute', user=21)
-            elif later == 'unreadable':
+            elif later == 'someone else after 20 bot posts':
+                for _ in range(20):
+                    message('[Gene] now playing', user=55).author.bot = True
+                message('yeah it is down, give it a minute', user=21)
+            elif later in ('unreadable', 'disconnected'):
                 channel.history = None  # Calling it fails like a refused read.
             return ChatResult(status='completed', reply='yeah, it went down a minute ago')
         fri.chat_once.side_effect = answer
-        if later == 'unreadable':
+        if later in ('unreadable', 'disconnected'):
             async def refused(*args, **kwargs):
+                if later == 'disconnected':  # The connection dropped: no HTTP status at all.
+                    raise aiohttp.ClientConnectionError('connection reset')
                 raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'no')
                 yield
             original = answer
@@ -179,7 +188,7 @@ def test_an_ambient_reply_is_dropped_once_someone_else_spoke(monkeypatch, tmp_pa
         try:
             await asyncio.wait_for(agent.respond(picked, picked.content, ambient=True), 5)
             assert log == ['model']  # No typing for a turn nobody asked for.
-            if later in ('someone else', 'unreadable'):
+            if later in ('someone else', 'someone else after 20 bot posts', 'unreadable', 'disconnected'):
                 picked.reply.assert_not_awaited()  # Someone answered first, or it can't tell: stays quiet.
                 assert not store.chat_context('123', 'public:1', '20')['turns']
             else:
@@ -248,6 +257,69 @@ def test_a_question_after_the_burst_span_is_answered_on_its_own(monkeypatch, tmp
             bare.reply.assert_not_awaited()
             assert f'Mention 1/{bare.id} not answered: rest came separately' in caplog.messages
             assert log == ['typing', 'model', 'stopped']
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_question_sent_inside_the_wait_is_answered_when_its_checks_finish_after_it(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        rest(monkeypatch, 1)
+        bare = message('<@99>')
+        question = message('is the end portal under spawn')  # No "fri" in it, sent 0.5 s into the 1 s wait.
+        seen = []
+        async def answer(text, context):
+            seen.append(context.get('message', text))
+            if len(seen) == 1:
+                await asyncio.sleep(1.5)  # Still writing the bare ping's reply when the question's checks end.
+            return ChatResult(status='completed', reply='under spawn. obviously')
+        fri.chat_once.side_effect = answer
+        incoming = agent.incoming
+        async def held(event, *args, **kwargs):  # The question's profile read is held past the deadline.
+            if event is question:
+                await asyncio.sleep(1.1)
+            return await incoming(event, *args, **kwargs)
+        agent.incoming = held
+        tasks = [asyncio.create_task(agent.handle(bare))]
+        try:
+            await asyncio.sleep(0.5)
+            tasks.append(asyncio.create_task(agent.handle(question)))
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            question.reply.assert_awaited_once()  # Sent in time: answered, not dropped as unaddressed.
+            assert fri.chat_once.await_count == 2
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('window', [None, 'an earlier reply'])
+def test_deleting_a_bare_ping_ends_the_window_it_opened(monkeypatch, tmp_path, window):
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        rest(monkeypatch, 2)
+        if window:  # Still open from a reply before the ping: deleting the ping leaves it alone.
+            agent.active[(1, 20)] = time.time()+120
+        bare = message('<@99>')
+        sentence = message('is the end portal under spawn')  # No "fri" in it.
+        tasks = [asyncio.create_task(agent.handle(bare))]
+        try:
+            async with asyncio.timeout(2):
+                while (1, 20) not in agent.summons:
+                    await asyncio.sleep(0)
+            del rows[bare.id]
+            await fri.on_raw_message_delete(SimpleNamespace(channel_id=1, message_id=bare.id))
+            tasks.append(asyncio.create_task(agent.handle(sentence)))
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            bare.reply.assert_not_awaited()
+            if window:
+                sentence.reply.assert_awaited_once()
+            else:  # Taken back: the next unaddressed line isn't answered through it.
+                fri.chat_once.assert_not_awaited()
+                sentence.reply.assert_not_awaited()
+                assert (1, 20) not in agent.summons and agent.active.get((1, 20), 0) <= time.time()
         finally:
             await asyncio.gather(*tasks, return_exceptions=True)
             await fri.close()
