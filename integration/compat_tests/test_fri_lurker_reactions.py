@@ -559,3 +559,52 @@ def test_laughter_takes_no_time_on_long_near_laughs_and_matches_the_same_laughs(
         stripped = text.replace('️', '').strip()
         expected = 0 < len(stripped) <= 40 and OLD_LAUGHTER.fullmatch(stripped) is not None
         assert laughter(text) == expected, repr(text)
+
+
+@pytest.mark.parametrize('change', ['delete', 'forget', 'edit', 'optout'])
+def test_context_withdrawn_during_the_last_looks_reads_never_reaches_the_model(chat, monkeypatch, change):
+    """The last look's Discord fetch comes first and its live-view check last, so a change while it reads still counts."""
+    async def scenario():
+        h = chat
+        analyze = model(h, monkeypatch)
+        line = await h.bit()
+        await h.say(101, 30, 'lol')
+        old_text = next(r for r in h.agent.recent[3] if r['id'] == '94')['text']
+        changed, observed = [], []
+        checked = h.agent.unwithdrawn
+
+        def withdraw():
+            if change == 'delete':
+                h.agent.unsend(3, [94])
+            elif change == 'forget':
+                h.agent.forget(14)
+            elif change == 'edit':
+                message = next(m for m in h.rows if m.id == 94)
+                message.content = 'I take that back'
+                message.edited_at = dt.datetime.fromtimestamp(h.clock[0], dt.timezone.utc)
+                h.agent.edit(3, message)
+            else:
+                h.store.personal_control('14', 'disable')
+            changed.append(True)
+
+        async def fetch(mid):  # Discord's HTTP read yields; a withdrawal can land meanwhile.
+            await asyncio.sleep(0)
+            return next(m for m in h.rows if m.id == mid)
+
+        async def last_check(*args):
+            allowed = await checked(*args)
+            asyncio.get_running_loop().call_soon(withdraw)  # Lands right after the privacy read.
+            return allowed
+
+        def infer(*args, **kwargs):
+            observed.append((bool(changed), any(r['text'] == old_text for r in args[2]['preceding_lines'])))
+            return {'reaction': 'quiet', 'confidence': 'high', 'observation': ''}, {}, 'completed'
+
+        h.agent.unwithdrawn = last_check
+        h.channel.fetch_message.side_effect = fetch
+        analyze.side_effect = infer
+        await h.say(102, 31, 'lmao')
+        await settled(h)
+        line.add_reaction.assert_not_awaited()
+        assert not any(withdrawn and sent for withdrawn, sent in observed)
+    asyncio.run(scenario())

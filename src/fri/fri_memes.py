@@ -275,16 +275,17 @@ class Memes:
             too, is still in Fri's live view as it was, from authors who still allow it at that revision (a
             forget or delete takes their rows out of the view), and a reaction could still follow."""
             try:  # The controller or Discord down here means no model call, and a receipt that says so.
+                # The whole line first, not the live view's first 500 characters: an edit past them counts too.
+                current = await channel.fetch_message(int(post_id))
+                if current.edited_at is not None or current.content != message.content:
+                    return True
                 if not await self.agent.unwithdrawn(channel_id, shown):
                     return True
+                # Last, with nothing awaited after it: a delete, edit or forget during the reads above shows here.
                 live = {row['id']: row for row in self.agent.recent.get(channel_id, ())}
                 with self.state(write=False) as state:
-                    if (full(state, self.agent.config, time.time()) or
-                            any(live[row['id']]['text'] != row['text'] for row in shown)):
-                        return True
-                # The whole line, not the live view's first 500 characters: an edit past them counts too.
-                current = await channel.fetch_message(int(post_id))
-                return current.edited_at is not None or current.content != message.content
+                    return (full(state, self.agent.config, time.time()) or
+                            any(row['id'] not in live or live[row['id']]['text'] != row['text'] for row in shown))
             except (ControllerUnavailable, ControllerRejected, discord.HTTPException):
                 return True
 
