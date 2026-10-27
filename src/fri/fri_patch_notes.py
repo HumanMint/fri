@@ -2,7 +2,7 @@
 
     docker exec -i fri-runtime-1 python -m fri.fri_patch_notes draft 0.7.0 < facts.md > notes.md
     python -m fri.fri_patch_notes preview 0.7.0 < notes.md
-    docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 --channel fri-chat < notes.md
+    docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 --channel fri-chat < notes.md   # + changelog
     docker exec -i fri-runtime-1 python -m fri.fri_patch_notes pin 0.7.0 --channel fri-chat   # the pin alone
     docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md   # the owner's DM
 
@@ -13,7 +13,8 @@ Each version reaches each place once: every part has a fixed nonce, FRI_DATA/pat
 or patch-notes-server.json (the channel) lists the parts Discord confirmed, and a part whose send was
 attempted but never confirmed is looked for there, after the newest message from before that attempt
 (kept under `anchors`), before it is sent again.
-A channel post is then pinned there: its first part, the one a member finds in the channel's pins. The
+A channel post is one message: a short summary, with the full changelog attached as fri-<version>-changelog.md
+(the notes file holds the summary, a `<!-- changelog -->` line, then the changelog). It is then pinned there. The
 record keeps the pinned message's id, so a rerun after a failed pin only pins, never posts again, and
 `pin` pins a version already posted from the record alone. Fri never unpins or removes anything.
 Exit codes: 0 sent (or already sent) and, in a channel, pinned; 2 refused (fix the notes or the record);
@@ -25,6 +26,7 @@ import asyncio
 import datetime as dt
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -40,6 +42,8 @@ from .private_files import private_json
 
 LIMIT = 2000  # Discord's message length, in UTF-16 units.
 MAX_PARTS = 4
+CHANGELOG_MARK = '<!-- changelog -->'  # A line of its own: the summary above it, the attached changelog below.
+CHANGELOG_LIMIT = 512 * 1024  # bytes; far under Discord's attachment limit
 EARLIEST = 1767225600  # 2026-01-01 UTC. No real attempt is older; an older attempt time is damage.
 VERSION = re.compile(r'(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})')
 ID = re.compile(r'[1-9]\d{0,19}')  # A Discord snowflake.
@@ -84,6 +88,26 @@ def parts(text):
     if len(chunks) > MAX_PARTS:
         raise NotesRefused(f'the notes need {len(chunks)} messages; at most {MAX_PARTS} are sent')
     return chunks
+
+
+def split_changelog(text):
+    """The post's text and the full changelog attached to it, split at a `<!-- changelog -->` line (None without one)."""
+    lines = text.replace('\r\n', '\n').split('\n')
+    marks = [i for i, line in enumerate(lines) if line.strip() == CHANGELOG_MARK]
+    if not marks:
+        return text, None
+    if len(marks) > 1:
+        raise NotesRefused(f'the notes have {len(marks)} {CHANGELOG_MARK} lines; need one')
+    changelog = '\n'.join(lines[marks[0]+1:]).strip()
+    if not changelog:
+        raise NotesRefused('the changelog after the mark is empty')
+    if len(changelog.encode()) > CHANGELOG_LIMIT:
+        raise NotesRefused(f'the changelog is over {CHANGELOG_LIMIT // 1024} KiB')
+    return '\n'.join(lines[:marks[0]]), changelog + '\n'
+
+
+def changelog_name(version):
+    return f'fri-{version}-changelog.md'
 
 
 def nonce(version, digest, index, place=''):
@@ -137,7 +161,10 @@ def entry_ok(entry):
     pinned = 'pinned' not in entry or (set(stages) == {2} and entry['pinned'] == states[0]['message_id'])
     trimmed = 'trimmed' not in entry or (isinstance(entry['trimmed'], list) and len(entry['trimmed']) == len(states) and
                                          all(isinstance(h, str) and HASH.fullmatch(h) for h in entry['trimmed']))
-    return stages == sorted(stages, reverse=True) and stages.count(1) <= 1 and stages[0] > 0 and pinned and trimmed
+    changelog = 'changelog' not in entry or (isinstance(entry['changelog'], str) and HASH.fullmatch(entry['changelog'])
+                                             and len(states) == 1)
+    return (stages == sorted(stages, reverse=True) and stages.count(1) <= 1 and stages[0] > 0 and pinned and trimmed
+            and changelog)
 
 
 def sent_ids(state):
@@ -216,13 +243,14 @@ def set_anchor(state, version, index, mark):
         del state['anchors'][version]
 
 
-async def landed(dm, me, chunk, after, taken):
+async def landed(dm, me, chunk, after, taken, attachment=None):
     """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
     Every message after `after` is read (the whole DM if it was empty). Only Fri's own messages with
     exactly this text count (Discord trims the ends it stores), and never one the record already gives a
     part: Discord keeps no nonce in history, so that is what tells identical parts and releases apart."""
     async for message in dm.history(limit=None, after=after, oldest_first=True):
-        if message.author.id == me and message.content.strip() == chunk.strip() and str(message.id) not in taken:
+        if message.author.id == me and message.content.strip() == chunk.strip() and str(message.id) not in taken and (
+                attachment is None or any(getattr(a, 'filename', None) == attachment for a in getattr(message, 'attachments', []))):
             return message
     return None
 
@@ -290,17 +318,30 @@ async def pin_posted(version, *, token, data, guild_id, channel, out=print):
 
 
 async def send(version, text, *, token, owner_id, data, out=print, guild_id=None, channel=None):
+    text, changelog = split_changelog(text)
     chunks = parts(text)
-    digest = hashlib.sha256(json.dumps(chunks).encode()).hexdigest()  # The split, not just the text.
+    if changelog is not None and channel is None:
+        raise NotesRefused('a changelog goes with a channel post; the owner\'s DM gets the note alone')
+    if changelog is not None and len(chunks) != 1:
+        raise NotesRefused(f'a channel post is one message, and this summary needs {len(chunks)}; shorten it '
+                           f'(the full changelog is attached)')
+    # The split, not just the text; and with a changelog, the changelog too (its file is part of the post).
+    digest = hashlib.sha256(json.dumps(chunks if changelog is None else
+                                       {'parts': chunks, 'changelog': text_hash(changelog)}).encode()).hexdigest()
     hashes = [text_hash(chunk) for chunk in chunks]
+    attachment = None if changelog is None else changelog_name(version)
     path = data / ('patch-notes.json' if channel is None else 'patch-notes-server.json')
     with locked(data):
         state = load(path)
         entry = state['versions'].get(version)
         if entry and (entry['sha256'] != digest or len(entry['parts']) != len(chunks)):
             raise NotesRefused(f'{version} was already sent with different notes; use a new version')
+        if entry is None and channel is not None and changelog is None:
+            raise NotesRefused(f'a channel post attaches its full changelog: add a {CHANGELOG_MARK} line, then the changelog')
         if entry is None:
             entry = state['versions'][version] = {'sha256': digest, 'parts': [{} for _ in chunks]}
+            if changelog is not None:
+                entry['changelog'] = text_hash(changelog)
         if any(part.get('sha256', h) != h for part, h in zip(entry['parts'], hashes)):
             raise NotesRefused(f'{path.name} is not a patch-notes record')
         posted = all(part.get('message_id') for part in entry['parts'])
@@ -344,7 +385,7 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
                     continue
                 taken = set(sent_ids(state))
                 start = 'attempted_at' in part and search_from(state, version, index, part)
-                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, start, taken)
+                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, start, taken, attachment)
                 if not message:
                     attempted_at = time.time()
                     mark = await anchor(dm, attempted_at)
@@ -353,8 +394,10 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
                     set_anchor(state, version, index, mark)
                     part.update(attempted_at=attempted_at, sha256=hashes[index - 1])
                     private_json(path, state)
+                    extra = {} if changelog is None else {
+                        'file': discord.File(io.BytesIO(changelog.encode()), filename=attachment)}
                     message = await dm.send(chunk, nonce=nonce(version, digest, index, '' if channel is None else f'#{dm.id}'),
-                                            allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+                                            allowed_mentions=NO_MENTIONS, suppress_embeds=True, **extra)
                     if str(message.id) in taken:
                         raise NotesRefused(f'Discord answered part {index} with message {message.id}, which '
                                            f'{path.name} already gives another part')
@@ -379,9 +422,9 @@ everyone there. Talk to the server, not to one person. The owner is mint, or bos
 the third person if at all ("mint finally shipped it"). Use only the facts given: never invent a
 feature, fix, number, date or name, and leave out anything members wouldn't notice. Plain words a
 member gets: no PR numbers, file names, or words like controller, heartbeat, pin or release script.
-Shape: one version line, then **added** and **fixed** as short "- " lists (group small fixes into one
-line), then one **next** line. Keep it brief: under 1200 characters, or under 2500 when the facts say
-it's the first patch notes the server has seen. Same voice as always: lowercase, deadpan, a jab or two,
+It goes out as one Discord message, with the full changelog attached as a file below it, so this is the
+short version: one version line, then the few **added** and **fixed** things members would notice most
+as short "- " lists (group small fixes into one line), then one **next** line. Under 1500 characters. Same voice as always: lowercase, deadpan, a jab or two,
 no exclamation marks, no hype, never cheerful or salesy, no em dashes, few emojis.
 Return the whole post as Discord text in `notes`.'''
 
@@ -397,10 +440,11 @@ async def draft(version, facts, *, chat, model, effort, voice_notes=''):
 
 
 def drafted(text, status):
-    """A draft that came back whole and would send as it is."""
+    """A draft that came back whole and would send as it is: one message."""
     if status != 'completed' or not text:
         raise SendFailed(f'the draft came back {status}')
-    parts(text)  # Refused here if it wouldn't send.
+    if len(parts(text)) != 1:  # Refused here if it wouldn't send.
+        raise NotesRefused('the draft needs more than one message; ask for it again, shorter')
     return text
 
 
@@ -459,8 +503,12 @@ def main(argv=None):
         except UnicodeDecodeError:
             raise NotesRefused('the notes are not UTF-8') from None
         if args.command == 'preview':
-            for index, chunk in enumerate(parts(text), 1):
+            summary, changelog = split_changelog(text)
+            for index, chunk in enumerate(parts(summary), 1):
                 print(f'--- part {index} ({length(chunk)} chars)\n{chunk}')
+            if changelog is not None:
+                print(f'--- attached {changelog_name(args.version)} ({len(changelog.encode())} bytes, '
+                      f'{changelog.count(chr(10))} lines)\n{changelog}', end='')
             return 0
         if args.command == 'draft':
             if not text.strip():
