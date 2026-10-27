@@ -12,6 +12,7 @@ from fri import fri_patch_notes as notes
 
 OWNER = 4242
 BOT = 99
+GUILD = 123
 
 
 class FakeDM:
@@ -76,6 +77,12 @@ class FakeClient:
             return FakeClient.dm
         return types.SimpleNamespace(id=user_id, create_dm=create_dm)
 
+    async def fetch_guild(self, guild_id):
+        assert guild_id == GUILD
+        async def fetch_channels():
+            return FakeClient.channels
+        return types.SimpleNamespace(id=guild_id, fetch_channels=fetch_channels)
+
     async def close(self):
         self.closed = True
 
@@ -85,6 +92,7 @@ def dm(monkeypatch):
     FakeClient.instances = []
     FakeClient.dm = FakeDM()
     FakeClient.login_error = None
+    FakeClient.channels = []
     monkeypatch.setattr(notes.discord, 'Client', FakeClient)
     return FakeClient.dm
 
@@ -531,3 +539,118 @@ def test_cli_reports_a_refusal_with_exit_code_2(monkeypatch, capsys, tmp_path, d
     assert notes.main(['send', '0.4.0']) == 0
     assert dm.sends[0]['content'] == '**fri 0.4.0**'
     assert 'secret-token' not in capsys.readouterr().out
+
+
+def channel(name, kind=discord.ChannelType.text, id=888):
+    room = FakeDM()
+    room.id, room.name, room.type = id, name, kind
+    return room
+
+
+def post(text, tmp_path, version='0.7.0', name='fri-chat'):
+    lines = []
+    asyncio.run(notes.send(version, text, token='secret-token', owner_id=OWNER, data=tmp_path, out=lines.append,
+                           guild_id=GUILD, channel=name))
+    return lines
+
+
+def test_a_channel_post_goes_to_the_named_text_channel_once(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [channel('fri-chat', discord.ChannelType.voice, 1), channel('general', id=2), chat]
+    post('fri 0.7.0\n\n**added**\n- things', tmp_path)
+    assert [m.content for m in chat.messages] == ['fri 0.7.0\n\n**added**\n- things'] and not dm.messages
+    assert chat.sends[0]['mentions'] == notes.NO_MENTIONS
+    assert json.loads((tmp_path/'patch-notes-server.json').read_text())['versions']['0.7.0']['parts'][0]['channel_id'] == '888'
+    assert not (tmp_path/'patch-notes.json').exists()
+    assert post('fri 0.7.0\n\n**added**\n- things', tmp_path) == ['0.7.0: all 1 parts were already sent']
+    assert len(chat.sends) == 1
+
+
+def test_the_owners_dm_and_the_channel_each_get_a_version_once(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    run('fri 0.7.0', tmp_path, version='0.7.0')
+    post('fri 0.7.0, for everyone', tmp_path)
+    assert [m.content for m in dm.messages] == ['fri 0.7.0']
+    assert [m.content for m in chat.messages] == ['fri 0.7.0, for everyone']
+
+
+@pytest.mark.parametrize('rooms', [[], ['fri-chat', 'fri-chat']])
+def test_a_channel_post_needs_exactly_one_text_channel_with_the_name(dm, tmp_path, rooms):
+    FakeClient.channels = [channel(name, id=i+1) for i, name in enumerate(rooms)]
+    with pytest.raises(notes.NotesRefused, match='text channels named #fri-chat'):
+        post('fri 0.7.0', tmp_path)
+    assert not any(room.sends for room in FakeClient.channels)
+
+
+def test_fri_drafts_the_post_for_the_server_from_the_facts_only(monkeypatch):
+    seen = {}
+
+    async def analyze(chat, instruction, data, model, effort, schema):
+        seen.update(instruction=instruction, data=data, model=model, effort=effort, schema=schema)
+        return {'notes': '  fri 0.7.0\n\n**added**\n- replies come faster  '}, {'input_tokens': 9}, 'completed'
+    monkeypatch.setattr('fri.fri_agent_model.analyze', analyze)
+    text, counters, status = asyncio.run(notes.draft('0.7.0', '- faster replies to pings', chat=None,
+                                                     model='m', effort='e', voice_notes='less sass on mondays'))
+    assert (text, counters, status) == ('fri 0.7.0\n\n**added**\n- replies come faster', {'input_tokens': 9}, 'completed')
+    assert seen['data'] == {'version': '0.7.0', 'facts': '- faster replies to pings'}
+    assert seen['instruction'].startswith(notes_voice()) and 'less sass on mondays' in seen['instruction']
+    for words in ('#fri-chat', 'Talk to the server', 'mint, or bossman', 'Use only the facts given'):
+        assert words in seen['instruction']
+    assert seen['schema'] == notes.DRAFT and (seen['model'], seen['effort']) == ('m', 'e')
+
+
+def notes_voice():
+    from fri.fri_chat import VOICE
+    return VOICE
+
+
+def test_a_draft_that_failed_or_wont_send_is_refused():
+    assert notes.drafted('fri 0.7.0', 'completed') == 'fri 0.7.0'
+    with pytest.raises(notes.SendFailed):
+        notes.drafted('', 'completed')
+    with pytest.raises(notes.SendFailed):
+        notes.drafted('fri 0.7.0', 'incomplete')
+    with pytest.raises(notes.NotesRefused):
+        notes.drafted('x' * 2001, 'completed')
+
+
+@pytest.mark.parametrize('argv', [['preview', '0.7.0', '--channel', 'fri-chat'], ['send', '0.7.0', '--channel', '#fri chat']])
+def test_channel_is_a_plain_name_and_only_for_send(argv):
+    with pytest.raises(SystemExit) as raised:
+        notes.main(argv)
+    assert raised.value.code == 2
+
+
+def test_a_channel_posts_nonces_differ_from_the_dms_for_the_same_text(dm, tmp_path):
+    """Discord dedupes nonces per author, so the same version and text in the DM must not confirm the channel."""
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    run('fri 0.7.0', tmp_path, version='0.7.0')
+    post('fri 0.7.0', tmp_path)
+    assert dm.sends[0]['nonce'] == notes.nonce('0.7.0', notes.hashlib.sha256(json.dumps(['fri 0.7.0']).encode()).hexdigest(), 1)
+    assert chat.sends[0]['nonce'] != dm.sends[0]['nonce']
+
+
+def test_a_drafts_usage_survives_a_failed_report(monkeypatch, tmp_path):
+    import httpx
+
+    async def analyze(*args, **kwargs):
+        return {'notes': 'fri 0.7.0'}, {'input_tokens': 9}, 'completed'
+    monkeypatch.setattr('fri.fri_agent_model.analyze', analyze)
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    monkeypatch.setenv('GENE_FRI_TOKEN', 'synthetic')
+    monkeypatch.setattr('fri.subscription.Subscription', lambda path: None)
+
+    def controller(request):
+        if request.url.path == '/status':
+            return httpx.Response(200, json={'chat_model': 'm', 'chat_effort': 'e'})
+        if request.url.path == '/agent/state':
+            return httpx.Response(200, json={'config': {'voice_notes': ''}})
+        raise httpx.ConnectError('controller went away')
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: real(transport=httpx.MockTransport(controller), **kw))
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(notes.draft_from_controller('0.7.0', '- facts'))
+    [receipt] = (tmp_path/'usage').iterdir()
+    assert json.loads(receipt.read_text())['counters'] == {'input_tokens': 9}
