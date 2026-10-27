@@ -106,7 +106,7 @@ one deleted while the reply, reaction or card goes out leaves it delivered but u
 model sees; deleted after, the reply is withheld (`nearby message deleted`), with the "things
 changed while i was typing" notice when someone addressed Fri; a reaction or quiet decision is
 dropped too, unsaved and without a notice. An edit replaces a member's row
-with the edited text; an edit Discord sends without its author drops the row. An edit to a member's
+with the edited text and what the post still carries (an image edited out leaves the row's kinds too); an edit Discord sends without its author drops the row. An edit to a member's
 message Fri is still handling (still coming in, or being answered) withdraws it instead: it leaves,
 or never enters, the view, and a reply to it that hasn't reached the model yet is refused. Fri's and Gene's
 rows, bursts and the reply fences keep comparing against what arrived. Fri's own reply to a
