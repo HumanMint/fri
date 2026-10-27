@@ -377,8 +377,8 @@ Calls whose result can't change what members see are skipped before inference.
   it that isn't a laugh too, within the next 8 messages in Fri's live view and 10 minutes. A laughing
   reply counts for the line it replies to, anywhere in those 10 minutes. The author's own laughs,
   bots, webhooks and members with memory off don't count, and a laugher who changes their privacy
-  before the check is taken back out. The second laugh starts the check right away, in the
-  background. The line is judged as a meme post is: same model, quiet by default, same fences on its
+  or leaves the server before the check is taken back out. The second laugh starts the check right
+  away, in the background. The line is judged as a meme post is: same model, quiet by default, same fences on its
   author, edits and deletes, receipts and kept notes. The model also gets up to 5 lines before it from
   Fri's privacy-fenced live view as untrusted context, but not who laughed. These checks share the
   daily check and reaction budgets and the hourly gap between reactions. Unlike a meme check, one

@@ -111,7 +111,7 @@ def test_laughs_in_other_words_or_a_laughing_reply_from_further_down_count(chat,
 
 
 @pytest.mark.parametrize('case', ['one', 'same_member', 'author', 'bot', 'webhook', 'opted_out', 'opted_out_since',
-                                  'other_reply', 'too_far', 'too_late', 'not_laughter'])
+                                  'left_server', 'other_reply', 'too_far', 'too_late', 'not_laughter'])
 def test_laughs_that_dont_count_start_nothing(chat, case):
     async def scenario():
         h = chat
@@ -130,6 +130,9 @@ def test_laughs_that_dont_count_start_nothing(chat, case):
             await h.say(102, 31, 'lmao')
         elif case == 'opted_out_since':  # Their laugh is still in Fri's live view, but no longer theirs to give.
             h.store.personal_control('30', 'disable')
+            await h.say(102, 31, 'lmao')
+        elif case == 'left_server':
+            h.agent.member.side_effect = lambda user, **_: None if user == 31 else object()
             await h.say(102, 31, 'lmao')
         elif case == 'other_reply':  # Laughing at another line.
             await h.say(102, 31, 'lmao', reference=reply_to(93))

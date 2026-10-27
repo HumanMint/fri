@@ -208,8 +208,9 @@ class Memes:
                         'name': clean(channel.name, 60), 'last_check': now, 'status': 'check_failed'}
 
     def heard(self, message):
-        """A member's message just joined Fri's live view. In a chat meme channel, the laugh that makes it two
-        other members laughing at a line starts that line's check now, not on the next meme check."""
+        """A member's message just joined Fri's live view. In a chat meme channel, a laugh from a new member
+        that makes it two or more other members laughing at a line starts that line's check now, not on the
+        next meme check. A line already judged is skipped there (see lurk)."""
         config, channel = self.agent.config, message.channel.id
         if not config['enabled'] or not config['meme_enabled'] or not self.chat(channel):
             return
@@ -224,9 +225,10 @@ class Memes:
             self.replies[str(message.id)] = (str(target), now)
         replies = {key: value[0] for key, value in self.replies.items()}
         post = laughed_at(rows, replies, at)
-        if (post is None or not said(rows[post]) or rows[post]['id'] in self.lurking or
-                len(laughers(rows[:at], replies, post)) >= LAUGHERS or
-                len(laughers(rows[:at+1], replies, post)) < LAUGHERS):
+        if post is None or not said(rows[post]) or rows[post]['id'] in self.lurking:
+            return
+        who = laughers(rows[:at+1], replies, post)
+        if rows[at]['user_id'] in laughers(rows[:at], replies, post) or rows[at]['user_id'] not in who or len(who) < LAUGHERS:
             return
         self.lurking.add(rows[post]['id'])
         task = asyncio.create_task(self.lurk(channel, rows[post]['id']))
@@ -245,11 +247,17 @@ class Memes:
             config, channel = self.agent.config, self.fri.get_channel(channel_id)
             if not config['enabled'] or not config['meme_enabled'] or not self.readable(channel) or not self.chat(channel_id):
                 return
+            with self.state(write=False) as state:
+                if post_id in state['entries']:
+                    return  # Considered once: later laughs change nothing.
             # Privacy-fenced: rows of members who opted out or changed their privacy since are gone, laughs too.
             rows = await self.agent.context_messages(channel_id)
             at = next((i for i, row in enumerate(rows) if row['id'] == post_id), None)
             replies = {key: value[0] for key, value in self.replies.items()}
-            if at is None or not said(rows[at]) or len(laughers(rows, replies, at)) < LAUGHERS:
+            if at is None or not said(rows[at]):
+                return
+            # Still here too, as a meme post's author must be (see eligible).
+            if len([user for user in laughers(rows, replies, at) if await self.agent.member(int(user), fresh=True)]) < LAUGHERS:
                 return
             before = [{'name': row['name'], 'text': row['text'],
                        **({'attachments': row['attachments']} if row.get('attachments') else {})}
