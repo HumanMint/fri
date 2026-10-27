@@ -181,6 +181,14 @@ def search_from(state, version, index, part):
     return dt.datetime.fromtimestamp(min(part['attempted_at'], time.time()) - 60, dt.timezone.utc)
 
 
+def kept(start):
+    """A retry's anchor from search_from's boundary: the earlier send may still land behind a new one, so
+    the boundary stays put. A time one, from code before anchors, becomes the id Discord reads after for it."""
+    if isinstance(start, dt.datetime):
+        return str(discord.utils.time_snowflake(start, high=True))
+    return str(start.id) if start else ''
+
+
 def set_anchor(state, version, index, mark):
     """Keeps one anchor per tried part, and none once it's confirmed or Discord's id was untrustworthy."""
     if not isinstance(state.get('anchors'), dict):
@@ -256,9 +264,8 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
                 if not message:
                     attempted_at = time.time()
                     mark = await anchor(dm, attempted_at)
-                    if not isinstance(start, (bool, dt.datetime)):
-                        # A retry keeps the earlier boundary: the earlier send may still land behind a new one.
-                        mark = {'attempted_at': attempted_at, 'after': str(start.id) if start else ''}
+                    if start is not False:
+                        mark = {'attempted_at': attempted_at, 'after': kept(start)}
                     set_anchor(state, version, index, mark)
                     part.update(attempted_at=attempted_at, sha256=hashes[index - 1])
                     private_json(path, state)

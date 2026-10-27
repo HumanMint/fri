@@ -677,3 +677,45 @@ def test_an_anchor_past_discords_64_bit_ids_recovers_by_time(dm, tmp_path, monke
     assert len(dm.sends) == 1
     assert json.loads(path.read_text())['versions']['0.4.0']['parts'][0]['message_id'] == str(dm.messages[0].id)
 
+
+class ClockDM(FakeDM):
+    """Ids from Discord's clock, as real ones are: a time boundary and an id boundary pick the same messages."""
+
+    async def send(self, content, *, nonce, allowed_mentions, suppress_embeds):
+        self.sends.append({'content': content, 'nonce': nonce})
+        index = len(self.sends)
+        if index in self.refused:
+            raise RuntimeError('discord refused')
+        message = said(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)) + index, content, BOT)
+        self.messages.append(message)
+        if index in self.lost:
+            raise RuntimeError('reply lost')
+        return message
+
+
+def test_a_retry_of_a_part_older_code_tried_keeps_its_time_boundary(dm, tmp_path, monkeypatch):
+    """Code before anchors left a part tried with only its time. Its message shows up between a rerun's search and the
+    anchor read, and that send fails: a later rerun still searches from the old time and finds it."""
+    room = FakeClient.dm = ClockDM()
+    room.messages.append(said(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)),
+                              'earlier dm', BOT))
+    room.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run('notes', tmp_path)
+    path = tmp_path / 'patch-notes.json'
+    record = json.loads(path.read_text())
+    del record['anchors']  # As the code before anchors wrote it.
+    path.write_text(json.dumps(record))
+    hidden = [room.messages.pop()]  # Not visible in history yet.
+    search = room.history
+    def late(**kwargs):
+        if kwargs.get('limit') == 1 and hidden:
+            room.messages.append(hidden.pop())  # Lands between the rerun's search and its anchor read.
+        return search(**kwargs)
+    monkeypatch.setattr(room, 'history', late)
+    room.refused.add(2)
+    with pytest.raises(RuntimeError, match='refused'):
+        run('notes', tmp_path)
+    run('notes', tmp_path)
+    assert len(room.sends) == 2 and [m.content for m in room.messages] == ['earlier dm', 'notes']
+
