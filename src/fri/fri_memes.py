@@ -184,7 +184,7 @@ class Memes:
                     with self.state() as state:
                         if str(message.id) in state['entries']:
                             continue
-                        if sum(e['at'] > time.time()-86400 for e in state['entries'].values()) >= config['meme_daily_checks']:
+                        if capped(state, config, time.time()):
                             return
                     urls = sources(message)
                     # On a timer, a line of chat is noise: there it waits for laughs instead (see heard).
@@ -197,6 +197,8 @@ class Memes:
                     with self.state() as state:
                         if str(message.id) in state['entries']:
                             continue
+                        if capped(state, config, time.time()):  # Again: a laugh check may have taken one meanwhile.
+                            return
                         state['entries'][str(message.id)] = {'at': time.time(), 'channel': channel_id,
                                                              'status': 'reserved'}
                     remaining -= 1
@@ -420,6 +422,11 @@ def reacted(notes, message, profile, stale=None):
             stale.append(message.id)
         return {}
     return {'fri_reacted': {'emoji': note['emoji'], **({'saw': note['note']} if note['note'] else {})}}
+
+
+def capped(state, config, now):
+    """Today's meme checks are used up, the timer's and laugh-started ones together."""
+    return sum(e['at'] > now-86400 for e in state['entries'].values()) >= config['meme_daily_checks']
 
 
 def laughter(text):

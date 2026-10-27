@@ -57,6 +57,11 @@ def reply_to(mid):
     return SimpleNamespace(message_id=mid, resolved=None)
 
 
+def configure(h, version, **changes):
+    h.scheduler.update(changes, version, '10')
+    h.agent.state = h.scheduler.state()
+
+
 def test_the_periodic_check_skips_text_lines_in_a_chat_meme_channel_but_still_judges_images(chat):
     async def scenario():
         h = chat
@@ -331,6 +336,36 @@ def test_a_reply_edited_into_a_laugh_still_laughs_at_what_it_replied_to(chat):
         await h.say(84, 32, 'lmao', reference=reply_to(80))  # A second at the older one is what it needs.
         h.agent.run.assert_awaited_once()
         assert h.agent.run.await_args.args[2]['caption'] == 'the oven is self aware now'
+    asyncio.run(scenario())
+
+
+def test_the_timer_checks_the_daily_cap_again_where_it_reserves(chat):
+    async def scenario():
+        h = chat
+        configure(h, 2, meme_daily_checks=2)
+        with h.agent.memes.state() as state:  # One of today's two checks is used.
+            state['entries']['70'] = {'at': time.time(), 'channel': '3', 'status': 'quiet'}
+        meme = h.add(80, attachments=[attachment()], author=SimpleNamespace(id=50, bot=False))
+        line = await h.bit()
+        await h.say(101, 30, 'lol')
+        paused, resume = asyncio.Event(), asyncio.Event()
+
+        async def member(user, **_):
+            if user == 50:  # The meme's author: the timer waits here, past its first look at the cap.
+                paused.set()
+                await resume.wait()
+            return object()
+        h.agent.member.side_effect = member
+        timer = asyncio.create_task(h.agent.memes.check())
+        await paused.wait()
+        await h.say(102, 31, 'lmao')  # Meanwhile a laugh check takes the last one.
+        line.add_reaction.assert_awaited_once()
+        resume.set()
+        await timer
+        assert h.agent.run.await_count == 1
+        meme.add_reaction.assert_not_awaited()
+        with h.agent.memes.state(write=False) as state:
+            assert set(state['entries']) == {'70', '100'}
     asyncio.run(scenario())
 
 
