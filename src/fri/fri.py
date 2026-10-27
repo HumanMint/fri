@@ -406,10 +406,10 @@ class Fri(discord.Client):
                 # in, or while the access check above waited on Discord, never reaches the model.
                 if actions and not await images_unchanged(actions.image_context, actions.event):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
-                # A ping's own check before each request after a tool, now that Fri signed in, as an outside ping's
-                # (above): its access, the ping, every nearby post its read showed and their authors' privacy.
-                # Unless the image check just ran it (fri #75). Before the first, its check as typing started did.
-                if invitation and 'action_result' in context and invitation.checked == checked:
+                # A ping's own check before every request, the first too, now that Fri signed in, as an outside
+                # ping's (above): its access, the ping, every nearby post its read showed and their authors' privacy.
+                # Unless the image check just ran it (fri #75). It refreshes the channel the audience is judged from.
+                if invitation and invitation.checked == checked:
                     await invitation.require_current()
                 if actions and not await actions.reads_unchanged():  # And every post a read showed.
                     raise commands.UserFeedbackCheckFailure(READ_CHANGED)

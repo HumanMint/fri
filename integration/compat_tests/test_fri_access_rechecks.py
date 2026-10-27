@@ -186,3 +186,54 @@ def test_a_text_read_for_a_ping_is_checked_again_once_fri_signs_in(monkeypatch, 
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def denied_to(channel, uid):
+    result = copy.copy(channel)
+    result.overwrites = {discord.Object(id=uid): discord.PermissionOverwrite(view_channel=False)}
+    return result
+
+
+@pytest.mark.parametrize('change', ['audience', 'member', 'ping'])
+def test_a_pings_first_request_is_checked_again_once_fri_signs_in(monkeypatch, tmp_path, change):
+    """A change while Fri signs in, before its first request, counts: someone shut out of the channel keeps the
+    turn in this conversation, and the author losing the channel or editing the ping stops the request."""
+    async def run():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset({PROFILES})
+        channel.guild.default_role = SimpleNamespace(id=123)
+        channel.is_nsfw, channel.overwrites = lambda: False, {}
+        del fri.chat_once
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()
+        event = message('<@99> I like private jazz')
+        reached = []
+
+        async def respond(text, context, *, ready):
+            if change == 'audience':  # The cache still says everyone can read it.
+                channel.guild.fetch_channel.return_value = denied_to(channel, 30)
+            elif change == 'member':
+                denied = copy.copy(channel)
+                denied.permissions_for = lambda who: discord.Permissions.none() if who.id == 20 else discord.Permissions.all()
+                channel.guild.fetch_channel.return_value = denied
+            else:
+                edited = copy.copy(event)
+                edited.content = 'never mind'
+                rows[event.id] = edited
+            await ready()
+            reached.append(context)
+            return ChatResult(status='completed', reply='noted', notes=[{'category': 'music', 'evidence': 'I like private jazz'}])
+
+        fri.chat.respond = respond
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            saved = [body for path, body in calls if path == '/chat/turn']
+            elsewhere = store.chat_context('123', 'public:2', '20', True)
+            if change == 'audience':
+                assert reached and saved and saved[-1]['audience'] != 'server'
+                assert not elsewhere['personal_memory']['notes'] and not elsewhere.get('elsewhere')
+            else:
+                assert not reached and not saved
+        finally:
+            await fri.close()
+    asyncio.run(run())
