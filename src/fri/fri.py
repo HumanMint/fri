@@ -413,14 +413,21 @@ class Fri(discord.Client):
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
             drop_unheard(self.get_channel, context)  # Nor a profile note said there (fri #98).
-            if context.get('member_summary') and not all(server_wide(self.get_channel(int(origin.split(':', 1)[1])))
-                                                         for origin in context['member_summary']['origins']):
-                context['member_summary'] = None
+            # Fri's summary of the member, while it may still show here (their private chat, or a channel everyone
+            # can still read) and every channel it came from is still one everyone can read.
+            destination = (fence or {}).get('turn') or {}
+            here, guild_id = destination.get('conversation_id', ''), destination.get('guild_id', 0)
+            if context.get('member_summary'):
+                context['member_summary'] = self.member_summary(context['member_summary'], guild_id, here.startswith(
+                    'private:') or self.readable(here, guild_id) is not None)
             if fence:  # Checked again before delivery, with where each profile note shown in public was said.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
                 fence['shown'].update(origin for origin in (context.get('profile_origins') or {}).values()
                                       if str(origin).startswith('public:') and str(origin)[7:].isdigit())
-                fence['shown'].update((context.get('member_summary') or {}).get('origins', []))
+                if context.get('member_summary'):  # Where it came from and, in public, where it shows.
+                    origins = context['member_summary'].get('origins', [])
+                    fence['shown'].update([*origins, *([here] if here.startswith('public:') else [])])
+                    fence.setdefault('summarized', set()).update(origins)  # What the reply drew on (see stage_turn).
             if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
                 source = context.get('source') or {}
                 asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),

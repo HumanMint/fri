@@ -344,3 +344,54 @@ def test_a_controller_rolled_back_past_summaries_stops_the_builder(monkeypatch, 
         finally:
             await w.fri.close()
     run(scenario)
+
+
+CONTINUATION = 'still up for that raid?'
+
+
+def recalls(context):
+    """The model, answering from the summary when it has one."""
+    return ChatResult(status='completed', reply=CONTINUATION if context.get('member_summary') else 'no summary')
+
+
+def signed_in_chat(w, handler, access_token=lambda: 'test'):
+    """Fri's real Chat over a mock transport, so ready() runs once signed in, as in production."""
+    w.fri.chat = Chat(SimpleNamespace(access_token=access_token), httpx.MockTransport(handler))
+
+    async def call(text, context):
+        return await Fri.chat_once(w.fri, text, context)
+    w.fri.chat_once = AsyncMock(side_effect=call)
+
+
+@pytest.mark.parametrize('when', ['signin', 'inference'])
+def test_a_destination_closed_mid_turn_drops_the_summary_or_keeps_its_reply_unsaid(monkeypatch, tmp_path, when):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await summarize(monkeypatch, w, 13*3600)  # From #general; #general stays readable throughout.
+            saved, sent = len(turns(w)), []
+
+            def access_token():
+                if when == 'signin':
+                    w.readable[GAMING] = False  # Where it would show, restricted after Fri gathered context.
+                return 'test'
+
+            def handler(request):
+                sent.append(json.loads(json.loads(request.content)['input'][-1]['content']))
+                if when == 'inference':
+                    w.readable[GAMING] = False
+                return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(
+                    {'reply': CONTINUATION, 'request_draft': None})))+'\n\n')
+            signed_in_chat(w, handler, access_token)
+            if when == 'signin':
+                await w.say(GAMING, 'fri what were we on about')
+                assert sent and 'your_summary_of_speaker_untrusted' not in sent[-1]
+            else:
+                with pytest.raises(commands.UserFeedbackCheckFailure, match='went private'):
+                    await w.say(GAMING, 'fri what were we on about')
+                assert SUMMARY in sent[-1]['your_summary_of_speaker_untrusted']  # It was readable when sent.
+                assert len(turns(w)) == saved  # Nothing built on it is said or kept.
+        finally:
+            await w.fri.close()
+    run(scenario)
+
