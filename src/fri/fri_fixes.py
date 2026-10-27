@@ -96,15 +96,32 @@ async def follow(agent, channel_id, message_id, job):
         private_json(agent.fri.data/FILE, entries)
     except OSError as exc:
         LOG.warning('Gene fix watch not saved: %s', type(exc).__name__)
-    # The 👀 runs as its own task, waited on for MARK and never cancelled (see check): attention calls this
-    # from the heartbeat, which a Discord read held up by a rate limit must not stall.
-    task = asyncio.create_task(mark(agent, channel_id, message_id))
+    # Attention calls this from the heartbeat, which a Discord read held up by a rate limit must not stall.
+    await asyncio.wait({eyes(agent, job_id, entry)}, timeout=MARK)
+
+
+def eyes(agent, job_id, entry):
+    """The 👀 as its own task, never cancelled (see check), or the one already on its way, so none is doubled."""
+    name = 'fri-mark:'+job_id
+    for task in MARKING:
+        if task.get_name() == name and not task.done():
+            return task
+    task = asyncio.create_task(mark(agent, job_id, entry['channel_id'], entry['message_id']), name=name)
     MARKING.add(task)
     task.add_done_callback(marked)
-    await asyncio.wait({task}, timeout=MARK)
+    return task
 
 
-async def mark(agent, channel_id, message_id):
+async def mark(agent, job_id, channel_id, message_id):
+    """Noted in the watch once tried, so a pass adds one a shutdown cut off, and never retries one Discord refused."""
+    await react(agent, channel_id, message_id)
+    entries = watched(agent.fri)
+    if isinstance(entries.get(job_id), dict):  # A pass may have ended the watch meanwhile; it stays ended.
+        entries[job_id]['marked'] = True
+        private_json(agent.fri.data/FILE, entries)
+
+
+async def react(agent, channel_id, message_id):
     """Its own reaction on Gene's own message, not acknowledge(): that one is for members' turns."""
     channel = agent.fri.get_channel(int(channel_id))
     if channel is None or getattr(channel, 'guild', None) is None or not agent.allowed(channel):
@@ -217,6 +234,8 @@ async def sweep(agent):
                 outcome = 'drop' if expired(entry) else 'keep'  # Kept only so a refile isn't watched again.
             else:
                 outcome = await due(agent, job_id, entry)
+                if outcome == 'keep' and not entry.get('marked') and agent.config['enabled']:
+                    eyes(agent, job_id, entry)  # A 👀 a shutdown cut off. Not waited on: a pass never stalls on one.
         except MALFORMED:
             outcome = 'drop'  # A malformed entry would fail every heartbeat.
         if outcome == 'keep':

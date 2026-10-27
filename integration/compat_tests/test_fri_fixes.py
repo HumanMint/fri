@@ -812,3 +812,30 @@ def test_an_uncached_thread_archived_during_the_release_read_or_the_claim_gets_n
     assert not sent and not world.sent and 'archived' in text
     with world.store.connection() as db:
         assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
+
+
+def test_a_mark_cut_off_by_a_shutdown_is_added_by_the_next_pass(world, monkeypatch):
+    monkeypatch.setattr(fri_fixes, 'MARK', 0.01)
+    fetch = world.room.fetch_message.side_effect
+
+    async def stalled(id):
+        await asyncio.Event().wait()  # Discord hasn't answered when Fri shuts down.
+
+    world.room.fetch_message = AsyncMock(side_effect=stalled)
+    error, job_id = filed(world)  # asyncio.run cancels the 👀 still in flight on its way out, as a shutdown does.
+    error.add_reaction.assert_not_awaited()
+    world.room.fetch_message = AsyncMock(side_effect=fetch)
+
+    async def restarted():
+        await check(world.agent)  # While the watch is open.
+        await asyncio.wait_for(asyncio.gather(*fri_fixes.MARKING), 2)
+    asyncio.run(restarted())
+    error.add_reaction.assert_awaited_once_with('👀')
+    asyncio.run(restarted())
+    assert error.add_reaction.await_count == 1 and not world.sent
+    world.agent.state['config']['enabled'] = False  # Never a reaction while Fri is switched off.
+    entries = json.loads((world.fri.data/'gene-fixes.json').read_text())
+    assert entries[job_id].pop('marked') is True
+    (world.fri.data/'gene-fixes.json').write_text(json.dumps(entries))
+    asyncio.run(restarted())
+    assert error.add_reaction.await_count == 1
