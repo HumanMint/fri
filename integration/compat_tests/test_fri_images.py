@@ -16,7 +16,7 @@ from compat_tests.test_fri_social import DM, api, confirmed, source  # noqa: F40
 from fri import feedback as commands
 from fri.fri_actions import Actions
 from fri.fri_chat import Chat, ChatResult
-from fri.fri_images import attach, unchanged
+from fri.fri_images import attach, still_there, unchanged
 
 
 def message():
@@ -71,6 +71,32 @@ def test_images_not_loaded_from_nonmessage_missing_or_unsupported_attachments(mo
         with pytest.raises(commands.UserFeedbackCheckFailure, match='still images'):
             await attach({}, event, 'what is this?')
         loader.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def signed(url, hm):
+    """A Discord CDN link as Discord serves it: signed, with a signature it renews on refetch."""
+    return f'{url}?ex=6720d7a1&is=671f8621&hm={hm}'
+
+
+@pytest.mark.parametrize('change', ['renewed', 'replaced', 'removed'])
+def test_a_renewed_cdn_signature_is_the_same_image_but_a_replaced_one_is_not(monkeypatch, change):
+    async def scenario():
+        event, context = message(), {}
+        upload = event.attachments[0].url
+        event.attachments[0].url = signed(upload, 'a1')
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(return_value='data:image/png;base64,aGVsbG8='))
+        await attach(context, event, event.content)
+        current = message()  # Discord's copy on the recheck: the same post, unedited.
+        if change == 'renewed':  # Only the signature: the same upload the model was shown.
+            current.attachments[0].url = signed(upload, 'b2')
+        elif change == 'replaced':  # The same file name, but another upload (its own attachment ID).
+            current.attachments[0].url = signed('https://cdn.discordapp.com/attachments/456/2/test.png', 'c3')
+        else:
+            current.attachments = []
+        event.channel.fetch_message = AsyncMock(return_value=current)
+        assert await unchanged(context, event) == (change == 'renewed')
+        assert await still_there(event) == (change == 'renewed')
     asyncio.run(scenario())
 
 
