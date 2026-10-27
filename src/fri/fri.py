@@ -352,8 +352,16 @@ class Fri(discord.Client):
             looked = [read['event'].id for read in context.get('image_reads', [])]
             if context.get('image_event') is not None:
                 looked.append(context['image_event'].id)
+            # Every message this request carries: the live view's rows, what it quotes or replies to, the turn's
+            # own burst, the posts it looked at and the posts a read showed. One place, so a delete of any of
+            # them is marked even once it leaves the live view (see unsend), and delivery refuses after it.
+            quoted = [int(row['source']['id']) for row in context.get('reply_target', []) + context.get('invited_context', [])
+                      if str(row.get('source', {}).get('id', '')).isdigit()]
+            read = [mid for entry in getattr((fence or {}).get('actions'), 'reads', ()) for mid in entry['shown']]
+            carried = [*looked, *quoted, *read, *(int(row['id']) for row in context.get('recent', [])
+                                                  if not row.get('gene_error') and str(row.get('id', '')).isdigit())]
             if self.agent:  # Before the checks below refetch them: a delete after that is marked (see unsend).
-                self.agent.saw(looked)
+                self.agent.saw(carried)
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
@@ -406,7 +414,12 @@ class Fri(discord.Client):
                 # A post Fri looked at, deleted during the last waits (the gate, Gene's check): its image stays out.
                 if any(mid in self.agent.unsent for mid in looked):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
-                seen.update(looked)  # And a delete before delivery withholds what the model made of it.
+                # So does one it quotes or replies to: the answer would be about words taken back.
+                if any(mid in self.agent.unsent for mid in quoted):
+                    raise commands.UserFeedbackCheckFailure(WITHDRAWN)
+                # And a delete before delivery withholds what the model made of any of it: what it carries, that is,
+                # so a live-view row dropped just below (deleted before this request) doesn't count.
+                seen.update([*looked, *quoted, *read])
                 if 'recent' in context:
                     context['recent'] = [row for row in context['recent']
                                          if row.get('gene_error') or int(row['id']) not in self.agent.unsent]
