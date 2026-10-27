@@ -68,22 +68,27 @@ def cancellation_requested(text, bot_id=0):
     return bool(re.fullmatch(r'(?:to|for|about|called|named|at|on|quoted) [^;.!?]{1,240}|quoted|[a-f0-9]{32}', tail))
 
 
+def reminder_tools(clock):
+    """The reminder tools a member's DM offers, as the model reads them (the loops eval offers these too)."""
+    return {
+        'reminder_prepare': {**clock, 'description': 'Prepare a ONE-OFF personal DM reminder only when requested. '
+            'Resolve natural dates against utc_now. local_time=YYYY-MM-DDTHH:MM (24-hour), timezone=explicit IANA zone '
+            'or labeled server_default_timezone. Ask ONE brief question for ambiguous AM/PM or genuinely missing details. '
+            'body is the reminder text, max 1000 characters; due in 1 minute–30 days. This is only a preview; a fresh '
+            'Confirm button authorizes it. No recurring jobs, other-member DMs or future tools/code/music. '
+            'DST repeated/nonexistent local times require clarification or explicit UTC.'},
+        'reminder_list': {'description': 'List this member’s personal DM reminders, exact IDs and delivery states. reminder_id="".'},
+        'reminder_cancel': {'description': 'Cancel a reminder only when this member explicitly asks. First list to get its exact reminder_id; never guess.'},
+    }
+
+
 def available(actions):
     if not isinstance(actions.event, discord.Message) or actions.guild != actions.fri.guild_id:
         return {}
     clock = {'utc_now': dt.datetime.now(dt.timezone.utc).isoformat(),
              'server_default_timezone': os.getenv('FRI_TIMEZONE', 'America/Los_Angeles')}
     if not actions.public and isinstance(actions.event.channel, discord.DMChannel) and actions.agent.config['support_dms']:
-        tools = {
-            'reminder_prepare': {**clock, 'description': 'Prepare a ONE-OFF personal DM reminder only when requested. '
-                'Resolve natural dates against utc_now. local_time=YYYY-MM-DDTHH:MM (24-hour), timezone=explicit IANA zone '
-                'or labeled server_default_timezone. Ask ONE brief question for ambiguous AM/PM or genuinely missing details. '
-                'body is the reminder text, max 1000 characters; due in 1 minute–30 days. This is only a preview; a fresh '
-                'Confirm button authorizes it. No recurring jobs, other-member DMs or future tools/code/music. '
-                'DST repeated/nonexistent local times require clarification or explicit UTC.'},
-            'reminder_list': {'description': 'List this member’s personal DM reminders, exact IDs and delivery states. reminder_id="".'},
-            'reminder_cancel': {'description': 'Cancel a reminder only when this member explicitly asks. First list to get its exact reminder_id; never guess.'},
-        }
+        tools = reminder_tools(clock)
         if actions.private_evidence:
             tools.pop('reminder_prepare')
         if not cancellation_requested(actions.event.content, getattr(actions.fri.user, 'id', 0)):

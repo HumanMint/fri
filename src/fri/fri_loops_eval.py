@@ -6,6 +6,7 @@ No Discord client, controller writes or member context. The caller records only 
 from .fri_agent_model import STRING, analyze, obj
 from .fri_chat import ChatResult
 from .fri_request_eval import source
+from .fri_social import cancellation_requested, reminder_tools
 from .privacy import model_json
 
 VERDICT = obj({'verdict': {'type': 'string', 'enum': ['pass', 'fail']}, 'reason': STRING})
@@ -29,6 +30,16 @@ HELLDIVERS = {'title': 'Helldivers', 'state': 'finalized', 'timezone': 'America/
 
 def loops(reminders=None, saved_work=(), game_nights=None):
     return {'reminders': reminders, 'saved_work': list(saved_work), 'game_nights': game_nights}
+
+
+def offered(case):
+    """The tools a DM offers, as fri_social.available builds them, so a duplicate reminder is a real choice."""
+    if not case.get('dm'):
+        return {}
+    tools = reminder_tools({'utc_now': source(True)['at'], 'server_default_timezone': 'America/Los_Angeles'})
+    if not cancellation_requested(case['text']):
+        tools.pop('reminder_cancel')
+    return tools
 
 
 def cases():
@@ -70,11 +81,11 @@ async def evaluate(chat, model, effort, voice_notes, *, judge=None):
     judge = judge or grade
     for case in cases():
         context = {'model': model, 'effort': effort, 'voice_notes': voice_notes, 'facts': [], 'turns': [],
-                   'actions': {}, 'requests_enabled': True, 'personal_memory': {'enabled': True, 'notes': []},
+                   'actions': offered(case), 'requests_enabled': True, 'personal_memory': {'enabled': True, 'notes': []},
                    'display_name': 'Mint', 'speaker': {'user_id': '101', 'display_name': 'Mint'},
                    'source': source(case.get('dm', False)), 'loops': case['loops']}
         result = await chat.respond(case['text'], context)
-        # Checked without a model: each answer is a plain reply, never a new draft or tool call.
+        # Checked without a model: each answer is a plain reply, never a new draft or tool call, even offered.
         guarded = (result.status == 'completed' and result.response_kind == 'reply' and bool(result.reply)
                    and not result.draft and not result.action)
         if not guarded:
