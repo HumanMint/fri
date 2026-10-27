@@ -1417,10 +1417,15 @@ class Agent:
             missed('message deleted')
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        if result.response_kind not in ('react', 'quiet') and self.unsent.keys() & result.shown:
-            # Someone took back a message the model was shown: the reply may repeat it.
+        if self.unsent.keys() & result.shown:
+            # Someone took back a message the model was shown: the reply may repeat it, and a reaction or a quiet
+            # decision answers it. None goes out or is saved; only a reply's words are worth saying why.
             if ambient:
                 return missed('nearby message deleted')
+            if result.response_kind in ('react', 'quiet'):
+                missed('nearby message deleted')
+                await self.fri.waiting_notices.clear(message.author.id)
+                return
             return await self.withheld(message, events, 'nearby message changed', invitation,
                                        fenced=since is not None, control=since is None, logged='nearby message deleted')
         if result.response_kind in ('react', 'quiet'):

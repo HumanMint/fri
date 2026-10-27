@@ -362,6 +362,36 @@ def test_another_members_deleted_message_never_reaches_the_model_or_the_reply(mo
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('kind', ['react', 'quiet'])
+def test_another_members_message_deleted_after_the_model_saw_it_stops_a_reaction_or_quiet(monkeypatch, tmp_path, kind):
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        regret = message('my landlord is ezra kim on 5th street lol', user=21)
+        trigger = message('fri lmaooo')
+        trigger.reactions, trigger.add_reaction = [], AsyncMock()
+        async def respond(context, ready):
+            await ready()
+            assert any('ezra' in r['text'] for r in context.get('recent', []))
+            await delete(fri, rows, regret)  # Deleted while the model decided.
+            return (ChatResult(status='completed', response_kind='react', reaction='😭') if kind == 'react' else
+                    ChatResult(status='completed', response_kind='quiet'))
+        model(fri, tmp_path, respond)
+        record = AsyncMock(wraps=fri.record_turn)
+        monkeypatch.setattr(fri, 'record_turn', record)
+        try:
+            await heard(agent, regret)
+            await asyncio.wait_for(agent.handle(trigger), 10)
+            fri.chat_once.assert_awaited_once()
+            trigger.add_reaction.assert_not_awaited()
+            trigger.reply.assert_not_awaited()
+            record.assert_not_awaited()  # The decision drew on it, so it isn't saved either.
+            assert not store.chat_context('123', 'public:1', '20')['turns']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_message_deleted_while_typing_starts_never_reaches_the_model(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)

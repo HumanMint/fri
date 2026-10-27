@@ -102,7 +102,8 @@ still being composed for a deleted
 message is neither sent nor saved (`message deleted`), and one deleted before the model is
 asked never reaches it. Another member's message deleted before then is left out of what the
 model sees; deleted after, the reply is withheld (`nearby message deleted`), with the "things
-changed while i was typing" notice when someone addressed Fri. An edit replaces a member's row
+changed while i was typing" notice when someone addressed Fri; a reaction or quiet decision is
+dropped too, unsaved and without a notice. An edit replaces a member's row
 with the edited text; an edit Discord sends without its author drops the row. An edit to a member's
 message Fri is still handling (still coming in, or being answered) withdraws it instead: it leaves,
 or never enters, the view, and a reply to it that hasn't reached the model yet is refused. Fri's and Gene's
