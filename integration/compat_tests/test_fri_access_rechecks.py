@@ -3,6 +3,7 @@ its author's access, and whether everyone can still read it before their words f
 
 import asyncio
 import copy
+import datetime as dt
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -24,6 +25,7 @@ from compat_tests.test_fri_mentions import environment
 from fri.fri import CONVERSATION_CHANGED
 from fri.fri_chat import ChatResult
 from fri.fri_memory import PROFILES
+from fri.fri_mentions import CONTEXT_CHANGED
 
 
 def not_found():
@@ -140,6 +142,47 @@ def test_a_ping_where_discord_keeps_someone_out_keeps_its_words_there(monkeypatc
             assert len(reached) == 1 and [item.args[0] for item in event.reply.await_args_list] == ['an answer']
             assert [body['audience'] for path, body in calls if path == '/chat/turn'] == [
                 'conversation' if denied else 'server']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['stays', 'edited', 'deleted'])
+def test_a_text_read_for_a_ping_is_checked_again_once_fri_signs_in(monkeypatch, tmp_path, change):
+    # A configured ping reads its own channel's nearby posts (Actions.invited_context): no image, so no image
+    # check asks the invitation. A post edited or deleted while Fri signs in for the next request stays out of
+    # it, with no gateway event to mark it (fri #75).
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        nearby = message('the old plan', user=30, age=120)
+        event = message('<@99> sum up what they said above')
+        del fri.chat_once  # The real one, with its last checks before the request.
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()
+        reached = []
+
+        async def respond(text, context, *, ready=None):
+            if context.get('action_result') and change == 'edited':
+                changed = copy.copy(nearby)
+                changed.content, changed.edited_at = 'retracted', dt.datetime.now(dt.timezone.utc)
+                rows[nearby.id] = changed
+            elif context.get('action_result') and change == 'deleted':
+                del rows[nearby.id]
+            await ready()
+            reached.append(context)
+            if not context.get('action_result'):
+                return ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': '1'})
+            return ChatResult(status='completed', reply='they wanted the old plan')
+        fri.chat.respond = respond
+        channel.fetch_message.side_effect = lambda mid: rows[mid] if mid in rows else (_ for _ in ()).throw(not_found())
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            texts = [item.args[0] for item in event.reply.await_args_list]
+            if change == 'stays':
+                assert len(reached) == 2 and texts == ['they wanted the old plan']
+                assert [row['text'] for row in reached[1]['invited_context']] == ['the old plan']
+            else:  # The request carrying the old words never goes out; the ping hears why.
+                assert len(reached) == 1 and texts == [CONTEXT_CHANGED]
         finally:
             await fri.close()
     asyncio.run(scenario())

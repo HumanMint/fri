@@ -15,7 +15,8 @@ The controller applies the existing member allowance. Disabled mode and in-progr
 reply notices keep their existing behavior. The runtime rechecks the current event,
 member roles, channel/thread permissions, source contents and privacy before output.
 After the model answers, a ping is rechecked before each tool acts, before the model hears
-the turn again, and once right before sending; checks repeated with nothing in between are
+the turn again (once signed in for that request, with every nearby post its read showed, text-only
+included), and once right before sending; checks repeated with nothing in between are
 gone. That last check reads the ping again after its privacy read, and also covers its image
 post, including a photo the author posted just before the ping.
 In configured channels, local privacy/usage utilities, exact controls and accepted

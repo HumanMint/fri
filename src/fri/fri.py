@@ -400,10 +400,17 @@ class Fri(discord.Client):
                 actions = fence['actions']
                 if actions and actions.sources and not actions.sources <= set(await actions.channels(fresh=True, around=True)):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
+                invitation = getattr(actions, 'invitation', None)
+                checked = getattr(invitation, 'checked', 0)
                 # Every post Fri looked at is still there as it was read: an edit or delete while Fri signed
                 # in, or while the access check above waited on Discord, never reaches the model.
                 if actions and not await images_unchanged(actions.image_context, actions.event):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+                # A ping's own check before each request after a tool, now that Fri signed in, as an outside ping's
+                # (above): its access, the ping, every nearby post its read showed and their authors' privacy.
+                # Unless the image check just ran it (fri #75). Before the first, its check as typing started did.
+                if invitation and 'action_result' in context and invitation.checked == checked:
+                    await invitation.require_current()
                 if actions and not await actions.reads_unchanged():  # And every post a read showed.
                     raise commands.UserFeedbackCheckFailure(READ_CHANGED)
                 # So is the post they replied to or linked, and the rest of their burst.
