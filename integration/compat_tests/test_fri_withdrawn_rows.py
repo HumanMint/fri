@@ -24,9 +24,11 @@ from fri.fri_mentions import Invitation
 MARKER = 'lavender-bicycle-private'
 
 
-def model(fri, requests, *, attention=False):
+def model(fri, requests, *, attention=False, failures=0):
     def handler(request):
         requests.append(json.loads(request.content))
+        if len(requests) <= failures:  # The model is down.
+            return httpx.Response(503)
         result = ({'action': 'quiet', 'source_id': '', 'reason': ''} if attention else
                   {'reply': 'okay', 'request_draft': None})
         return httpx.Response(200, text='data: ' + json.dumps(response_event(content=json.dumps(result))) + '\n\n')
@@ -102,6 +104,110 @@ def test_attention_rechecks_after_signin():
         release.set()
         await asyncio.wait_for(task, 2)
         assert not requests
+    asyncio.run(scenario())
+
+
+class Waits:
+    """Attention's slot and sign-in, either of which can hold its batch back: `during` holds the named one
+    while a change lands, then lets attention go on."""
+
+    def __init__(self, agent, fri):
+        self.held, self.waiting, self.release = None, asyncio.Event(), asyncio.Event()
+        signin, waits = fri.chat.headers, self
+
+        class Slot(asyncio.Semaphore):
+            async def acquire(self):
+                if waits.held == 'slot':
+                    await waits.wait()
+                return await super().acquire()
+
+        async def headers():
+            if waits.held == 'sign-in':
+                await waits.wait()
+            return await signin()
+
+        agent.slots, fri.chat.headers = Slot(1), headers
+
+    async def wait(self):
+        self.held = None
+        self.waiting.set()
+        await self.release.wait()
+
+    async def during(self, held, attend, change):
+        self.held = held
+        self.waiting.clear()
+        self.release.clear()
+        task = asyncio.create_task(attend())
+        await asyncio.wait_for(self.waiting.wait(), 2)
+        if asyncio.iscoroutine(changed := change()):  # A Discord event's handler, say.
+            await changed
+        self.release.set()
+        await asyncio.wait_for(task, 2)
+
+
+@pytest.mark.parametrize('wait', ['slot', 'sign-in'])
+def test_attention_never_sends_a_question_deleted_while_it_waited(wait):
+    # fri#50: the question is deleted after attention picked it up, before its model request.
+    async def scenario():
+        channel = SimpleNamespace(id=456)
+        requests = []
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel)
+        model(fri, requests, attention=True)
+        agent = Agent(fri)
+        agent.record = AsyncMock()
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        cache(agent, channel, SimpleNamespace(id=100, author=SimpleNamespace(id=11), content=MARKER+' anyone?'))
+        await Waits(agent, fri).during(wait, agent.attend, lambda: agent.unsend(456, [100]))
+        assert not requests
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('when', ['before the retry', 'during its slot wait', 'during its sign-in'])
+@pytest.mark.parametrize('change', ['deleted', 'edited', 'withdrawn', 'forgotten'])
+def test_a_retried_attention_batch_is_rechecked_like_a_first_attempt(change, when):
+    """A batch offered again after a failed model call carries nothing taken back since that call."""
+    async def scenario():
+        channel = SimpleNamespace(id=456)
+        requests = []
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: channel)
+        model(fri, requests, attention=True, failures=1)
+        agent = Agent(fri)
+        agent.record = AsyncMock()
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        question = SimpleNamespace(id=100, channel=channel, author=SimpleNamespace(id=11),
+                                   content='anyone know why the build is broken?')
+        aside = SimpleNamespace(id=101, channel=channel, author=SimpleNamespace(id=12), content=MARKER+' lol')
+        cache(agent, channel, question)
+        cache(agent, channel, aside)
+        waits = Waits(agent, fri)
+        await agent.attend()
+        assert len(requests) == 1 and MARKER in json.dumps(requests[0])
+
+        def withdraw():
+            if change == 'deleted':
+                agent.unsend(456, [101])
+            elif change == 'edited':
+                agent.edit(456, SimpleNamespace(id=101, content='never mind', author=SimpleNamespace(id=12),
+                                                attachments=[]))
+            elif change == 'withdrawn':  # Its own queue recheck found it changed.
+                agent.withdraw(aside)
+            else:
+                agent.forget(12, erased=True)
+
+        agent.last_attention[456] = 0  # The next heartbeat window.
+        if when == 'before the retry':
+            withdraw()
+            await agent.attend()
+        else:
+            await waits.during('slot' if when == 'during its slot wait' else 'sign-in', agent.attend, withdraw)
+            if change != 'edited':  # The row left the live view: held back like a first attempt, then offered again.
+                assert len(requests) == 1
+                agent.last_attention[456] = 0
+                await agent.attend()
+        assert len(requests) == 2
+        retried = json.dumps(requests[1])
+        assert MARKER not in retried and question.content in retried
+        assert ('never mind' in retried) == (change == 'edited')
     asyncio.run(scenario())
 
 
