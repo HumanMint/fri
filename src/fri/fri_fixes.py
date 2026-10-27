@@ -96,15 +96,32 @@ async def follow(agent, channel_id, message_id, job):
         private_json(agent.fri.data/FILE, entries)
     except OSError as exc:
         LOG.warning('Gene fix watch not saved: %s', type(exc).__name__)
-    # The 👀 runs as its own task, waited on for MARK and never cancelled (see check): attention calls this
-    # from the heartbeat, which a Discord read held up by a rate limit must not stall.
-    task = asyncio.create_task(mark(agent, channel_id, message_id))
+    # Attention calls this from the heartbeat, which a Discord read held up by a rate limit must not stall.
+    await asyncio.wait({eyes(agent, job_id, entry)}, timeout=MARK)
+
+
+def eyes(agent, job_id, entry):
+    """The 👀 as its own task, never cancelled (see check), or the one already on its way, so none is doubled."""
+    name = 'fri-mark:'+job_id
+    for task in MARKING:
+        if task.get_name() == name and not task.done():
+            return task
+    task = asyncio.create_task(mark(agent, job_id, entry['channel_id'], entry['message_id']), name=name)
     MARKING.add(task)
     task.add_done_callback(marked)
-    await asyncio.wait({task}, timeout=MARK)
+    return task
 
 
-async def mark(agent, channel_id, message_id):
+async def mark(agent, job_id, channel_id, message_id):
+    """Noted in the watch once tried, so a pass adds one a shutdown cut off, and never retries one Discord refused."""
+    await react(agent, channel_id, message_id)
+    entries = watched(agent.fri)
+    if isinstance(entries.get(job_id), dict):  # A pass may have ended the watch meanwhile; it stays ended.
+        entries[job_id]['marked'] = True
+        private_json(agent.fri.data/FILE, entries)
+
+
+async def react(agent, channel_id, message_id):
     """Its own reaction on Gene's own message, not acknowledge(): that one is for members' turns."""
     channel = agent.fri.get_channel(int(channel_id))
     if channel is None or getattr(channel, 'guild', None) is None or not agent.allowed(channel):
@@ -217,6 +234,8 @@ async def sweep(agent):
                 outcome = 'drop' if expired(entry) else 'keep'  # Kept only so a refile isn't watched again.
             else:
                 outcome = await due(agent, job_id, entry)
+                if outcome == 'keep' and not entry.get('marked') and agent.config['enabled']:
+                    eyes(agent, job_id, entry)  # A 👀 a shutdown cut off. Not waited on: a pass never stalls on one.
         except MALFORMED:
             outcome = 'drop'  # A malformed entry would fail every heartbeat.
         if outcome == 'keep':
@@ -282,8 +301,18 @@ def postable(fri, channel):
         raise Unreachable('their thread’s archived, and i’m not reopening it for this')
 
 
+async def live(fri, job):
+    """The controller checks this in its claim too; an older one (gene #40) doesn't, so Fri reads the live release."""
+    status = await fri.api('GET', '/status')
+    if status.get('active_sha') != job['approved_sha']:
+        raise Unreachable('a newer release is live now, so "fixed" might not hold')
+    if (status.get('jobs') or {}).get('deploying'):
+        raise Unreachable('another release is going out right now. tap again once it lands')
+
+
 async def report(fri, job):
-    """The reporter's message and where it is, read before the claim: nothing has been sent yet."""
+    """The reporter's message and where it is, read before the claim: nothing has been sent yet.
+    Also whether it's a thread Fri had to fetch, which no archive update reaches."""
     source = job.get('source_url') if isinstance(job, dict) else None
     match = SOURCE.fullmatch(source) if isinstance(source, str) else None
     user = str(job.get('user_id', '')) if match else ''
@@ -303,8 +332,8 @@ async def report(fri, job):
                 raise Unreachable('i can’t post where they reported it anymore')
         postable(fri, channel)
         message = await channel.fetch_message(int(match['message']))
-        if match['guild'] != '@me' and cached is None and isinstance(channel, discord.Thread):
-            # A fetched thread isn't in the cache, so no archive update reaches it: read it again last.
+        fetched = match['guild'] != '@me' and cached is None and isinstance(channel, discord.Thread)
+        if fetched:  # Not in the cache, so read it again last.
             channel = await fri.fetch_channel(channel.id)
         # Last of the Discord reads: no members intent tells Fri someone left while the others ran.
         if not await fri.agent.member(int(user), fresh=True):
@@ -316,25 +345,21 @@ async def report(fri, job):
     if str(message.author.id) != user or message.author.bot or message.webhook_id:
         raise Unreachable('that report isn’t theirs anymore')
     postable(fri, channel)  # Again after the last read, so a change while Discord answered claims nothing.
-    return channel, message
+    return channel, message, fetched
 
 
 async def tell(fri, job_id, actor):
     """Read Discord, then claim the controller's mark, reply once and record what happened.
 
-    The claim is the last await before the send, and it checks erasure, rollbacks and the live release,
-    so nothing that changed while Discord answered can slip through. What the owner sees, and whether it posted."""
+    The claim checks erasure, rollbacks and the live release, so nothing that changed while Discord answered
+    can slip through. With it held, Fri reads the live release and a thread it had to fetch once more, so a
+    release or an archive while the claim was out stops the reply too. What the owner sees, and whether it posted."""
     from .fri_workspace import send_once
     scope = {'guild_id': str(fri.guild_id), 'user_id': str(actor)}
     try:
         job = await fri.api('GET', '/requests/'+job_id)
-        channel, message = await report(fri, job)
-        # The controller checks this too; an older one (gene #40) doesn't, so Fri reads the live release itself.
-        status = await fri.api('GET', '/status')
-        if status.get('active_sha') != job['approved_sha']:
-            raise Unreachable('a newer release is live now, so "fixed" might not hold')
-        if (status.get('jobs') or {}).get('deploying'):
-            raise Unreachable('another release is going out right now. tap again once it lands')
+        channel, message, fetched = await report(fri, job)
+        await live(fri, job)
         postable(fri, channel)
         claimed = await fri.api('POST', f'/requests/{job_id}/requester-notice', scope)
     except Unreachable as exc:
@@ -352,6 +377,9 @@ async def tell(fri, job_id, actor):
         if not isinstance(claimed.get('job'), dict) or any(
                 str(claimed['job'].get(key)) != str(job.get(key)) for key in ('user_id', 'source_url', 'approved_sha')):
             raise Unreachable('their report changed while i looked. tap again')
+        await live(fri, job)
+        if fetched:
+            channel = await fri.fetch_channel(channel.id)
         postable(fri, channel)  # Config or the channel may have changed while the claim was out.
         sending = True
         result = await send_once(fri, {'id': job_id, 'target_id': str(channel.id),
@@ -360,6 +388,8 @@ async def tell(fri, job_id, actor):
         text = f'told them: {message.jump_url}'
     except Unreachable as exc:
         text = f'didn’t send it: {exc}.'
+    except commands.UserFeedbackCheckFailure as exc:  # The controller's answer to the release read; nothing sent.
+        text = notice_text(str(exc))
     except httpx.HTTPStatusError as exc:
         # Discord refused it, so nothing posted and a later tap may try again. A 5xx may have posted.
         state = 'uncertain' if exc.response.status_code >= 500 else 'failed'

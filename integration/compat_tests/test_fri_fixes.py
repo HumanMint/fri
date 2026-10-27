@@ -763,3 +763,79 @@ def test_a_pass_still_running_posts_nothing_once_fri_is_paused(world, monkeypatc
         await asyncio.wait_for(fri_fixes.RUNNING[world.agent], 2)
         assert world.sent == []
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['released', 'rolled_back'])
+def test_a_release_landing_while_the_claim_is_out_stops_the_reply(world, change):
+    """An older controller (gene #40) grants a claim a release that landed after Fri's /status read made stale,
+    and a checking one can't see a release that lands after its claim: Fri reads the release again with the claim held."""
+    _, job_id, _ = reported(world)
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        result = await api(method, path, body)
+        if path.endswith('/requester-notice'):
+            released(world.store) if change == 'released' else rolled_back(world.store)
+        return result
+
+    world.fri.api.side_effect = meanwhile
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'newer release' in text
+    with world.store.connection() as db:  # Recorded as refused, so a later tap may try again.
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
+
+
+@pytest.mark.parametrize('when', ['status', 'claim'])
+def test_an_uncached_thread_archived_during_the_release_read_or_the_claim_gets_no_reply(world, monkeypatch, when):
+    report, job_id, _ = reported(world)
+    client, state, guild, payload = report_thread(world, report, job_id)
+    archived = {**payload, 'thread_metadata': {**payload['thread_metadata'], 'archived': True}}
+    now = {'thread': payload}
+    state.http.get_channel = AsyncMock(side_effect=lambda id: now['thread'])  # Discord's answer at the time.
+    world.fri.fetch_channel = client.fetch_channel
+
+    async def fetch(*args):
+        return report
+
+    monkeypatch.setattr(discord.Thread, 'fetch_message', fetch)
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        result = await api(method, path, body)
+        if path == ('/status' if when == 'status' else f'/requests/{job_id}/requester-notice'):
+            now['thread'] = archived
+            state.parse_thread_update(archived)  # Never reaches the fetched copy: it isn't in the cache.
+        return result
+
+    world.fri.api.side_effect = meanwhile
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and 'archived' in text
+    with world.store.connection() as db:
+        assert db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0] == 'failed'
+
+
+def test_a_mark_cut_off_by_a_shutdown_is_added_by_the_next_pass(world, monkeypatch):
+    monkeypatch.setattr(fri_fixes, 'MARK', 0.01)
+    fetch = world.room.fetch_message.side_effect
+
+    async def stalled(id):
+        await asyncio.Event().wait()  # Discord hasn't answered when Fri shuts down.
+
+    world.room.fetch_message = AsyncMock(side_effect=stalled)
+    error, job_id = filed(world)  # asyncio.run cancels the 👀 still in flight on its way out, as a shutdown does.
+    error.add_reaction.assert_not_awaited()
+    world.room.fetch_message = AsyncMock(side_effect=fetch)
+
+    async def restarted():
+        await check(world.agent)  # While the watch is open.
+        await asyncio.wait_for(asyncio.gather(*fri_fixes.MARKING), 2)
+    asyncio.run(restarted())
+    error.add_reaction.assert_awaited_once_with('👀')
+    asyncio.run(restarted())
+    assert error.add_reaction.await_count == 1 and not world.sent
+    world.agent.state['config']['enabled'] = False  # Never a reaction while Fri is switched off.
+    entries = json.loads((world.fri.data/'gene-fixes.json').read_text())
+    assert entries[job_id].pop('marked') is True
+    (world.fri.data/'gene-fixes.json').write_text(json.dumps(entries))
+    asyncio.run(restarted())
+    assert error.add_reaction.await_count == 1

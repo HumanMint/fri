@@ -154,12 +154,17 @@ def load(path):
     return state
 
 
+def snowflake(text):
+    """An id Discord could have made: a read after one past its unsigned 64 bits is refused outright."""
+    return ID.fullmatch(text) is not None and int(text) < 2**64
+
+
 async def anchor(dm, attempted_at):
     """Where recovery of this attempt starts reading: the DM's newest message id before it ('' for an
     empty DM), or None when Discord gave one the record couldn't trust, so recovery falls back to time."""
     async for message in dm.history(limit=1):
         after = str(message.id)
-        return {'attempted_at': attempted_at, 'after': after} if ID.fullmatch(after) else None
+        return {'attempted_at': attempted_at, 'after': after} if snowflake(after) else None
     return {'attempted_at': attempted_at, 'after': ''}
 
 
@@ -171,9 +176,17 @@ def search_from(state, version, index, part):
     anchors = state.get('anchors')
     mark = anchors.get(version, {}).get(str(index)) if isinstance(anchors, dict) and isinstance(anchors.get(version), dict) else None
     if (isinstance(mark, dict) and mark.get('attempted_at') == part['attempted_at'] and
-            isinstance(mark.get('after'), str) and (mark['after'] == '' or ID.fullmatch(mark['after']))):
+            isinstance(mark.get('after'), str) and (mark['after'] == '' or snowflake(mark['after']))):
         return discord.Object(id=int(mark['after'])) if mark['after'] else None
     return dt.datetime.fromtimestamp(min(part['attempted_at'], time.time()) - 60, dt.timezone.utc)
+
+
+def kept(start):
+    """A retry's anchor from search_from's boundary: the earlier send may still land behind a new one, so
+    the boundary stays put. A time one, from code before anchors, becomes the id Discord reads after for it."""
+    if isinstance(start, dt.datetime):
+        return str(discord.utils.time_snowflake(start, high=True))
+    return str(start.id) if start else ''
 
 
 def set_anchor(state, version, index, mark):
@@ -194,10 +207,10 @@ def set_anchor(state, version, index, mark):
 async def landed(dm, me, chunk, after, taken):
     """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
     Every message after `after` is read (the whole DM if it was empty). Only Fri's own messages with
-    exactly this text count, and never one the record already gives a part: Discord keeps no nonce in
-    history, so that is what tells identical parts and releases apart."""
+    exactly this text count (Discord trims the ends it stores), and never one the record already gives a
+    part: Discord keeps no nonce in history, so that is what tells identical parts and releases apart."""
     async for message in dm.history(limit=None, after=after, oldest_first=True):
-        if message.author.id == me and message.content == chunk and str(message.id) not in taken:
+        if message.author.id == me and message.content.strip() == chunk.strip() and str(message.id) not in taken:
             return message
     return None
 
@@ -251,9 +264,8 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
                 if not message:
                     attempted_at = time.time()
                     mark = await anchor(dm, attempted_at)
-                    if not isinstance(start, (bool, dt.datetime)):
-                        # A retry keeps the earlier boundary: the earlier send may still land behind a new one.
-                        mark = {'attempted_at': attempted_at, 'after': str(start.id) if start else ''}
+                    if start is not False:
+                        mark = {'attempted_at': attempted_at, 'after': kept(start)}
                     set_anchor(state, version, index, mark)
                     part.update(attempted_at=attempted_at, sha256=hashes[index - 1])
                     private_json(path, state)
