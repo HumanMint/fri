@@ -990,10 +990,14 @@ class Agent:
                 return False
         try:
             current = await message.channel.fetch_message(message.id)
+        except discord.NotFound:
+            self.withdraw(message)  # Out of the live view too, so a later turn can't show it.
+            return False
         except discord.HTTPException:
             return False
         if getattr(current, 'edited_at', None) is not None or current.content != message.content:
-            return False  # Edited since it was sent, maybe to take it back.
+            self.withdraw(message)  # Edited since it was sent, maybe to take it back.
+            return False
         return answering or message.guild is None or await addressed_text(current, self.fri.user.id) is not None
 
     async def listen(self, message):

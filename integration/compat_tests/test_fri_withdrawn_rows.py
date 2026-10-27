@@ -791,3 +791,120 @@ def test_a_delete_after_a_check_withdrew_the_row_still_stops_a_reply_in_flight(m
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('kind', ['burst', 'reply_target'])
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+def test_a_change_the_final_check_saw_is_withdrawn_though_discord_then_fails(monkeypatch, tmp_path, kind, change):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        source = message('fri private caption ' + MARKER)
+        latest = message('fri explain it please', user=20 if kind == 'burst' else 30)
+        cache(agent, channel, source)
+        burst = []
+        if kind == 'burst':
+            burst = [(0, item, item.content) for item in [source, latest]]
+        else:
+            latest.reference = SimpleNamespace(message_id=source.id, channel_id=1)
+        requests = []
+        model(fri, requests)
+        fri.chat_once = type(fri).chat_once.__get__(fri)
+        original_handler, original_fetch = fri.chat.transport.handler, channel.fetch_message.side_effect
+        def during_inference(request):  # Once the final check has seen the change, Discord fails.
+            seen = []
+            def changed(mid):
+                if mid != source.id:
+                    return original_fetch(mid)
+                seen.append(mid)
+                if len(seen) > 1:
+                    raise discord.HTTPException(SimpleNamespace(status=503, reason='Service Unavailable'), 'down')
+                if change == 'deleted':
+                    raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+                current = copy.copy(source)
+                current.content, current.edited_at = 'never mind', dt.datetime.now(dt.timezone.utc)
+                return current
+            channel.fetch_message.side_effect = changed
+            return original_handler(request)
+        fri.chat.transport.handler = during_inference
+        try:
+            with pytest.raises(UserFeedbackCheckFailure, match='conversation changed'):
+                await fri.talk(123, 1, latest.author.id, latest.content, 'public', event=latest, burst=burst)
+            channel.fetch_message.side_effect = original_fetch
+            requests.clear()
+            later = message('fri what is up?', user=40)
+            await fri.talk(123, 1, 40, later.content, 'public', event=later)
+            assert len(requests) == 1 and MARKER not in json.dumps(requests)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+def test_an_outage_notices_last_fetch_withdraws_a_change_the_loop_missed(monkeypatch, tmp_path, change):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        event = message('fri help with '+MARKER)
+        cache(agent, channel, event)
+        original_fetch, seen = channel.fetch_message.side_effect, []
+        def later_changed(mid):  # As it was for the outage loop, changed by the notice's own fetch.
+            seen.append(mid)
+            if mid != event.id or len(seen) == 1:
+                return original_fetch(mid)
+            if change == 'deleted':
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone')
+            current = copy.copy(event)
+            current.content, current.edited_at = 'never mind', dt.datetime.now(dt.timezone.utc)
+            return current
+        channel.fetch_message.side_effect = later_changed
+        try:
+            await agent.outage(event, [event], since=(0, 0))
+            event.reply.assert_not_awaited()
+            assert len(seen) == 2
+            channel.fetch_message.side_effect = original_fetch
+            requests = []
+            model(fri, requests)
+            fri.chat_once = type(fri).chat_once.__get__(fri)
+            later = message('fri can you help me with this?', user=30)
+            await fri.talk(123, 1, 30, later.content, 'public', event=later)
+            assert len(requests) == 1 and MARKER not in json.dumps(requests)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_changed_reply_target_still_withdraws_the_changed_burst_messages(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        target = message('the plan is tuesday', user=30)
+        first = message('fri about this '+MARKER)
+        latest = message('fri does that work')
+        latest.reference = SimpleNamespace(message_id=target.id, channel_id=1)
+        for item in (target, first, latest):
+            cache(agent, channel, item)
+        burst = [(0, item, item.content) for item in [first, latest]]
+        requests = []
+        model(fri, requests)
+        fri.chat_once = type(fri).chat_once.__get__(fri)
+        original_handler = fri.chat.transport.handler
+        def during_inference(request):  # Both the target and the earlier burst message are edited.
+            for item in (target, first):
+                current = copy.copy(item)
+                current.content, current.edited_at = 'never mind', dt.datetime.now(dt.timezone.utc)
+                rows[item.id] = current
+            return original_handler(request)
+        fri.chat.transport.handler = during_inference
+        try:
+            with pytest.raises(UserFeedbackCheckFailure, match='conversation changed'):
+                await fri.talk(123, 1, 20, latest.content, 'public', event=latest, burst=burst)
+            live = {row['id'] for row in agent.recent[1]}
+            assert str(target.id) not in live and str(first.id) not in live
+            requests.clear()
+            later = message('fri what is up?', user=40)
+            await fri.talk(123, 1, 40, later.content, 'public', event=later)
+            assert len(requests) == 1 and MARKER not in json.dumps(requests)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

@@ -232,10 +232,11 @@ def links(message):
     return found[:MAX_LINKS]
 
 
-async def reply_target(agent, message, posts=None):
+async def reply_target(agent, message, posts=None, gone=None):
     """The message they replied to, and up to two they linked, when this audience may read them.
 
-    posts, when given, collects each target's Discord message, for the images look() may inspect."""
+    posts, when given, collects each target's Discord message, for the images look() may inspect; gone, the IDs
+    Discord said were deleted."""
     from .fri_memory import open_to_everyone
 
     rows = []
@@ -244,7 +245,7 @@ async def reply_target(agent, message, posts=None):
     if reference and reference.message_id and getattr(reference, 'channel_id', channel.id) in (None, channel.id):
         if not message.guild or await readable(agent, message, channel):
             rows += await target_row(agent, channel, reference.message_id,
-                                     str(message.guild.id) if message.guild else None, posts)
+                                     str(message.guild.id) if message.guild else None, posts, gone)
     home = message.guild.id if message.guild else agent.fri.guild_id
     for guild_id, channel_id, message_id in links(message):
         if message_id == message.id or any(row['source']['id'] == str(message_id) for row in rows):
@@ -262,7 +263,7 @@ async def reply_target(agent, message, posts=None):
             continue
         if not await readable(agent, message, linked, now):
             continue
-        rows += [{**row, 'linked': True} for row in await target_row(agent, linked, message_id, str(home), posts)]
+        rows += [{**row, 'linked': True} for row in await target_row(agent, linked, message_id, str(home), posts, gone)]
     return rows
 
 
@@ -324,7 +325,7 @@ async def fetched(channel):
     return parent
 
 
-async def target_row(agent, channel, message_id, guild_id, posts):
+async def target_row(agent, channel, message_id, guild_id, posts, gone=None):
     """One referenced message as evidence: recent, by a member who allows it, or Fri itself."""
     import discord
 
@@ -349,6 +350,10 @@ async def target_row(agent, channel, message_id, guild_id, posts):
         if posts is not None:
             posts.append(target)
         return [row]
+    except discord.NotFound:
+        if gone is not None:
+            gone.add(message_id)
+        return []
     except discord.HTTPException:
         return []
 
@@ -363,41 +368,48 @@ async def unchanged(agent, message, context):
     """A final privacy/source fence before tools and before returning quoted evidence."""
     import discord
 
-    async def withdrawn(row, limit):
-        """Whether Discord confirms the row's message deleted or edited; if so it leaves the live view too."""
+    unread = object()
+
+    async def withdrawn(row, limit, current=unread):
+        """Whether Discord confirms the row's message deleted or edited; if so it leaves the live view too.
+        `current`: the message as this check already fetched it (None: deleted), so a failed second fetch
+        can't keep a change it saw."""
         from types import SimpleNamespace
         # From its own channel: a linked post can sit in another one.
         where = str(row['source'].get('channel_id') or message.channel.id)
         channel = message.channel if where == str(message.channel.id) else agent.fri.get_channel(int(where))
         if channel is None:
             return False  # Unconfirmed: refused, but not withdrawn.
-        try:
-            current = await channel.fetch_message(int(row['source']['id']))
-        except discord.NotFound:
-            current = None
-        except (discord.HTTPException, ValueError):
-            return False  # Unconfirmed: refused, but not withdrawn.
+        if current is unread:
+            try:
+                current = await channel.fetch_message(int(row['source']['id']))
+            except discord.NotFound:
+                current = None
+            except (discord.HTTPException, ValueError):
+                return False  # Unconfirmed: refused, but not withdrawn.
         if current is None or getattr(current, 'edited_at', None) is not None or clean(current.content, limit) != row['text']:
             agent.withdraw(SimpleNamespace(id=int(row['source']['id']), channel=channel))
             return True
         return False
 
     try:
-        if context.get('reply_target') != await reply_target(agent, message):
+        unchanged, posts, gone = True, [], set()
+        if context.get('reply_target') != await reply_target(agent, message, posts, gone):
+            fetched = {post.id: post for post in posts}
             for row in context.get('reply_target', []):
-                await withdrawn(row, 1800)
-            return False
-        unchanged = True
+                mid = int(row['source']['id'])
+                await withdrawn(row, 1800, None if mid in gone else fetched.get(mid, unread))
+            unchanged = False  # The burst still goes on, so each changed message of it is withdrawn too.
         for row in context.get('message_burst', []):  # Every one, so each changed message is withdrawn.
             try:
                 current = await message.channel.fetch_message(int(row['source']['id']))
             except discord.NotFound:
-                await withdrawn(row, MAX_TEXT)
+                await withdrawn(row, MAX_TEXT, None)
                 unchanged = False
                 continue
             if (not same_source(discord_source(current), row['source']) or
                     clean(current.content, MAX_TEXT) != row['text'] or current.webhook_id):
-                await withdrawn(row, MAX_TEXT)
+                await withdrawn(row, MAX_TEXT, current)
                 unchanged = False
         return unchanged
     except (discord.HTTPException, ValueError):
