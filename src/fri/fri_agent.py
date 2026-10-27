@@ -369,6 +369,7 @@ class Agent:
             if key[1] == user:
                 del self.pending[key]
         self.uncache(user)
+        self.ensure_memes().forget(user)  # What Fri saw in their memes goes too.
 
     def uncache(self, user):
         """Drop a member's cached rows, Fri's replies drawing on them, and Fri's attention to them.
@@ -1708,10 +1709,13 @@ class Agent:
             await self.presence.check()
 
     async def check_memes(self):
+        await self.ensure_memes().check()
+
+    def ensure_memes(self):
         from .fri_memes import Memes
         if self.memes is None:
             self.memes = Memes(self)
-        await self.memes.check()
+        return self.memes
 
     async def stage(self, name, step, *switches, when=None):
         """One heartbeat stage. A failure is logged by class and recorded, and never skips later stages."""
@@ -1733,6 +1737,7 @@ class Agent:
     @tasks.loop(seconds=30)
     async def heartbeat(self):
         self.heartbeat_started = time.time()
+        self.ensure_memes().expire()  # In memory, so before anything that waits on the controller.
         try:
             self.state = await self.fri.api('GET', '/agent/state')
         except Exception as exc:  # A bad tick never ends the loop; the next one retries.
@@ -1745,6 +1750,10 @@ class Agent:
             from .fri_social import deliver_one as deliver_reminder
             from .fri_workspace import deliver_one as deliver_post
             # An undeliverable owner report or a broken meme check must not silence attention.
+            try:  # Meme notes follow their authors' privacy even while meme checks are off.
+                await self.ensure_memes().verify()
+            except Exception as exc:  # Never at the cost of the stages below.
+                LOG.warning('Meme notes not verified this tick: %s', type(exc).__name__)
             results = [await self.stage('presence', self.check_presence),
                        await self.stage('posts', lambda: deliver_post(self.fri)),
                        await self.stage('reminders', lambda: deliver_reminder(self.fri)),

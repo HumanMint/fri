@@ -33,7 +33,7 @@ def picture(channel, name, kind='image/png'):
 
 def loads(monkeypatch, fail=()):
     """Each image loads as a data URL naming its file, so tests can see which ones Fri looked at."""
-    async def load(url, channel):
+    async def load(url, channel, **_):
         if url.rsplit('/', 1)[1] in fail:
             raise httpx.ConnectError('cdn down')
         return 'data:image/png;base64,'+url.rsplit('/', 1)[1]
@@ -415,7 +415,7 @@ def test_a_channel_they_lose_mid_read_never_reaches_the_next_model_request(monke
         async def history(**kwargs):
             yield meme
         general.history, general.fetch_message = history, AsyncMock(return_value=meme)
-        async def load(url, channel):  # They lose the channel while its images download.
+        async def load(url, channel, **_):  # They lose the channel while its images download.
             if lost == 'access':
                 general.permissions_for = lambda who: (discord.Permissions.none() if getattr(who, 'id', None) == 20
                                                        else discord.Permissions.all())
@@ -461,7 +461,7 @@ def test_each_model_request_checks_access_first_and_privacy_last(monkeypatch, tm
             order.append('request')
             return ChatResult(status='completed', reply='ok')
         model(w, respond)
-        async def channels(fresh=False):
+        async def channels(fresh=False, around=False):
             order.append('access')
             return readable
         async def api(method, path, payload=None):
@@ -470,7 +470,8 @@ def test_each_model_request_checks_access_first_and_privacy_last(monkeypatch, tm
         w.fri.api = api
         w.fri.flush_usage = AsyncMock()
         # A Gene receipt from #1 on an ordinary turn: no read, so no private evidence.
-        actions = SimpleNamespace(sources={'1'}, private_evidence=False, channels=channels, image_context={}, event=None)
+        actions = SimpleNamespace(sources={'1'}, private_evidence=False, channels=channels, image_context={}, event=None,
+                                  conversation={}, reads_unchanged=AsyncMock(return_value=True))
         context = {'model': 'm', 'effort': 'high', 'fence': {'turn': {'user_id': '20'}, 'actions': actions,
                                                               'shown': set()}}
         monkeypatch.setattr('fri.fri.turn_provenance', lambda *_: [])
@@ -511,6 +512,31 @@ def test_a_mention_read_and_retained_reports_record_where_they_came_from(monkeyp
         try:
             await owner.execute({'kind': 'learning_overview', 'channel_id': ''})
             assert owner.sources == {'2'}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_gallery_post_is_looked_at_whole_within_the_budget(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, channel, rows, post = read_harness(monkeypatch, tmp_path)
+        post('', attachments=[picture(1, f'big{n}.png') for n in range(5)], age=60)  # Over the budget alone.
+        gallery = post('three for the price of one', attachments=[picture(1, f'g{n}.png') for n in range(3)], age=120)
+        loads(monkeypatch)
+        actions = Actions(agent, 20, 999, False)
+        actions.turn_context, actions.media_allowed = {}, True
+        actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
+        try:
+            receipt = await actions.execute({'kind': 'read_recent', 'channel_id': '1', 'window': 'recent'})
+            assert receipt['images_inspected'] == 1 and receipt['images_not_inspected'] == 1
+            assert actions.turn_context['images'] == [f'data:image/png;base64,g{n}.png' for n in range(3)]
+            assert actions.turn_context['inspected_images'] == [
+                {'images': [1, 2, 3], 'source': actions.turn_context['inspected_images'][0]['source']}]
+            assert await actions.valid()
+            trimmed = copy.copy(gallery)
+            trimmed.attachments = gallery.attachments[:2]
+            rows[gallery.id] = trimmed
+            assert not await actions.valid()
         finally:
             await fri.close()
     asyncio.run(scenario())
