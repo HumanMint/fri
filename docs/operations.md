@@ -401,7 +401,10 @@ Calls whose result can't change what members see are skipped before inference.
   post and drops those whose post was deleted or edited or whose author changed privacy outside Fri,
   whether or not meme checks are on. Every note's privacy is read from Gene before any post is
   refetched, so an opt-out goes whatever Discord does; a post Discord can't show right now (refused,
-  rate-limited, connection failed) keeps its note until a later check.
+  rate-limited, connection failed) keeps its note until a later check. The heartbeat waits up to 10 s
+  on the refetches, then moves on to its stages without cancelling them, since discord.py can't recover
+  from a cancel inside its global rate-limit wait; a pass still running at the next check is left to
+  finish rather than doubled, and that check's privacy reads don't wait on it.
 - **Chat meme channels.** In a meme channel that's also one of Fri's chat channels (like #fri-chat),
   the meme check still judges posts with images but never a post that's only text. A line of text is
   judged only once two other members laugh at it. A laugh is a whole message from a short fixed list

@@ -27,6 +27,7 @@ KEEP = 3 * 86400  # How long an entry, and the note on it, lasts.
 VERIFY_SECONDS = 600  # How often kept notes are checked against their authors' privacy.
 # Discord can't show a post right now: refused, rate-limited past discord.py's wait, or the connection failed.
 UNREADABLE = (discord.DiscordException, aiohttp.ClientError, OSError, TimeoutError)
+REFETCH_WAIT = 10  # How long a heartbeat waits on the notes' refetch before moving on. It never cancels it.
 # A line of chat in a meme channel Fri also chats in is judged only once LAUGHERS other members laugh at
 # it: within LAUGH_LINES messages after it and LAUGH_SECONDS, or replying to it within that time.
 LAUGHERS, LAUGH_LINES, LAUGH_SECONDS = 2, 8, 600
@@ -84,6 +85,7 @@ class Memes:
         # restart or a rollback leaves none of it behind and erasing it never depends on that file.
         self.noted = {}
         self.verified = 0
+        self.refetching = None  # The notes' refetch pass, if any: one at a time, never cancelled (see verify).
         self.replies = {}  # A reply's message ID -> (ID of the message it replies to, when), for LAUGH_SECONDS.
         self.tasks = set()  # The laugh-started check running, if any: one at a time (see heard).
 
@@ -366,7 +368,12 @@ class Memes:
     async def verify(self, now=None):
         """Drop the notes whose author turned memory off or changed their privacy since, through Fri or
         elsewhere, or whose post was deleted or edited, whether or not meme checks are on. At most every
-        VERIFY_SECONDS."""
+        VERIFY_SECONDS.
+
+        The posts are refetched in their own task, waited on for REFETCH_WAIT and never cancelled: this runs
+        in the heartbeat, which a read held in Discord's global rate-limit wait must not stall, and discord.py
+        can't recover from a cancel inside that wait (see fri_fixes.check). A pass still running when the next
+        check comes is left to finish instead of doubled; that check's privacy reads don't wait on it."""
         now = now or time.time()
         if not self.noted or now-self.verified < VERIFY_SECONDS:
             return
@@ -382,7 +389,18 @@ class Memes:
                 continue
             if not profile['enabled'] or profile['revision'] != note['revision']:
                 self.noted.pop(message_id, None)
-        await self.refetch()
+        if not self.noted or (self.refetching is not None and not self.refetching.done()):
+            return
+        task = self.refetching = asyncio.create_task(self.refetch())
+        task.add_done_callback(self.refetched)
+        done, _ = await asyncio.wait({task}, timeout=REFETCH_WAIT)
+        if not done:
+            LOG.info('Meme note refetch still waiting on Discord; the heartbeat moves on')
+
+    def refetched(self, task):
+        """A pass that fails after its heartbeat moved on is still logged, not left unretrieved."""
+        if not task.cancelled() and task.exception() is not None:
+            LOG.info('Meme note refetch ended: %s', type(task.exception()).__name__)
 
     async def refetch(self):
         """Drop the notes whose post was deleted or edited: a read can't return a deleted post, so nothing
