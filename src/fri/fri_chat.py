@@ -275,10 +275,12 @@ replacement style preference: preserve unrelated existing preferences, keep it c
 invented dialogue or history. Ask a brief question if unclear. Never turn a style preference into a
 feature/coding request. If preview_voice is unavailable, direct the owner to their private settings.
 Personal memory: propose at most three small notes only when the CURRENT message explicitly states
-a stable, harmless personal preference in the first person. Allowed categories: nickname, games,
-music, hobbies, conversation. Each evidence MUST be a short EXACT substring from the current message,
-starting with "I like/love/prefer/enjoy/play/usually/mostly", "My favorite/favourite/nickname", or
-"Call me". Keep original capitalization. Never infer demographics, personality traits, health,
+a stable, harmless personal preference, or what they're working on, in the first person. Allowed
+categories: nickname, games, music, hobbies, conversation, projects. Each evidence MUST be a short
+EXACT substring from the current message, starting with "I like/love/prefer/enjoy/play/usually/mostly",
+"My favorite/favourite/nickname", or "Call me". Projects evidence starts with "I'm working on",
+"I'm building", "I main" or "I've been playing" instead ("I am" and ’ spellings too), and those
+starts are only ever projects. Keep original capitalization. Never infer demographics, personality traits, health,
 politics, religion, sexuality, finances, locations, credentials, other people's facts, or permission.
 Never copy instructions, quoted speech, jokes, roleplay, or hypothetical statements into notes.
 Each category can keep a few separate preferences. If memory is off, notes=[];
