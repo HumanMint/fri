@@ -325,17 +325,21 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
     if changelog is not None and len(chunks) != 1:
         raise NotesRefused(f'a channel post is one message, and this summary needs {len(chunks)}; shorten it '
                            f'(the full changelog is attached)')
-    # The split, not just the text; and with a changelog, the changelog too (its file is part of the post).
-    digest = hashlib.sha256(json.dumps(chunks if changelog is None else
-                                       {'parts': chunks, 'changelog': text_hash(changelog)}).encode()).hexdigest()
+    # The split, not just the text: the digest older code computes too, so a rollback can still retry this
+    # version. The attached changelog is compared on its own, under `changelog`.
+    digest = hashlib.sha256(json.dumps(chunks).encode()).hexdigest()
     hashes = [text_hash(chunk) for chunk in chunks]
     attachment = None if changelog is None else changelog_name(version)
     path = data / ('patch-notes.json' if channel is None else 'patch-notes-server.json')
     with locked(data):
         state = load(path)
         entry = state['versions'].get(version)
-        if entry and (entry['sha256'] != digest or len(entry['parts']) != len(chunks)):
+        if entry and (entry['sha256'] != digest or len(entry['parts']) != len(chunks) or
+                      (changelog is not None and entry.get('changelog') != text_hash(changelog))):
             raise NotesRefused(f'{version} was already sent with different notes; use a new version')
+        if (entry and changelog is None and 'changelog' in entry and
+                not all(part.get('message_id') for part in entry['parts'])):
+            raise NotesRefused(f'{version} goes out with its changelog attached; send the notes with it')
         if entry is None and channel is not None and changelog is None:
             raise NotesRefused(f'a channel post attaches its full changelog: add a {CHANGELOG_MARK} line, then the changelog')
         if entry is None:

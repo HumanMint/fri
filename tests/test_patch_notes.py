@@ -1035,3 +1035,21 @@ def test_preview_shows_the_message_and_the_attached_changelog(monkeypatch, capsy
 def test_a_draft_longer_than_one_message_is_refused():
     with pytest.raises(notes.NotesRefused, match='more than one message'):
         notes.drafted(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), 'completed')
+
+
+def test_an_attached_post_keeps_the_record_older_code_retries(dm, tmp_path):
+    """A rollback to code without changelogs must still finish an unconfirmed post from its summary: the version's
+    sha256 stays the summary's digest, which older code compares, and its nonce stays the same."""
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    chat.lost.add(1)  # the post lands, its reply doesn't
+    with pytest.raises(RuntimeError):
+        post('fri 0.7.0', tmp_path)
+    entry = server_record(tmp_path)['0.7.0']
+    legacy = notes.hashlib.sha256(json.dumps(notes.parts('fri 0.7.0')).encode()).hexdigest()
+    assert entry['sha256'] == legacy and entry['changelog'] == notes.text_hash(CHANGELOG)
+    assert chat.sends[0]['nonce'] == notes.nonce('0.7.0', legacy, 1, '#888')
+    with pytest.raises(notes.NotesRefused, match='goes out with its changelog attached'):
+        post('fri 0.7.0', tmp_path, changelog=None)  # this code never resends without the file
+    post('fri 0.7.0', tmp_path)
+    assert len(chat.sends) == 1 and server_record(tmp_path)['0.7.0']['parts'][0]['message_id'] == '1001'

@@ -658,8 +658,9 @@ docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md 
 ```
 
 `draft` runs one model call with Fri's voice, the owner's voice notes and the controller's chat model:
-talk to the server, call the owner mint or bossman, use only the given facts, and fit one message (under
-1,500 characters) with only the highlights, since the full changelog is attached; a longer draft is refused. It prints
+talk to the server, call the owner mint or bossman, use only the given facts, and aim for one message
+(under 1,500 characters) with only the highlights, since the full changelog is attached; a draft that
+needs more than one message is refused. It prints
 the post and sends nothing; its usage is reported like an eval's. The maintainer checks every line
 against the facts before sending, and edits the file if a line isn't backed by them.
 
@@ -668,9 +669,10 @@ there are none or several); without `--channel` the recipient is `GENE_OWNER_ID`
 message (owner request, 2026-10-27): the notes file holds that short summary, then a `<!-- changelog -->`
 line, then the full changelog, which goes out attached to the same message as `fri-<version>-changelog.md`.
 A summary that needs two messages, or a new channel post without a changelog, is refused before login; a
-changelog in the owner's DM is refused too. The record keeps the changelog's hash beside the version, so
-the same summary with another changelog counts as different notes, and recovery only takes a message that
-carries the file. A version posted before this (1.0.0) keeps working without one. There is no way to
+changelog in the owner's DM is refused too. The version's `sha256` stays the summary's digest, as older
+code computes it, so a rollback can still finish an unconfirmed post from its summary; the changelog's hash
+is kept beside it, so the same summary with another changelog counts as different notes, a retry that
+might resend refuses to go without the changelog, and recovery only takes a message that carries the file. A version posted before this (1.0.0) keeps working without one. There is no way to
 name anyone else. It logs in over REST only, so the running Fri's gateway session is untouched, and
 sends with mentions and link embeds off. Notes are split at blank lines into at most four messages of
 2000 characters, counted the way Discord counts them (UTF-16 units, so most emoji count 2).
