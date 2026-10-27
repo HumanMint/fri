@@ -16,7 +16,7 @@ import httpx
 from . import feedback as commands
 from .fri_agent_model import STRING, obj
 from .fri_errors import ControllerRejected, ControllerUnavailable
-from .fri_meme_media import load_image, sources
+from .fri_meme_media import load_image, sources, unsigned
 from .privacy import clean
 from .private_files import private_json
 
@@ -384,7 +384,7 @@ class Memes:
         current_profile = await self.eligible(current)
         if (not current_profile or current_profile['revision'] != profile['revision'] or
                 current.author.id != message.author.id or current.content != message.content or
-                current.edited_at != message.edited_at or sources(current) != urls):
+                current.edited_at != message.edited_at or unsigned(sources(current)) != unsigned(urls)):
             return
         now = time.time()
         with self.state() as state:
