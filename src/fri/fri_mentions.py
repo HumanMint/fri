@@ -10,10 +10,12 @@ from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import AuthorErased, ControllerUnavailable
-from .fri_meme_media import sources
+from .fri_images import details
+from .fri_meme_media import gif_previews, sources
+from .fri_memes import reacted
 from .privacy import clean
 
-NEARBY_SECONDS = 30 * 60
+NEARBY_SECONDS = 6 * 3600  # "The memes above" in a slow channel can be hours old; MAX_MESSAGES still bounds it.
 REFERENCE_SECONDS = 7 * 86400
 MAX_MESSAGES = 12
 CHANGED = 'That mention or its context changed while I was replying. Ask again for a fresh reply.'
@@ -38,6 +40,12 @@ def fingerprint(message):
                   for a in message.attachments))
 
 
+def snapshot(message):
+    """A nearby post as read: its fingerprint, and the GIF link previews look() may have inspected,
+    which live in the embeds (a poster can swap or remove them without an edit time)."""
+    return fingerprint(message), tuple(gif_previews(message))
+
+
 class Invitation:
     def __init__(self, agent, message):
         self.agent, self.fri, self.event = agent, agent.fri, message
@@ -48,8 +56,8 @@ class Invitation:
                       'channel_id': str(message.channel.id), 'conversation_id': f'public:{message.channel.id}'}
         self.grant = None
         self.rows, self.events, self.profiles, self.snapshots = [], {}, {}, {}
-        self.image = None  # The one image post it inspects, snapshotted as chosen (see current).
-        self.ambiguous_images = False
+        self.image = None  # The ping's own image post, the one it replies to, or their photo just before (see current).
+        self.images = []  # Otherwise, nearby posts with attachments, for look() to choose from.
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
         self.revision = None  # The author's privacy revision as Fri first read it for this ping.
@@ -165,7 +173,7 @@ class Invitation:
                         self.agent.withdraw(event)
                         changed = True
                         continue
-                    if current.webhook_id or current.author.bot or fingerprint(current) != self.snapshots[mid]:
+                    if current.webhook_id or current.author.bot or snapshot(current) != self.snapshots[mid]:
                         self.agent.withdraw(event)
                         changed = True
                 if changed:
@@ -173,6 +181,10 @@ class Invitation:
                 # The ping again, as an edit during the privacy read would otherwise go unseen.
                 if not await self.ping_unchanged():
                     return self.refuse('message changed')
+                # Their privacy once more, a controller read, so an opt-out during the refetches above counts too.
+                profiles = await self.profile_sources(list(self.events.values()))
+                if any(profiles.get(user) != before for user, before in self.profiles.items()):
+                    return self.refuse('nearby privacy changed')
             return True
         except ControllerUnavailable:
             raise  # Nothing changed; the controller is down, and the caller's outage handling says so.
@@ -264,6 +276,7 @@ class Invitation:
                 continue
             accepted.append(item)
         profiles = await self.profile_sources(accepted)
+        notes, stale = self.agent.ensure_memes().notes(), []
         for item in sorted(accepted, key=lambda m: m.id):
             user = str(item.author.id)
             profile = profiles.get(user)
@@ -271,31 +284,34 @@ class Invitation:
                 continue
             self.profiles[user] = profile
             self.events[item.id] = item
-            self.snapshots[item.id] = fingerprint(item)
+            self.snapshots[item.id] = snapshot(item)
             self.rows = [row for row in self.rows if row['source']['id'] != str(item.id)]
             self.rows.append({'source': discord_source(item).evidence(), 'text': clean(item.content, 500),
-                              'privacy_revision': profile['revision'], 'referenced': item.id == reference_id})
+                              'privacy_revision': profile['revision'], 'referenced': item.id == reference_id,
+                              **details(item), **reacted(notes, item, profile, stale)})
+        self.agent.ensure_memes().drop(stale)
         self.rows.sort(key=lambda row: int(row['source']['id']))
         own = event if event.attachments else None
         referenced = self.events.get(reference_id)
-        images = [m for m in self.events.values() if m.attachments]
         if own:
             self.image = own
         elif referenced and referenced.attachments:
             self.image = referenced
-        elif len(images) == 1:
-            self.image = images[0]
-        elif len(images) > 1:
-            self.ambiguous_images = True
-        # Contextual images use attachments only. Never follow embeds or pasted URLs.
+        # Without one image the ping points at, "which of these" needs all of them; look() keeps the newest that fit.
+        self.images = [] if self.image else [m for m in self.events.values() if m.attachments or gif_previews(m)]
+        # Contextual images use attachments, or a GIF link's Discord-made preview. Never other embeds or URLs.
         if self.image and sources(self.image) != [str(a.url) for a in self.image.attachments]:
             self.image = None
         await self.require_current()
 
     def context(self):
-        return {'invited_context': self.rows, 'ambiguous_context_images': self.ambiguous_images,
-                'force_text_reply': True, 'acknowledgments_enabled': False,
+        return {'invited_context': self.rows, 'force_text_reply': True, 'acknowledgments_enabled': False,
                 'voice_notes': self.agent.config['voice_notes']}
+
+    async def look(self, context):
+        """Inspect the nearby image posts collect() found, as this invitation's evidence."""
+        from .fri_images import look
+        return await look(context, self.images, invitation=self)
 
 
 def force_text(result):

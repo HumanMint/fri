@@ -12,7 +12,8 @@ PAGE_SIZE = 10
 MAX_PAGES = 2
 MAX_RESULTS = 5
 MAX_DAYS = 365
-FIELDS = ('channel_id', 'query', 'author', 'after', 'before', 'cursor')
+FIELDS = ('channel_id', 'query', 'author', 'after', 'before', 'has', 'cursor')
+HAS = ('', 'image', 'video', 'file', 'link', 'sticker')  # Discord search's has: filter, or none.
 HISTORY_ACTIONS = {'history_search': dict.fromkeys(FIELDS, str)}
 READ_ONLY_AFTER_HISTORY = {'history_search', 'read_recent', 'learning_overview', 'web_sources',
                            'channel_capabilities', 'work_list', 'work_read'}
@@ -30,7 +31,20 @@ def requested(text):
         r'|\b(what|which|who|when|where)\b.*\bdid\b.+\b(say|recommend|mention|post|discuss|talk|link)\b'
         r'|\b(what|which|who|when|where|find|search|look up)\b.*\b(said|recommended|mentioned|posted|talked|discussed|linked)\b.*\b(earlier|before|yesterday|last week|last month|last year|ago|history|chat|messages?|logs?)\b'
         r'|\b(what|which|who|when|where|find|search|look up)\b.*\b(earlier|yesterday|last week|last month|last year|history|chat|messages?|logs?)\b.*\b(said|recommended|mentioned|posted|talked|discussed|linked)\b'
-        r'|\b(search|find)\b.*\b(before|last month|last week|last year|ago)\b', visible))
+        r'|\b(search|find)\b.*\b(before|last month|last week|last year|ago)\b'
+        # "find the meme kev posted": a post someone made, asked for by what it carries.
+        r'|\b(find|search|look\s+up|dig\s+up|pull\s+up)\b.*\b(memes?|pics?|pictures?|images?|photos?|screenshots?|gifs?|'
+        r'videos?|clips?|links?|files?)\b.*\b(posted|sent|shared|dropped|uploaded|linked)\b'
+        # The verb ends the clause, as in recall; "a shared drive" uses it as an adjective.
+        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn|in\s+[#<])))'
+        # "what was that song kev mentioned": a thing someone said, named before the verb. The word
+        # before the verb is who said it, so "the most commonly recommended laptop" or "the difference
+        # between shared and dedicated" stay general questions.
+        r"|\b(?:what(?:'s|’s|s)?|which)\s+(?:(?:was|were|is)\s+)?(?:that|the|those)\s+\w+(?:\s+\w+){0,3}?\s+"
+        r'(?!(?:\w+ly|most|more|least|between|and|or|of|for|with|in|on|to|by|than|as|being|been)\b)\w+\s+'
+        # The verb ends the clause, as in recall; "doctor recommended dose" uses it as an adjective.
+        r'(said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
+        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|in|on|here|there|again|lol|lmao|rn)\b))', visible))
 
 
 def valid_action(action):
@@ -41,8 +55,15 @@ def valid_action(action):
             and len(action['query']) <= 80 and len(action['author']) <= 80
             and all(not action[k] or re.fullmatch(r'\d{4}-\d{2}-\d{2}', action[k])
                     for k in ('after', 'before'))
+            and action['has'] in HAS
             and bool(re.fullmatch(r'(?:[a-f0-9]{32})?', action['cursor']))
             and all(clean(action[k], 80) == action[k] for k in ('query', 'author')))
+
+
+def attachment_ids(message):
+    attachments = getattr(message, 'attachments', None)
+    return tuple(getattr(a, 'id', None) or str(a.url).split('?')[0] for a in attachments) \
+        if isinstance(attachments, (list, tuple)) else ()
 
 
 def bounds(after, before, now):
@@ -79,7 +100,9 @@ class HistorySearch:
                 'description': 'Search old server messages for the current question. Choose a short natural '
                 'keyword/phrase (watched, played, recommend, or a specific title), or empty query for an '
                 'author/date search. author is a name/mention from the question, me, or empty. '
-                'after/before are YYYY-MM-DD UTC dates or empty; before is exclusive. At most two '
+                'after/before are YYYY-MM-DD UTC dates or empty; before is exclusive. has is image, video, '
+                'file, link or sticker for a post that carries one (a meme, a clip), else empty; up to four '
+                'images found are looked at. At most two '
                 '10-hit pages this turn, five excerpts each. If needed, repeat with the exact returned '
                 'cursor and unchanged fields for older matches, or refine the query with cursor="". '
                 'Only listed channels; public queries stay in the current channel. Ask which channel '
@@ -163,7 +186,7 @@ class HistorySearch:
                     floor, ceiling = bounds(action['after'], action['before'], time.time())
                     author = await self.author(action['author'], channel)
                     plan = {'min_id': snowflake(floor), 'max_id': snowflake(ceiling), 'author': author,
-                            'floor': floor, 'ceiling': ceiling, 'query': action['query']}
+                            'floor': floor, 'ceiling': ceiling, 'query': action['query'], 'has': action['has']}
                 return await self.page(channel, channel_id, plan, fingerprint)
         except (ValueError, KeyError, TypeError, OverflowError):
             return {'error': 'The history search could not validate its filters or results. Try a member mention and a date range.'}
@@ -173,6 +196,8 @@ class HistorySearch:
     async def page(self, channel, channel_id, plan, fingerprint):
         import discord
         from discord.http import Route
+
+        from .fri_images import image_context, look, media
 
         a = self.actions
         permissions = channel.permissions_for(channel.guild.me)
@@ -185,6 +210,8 @@ class HistorySearch:
             params['author_id'] = plan['author']
         if plan['query']:
             params['content'] = plan['query']
+        if plan.get('has'):
+            params['has'] = plan['has']
         route = Route('GET', '/guilds/{guild_id}/messages/search', guild_id=a.guild)
         result = await a.fri.http.request(route, params=params)
         if result.get('code') or result.get('doing_deep_historical_index'):
@@ -203,7 +230,7 @@ class HistorySearch:
                     or plan['author'] and str(row['author']['id']) != plan['author']):
                 raise ValueError('Out-of-scope search result')
         a.sources.add(channel_id)
-        examined = []
+        examined, posts = [], []
         for row in rows:
             if len(messages) >= MAX_RESULTS:
                 break
@@ -218,25 +245,35 @@ class HistorySearch:
                 message = await channel.fetch_message(int(row['id']))
             except discord.NotFound:
                 continue
+            carries = media(message)  # A meme with no caption is still a find.
             if (message.author.bot or message.webhook_id or str(message.author.id) != str(row['author']['id'])
-                    or message.content != row['content'] or not message.content.strip()):
+                    or message.content != row['content'] or not (message.content.strip() or carries)):
                 continue
             a.observe(scope, message.author.id, profile['revision'])
-            self.evidence[(channel_id, message.id)] = (message.author.id, message.content)
+            # What it carries counts too: an image removed since is an edit, and the attachments change.
+            self.evidence[(channel_id, message.id)] = (message.author.id, message.content,
+                                                       getattr(message, 'edited_at', None), attachment_ids(message))
             messages.append({'id': str(message.id), 'user_id': str(message.author.id),
                 'author': clean(message.author.display_name, 80), 'at': message.created_at.isoformat(),
-                'text': clean(message.content, 600), 'source': message.jump_url})
+                'text': clean(message.content, 600), 'source': message.jump_url,
+                **({'attachments': carries} if carries else {})})
+            if carries:
+                posts.append(message)
         cursor = ''
         # Discord warns a short page does not establish archive exhaustion.
         if examined and self.remaining:
             cursor = uuid.uuid4().hex
             self.cursors[cursor] = {'fingerprint': fingerprint,
                 'plan': {**plan, 'max_id': str(min(map(int, examined)))}}
+        looked = {}
+        if posts and a.media_allowed and a.turn_context is not None:  # The memes it found, looked at.
+            looked = await look(a.turn_context, posts)
+            a.image_context = image_context(a.turn_context)
         return {'kind': 'history_search', 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
-                'messages': messages, 'matched': len(rows), 'shown': len(messages), 'next_cursor': cursor,
+                'messages': messages, 'matched': len(rows), 'shown': len(messages), 'next_cursor': cursor, **looked,
                 'remaining_searches': self.remaining, 'after_utc': dt.datetime.fromtimestamp(plan['floor'], dt.timezone.utc).isoformat(),
                 'before_utc': dt.datetime.fromtimestamp(plan['ceiling'], dt.timezone.utc).isoformat(),
-                'query': plan['query'], 'author_id': plan['author'], 'complete_archive': False,
+                'query': plan['query'], 'author_id': plan['author'], 'has': plan.get('has', ''), 'complete_archive': False,
                 'personal_notes_saved': 0}
 
     async def valid(self, channels):
@@ -244,7 +281,7 @@ class HistorySearch:
             return await self._valid(channels)
 
     async def _valid(self, channels):
-        for (channel_id, message_id), (user, content) in self.evidence.items():
+        for (channel_id, message_id), (user, content, edited, attachments) in self.evidence.items():
             if channel_id not in channels:
                 return False
             channel = channels[channel_id]
@@ -252,6 +289,7 @@ class HistorySearch:
             if not permissions.view_channel or not permissions.read_message_history:
                 return False
             message = await channel.fetch_message(message_id)
-            if (message.author.id != user or message.content != content or message.author.bot or message.webhook_id):
+            if (message.author.id != user or message.content != content or message.author.bot or message.webhook_id or
+                    getattr(message, 'edited_at', None) != edited or attachment_ids(message) != attachments):
                 return False
         return True

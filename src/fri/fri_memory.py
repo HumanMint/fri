@@ -46,6 +46,25 @@ def server_wide(channel):
     return True
 
 
+def open_to_everyone(channel):
+    """server_wide, and no role or member is kept out of it or its history, so an answer quoting it
+    can be read anywhere in the server. server_wide asks only the default role; a channel can still
+    deny one role or one member."""
+    if not server_wide(channel):
+        return False
+    parent = channel.parent if isinstance(channel, discord.Thread) else channel
+    try:
+        if not parent.permissions_for(parent.guild.default_role).read_message_history:
+            return False
+        for overwrite in parent.overwrites.values():
+            deny = overwrite.pair()[1]
+            if deny.view_channel or deny.read_message_history:
+                return False
+    except (AttributeError, TypeError):
+        return False
+    return True
+
+
 def before_removal(message_id, profile):
     """Sent before the member last edited their memory, so Fri keeps it nowhere (the controller's removed_at)."""
     return discord.utils.snowflake_time(int(message_id)).timestamp() <= (profile.get('removed_at') or 0)

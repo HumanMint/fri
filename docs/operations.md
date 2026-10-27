@@ -24,12 +24,21 @@ New conversation and on-demand surrounding context still need normal chat admiss
 an outside mention always keeps its separate one-event social admission.
 
 Each invitation can use at most twelve preceding messages from the same channel in
-the last thirty minutes and a direct reference up to seven days old. A catch-up in a
-configured channel uses its own read instead (see "Catching up"). At most one
-image post is inspected, preferring the current attachments, then the reference,
-then a single nearby candidate. Multiple candidates need clarification. Existing
-limits remain two non-spoiler PNG/JPEG/WebP attachments, 4 MB each, twenty million
-pixels; external embeds, GIFs and videos are not inspected by this path. Captions
+the last six hours and a direct reference up to seven days old. A catch-up in a
+configured channel uses its own read instead (see "Catching up"). Up to four still
+images are inspected in one model call, the current attachments and the reference
+first, then the newest nearby posts' own attachments; Fri picks among several instead
+of asking which one. A speaker's own post keeps the two-image limit; a nearby gallery
+post can use the whole budget. Each image stays a non-spoiler PNG/JPEG/WebP, 4 MB,
+twenty million pixels. A GIF link (Tenor, Giphy) counts as one image through the still preview
+Discord's own proxy made of it; nothing decodes an animation, so an uploaded GIF or an animated
+preview is not inspected. Other external embeds and videos are not inspected by this path.
+A pasted message link or a replied-to post is opened only when the speaker and Fri can
+read it now (fetched overwrites and roles); from a server channel, only when it is this
+channel or one that keeps no role or member out. Every post a read or a link showed is
+found again unchanged before each later model request and before delivery. Asked what's
+pinned, Fri reads up to twenty of a channel's pins, any age, with the same channel, audience
+and author checks as any read; each must still be pinned and unchanged before the next request. Captions
 and filenames are never visual evidence. Public research only exports an exact
 public question from the current request, never surrounding chat or image captions.
 
@@ -194,6 +203,25 @@ advertises it, so the controller must be released first.
   speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
+- **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
+  research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
+  an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead
+  of six. Only a pinned allowlist is raw (`privacy.RAW`): Emoji_Presentation emoji from Unicode 14.0
+  except the regional indicators (🇫🇷 and Clipperton's 🇨🇵 are the same flag), plus ❤, Hangul
+  syllables and the modern Hangul compatibility jamo such as ㅋ. None of them looks like another or
+  like ASCII, alone or in a row, so a row of lookalikes can't spell bits a
+  person reading the log won't see. Everything else stays escaped exactly as before: other scripts
+  and symbols (Latin A and Cyrillic А, the Kelvin sign and K, look-alike combining marks, and ’”
+  and ”’ render alike), combining marks, every variation selector (even an emoji's own U+FE0F: 👍 and 👍️
+  look the same), controls, format and invisible characters, spaces and separators, surrogates,
+  private-use and unassigned code points. Widening the list needs the same test: no member may look
+  like another raw character. `json.dumps` still does the traversal, key conversion and errors. To
+  compare against the old escaping, run `python -m fri.fri_eval --suite model-text` with and without
+  `--baseline` (same cases and settings, model-graded: boundaries, attribution, tone, Korean and
+  Korean chat shorthand, and hidden carriers (thumbs, doubled shaddas, overlay order, Kelvin signs,
+  Cyrillic A, French-looking flags)). The baseline escapes all of Fri's own model input, internal tasks such as image
+  selection included; the graders pin `privacy.model_json`, so they read both runs the same way. A
+  case whose reply fails, or whose grade fails, fails the run.
 
 ## Members' own requests
 
@@ -361,6 +389,13 @@ Calls whose result can't change what members see are skipped before inference.
   is skipped, since the normal path can't answer then.
 - Meme checks are unchanged: an inspection still runs while the reaction budget is closed, because
   the budget can reopen (or the owner can raise it) before the model answers.
+- When a meme check reacts, Fri keeps in memory, never on disk, the emoji, the post's author ID, their
+  privacy revision, the post's edit time and up to 200 characters of what the model saw (never the
+  caption), for up to three days or until Fri restarts; a rollback leaves nothing behind. A read or a
+  mention's nearby rows show it as `fri_reacted` on that post only while the author's revision and the
+  edit time still match, and drop it when they don't. Forgetting a member drops theirs; every heartbeat
+  expires old ones (before it waits on the controller) and, every ten minutes, drops those whose
+  author changed privacy outside Fri, whether or not meme checks are on.
 
 ## Deployment boundary
 
@@ -580,28 +615,38 @@ explicitly reviewed retirement step.
 
 ## Release patch notes
 
-After a release, the maintainer sends the owner that release's notes from Fri's account:
+After a release, Fri drafts that release's patch notes from the maintainer's facts and posts them in
+the server's #fri-chat, for everyone there. The owner's DM stays for owner-only notes (no release
+today, a rollback).
 
 ```sh
-docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.4.0 < notes.md
-docker exec -i fri-runtime-1 python -m fri.fri_patch_notes preview 0.4.0 < notes.md  # no send
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes draft 0.7.0 < facts.md > notes.md
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes preview 0.7.0 < notes.md  # no send
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 --channel fri-chat < notes.md
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md  # the owner's DM
 ```
 
-The recipient is always `GENE_OWNER_ID`; there is no way to name anyone else. It logs in over
-REST only, so the running Fri's gateway session is untouched, and sends with mentions and link
-embeds off. Notes are split at blank lines into at most four messages of 2000 characters,
-counted the way Discord counts them (UTF-16 units, so most emoji count 2).
-`/data/patch-notes.json` records each version's confirmed parts, so a rerun finishes a partial
-send and never repeats a part: a part whose send was attempted but never confirmed is looked for
-in the DM first (Fri's own messages since the attempt with exactly that text, skipping any the
-record already gives another part), and every part carries a fixed nonce. If two versions each
-have an unconfirmed part with the same text, the DM can't say whose a message is, so both are
-refused until someone checks the DM and fixes the record by hand.
+`draft` runs one model call with Fri's voice, the owner's voice notes and the controller's chat model:
+talk to the server, call the owner mint or bossman, use only the given facts, keep it brief. It prints
+the post and sends nothing; its usage is reported like an eval's. The maintainer checks every line
+against the facts before sending, and edits the file if a line isn't backed by them.
 
-Exit codes: 0 sent (or already sent); 2 refused: the same version with
-different notes (send a correction as a new version), notes that don't fit, a damaged record, or
-missing settings; 1 failed: Discord refused, answered badly or the connection dropped. Every confirmed part is on
-record, so rerunning the same command after a 1 is safe. Members see nothing.
+`send --channel <name>` posts in the one text channel of `GENE_GUILD_ID` with that name (refused if
+there are none or several); without `--channel` the recipient is `GENE_OWNER_ID`. There is no way to
+name anyone else. It logs in over REST only, so the running Fri's gateway session is untouched, and
+sends with mentions and link embeds off. Notes are split at blank lines into at most four messages of
+2000 characters, counted the way Discord counts them (UTF-16 units, so most emoji count 2).
+`/data/patch-notes-server.json` (the channel) and `/data/patch-notes.json` (the DM) record each
+version's confirmed parts, so a rerun finishes a partial send and never repeats a part: a part whose
+send was attempted but never confirmed is looked for there first (Fri's own messages since the attempt
+with exactly that text, skipping any the record already gives another part), and every part carries a
+fixed nonce. If two versions each have an unconfirmed part with the same text, the history can't say
+whose a message is, so both are refused until someone checks and fixes the record by hand.
+
+Exit codes: 0 sent (or already sent) or drafted; 2 refused: the same version with different notes
+(send a correction as a new version), notes that don't fit, a damaged record, a missing or doubled
+channel, or missing settings; 1 failed: Discord or the model refused, answered badly or the connection
+dropped. Every confirmed part is on record, so rerunning the same command after a 1 is safe.
 
 ## Background work and health
 
@@ -742,7 +787,8 @@ Each step records:
 - the observed route: local intercept, admission, model, tools, outcome, and how the turn was
   stored;
 - a context manifest: field sizes, offered actions, prompt version, model and effort, with no raw
-  member text;
+  member text; `input_chars` counts the characters of text the model reads, not the request's own
+  JSON escaping;
 - token usage.
 
 Production source is unchanged. Routes come from observable effects plus a pass-through spy on

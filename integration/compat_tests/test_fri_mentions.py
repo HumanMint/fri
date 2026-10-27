@@ -166,7 +166,9 @@ def test_ping_after_another_members_meme_gets_text_without_ambient_expansion(mon
             context = fri.chat_once.await_args.args[1]
             assert context['force_text_reply'] and not context['acknowledgments_enabled']
             assert context['invited_context'][0]['source']['user_id'] == '30'
-            assert context['image_event'].id == meme.id and context['images']
+            assert [read['event'].id for read in context['image_reads']] == [meme.id] and context['images']
+            assert context['inspected_images'] == [{'images': [1], 'source': context['invited_context'][0]['source']}]
+            assert context['invited_context'][0]['attachments'] == ['image']
             saved = store.chat_context('123', f'public:{channel.id}', '20')
             assert not saved['personal_memory']['notes']
             assert 'public meme caption' not in str(saved)
@@ -1249,7 +1251,11 @@ def test_an_erasure_during_a_pings_last_checks_stops_the_reply(monkeypatch, tmp_
             assert seen
             event.reply.assert_not_awaited()
             assert not any(path == '/chat/turn' for path, _ in calls)
-            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+            # A Gene erasure during the last look outside a configured channel is now caught by the
+            # nearby authors' privacy check that runs after the refetches: Gene refuses the fenced grant.
+            reason = ('reply withheld: check failed: ControllerRejected' if (channel_id, erasure) == (8, 'gene')
+                      else 'author privacy changed')
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: {reason}']
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -2690,17 +2696,17 @@ def test_configured_complete_requests_keep_existing_capabilities(monkeypatch, tm
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('mode', ['optout', 'ambiguous', 'reference', 'old'])
-def test_context_images_keep_privacy_age_reference_and_ambiguity_limits(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize('mode', ['optout', 'several', 'reference', 'old'])
+def test_context_images_keep_privacy_age_and_reference_limits(monkeypatch, tmp_path, mode):
     async def scenario():
         fri, agent, store, _, channel, message, _, _ = environment(monkeypatch, tmp_path)
         meme = message('caption is not proof of image contents', user=30,
-            age=3*86400 if mode == 'reference' else 31*60 if mode == 'old' else 60,
+            age=3*86400 if mode == 'reference' else 6*3600+60 if mode == 'old' else 60,
             attachments=[attachment(channel.id)])
         if mode == 'optout':
             store.personal_control('30', 'disable')
-        elif mode == 'ambiguous':
-            message('a second image', user=40, age=30, attachments=[attachment(channel.id)])
+        elif mode == 'several':
+            second = message('a second image', user=40, age=30, attachments=[attachment(channel.id)])
         event = message('<@99> you support the protests in france')
         if mode == 'reference':
             event.reference = SimpleNamespace(message_id=meme.id, channel_id=channel.id)
@@ -2709,11 +2715,15 @@ def test_context_images_keep_privacy_age_reference_and_ambiguity_limits(monkeypa
         try:
             await agent.handle(event)
             context = fri.chat_once.await_args.args[1]
-            assert bool(context.get('images')) == (mode == 'reference')
-            assert context['ambiguous_context_images'] == (mode == 'ambiguous')
+            assert len(context.get('images', [])) == {'several': 2, 'reference': 1}.get(mode, 0)
+            assert 'ambiguous_context_images' not in context
             if mode == 'reference':
-                assert context['image_provenance']['user_id'] == '30'
-            elif mode != 'ambiguous':
+                assert context['image_provenance']['user_id'] == '30' and not context.get('inspected_images')
+            elif mode == 'several':  # Newest first, each image with its own post and author.
+                assert [(row['images'], row['source']['id'], row['source']['user_id']) for row in context['inspected_images']] == [
+                    ([1], str(second.id), '40'), ([2], str(meme.id), '30')]
+                assert context.get('image_provenance') is None
+            else:
                 assert not context['invited_context']
             event.reply.assert_awaited_once()
         finally:
@@ -2809,7 +2819,7 @@ def test_on_demand_meme_read_checks_sources_before_reply_and_prevents_persistenc
                 assert not context['invited_context'] and not context.get('images')
                 assert 'work_save' in context['actions']
                 return ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': '1'})
-            assert context['images'] and context['image_provenance']['user_id'] == '30'
+            assert context['images'] and context['inspected_images'][0]['source']['user_id'] == '30'
             assert not {'work_save', 'prepare_post', 'preview_voice', 'reminder_prepare', 'plan_prepare', 'image_search'} & set(context['actions'])
             if change == 'privacy':
                 store.personal_control('30', 'disable')

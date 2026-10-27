@@ -1,6 +1,7 @@
 """Bounded conversational tools. Discord text never selects authority or scope."""
 
 import asyncio
+import copy
 import datetime as dt
 import json
 import time
@@ -14,6 +15,8 @@ from .fri_conversation import PERSISTENT_MODEL_WRITES
 from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
+from .fri_images import details, image_context, look, media
+from .fri_memes import carried, reacted
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
 from .gene_controls import COMMANDS, arguments, grounded, music_control_intent, own_words, requested
@@ -23,8 +26,18 @@ from .web_policy import public_query
 CATCH_UP_MESSAGES, CATCH_UP_SECONDS = 100, 12 * 3600
 CATCH_UP_CHARS = 20000  # Serialized rows, so emoji-heavy chat can't blow up the prompt.
 RETURN_SECONDS = 5 * 60  # The speaker's own recent messages ("yo", "back") are part of coming back.
+MAX_THREADS = 6  # Active public threads a read can pick from, most recently active first.
+PINS = 20  # Pinned posts a pins read shows, newest pinned first, any age.
+PINS_AGAIN = 50  # One page when a pins read is checked again, so a new pin can't push one out.
+PINNED = ('The channel\'s pinned posts, newest pinned first, up to twenty of any age: when they ask '
+          'what\'s pinned or say something is in the pins.')
 CATCH_UP = ('Only when the speaker asks what they missed: other members\' text in that channel since '
             'the speaker\'s last message there, up to 100 messages or 12 hours. No images.')
+
+
+def posts_in(channel):
+    """A channel with posts of its own to read: a forum or a category only holds threads or channels."""
+    return callable(getattr(channel, 'history', None))
 
 
 class Actions:
@@ -47,7 +60,7 @@ class Actions:
         self.media_allowed = False
         self.invitation = None
         self.turn_context = None
-        self.caught_up = None
+        self.reads = []  # What each read showed, and the history window that finds it again.
         from .fri_image_share import ImageShare
         self.image_share = ImageShare(self)
         self.history = HistorySearch(self)
@@ -106,25 +119,83 @@ class Actions:
         return (original.author.id == self.user and not original.webhook_id and
                 clean(original.content, 4000) == self.pending['request_text'])
 
-    async def channels(self, fresh=False):
+    async def channels(self, fresh=False, around=False):
+        """What this member can read through Fri: in public, this channel.
+
+        around, for read_recent, adds active public threads, and in public the other channels Fri
+        reads that everyone in the server could read anyway (open_to_everyone). This channel's own
+        threads and, in a thread, its parent and siblings have this channel's audience."""
+        from .fri_memory import PUBLIC_THREADS, open_to_everyone
+
         member = await self.agent.member(self.user, fresh=fresh, guild_id=self.guild)
         if not member or not self.agent.config['enabled']:
             return {}
-        ids = [str(self.channel)] if self.public else list(dict.fromkeys(
-            self.agent.state['history_channels'] + self.agent.state['channels'] + [str(self.fri.workshop_id)]))
+        listed = self.agent.state['history_channels'] + self.agent.state['channels']
+        ids = [str(self.channel)] if self.public else list(dict.fromkeys(listed + [str(self.fri.workshop_id)]))
+        home = self.fri.get_channel(int(self.channel)) if self.public and str(self.channel).isdigit() else None
+        home = str(getattr(home, 'parent_id', None) or self.channel)
+        if around and self.public:
+            ids = list(dict.fromkeys(ids + [home] + listed))
         result = {}
-        for channel_id in ids[:10]:
-            if not channel_id.isdigit():
-                continue
-            channel = self.fri.get_channel(int(channel_id))
+        def elsewhere(channel):  # Outside this channel's own audience, so it needs everyone's.
+            return (around and self.public and str(channel.id) != str(self.channel) and
+                    str(getattr(channel, 'parent_id', None) or channel.id) != home)
+
+        def readable(channel):
             if (not channel or getattr(getattr(channel, 'guild', None), 'id', None) != self.guild or
-                    (not self.agent.allowed(channel) and str(channel.id) not in self.agent.state['history_channels']) or getattr(channel, 'nsfw', False) or
+                    (not self.agent.allowed(channel) and not {str(channel.id), str(getattr(channel, 'parent_id', None))}
+                     & set(self.agent.state['history_channels'])) or getattr(channel, 'nsfw', False) or
                     (isinstance(channel, discord.Thread) and (channel.is_private() or getattr(channel.parent, 'nsfw', True)))):
-                continue
+                return False
+            if elsewhere(channel) and not open_to_everyone(channel):
+                return False
             permissions = channel.permissions_for(member)
-            if permissions.view_channel and permissions.read_message_history:
+            return permissions.view_channel and permissions.read_message_history
+        for channel_id in ids[:10]:
+            if channel_id.isdigit() and readable(channel := self.fri.get_channel(int(channel_id))):
                 result[str(channel.id)] = channel
+        if around:
+            threads = []
+            for channel in list(result.values()):
+                found = getattr(channel, 'threads', None)  # Discord's cache of active threads.
+                if not isinstance(channel, discord.Thread) and isinstance(found, list):
+                    threads += [thread for thread in found if isinstance(thread, discord.Thread) and
+                                thread.type in PUBLIC_THREADS and not thread.archived and str(thread.id) not in result]
+            threads.sort(key=lambda thread: thread.last_message_id or thread.id, reverse=True)
+            # A thread this turn already read stays listed when busier ones push it past the cap.
+            kept = threads[:MAX_THREADS] + [thread for thread in threads[MAX_THREADS:] if str(thread.id) in self.sources]
+            result.update((str(thread.id), thread) for thread in kept if readable(thread))
+        if fresh and self.sources & result.keys():
+            result = await self.recheck(result, member, elsewhere)
         return result
+
+    async def recheck(self, channels, member, elsewhere=lambda channel: False):
+        """Drop each channel this turn read from that `member` can't read now, judged from fetched
+        overwrites and roles: the cached channel can lag a revoke (see Invitation.access). One read
+        outside this channel's audience must also still keep nobody out."""
+        from .fri_conversation import age_restricted
+        from .fri_memory import open_to_everyone
+
+        read = sorted(self.sources & channels.keys())
+        guild = channels[read[0]].guild  # channels() keeps only this server's channels
+        try:
+            fresh_guild = copy.copy(guild)
+            fresh_guild._roles = {role.id: role for role in await guild.fetch_roles()}
+            for channel_id in read:
+                channel = await guild.fetch_channel(int(channel_id))
+                if isinstance(channel, discord.Thread) and channel.archived is True:  # Reads take active threads.
+                    del channels[channel_id]
+                    continue
+                parent = await guild.fetch_channel(channel.parent_id) if isinstance(channel, discord.Thread) else channel
+                parent = copy.copy(parent)
+                parent.guild = fresh_guild
+                permissions = parent.permissions_for(member)
+                if (not (permissions.view_channel and permissions.read_message_history) or age_restricted(parent) or
+                        (elsewhere(channels[channel_id]) and not open_to_everyone(parent))):
+                    del channels[channel_id]
+        except discord.HTTPException:
+            return {key: value for key, value in channels.items() if key not in self.sources}
+        return channels
 
     async def available(self):
         if self.invitation and self.invitation.outside:
@@ -142,17 +213,30 @@ class Actions:
         channels = await self.channels()
         if not channels:
             return {}
-        actions = {'read_recent': {'channels': [{'channel_id': k, 'name': clean(v.name, 60)}
-                                                for k, v in channels.items()],
-                    'default_channel_id': next(iter(channels)), 'limit': 20, 'max_age_days': 7,
-                    'description': 'Read one small recent text batch when asked. No images or saved personal notes.',
-                    'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP}}}
-        if self.invitation:
-            actions['read_recent'].update(limit=12, max_age_days=30/(24*60),
-                description='Read up to twelve preceding same-channel messages from the last thirty minutes '
-                'when this mention needs nearby conversation or meme context. Can inspect one attributed '
-                'small still-image post, up to two attachments. This read disables persistent writes '
-                'and external image selection for this turn; complete current requests need no read.')
+        def listed(key, channel):
+            row = {'channel_id': key, 'name': clean(channel.name, 60)}
+            if isinstance(channel, discord.Thread) and channel.parent:
+                row['thread_in'] = clean(channel.parent.name, 60)
+            return row
+        # A forum holds threads, not posts: its threads are listed, the forum itself isn't read.
+        readable = {k: v for k, v in (await self.channels(around=True)).items() if posts_in(v)}
+        # A forum's threads can be all there is to read, so fall back to the first of those.
+        default = next((k for k, v in channels.items() if posts_in(v)), next(iter(readable), None))
+        actions = {} if default is None else {'read_recent': {'channels': [listed(k, v) for k, v in readable.items()],
+                    'default_channel_id': default, 'limit': 20, 'max_age_days': 7,
+                    'description': 'Read one small recent batch when asked: text, what each post carries '
+                    '(image, gif, video, file), and a look at up to four of the newest still images. '
+                    'Another listed channel or thread when they ask about it. No saved personal notes.',
+                    'windows': {'recent': 'the read described above', 'since_my_last_message': CATCH_UP,
+                                'pins': PINNED}}}
+        if self.invitation and 'read_recent' in actions:
+            actions['read_recent'].update(limit=12, max_age_days=6/24,
+                description='Read up to twelve preceding same-channel messages from the last six hours '
+                'when this mention needs nearby conversation, memes or images. Looks at the image the ping '
+                'replies to or carries, else up to four of the newest nearby still images, each with its author. '
+                'Another listed channel or thread, when they ask about it, reads its latest twenty from the last week. '
+                'This read disables persistent writes and external image selection for this turn; '
+                'complete current requests need no read.')
         if isinstance(self.event, discord.Message) and history_requested(self.message):
             actions['history_search'] = self.history.descriptor(channels)
         if self.owner:
@@ -234,8 +318,8 @@ class Actions:
                 return {'blocked': 'The conversation evidence changed. Send a fresh request.'}
         from .fri_images import require_current
         await require_current(self.image_context, self.event)  # Fresh: the conversation check above awaited.
-        channels = await self.channels(fresh=True)
         kind = action.get('kind')
+        channels = await self.channels(fresh=True, around=kind == 'read_recent')
         if not channels:
             return {'blocked': 'No approved channels are currently readable.'}
         if self.history.pages and kind not in READ_ONLY_AFTER_HISTORY:
@@ -329,6 +413,9 @@ class Actions:
             overview = await self.fri.api('POST', '/agent/learning/overview', self.agent.identity(self.user))
             self.overview = self.scoped_overview(overview, channels)
             self.sources.update(self.overview['history_channels'])
+            # A retained report can come from a channel that is no longer a learning channel.
+            self.sources.update(row['channel_id'] for key in ('reports', 'summaries', 'historical_notes')
+                                for row in self.overview[key] if row.get('channel_id'))
             return {'kind': kind, 'completion': receipt, 'evidence': self.overview}
         if kind != 'read_recent':
             return {'blocked': 'That action is not available.'}
@@ -336,11 +423,14 @@ class Actions:
         channel_id = action.get('channel_id') or next(iter(channels))
         if channel_id not in channels:
             return {'blocked': 'That channel is outside this conversation’s readable scope.'}
+        if not posts_in(channels[channel_id]):
+            return {'blocked': 'That forum holds threads, not posts. Read one of its listed threads.'}
         catch_up = action.get('window') == 'since_my_last_message'
-        if self.invitation and not catch_up:
+        pins = action.get('window') == 'pins'
+        self.sources.add(channel_id)
+        if self.invitation and not catch_up and not pins and channel_id == str(self.channel):
             return await self.invited_context(channel_id)
         channel = channels[channel_id]
-        self.sources.add(channel_id)
         scope = getattr(channel, 'parent_id', None) or channel.id
         after = time.time()-min(7, self.agent.config['history_days'])*86400
         # A catch-up's window hangs off the request, so a slow model call can't move where they left.
@@ -349,8 +439,9 @@ class Actions:
             asked = discord.utils.snowflake_time(self.event.id).timestamp()
         if catch_up:
             after = max(after, asked-CATCH_UP_SECONDS)
-        if channel.id == self.agent.dedicated:
-            after = max(after, self.agent.state.get('started', time.time()))
+        # Fri's own channel reads only what was said since Fri started there, pins included.
+        floor = self.agent.state.get('started', time.time()) if channel.id == self.agent.dedicated else 0
+        after = max(after, floor)
         options = {'limit': 20, 'after': dt.datetime.fromtimestamp(after, dt.timezone.utc), 'oldest_first': False}
         if catch_up:
             options['limit'] = CATCH_UP_MESSAGES
@@ -359,10 +450,12 @@ class Actions:
         # A catch-up stops at the speaker's last message before anyone else spoke. Messages
         # they sent just before asking, or that only bots answered, are them coming back, not leaving.
         returned, others, left, full = asked-RETURN_SECONDS, False, None, False
-        records, scanned, profiles, shown, size = [], 0, {}, {}, 0
-        async for message in channel.history(**options):
-            scanned += 1
-            if message.author.bot or message.webhook_id:
+        records, scanned, profiles, shown, size, posts, newest = [], 0, {}, {}, 0, [], 0
+        notes = {} if catch_up else self.agent.ensure_memes().notes()  # Memes Fri reacted to lately.
+        stale = []  # Notes on posts edited, or by members whose privacy changed, since Fri reacted.
+        async for message in (channel.pins(limit=PINS) if pins else channel.history(**options)):
+            scanned, newest = scanned+1, max(newest, message.id)
+            if message.author.bot or message.webhook_id or (floor and message.created_at.timestamp() < floor):
                 continue
             user = message.author.id
             if catch_up and user == self.user:
@@ -371,7 +464,8 @@ class Actions:
                     break
                 continue
             others = True
-            if not message.content.strip():
+            carries = media(message)
+            if not message.content.strip() and not carries:
                 continue
             if user not in profiles:
                 profiles[user] = await self.agent.profile(scope, user)
@@ -381,36 +475,63 @@ class Actions:
             if catch_up:  # Up to 100 rows, so drop the links and keep each line short.
                 row = {'user_id': user, 'name': clean(message.author.display_name, 60),
                        'at': message.created_at.isoformat(timespec='minutes'), 'text': clean(message.content, 300)}
+                if carries:
+                    row['attachments'] = carries
+                if getattr(message, 'pinned', None) is True:
+                    row['pinned'] = True
                 size += len(json.dumps(row))
                 if size > CATCH_UP_CHARS:
                     full = True
                     break
                 self.observe(scope, user, profile['revision'])
-                shown[message.id] = (user, message.content, message.edited_at)
+                shown[message.id] = (user, message.content, message.edited_at, carried(message))
                 records.append(row)
                 continue
             self.observe(scope, user, profile['revision'])
+            shown[message.id] = (user, message.content, message.edited_at, carried(message))
             records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
-                            'at': message.created_at.isoformat(), 'text': clean(message.content, 500)})
+                            'at': message.created_at.isoformat(), 'text': clean(message.content, 500), **details(message),
+                            **reacted(notes, message, profile, stale)})
+            if carries:
+                posts.append(message)
+        if stale:
+            self.agent.ensure_memes().drop(stale)
         result = {'kind': kind, 'channel_id': channel_id, 'channel_name': clean(channel.name, 60),
-                  'scanned': scanned, 'messages': list(reversed(records)), 'lookback_floor': after,
-                  'images_inspected': False, 'personal_notes_saved': 0}
+                  'scanned': scanned, 'messages': records if pins else list(reversed(records)),  # Pins: newest pinned first.
+                  'lookback_floor': floor if pins else after,
+                  'images_inspected': 0, 'personal_notes_saved': 0, **({'window': 'pins'} if pins else {})}
+        # Asked to look around, Fri looks at the pictures too, as a member scrolling up would.
+        if posts and self.media_allowed and self.turn_context is not None:
+            result.update(await look(self.turn_context, posts))
+            self.image_context = image_context(self.turn_context)
+        if shown and pins:
+            self.reads.append({'channel': channel, 'pins': PINS_AGAIN, 'shown': shown})
+        elif shown:
+            # The same window, ending at the newest post it scanned, so a later post can't push one out.
+            self.reads.append({'channel': channel, 'options': {'before': discord.Object(id=newest+1), **options},
+                               'shown': shown})
         if catch_up:
-            self.caught_up = {'channel': channel, 'options': options, 'shown': shown}
             result.update(window='since_my_last_message',
                 your_last_message_at=left.created_at.isoformat(timespec='minutes') if left else None,
                 stopped_at='your_last_message' if left else 'size_limit' if full else
                     'message_limit' if scanned >= CATCH_UP_MESSAGES else 'time_limit')
         return result
 
-    async def caught_up_unchanged(self):
-        """Every message a catch-up showed must still exist unedited, like an invitation's sources."""
-        if not self.caught_up:
-            return True
-        read, shown = self.caught_up, self.caught_up['shown']
-        latest = {message.id: (message.author.id, message.content, message.edited_at)
-                  async for message in read['channel'].history(**read['options']) if message.id in shown}
-        return latest == shown
+    async def reads_unchanged(self):
+        """Every post a read showed still exists unedited, like an invitation's sources: one history
+        refetch per read, before each model request and before delivery. A pin read's posts must
+        also still be pinned."""
+        try:
+            for read in self.reads:
+                shown, channel = read['shown'], read['channel']
+                found = channel.pins(limit=read['pins']) if 'pins' in read else channel.history(**read['options'])
+                latest = {message.id: (message.author.id, message.content, message.edited_at, carried(message))
+                          async for message in found if message.id in shown}
+                if latest != shown:
+                    return False
+        except discord.HTTPException:
+            return False
+        return True
 
     async def invited_context(self, channel_id):
         """An explicit configured-channel read introduces ephemeral evidence only now."""
@@ -422,10 +543,11 @@ class Actions:
         context = self.turn_context
         context.update(invitation.context())
         await attach(context, self.event, self.message, source=invitation.image, invitation=invitation)
-        self.image_context = {key: context[key] for key in ('image_sources', 'image_event', 'image_invitation') if key in context}
+        looked = await invitation.look(context) if self.media_allowed else {}
+        self.image_context = image_context(context)
         return {'kind': 'read_recent', 'channel_id': str(channel_id), 'messages': invitation.rows,
-                'images_inspected': bool(context.get('images')), 'personal_notes_saved': 0,
-                'ambiguous_context_images': invitation.ambiguous_images}
+                'images_inspected': len(context.get('images', [])), 'personal_notes_saved': 0,
+                'images_not_inspected': looked.get('images_not_inspected', 0)}
 
     async def control(self, action, channels):
         if self.guild != self.fri.guild_id or not isinstance(self.event, discord.Message):
@@ -574,12 +696,14 @@ class Actions:
             from .fri_images import unchanged
             if not (sending and self.invitation) and not await unchanged(self.image_context, self.event):
                 return False
+            if not await self.reads_unchanged():
+                return False
+            if not await self.history.valid(await self.channels(around=True)):
+                return False
+            # Access after those Discord waits, so a channel restricted during the refetches still counts.
             channels = await self.channels(fresh=True)
-            if not channels or not self.sources <= set(channels):
-                return False
-            if not await self.history.valid(channels):
-                return False
-            if not await self.caught_up_unchanged():
+            if not channels or not (self.sources <= set(channels) or
+                                    self.sources <= set(await self.channels(fresh=True, around=True))):
                 return False
             for (scope, user), revision in self.revisions.items():
                 profile = await self.agent.profile(scope, user)

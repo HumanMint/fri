@@ -90,19 +90,24 @@ def harness(monkeypatch, tmp_path):
     agent.member = AsyncMock(return_value=SimpleNamespace(id=10))
     agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'summary': ''})
     reads = []
+    ids = iter(range(1, 10**6))
     def message(user=20, text='I love trance', bot=False, age=60):
-        return SimpleNamespace(author=SimpleNamespace(id=user, bot=bot, display_name='friend'),
-            webhook_id=None, content=text, jump_url='https://discord.com/channels/123/1/100',
-            created_at=dt.datetime.fromtimestamp(time.time()-age, dt.timezone.utc))
+        at = dt.datetime.fromtimestamp(time.time()-age, dt.timezone.utc)
+        return SimpleNamespace(id=discord.utils.time_snowflake(at)+next(ids), edited_at=None,
+            author=SimpleNamespace(id=user, bot=bot, display_name='friend'),
+            webhook_id=None, content=text, jump_url='https://discord.com/channels/123/1/100', created_at=at)
     rows = [message(), message(bot=True, text='Old bot personality'), message(user=30, text='opted out')]
     async def history(**kwargs):
         reads.append(kwargs)
         for row in rows[:kwargs['limit']]:
             if row.created_at > kwargs['after']:
                 yield row
-    channels = {i: SimpleNamespace(id=i, name='channel-'+str(i), guild=SimpleNamespace(id=123),
+    # One server whose REST copies (fresh access checks) match the cache unless a test changes them.
+    guild = SimpleNamespace(id=123, fetch_roles=AsyncMock(return_value=[]))
+    channels = {i: SimpleNamespace(id=i, name='channel-'+str(i), guild=guild,
         nsfw=False, parent_id=None, history=history, permissions_for=lambda _: SimpleNamespace(
             view_channel=True, read_message_history=True)) for i in (1, 2, 3, 456)}
+    guild.fetch_channel = AsyncMock(side_effect=lambda cid: channels[cid])
     fri.get_channel = lambda cid: channels.get(cid)
     return fri, agent, channels, reads
 
@@ -415,7 +420,7 @@ def test_read_recent_schema_always_names_a_window():
     branches = [branch for branch in SCHEMA['properties']['action']['anyOf']
                 if 'read_recent' in branch.get('properties', {}).get('kind', {}).get('enum', [])]
     assert len(branches) == 1 and branches[0]['required'] == ['kind', 'channel_id', 'window']
-    assert branches[0]['properties']['window']['enum'] == ['recent', 'since_my_last_message']
+    assert branches[0]['properties']['window']['enum'] == ['recent', 'since_my_last_message', 'pins']
 
 
 @pytest.mark.parametrize('outcome', ['completed', 'failed', 'second_action', 'erased'])
