@@ -149,6 +149,7 @@ class Agent:
         self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
         self.seen = {}
         self.withdrawn = {}  # Message IDs edited or deleted while handled, newest last (see withdraw).
+        self.revised = {}  # Message ID -> when a member edited it after a model request carried it (see edit).
         self.last_attention = {}
         self.last_spoke = {}
         self.acknowledged = {}
@@ -367,9 +368,14 @@ class Agent:
         """A member's edit shows in Fri's live view as they left it. Fri's and Gene's rows keep what they
         said, and in-flight bursts and reply fences keep comparing against what arrived. A member's message
         still being handled is withdrawn instead: what handles it holds what it said before, maybe with no
-        row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once)."""
-        if (self.handling[message.id] and getattr(message, 'edited_at', None) is not None and
-                not getattr(getattr(message, 'author', None), 'bot', True)):  # Not an embed or pin update.
+        row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once).
+        One a model request carried, handled or not, is marked revised: a turn still running may hold what it
+        said before, so its reply, reaction or save stops (see reply_once), while a later read gets the edit."""
+        edited = (getattr(message, 'edited_at', None) is not None and
+                  not getattr(getattr(message, 'author', None), 'bot', True))  # Not an embed or pin update.
+        if edited and message.id in self.looked:
+            self.revise(message.id)
+        if self.handling[message.id] and edited:
             return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
         rows = self.recent.get(channel)
         author = getattr(getattr(message, 'author', None), 'id', None)
@@ -384,6 +390,14 @@ class Agent:
                     row['text'] = text
                 else:
                     rows.remove(row)
+
+    def revise(self, mid):
+        now = time.time()
+        self.revised.pop(mid, None)
+        self.revised[mid] = now
+        # Kept an hour, as withdrawn is: longer than any turn that could still hold a copy runs.
+        while self.revised and (next(iter(self.revised.values())) < now-3600 or len(self.revised) > 100000):
+            del self.revised[next(iter(self.revised))]
 
     def forget(self, user, erased=False):
         """The member used a privacy control through Fri: their messages still waiting for a reply
@@ -1342,6 +1356,7 @@ class Agent:
         def changed(ids):
             """Those of `ids` deleted, or edited since this turn began: what the model saw of them may be gone."""
             edited = {int(i) for i, at in self.withdrawn.items() if at >= began and i.isdigit()}
+            edited |= {i for i, at in self.revised.items() if at >= began}
             return (self.unsent.keys() | edited) & set(ids)
 
         def taken(event):  # One this turn answers, deleted or edited (an edit may take it back) while it ran.

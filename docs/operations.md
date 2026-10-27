@@ -108,7 +108,11 @@ changed while i was typing" notice when someone addressed Fri; a reaction or qui
 dropped too, unsaved and without a notice. An edit replaces a member's row
 with the edited text; an edit Discord sends without its author drops the row. An edit to a member's
 message Fri is still handling (still coming in, or being answered) withdraws it instead: it leaves,
-or never enters, the view, and a reply to it that hasn't reached the model yet is refused. Fri's and Gene's
+or never enters, the view, and a reply to it that hasn't reached the model yet is refused. A member's edit
+to any post a model request already carried, after its own handling, stops a turn still running like a
+delete of it: a request whose quoted, read or looked-at copy predates the edit is refused, and a reply,
+reaction or quiet decision the model made is withheld and unsaved. A turn begun after the edit reads it as
+it is now, from the view or as the post it replies to. Fri's and Gene's
 rows, bursts and the reply fences keep comparing against what arrived. Fri's own reply to a
 message that was later deleted stays in the view as long as it stays in the channel.
 
