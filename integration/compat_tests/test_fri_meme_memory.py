@@ -183,6 +183,33 @@ def test_an_opt_out_through_gene_drops_the_note_even_with_meme_checks_off(harnes
     asyncio.run(scenario())
 
 
+def test_a_note_on_a_deleted_or_edited_post_goes_at_the_next_check_even_with_meme_checks_off(harness):  # noqa: F811
+    """A read can't return a deleted post, so nothing else would notice it: the ten-minute check refetches."""
+    import discord
+
+    async def scenario():
+        h = harness
+        deleted, edited, kept, unread = (h.add(mid=mid, attachments=[attachment()]) for mid in (100, 101, 102, 103))
+        for post in (deleted, edited, kept, unread):
+            h.agent.memes.remember(post, '🗿', 'a desk', 0)
+        h.scheduler.update({'meme_enabled': False}, 2, '10')
+        h.agent.state = h.scheduler.state()
+        h.rows.remove(deleted)
+        edited.edited_at = dt.datetime.fromtimestamp(h.clock[0]+1, dt.timezone.utc)
+
+        async def fetch(mid):
+            if mid == unread.id:
+                raise discord.HTTPException(SimpleNamespace(status=503, reason='down'), 'down')
+            if not any(m.id == mid for m in h.rows):
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+            return next(m for m in h.rows if m.id == mid)
+        h.channel.fetch_message.side_effect = fetch
+        await h.agent.memes.verify(now=h.clock[0]+601)
+        # Deleted or edited: dropped. Discord unreachable for now: kept for next time. Unchanged: kept.
+        assert set(h.agent.memes.notes()) == {kept.id, unread.id}
+    asyncio.run(scenario())
+
+
 def test_a_note_that_expires_during_a_read_is_not_shown():
     import time
 
@@ -236,11 +263,18 @@ def test_one_channel_gene_refuses_never_stops_the_other_notes_privacy_check(tmp_
             if channel == 4:
                 raise ControllerUnavailable('down')
             return {'enabled': user != 12, 'revision': 0}
-        memes = Memes(SimpleNamespace(fri=SimpleNamespace(data=tmp_path), profile=profile))
+        notes = ((1, 3, '11'), (2, 1, '12'), (3, 4, '13'), (4, 1, '14'))
+        posts = {mid: SimpleNamespace(id=mid, author=SimpleNamespace(id=int(author)), edited_at=None)
+                 for mid, _, author in notes}  # Each post still there, unchanged.
+
+        async def fetch(mid):
+            return posts[mid]
+        fri = SimpleNamespace(data=tmp_path, get_partial_messageable=lambda _: SimpleNamespace(fetch_message=fetch))
+        memes = Memes(SimpleNamespace(fri=fri, profile=profile))
         now = time.time()
-        for mid, channel, author in ((1, 3, '11'), (2, 1, '12'), (3, 4, '13'), (4, 1, '14')):
+        for mid, channel, author in notes:
             memes.noted[mid] = {'at': now, 'channel': channel, 'author': author, 'revision': 0, 'emoji': '🗿',
-                                'note': 'a desk', 'edited': None}
+                                'note': 'a desk', 'edited': None, 'media': []}
         await memes.verify(now=now+601)
         # Refused for good: dropped. Opted out: dropped. Unreachable for now: kept for next time. Fine: kept.
         assert set(memes.noted) == {3, 4}

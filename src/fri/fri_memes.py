@@ -362,12 +362,21 @@ class Memes:
 
     async def verify(self, now=None):
         """Drop the notes whose author turned memory off or changed their privacy since, through Fri or
-        elsewhere, whether or not meme checks are on. At most every VERIFY_SECONDS."""
+        elsewhere, or whose post was deleted or edited, whether or not meme checks are on. At most every
+        VERIFY_SECONDS."""
         now = now or time.time()
         if not self.noted or now-self.verified < VERIFY_SECONDS:
             return
         self.verified = now
         for message_id, note in list(self.noted.items()):
+            # Refetched: a read can't return a deleted post, so nothing else would notice it went.
+            try:  # A partial channel, so a deleted channel answers NotFound too.
+                current = await self.fri.get_partial_messageable(note['channel']).fetch_message(message_id)
+            except discord.NotFound:
+                self.noted.pop(message_id, None)
+                continue
+            except discord.HTTPException:  # Unreadable for now: the privacy check still runs.
+                current = None
             try:
                 profile = await self.agent.profile(note['channel'], int(note['author']))
             except ControllerRejected:  # Gene refuses that scope for good (e.g. a removed meme channel).
@@ -375,7 +384,8 @@ class Memes:
                 continue
             except commands.UserFeedbackCheckFailure:  # Unavailable: this note waits, the others go on.
                 continue
-            if not profile['enabled'] or profile['revision'] != note['revision']:
+            if (not profile['enabled'] or profile['revision'] != note['revision'] or
+                    current is not None and not reacted({message_id: note}, current, profile)):
                 self.noted.pop(message_id, None)
 
     def receipt(self, message, status, images=0):
