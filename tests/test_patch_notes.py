@@ -23,6 +23,10 @@ class FakeDM:
         self.sends = []
         self.lost = set()  # Sends Discord takes but whose reply never arrives.
         self.refused = set()  # Sends that fail before Discord takes them.
+        self.pinned = set()
+        self.pin_calls = []
+        self.pin_error = None  # What Discord answers a pin with,
+        self.pin_lands = False  # after making it anyway.
 
     async def send(self, content, *, nonce, allowed_mentions, suppress_embeds):
         self.sends.append({'content': content, 'nonce': nonce, 'mentions': allowed_mentions,
@@ -48,6 +52,20 @@ class FakeDM:
             found = [m for m in self.messages if after is None or m.created_at > after]
         for message in found[:limit]:
             yield message
+
+
+    async def fetch_message(self, message_id):
+        if message_id not in {m.id for m in self.messages}:
+            raise discord.NotFound(types.SimpleNamespace(status=404, reason='Not Found'),
+                                   {'code': 10008, 'message': 'Unknown Message'})
+
+        async def pin(*, reason):
+            self.pin_calls.append((message_id, reason))
+            if self.pin_lands or not self.pin_error:
+                self.pinned.add(message_id)
+            if self.pin_error:
+                raise self.pin_error
+        return types.SimpleNamespace(id=message_id, pinned=message_id in self.pinned, pin=pin)
 
 
 def said(id, content, author):
@@ -563,7 +581,7 @@ def test_a_channel_post_goes_to_the_named_text_channel_once(dm, tmp_path):
     assert chat.sends[0]['mentions'] == notes.NO_MENTIONS
     assert json.loads((tmp_path/'patch-notes-server.json').read_text())['versions']['0.7.0']['parts'][0]['channel_id'] == '888'
     assert not (tmp_path/'patch-notes.json').exists()
-    assert post('fri 0.7.0\n\n**added**\n- things', tmp_path) == ['0.7.0: all 1 parts were already sent']
+    assert post('fri 0.7.0\n\n**added**\n- things', tmp_path) == ['0.7.0: all 1 parts were already sent and pinned']
     assert len(chat.sends) == 1
 
 
@@ -736,3 +754,130 @@ def test_a_part_discord_stored_without_its_outer_whitespace_is_still_found(dm, t
         run(text, tmp_path)
     run(text, tmp_path)
     assert len(dm.sends) == 2 and len(dm.messages) == 2
+
+
+def discord_error(kind, status, code, message):
+    return kind(types.SimpleNamespace(status=status, reason=message), {'code': code, 'message': message})
+
+
+def server_record(tmp_path):
+    return json.loads((tmp_path/'patch-notes-server.json').read_text())['versions']
+
+
+def test_a_channel_post_pins_its_first_part_and_leaves_other_pins_alone(dm, tmp_path):
+    chat = channel('fri-chat')
+    chat.pinned.add(5)  # an older release's notes, or anything a member pinned
+    FakeClient.channels = [chat]
+    lines = post(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), tmp_path)
+    assert len(chat.sends) == 2 and chat.pin_calls == [(1001, 'Fri patch notes 0.7.0')]
+    assert chat.pinned == {5, 1001} and server_record(tmp_path)['0.7.0']['pinned'] == '1001'
+    assert lines[-1] == '0.7.0: message 1001 is pinned in #fri-chat'
+    assert post(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), tmp_path) == ['0.7.0: all 2 parts were already sent and pinned']
+    assert len(chat.sends) == 2 and len(chat.pin_calls) == 1
+
+
+def test_the_owners_dm_is_never_pinned(dm, tmp_path):
+    run('fri 0.7.0', tmp_path, version='0.7.0')
+    assert not dm.pin_calls and 'pinned' not in json.loads((tmp_path/'patch-notes.json').read_text())['versions']['0.7.0']
+
+
+@pytest.mark.parametrize('error, says', [
+    (discord_error(discord.Forbidden, 403, 50013, 'Missing Permissions'), 'needs Pin Messages and Read Message History'),
+    (discord_error(discord.HTTPException, 400, 30003, 'Maximum number of pins reached for the channel (250)'),
+     "maximum of 250 pins; none was removed to make room"),
+    (discord_error(discord.DiscordServerError, 503, 0, 'Service Unavailable'), 'Discord failed the pin'),
+    (aiohttp.ClientConnectionError('cannot connect'), 'ClientConnectionError: cannot connect'),
+])
+def test_a_refused_pin_keeps_the_post_and_a_rerun_only_pins(dm, tmp_path, error, says):
+    chat = channel('fri-chat')
+    chat.pinned.update({5, 6})
+    FakeClient.channels = [chat]
+    chat.pin_error = error
+    with pytest.raises(notes.PinFailed, match=says):
+        post('fri 0.7.0', tmp_path)
+    entry = server_record(tmp_path)['0.7.0']
+    assert entry['parts'][0]['message_id'] == '1001' and 'pinned' not in entry  # posted, never claimed as pinned
+    assert chat.pinned == {5, 6} and len(chat.sends) == 1
+    chat.pin_error = None
+    assert post('fri 0.7.0', tmp_path) == ['part 1/1: already sent', '0.7.0: message 1001 is pinned in #fri-chat']
+    assert len(chat.sends) == 1 and chat.pinned == {5, 6, 1001}
+
+
+def test_a_message_already_pinned_or_a_pin_whose_answer_was_lost_counts(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    chat.pin_error, chat.pin_lands = discord_error(discord.DiscordServerError, 504, 0, 'Gateway Timeout'), True
+    post('fri 0.7.0', tmp_path)
+    assert server_record(tmp_path)['0.7.0']['pinned'] == '1001' and len(chat.pin_calls) == 1
+    chat.pinned.add(1002)
+    chat.pin_error = discord_error(discord.Forbidden, 403, 50013, 'Missing Permissions')
+    post('fri 0.8.0', tmp_path, version='0.8.0')  # already pinned by hand: no pin call at all
+    assert server_record(tmp_path)['0.8.0']['pinned'] == '1002' and len(chat.pin_calls) == 1
+
+
+def test_a_deleted_post_or_a_recreated_channel_is_reported_not_reposted(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    chat.pin_error = discord_error(discord.Forbidden, 403, 50013, 'Missing Permissions')
+    with pytest.raises(notes.PinFailed):
+        post('fri 0.7.0', tmp_path)
+    chat.pin_error, chat.messages = None, []
+    with pytest.raises(notes.PinFailed, match='no longer in #fri-chat; it was not posted again'):
+        post('fri 0.7.0', tmp_path)
+    FakeClient.channels = [channel('fri-chat', id=889)]
+    with pytest.raises(notes.PinFailed, match='posted in channel 888, not #fri-chat'):
+        post('fri 0.7.0', tmp_path)
+    assert len(chat.sends) == 1 and not FakeClient.channels[0].sends and not FakeClient.channels[0].pin_calls
+
+
+def pin_cli(monkeypatch, tmp_path, *argv):
+    monkeypatch.setenv('DISCORD_TOKEN', 'secret-token')
+    monkeypatch.setenv('GENE_GUILD_ID', str(GUILD))
+    monkeypatch.delenv('GENE_OWNER_ID', raising=False)
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'')))
+    return notes.main(['pin', *argv])
+
+
+def test_pin_pins_a_version_posted_before_pins_from_its_record_alone(monkeypatch, capsys, dm, tmp_path):
+    """Like 1.0.0: posted by code without the pin step, so its record has no pin. Nothing is sent again."""
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    chat.messages.append(said(1564587767155925144, '1.0.0 notes', BOT))
+    (tmp_path/'patch-notes-server.json').write_text(json.dumps({'versions': {'1.0.0': {'sha256': 'a'*64, 'parts': [
+        {'attempted_at': 1793095990.0, 'sha256': 'b'*64, 'message_id': '1564587767155925144', 'channel_id': '888'}]}}}))
+    assert pin_cli(monkeypatch, tmp_path, '1.0.0', '--channel', 'fri-chat') == 0
+    assert chat.pin_calls == [(1564587767155925144, 'Fri patch notes 1.0.0')] and not chat.sends
+    assert server_record(tmp_path)['1.0.0']['pinned'] == '1564587767155925144'
+    assert pin_cli(monkeypatch, tmp_path, '1.0.0', '--channel', 'fri-chat') == 0
+    assert '1.0.0: already pinned' in capsys.readouterr().out and len(chat.pin_calls) == 1
+    chat.pin_error = discord_error(discord.Forbidden, 403, 50013, 'Missing Permissions')
+    assert pin_cli(monkeypatch, tmp_path, '0.9.0', '--channel', 'fri-chat') == 2  # never posted
+    assert 'refused: 0.9.0 is not fully posted' in capsys.readouterr().err
+    chat.messages.append(said(1003, '1.0.1 notes', BOT))
+    record = json.loads((tmp_path/'patch-notes-server.json').read_text())
+    record['versions']['1.0.1'] = {'sha256': 'c'*64, 'parts': [
+        {'attempted_at': 1793095990.0, 'sha256': 'd'*64, 'message_id': '1003', 'channel_id': '888'}]}
+    (tmp_path/'patch-notes-server.json').write_text(json.dumps(record))
+    assert pin_cli(monkeypatch, tmp_path, '1.0.1', '--channel', 'fri-chat') == 3
+    assert 'posted, not pinned: Fri may not pin in #fri-chat' in capsys.readouterr().err
+    assert not chat.sends
+
+
+@pytest.mark.parametrize('argv', [['pin', '1.0.0'], ['pin', '1.0.0', '--channel', '#fri chat']])
+def test_pin_needs_a_plain_channel_name(argv):
+    with pytest.raises(SystemExit) as raised:
+        notes.main(argv)
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize('pinned', ['1002', '1001'])
+def test_a_pin_that_names_another_message_or_comes_before_every_part_is_refused(tmp_path, pinned):
+    parts = [{'attempted_at': 1793095990.0, 'sha256': 'b'*64, 'message_id': '1001', 'channel_id': '888'},
+             {'attempted_at': 1793095991.0, 'sha256': 'c'*64}]
+    if pinned == '1002':
+        parts[1].update(message_id='1002', channel_id='888')
+    path = tmp_path/'patch-notes-server.json'
+    path.write_text(json.dumps({'versions': {'0.7.0': {'sha256': 'a'*64, 'parts': parts, 'pinned': pinned}}}))
+    with pytest.raises(notes.NotesRefused):
+        notes.load(path)
