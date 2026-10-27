@@ -262,7 +262,8 @@ posted card, so nothing reaches a new audience. A kind the conversation can neve
 an empty list there doesn't read as "none". Memory off sends none. Fri uses them when the member asks
 what's coming up or about one of them, and before preparing a duplicate, and doesn't bring them up
 unprompted. An older controller sends no `loops`, which the model reads as unavailable.
-`python -m fri.fri_eval --suite loops` checks these answers with the real model and a rubric judge:
+`python -m fri.fri_eval --suite loops` checks these answers with the real model and a rubric judge,
+offering the DM cases the reminder tools a DM offers, and fails any tool call or draft:
 an existing reminder isn't set again, pending, `will_not_send` and uncertain aren't promised, a
 game night's time comes from the card without naming who's going, banter leaves loops alone, and
 reminders outside DMs aren't called none.
