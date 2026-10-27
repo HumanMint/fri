@@ -240,3 +240,45 @@ def test_the_times_evaluation_shows_the_model_dated_posts():
             assert row['at'] == discord.utils.snowflake_time(int(row['id'])).isoformat(timespec='seconds')
         for row in payload['reply_target']:
             assert row['source']['at'] == discord.utils.snowflake_time(int(row['source']['id'])).isoformat(timespec='seconds')
+
+
+@pytest.mark.parametrize('bad', [False, True])
+def test_a_clarifying_question_renders_its_times_like_a_reply(monkeypatch, tmp_path, bad):
+    """An action's question reaches Discord and the saved turn as a reply would: rendered, or the ask."""
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        wall = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)).strftime('%Y-%m-%dT20:00')
+        token = '[[time tomorrow 8pm UTC]]' if bad else f'[[time {wall} UTC]]'
+        topic = 'what time is the chess final for everyone'
+        event = message(f'fri {topic}, tomorrow or friday at 8pm UTC?')
+        model(fri, tmp_path, [{'action': {'kind': 'clarify', 'goal': 'web', 'topic': topic,
+                                          'question': f'do you mean {token}?'}}])
+        texts = delivered(event)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert texts and not any('[[' in text for text in texts)
+            assert texts == [ASK] if bad else '<t:' in texts[0]
+            assert not any('[[' in reply for reply in saved_replies(calls))
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_drafts_body_renders_its_times_before_it_is_saved():
+    """What a work_save would save (and later post) is rendered in Chat.respond, like the reply."""
+    wall = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)).strftime('%Y-%m-%dT20:00')
+    action = {'kind': 'work_save', 'work_id': '', 'version': 0, 'title': 'Game night',
+              'body': f'game night is [[time {wall} UTC]]', 'state': 'open'}
+
+    def model_reply(request):
+        output = {'reply': '', 'request_draft': None, 'action': action, 'notes': []}
+        return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(output)))+'\n\n')
+
+    async def scenario():
+        chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(model_reply))
+        context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high', 'actions': {'work_save': {}}}
+        result = await chat.respond('draft and save the game night time for everyone', context)
+        assert result.status == 'completed' and result.action['body'].startswith('game night is <t:')
+        assert '[[' not in result.action['body']
+    asyncio.run(scenario())

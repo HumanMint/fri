@@ -111,3 +111,20 @@ def render(text, now=None):
 
     rendered = PLACEHOLDER.sub(stamp, text)
     return ASK if broken or OPENING.search(rendered) else rendered
+
+
+def render_tree(value, now=None):
+    """Every string in a model's structured output (an action's question, a draft's body) rendered the same
+    way, and whether all of them could be: a broken one there can't fall back to the ask in place."""
+    if isinstance(value, str):
+        if not OPENING.search(value):
+            return value, True
+        rendered = render(value, now)
+        return rendered, rendered != ASK
+    if isinstance(value, list):
+        items = [render_tree(item, now) for item in value]
+        return [item for item, _ in items], all(ok for _, ok in items)
+    if isinstance(value, dict):
+        items = {key: render_tree(item, now) for key, item in value.items()}
+        return {key: item for key, (item, _) in items.items()}, all(ok for _, ok in items.values())
+    return value, True

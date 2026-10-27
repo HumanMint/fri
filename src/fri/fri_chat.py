@@ -15,8 +15,9 @@ from .fri_image_request import MAX_REQUEST
 from .fri_memory import CATEGORIES
 from .fri_responses import KINDS, REACTIONS, acknowledgment_allowed, validate_response
 from .fri_social import SOCIAL_ACTIONS
+from .fri_times import ASK as TIME_ASK
 from .fri_times import render as render_times
-from .fri_times import said_at
+from .fri_times import render_tree, said_at
 from .privacy import clean, model_json
 from .subscription import RESOURCE, SubscriptionError
 
@@ -699,8 +700,14 @@ class Chat:
                                 allow_closing = False
                             if response_kind != 'reply' and not acknowledgment_allowed(context):
                                 raise ValueError('This turn needs a text response or action')
-                            if response_kind == 'reply':  # Every path's words pass here before delivery and saving.
+                            # Every path's words pass here before delivery and saving: the reply, and what an
+                            # action or draft would post or save later (a clarifying question, a draft's body).
+                            if response_kind == 'reply':
                                 reply = render_times(reply, said_at(context))
+                            action, rendered_action = render_tree(action, said_at(context))
+                            draft, rendered_draft = render_tree(draft, said_at(context))
+                            if not (rendered_action and rendered_draft):
+                                reply, draft, action, response_kind = TIME_ASK, None, None, 'reply'
                             result.reply, result.draft, result.notes, result.action = reply, draft, notes, action
                             result.response_kind, result.reaction = response_kind, reaction
                             result.allow_closing = allow_closing
