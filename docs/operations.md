@@ -396,8 +396,9 @@ Calls whose result can't change what members see are skipped before inference.
   caption), for up to three days or until Fri restarts; a rollback leaves nothing behind. A read or a
   mention's nearby rows show it as `fri_reacted` on that post only while the author's revision and the
   edit time still match, and drop it when they don't. Forgetting a member drops theirs; every heartbeat
-  expires old ones (before it waits on the controller) and, every ten minutes, drops those whose
-  author changed privacy outside Fri, whether or not meme checks are on.
+  expires old ones (before it waits on the controller) and, every ten minutes, refetches each noted
+  post and drops those whose post was deleted or edited or whose author changed privacy outside Fri,
+  whether or not meme checks are on.
 - **Chat meme channels.** In a meme channel that's also one of Fri's chat channels (like #fri-chat),
   the meme check still judges posts with images but never a post that's only text. A line of text is
   judged only once two other members laugh at it. A laugh is a whole message from a short fixed list

@@ -62,7 +62,8 @@ def build(learning, tmp_path, monkeypatch, **changes):
     channel.name = 'meme-spam'
     channel.fetch_message = AsyncMock(side_effect=lambda mid: next(m for m in rows if m.id == mid))
     fri = SimpleNamespace(guild_id=123, owner_id=10, workshop_id=456, data=tmp_path/'fri',
-                          api=api, get_channel=lambda cid: channel if cid == 3 else None)
+                          api=api, get_channel=lambda cid: channel if cid == 3 else None,
+                          get_partial_messageable=lambda cid: channel if cid == 3 else None)
     agent = Agent(fri)
     fri.agent = agent
     agent.member = AsyncMock(return_value=object())
