@@ -1088,6 +1088,7 @@ class Agent:
                     'name': clean(message.author.display_name, 60), 'text': text[:500], 'at': time.time(),
                     'revision': profile.get('revision', 0), 'gene_error': False,
                     **({'attachments': media(message)} if media(message) else {})})
+                self.ensure_memes().heard(message)  # A second laugh at a line in a chat meme channel.
         elif message.author.bot:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})

@@ -370,6 +370,22 @@ Calls whose result can't change what members see are skipped before inference.
   edit time still match, and drop it when they don't. Forgetting a member drops theirs; every heartbeat
   expires old ones (before it waits on the controller) and, every ten minutes, drops those whose
   author changed privacy outside Fri, whether or not meme checks are on.
+- **Chat meme channels.** In a meme channel that's also one of Fri's chat channels (like #fri-chat),
+  the meme check still judges posts with images but never a post that's only text. A line of text is
+  judged only once two other members laugh at it. A laugh is a whole message from a short fixed list
+  (lol, lmao, lmfao, haha, ㅋㅋ, "im dead", "crying", 😂 🤣 💀 😭). It counts for the newest message before
+  it that isn't a laugh too, within the next 8 messages in Fri's live view and 10 minutes. A laughing
+  reply counts for the line it replies to, anywhere in those 10 minutes. The author's own laughs,
+  bots, webhooks and members with memory off don't count, and a laugher who changes their privacy
+  or leaves the server before the check is taken back out. The second laugh starts the check right
+  away, in the background. The line is judged as a meme post is: same model, quiet by default, same fences on its
+  author, edits and deletes, receipts and kept notes. The model also gets up to 5 lines before it from
+  Fri's privacy-fenced live view as untrusted context, but not who laughed. These checks share the
+  daily check and reaction budgets and the hourly gap between reactions. Unlike a meme check, one
+  doesn't call the model while no reaction could follow: that's checked before it reads anything and
+  again right before the model call, when every line it would show must also still be in the live view
+  as it was, from authors who still allow it. One runs at a time; a laugh while one runs starts nothing,
+  though a later member's laugh can. Each line is considered once, and Fri only reacts, never posts.
 
 ## Deployment boundary
 
