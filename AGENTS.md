@@ -20,13 +20,16 @@ The companion has no shell, SSH, Docker, GitHub or worker/deployer credentials.
   staging), uploads, host image builds and rehearsals, eval containers and live evals on the
   host or Fri's subscription, live config, restarts and patch-notes posts. Outside it: local
   work, offline tests, reviews and PR/merge work, plus read-only health/status/metadata
-  reads that take no lock, start no container and write nothing. Never begin a switch, eval
-  or build at or after 05:00: a drained batch takes its recovery or resume path instead,
-  never leaving a service paused. Rollback and restoring healthy service are allowed at any
-  hour; any other exception needs the owner's explicit words. Log every production action
-  (time and zone, actor, trigger, action, reason, before/after SHAs, restart duration,
-  outcome, exception), never secrets or member content. Fri ships only through Gene's
-  maintainer batch release (gene `ops/maintainer/batch-release.md`).
+  reads that take no lock, start no container and write nothing. At or after 05:00, restore
+  healthy service instead of finishing the deployment: begin no switch, eval or build. If
+  nothing switched, run `resume-old`. If a switch began and the evals haven't passed, roll
+  back, then `resume-old`. Only once the evals have passed may `verify-off`, then `resume`,
+  restore service (if `verify-off` fails, roll back). Never leave a service paused. Rollback
+  and restoring healthy service are allowed at any hour; any other exception needs the
+  owner's explicit words. Log every production action (time and zone, actor, trigger,
+  action, reason, before/after SHAs, restart duration, outcome, exception), never secrets or
+  member content. Fri ships only through Gene's maintainer batch release (gene
+  `ops/maintainer/batch-release.md`).
 - New Fri source releases are maintainer-only. Do not redirect Gene job approvals to this repo
   or broaden Gene's automatic repair policy. Runtime preferences cannot change authority.
 - Preserve owner-only versioned preview/apply settings and member/channel/DM/privacy gates.
