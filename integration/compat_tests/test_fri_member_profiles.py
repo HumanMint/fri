@@ -982,3 +982,24 @@ def test_placing_notes_fails_closed_on_a_mismatch(origins):
     private = place_notes(channels.get, {'personal_memory': {'notes': list(notes)}, 'profile_origins': origins},
                           'private:9')
     assert len(private['personal_memory']['notes']) == 2 and 'profile_origins' not in private
+
+
+def test_a_note_the_member_shared_keeps_showing_after_its_channel_closes(monkeypatch, tmp_path):
+    """Shared from My memory by their own press: its origin is that DM, so a closed channel doesn't hide it."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            w.readable[GENERAL] = False  # Said where not everyone can read: it stays there.
+            await w.say(GENERAL, 'fri I like private jazz', 'noted', note('I like private jazz', 'music'))
+            await w.say(GAMING, 'fri what should i play')
+            assert model_context(w)['personal_memory']['notes'] == []
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            await w.fri.api('POST', f"/chat/memory/notes/{state['entries'][0]['id']}", {
+                **scope, 'source': dm_control(), 'revision': state['revision'], 'action': 'share'})
+            await w.say(GAMING, 'fri what should i play')
+            assert [row['evidence'] for row in model_context(w)['personal_memory']['notes']] == ['I like private jazz']
+        finally:
+            await w.fri.close()
+    run(scenario)
