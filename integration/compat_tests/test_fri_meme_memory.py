@@ -11,7 +11,7 @@ from compat_tests.test_fri_memes import attachment
 from compat_tests.test_fri_memes import harness as harness  # noqa: F401
 from fri.fri_actions import Actions
 from fri.fri_chat import INSTRUCTIONS
-from fri.fri_memes import INSTRUCTION, NOTE, Memes, reacted
+from fri.fri_memes import INSTRUCTION, NOTE, Memes, carried, reacted
 
 
 def test_a_reaction_keeps_what_fri_saw_with_whose_post_it_was(harness):  # noqa: F811
@@ -76,6 +76,20 @@ def test_a_note_shows_only_while_the_author_and_the_post_are_as_they_were():
                                               attachments=[SimpleNamespace(url='https://cdn.test/new.png')]), {'revision': 2})
 
 
+def test_a_renewed_cdn_signature_keeps_a_meme_note():
+    """Discord renews an attachment link's signature on refetch; the same image keeps its note."""
+    now = __import__('time').time()
+    url = 'https://cdn.discordapp.com/attachments/1/2/meme.png?ex=1&is=2&hm=aa'
+    post = SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=None,
+                           attachments=[SimpleNamespace(id=2, url=url)])
+    notes = {5: {'author': '30', 'revision': 2, 'emoji': '🗿', 'note': 'a cat', 'edited': None, 'at': now,
+                 'media': carried(post)}}
+    renewed = SimpleNamespace(**{**vars(post), 'attachments': [SimpleNamespace(id=2, url=url.replace('hm=aa', 'hm=bb'))]})
+    assert reacted(notes, renewed, {'revision': 2})
+    replaced = SimpleNamespace(**{**vars(post), 'attachments': [SimpleNamespace(id=3, url=url)]})
+    assert not reacted(notes, replaced, {'revision': 2})
+
+
 def test_a_read_shows_fris_own_reaction_and_what_it_saw(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, channel, rows, post = read_harness(monkeypatch, tmp_path)
@@ -83,7 +97,7 @@ def test_a_read_shows_fris_own_reaction_and_what_it_saw(monkeypatch, tmp_path):
         other = post('lol', user=40, age=300)
         agent.ensure_memes = lambda: SimpleNamespace(notes=lambda: {meme.id: {
             'author': '30', 'revision': 0, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None,
-            'at': __import__('time').time(), 'media': [str(a.url) for a in meme.attachments]}})
+            'at': __import__('time').time(), 'media': carried(meme)}})
         actions = Actions(agent, 20, 999, False)
         actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
         try:

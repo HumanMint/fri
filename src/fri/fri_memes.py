@@ -280,13 +280,15 @@ class Memes:
 def carried(message):
     """What a post shows besides its text: its attachments, and each embed's image, thumbnail or video.
     An embed can be suppressed without an edit time, so a note on what Fri saw checks this too."""
+    # Attachment IDs, or URLs without their query: Discord renews a CDN link's signature on refetch.
     attachments, embeds = getattr(message, 'attachments', None), getattr(message, 'embeds', None)
-    shown = [str(a.url) for a in attachments] if isinstance(attachments, (list, tuple)) else []
+    shown = [str(getattr(a, 'id', None) or str(a.url).split('?')[0]) for a in attachments] \
+        if isinstance(attachments, (list, tuple)) else []
     for embed in embeds if isinstance(embeds, (list, tuple)) else ():
         for part in (getattr(embed, 'image', None), getattr(embed, 'thumbnail', None), getattr(embed, 'video', None)):
             url = getattr(part, 'proxy_url', None) or getattr(part, 'url', None)
             if url:
-                shown.append(str(url))
+                shown.append(str(url).split('?')[0])
     return shown
 
 
