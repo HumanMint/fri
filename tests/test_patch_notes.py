@@ -881,3 +881,32 @@ def test_a_pin_that_names_another_message_or_comes_before_every_part_is_refused(
     path.write_text(json.dumps({'versions': {'0.7.0': {'sha256': 'a'*64, 'parts': parts, 'pinned': pinned}}}))
     with pytest.raises(notes.NotesRefused):
         notes.load(path)
+
+
+def test_unfinished_parts_that_differ_only_in_outer_whitespace_are_refused_not_swapped(dm, tmp_path):
+    """#118: recovery matches trimmed text, so a part Discord took for 0.8.0 must not confirm 0.7.0's."""
+    first = paragraph(1500, 'a') + '\n\n  - ' + 'y' * 1500
+    second = paragraph(1500, 'b') + '\n\n- ' + 'y' * 1500
+    dm.refused.add(2)  # 0.7.0's second part never reaches Discord
+    with pytest.raises(RuntimeError):
+        run(first, tmp_path, version='0.7.0')
+    dm.lost.add(4)  # 0.8.0's second part lands, but its reply is lost
+    with pytest.raises(RuntimeError):
+        run(second, tmp_path, version='0.8.0')
+    with pytest.raises(notes.NotesRefused, match='the history can.t say whose a message is'):
+        run(first, tmp_path, version='0.7.0')
+    record = json.loads((tmp_path/'patch-notes.json').read_text())['versions']
+    assert 'message_id' not in record['0.7.0']['parts'][1] and len(dm.sends) == 4
+
+
+def test_an_unfinished_part_beside_one_older_code_recorded_is_refused(dm, tmp_path):
+    dm.refused.add(1)
+    with pytest.raises(RuntimeError):
+        run('fri 0.7.0', tmp_path, version='0.7.0')
+    path = tmp_path/'patch-notes.json'
+    state = json.loads(path.read_text())
+    state['versions']['0.6.0'] = {'sha256': 'c'*64, 'parts': [{'attempted_at': 1793095990.0, 'sha256': 'd'*64}]}
+    path.write_text(json.dumps(state))
+    with pytest.raises(notes.NotesRefused, match='recorded by older code'):
+        run('fri 0.7.0', tmp_path, version='0.7.0')
+    assert len(dm.sends) == 1

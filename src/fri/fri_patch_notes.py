@@ -135,7 +135,9 @@ def entry_ok(entry):
         return False
     stages = [stage(part) for part in states]
     pinned = 'pinned' not in entry or (set(stages) == {2} and entry['pinned'] == states[0]['message_id'])
-    return stages == sorted(stages, reverse=True) and stages.count(1) <= 1 and stages[0] > 0 and pinned
+    trimmed = 'trimmed' not in entry or (isinstance(entry['trimmed'], list) and len(entry['trimmed']) == len(states) and
+                                         all(isinstance(h, str) and HASH.fullmatch(h) for h in entry['trimmed']))
+    return stages == sorted(stages, reverse=True) and stages.count(1) <= 1 and stages[0] > 0 and pinned and trimmed
 
 
 def sent_ids(state):
@@ -303,12 +305,27 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
         if all(part.get('message_id') for part in entry['parts']) and (channel is None or entry.get('pinned')):
             out(f'{version}: all {len(chunks)} parts were already sent' + ('' if channel is None else ' and pinned'))
             return
-        tried = next((part['sha256'] for part in entry['parts'] if stage(part) == 1), None)
-        twins = sorted(other for other, e in state['versions'].items() if other != version
-                       for part in e['parts'] if stage(part) == 1 and part['sha256'] == tried)
+        # Recovery matches text with its ends trimmed, as Discord stores it, so twins are told by trimmed text.
+        entry.setdefault('trimmed', [text_hash(chunk.strip()) for chunk in chunks])
+        tried = next((index for index, part in enumerate(entry['parts']) if stage(part) == 1), None)
+        twins, unknown = set(), set()
+        for other, e in state['versions'].items():
+            for at, part in enumerate(e['parts'] if other != version and tried is not None else []):
+                if stage(part) != 1:
+                    continue
+                if 'trimmed' in e:
+                    if e['trimmed'][at] == entry['trimmed'][tried]:
+                        twins.add(other)
+                elif part['sha256'] == entry['parts'][tried]['sha256']:
+                    twins.add(other)
+                else:
+                    unknown.add(other)  # Older code kept no trimmed text: it could still be the same words.
         if twins:
-            raise NotesRefused(f'{version} and {", ".join(twins)} each have a part with this text that was tried but '
+            raise NotesRefused(f'{version} and {", ".join(sorted(twins))} each have a part with this text that was tried but '
                                f'never confirmed, and the history can\'t say whose a message is; check it, then fix {path.name}')
+        if unknown:
+            raise NotesRefused(f'{version} has a part that was tried but never confirmed, and so does {", ".join(sorted(unknown))}, '
+                               f'recorded by older code that kept no trimmed text; check them, then fix {path.name}')
         client = discord.Client(intents=discord.Intents.none())
         try:
             await client.login(token)

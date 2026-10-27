@@ -663,8 +663,10 @@ version's confirmed parts, so a rerun finishes a partial send and never repeats 
 send was attempted but never confirmed is looked for there first (Fri's own messages since the attempt
 with that text, ignoring leading and trailing whitespace, skipping any the record already gives
 another part), and every part carries a
-fixed nonce. If two versions each have an unconfirmed part with the same text, the history can't say
-whose a message is, so both are refused until someone checks and fixes the record by hand.
+fixed nonce. If two versions each have an unconfirmed part with the same text once its ends are
+trimmed (kept per version under `trimmed`), the history can't say whose a message is, so both are refused
+until someone checks and fixes the record by hand; an unconfirmed part older code recorded, without
+trimmed text, counts as possibly the same.
 
 Once every part of a channel post is confirmed, Fri pins its first part in that channel (owner request,
 2026-10-27); the DM is never pinned. The record keeps the pinned message's id under `pinned`, so a rerun
