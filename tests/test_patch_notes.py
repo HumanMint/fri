@@ -28,13 +28,16 @@ class FakeDM:
         self.pin_error = None  # What Discord answers a pin with,
         self.pin_lands = False  # after making it anyway.
 
-    async def send(self, content, *, nonce, allowed_mentions, suppress_embeds):
+    async def send(self, content, *, nonce, allowed_mentions, suppress_embeds, file=None):
+        attached = None if file is None else {'filename': file.filename, 'content': file.fp.read().decode()}
         self.sends.append({'content': content, 'nonce': nonce, 'mentions': allowed_mentions,
-                           'suppress_embeds': suppress_embeds})
+                           'suppress_embeds': suppress_embeds, 'file': attached})
         index = len(self.sends)
         if index in self.refused or len(content.encode('utf-16-le')) > 4000:
             raise RuntimeError('discord refused')
         message = said(1000+index, content, BOT)
+        if attached:
+            message.attachments = [types.SimpleNamespace(filename=attached['filename'])]
         self.messages.append(message)
         if index in self.lost:
             raise RuntimeError('reply lost')
@@ -566,8 +569,14 @@ def channel(name, kind=discord.ChannelType.text, id=888):
     return room
 
 
-def post(text, tmp_path, version='0.7.0', name='fri-chat'):
+CHANGELOG = '**fri 0.7.0, everything**\n\n**added**\n- things\n- more things\n'
+
+
+def post(text, tmp_path, version='0.7.0', name='fri-chat', changelog=CHANGELOG):
+    """A channel post: the summary, then its full changelog after the mark, as the release agent writes it."""
     lines = []
+    if changelog is not None:
+        text = f'{text}\n{notes.CHANGELOG_MARK}\n{changelog}'
     asyncio.run(notes.send(version, text, token='secret-token', owner_id=OWNER, data=tmp_path, out=lines.append,
                            guild_id=GUILD, channel=name))
     return lines
@@ -764,17 +773,16 @@ def server_record(tmp_path):
     return json.loads((tmp_path/'patch-notes-server.json').read_text())['versions']
 
 
-def test_a_channel_post_pins_its_first_part_and_leaves_other_pins_alone(dm, tmp_path):
+def test_a_channel_post_pins_its_message_and_leaves_other_pins_alone(dm, tmp_path):
     chat = channel('fri-chat')
     chat.pinned.add(5)  # an older release's notes, or anything a member pinned
     FakeClient.channels = [chat]
-    lines = post(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), tmp_path)
-    assert len(chat.sends) == 2 and chat.pin_calls == [(1001, 'Fri patch notes 0.7.0')]
+    lines = post(paragraph(1500, 'a'), tmp_path)
+    assert len(chat.sends) == 1 and chat.pin_calls == [(1001, 'Fri patch notes 0.7.0')]
     assert chat.pinned == {5, 1001} and server_record(tmp_path)['0.7.0']['pinned'] == '1001'
     assert lines[-1] == '0.7.0: message 1001 is pinned in #fri-chat'
-    assert post(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), tmp_path) == [
-        'part 1/2: already sent', 'part 2/2: already sent', '0.7.0: message 1001 is pinned in #fri-chat']
-    assert len(chat.sends) == 2 and len(chat.pin_calls) == 1  # checked with Discord, not pinned twice
+    assert post(paragraph(1500, 'a'), tmp_path) == ['part 1/1: already sent', '0.7.0: message 1001 is pinned in #fri-chat']
+    assert len(chat.sends) == 1 and len(chat.pin_calls) == 1  # checked with Discord, not pinned twice
 
 
 def test_the_owners_dm_is_never_pinned(dm, tmp_path):
@@ -955,3 +963,93 @@ def test_an_unreadable_channel_after_posting_reports_posted_not_pinned(monkeypat
     with pytest.raises(notes.PinFailed, match='could not be read'):
         post('fri 0.7.0', tmp_path)
     assert len(chat.sends) == 1
+
+
+def test_a_channel_post_is_one_message_with_its_full_changelog_attached(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    post('fri 0.7.0\n\n**added**\n- things', tmp_path)
+    [sent] = chat.sends
+    assert sent['content'] == 'fri 0.7.0\n\n**added**\n- things' and notes.CHANGELOG_MARK not in sent['content']
+    assert sent['file'] == {'filename': 'fri-0.7.0-changelog.md', 'content': CHANGELOG}
+    entry = server_record(tmp_path)['0.7.0']
+    assert entry['changelog'] == notes.text_hash(CHANGELOG) and entry['pinned'] == '1001'
+
+
+def test_a_summary_that_needs_two_messages_or_a_post_without_its_changelog_is_refused_before_login(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    with pytest.raises(notes.NotesRefused, match='one message, and this summary needs 2'):
+        post(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), tmp_path)
+    with pytest.raises(notes.NotesRefused, match='attaches its full changelog'):
+        post('fri 0.7.0', tmp_path, changelog=None)
+    with pytest.raises(notes.NotesRefused, match='the changelog after the mark is empty'):
+        post('fri 0.7.0', tmp_path, changelog='  \n')
+    with pytest.raises(notes.NotesRefused, match='goes with a channel post'):
+        run(f'fri 0.7.0\n{notes.CHANGELOG_MARK}\n{CHANGELOG}', tmp_path, version='0.7.0')
+    assert not chat.sends and not dm.sends and not FakeClient.instances
+
+
+def test_the_same_summary_with_another_changelog_is_another_post(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    post('fri 0.7.0', tmp_path)
+    with pytest.raises(notes.NotesRefused, match='already sent with different notes'):
+        post('fri 0.7.0', tmp_path, changelog='a different full changelog\n')
+    assert len(chat.sends) == 1
+
+
+def test_recovery_finds_the_post_only_with_its_changelog_attached(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    chat.messages.append(said(900, 'fri 0.7.0', BOT))  # the same words, without the file: not the post
+    chat.lost.add(1)  # the post lands, but its reply is lost
+    with pytest.raises(RuntimeError):
+        post('fri 0.7.0', tmp_path)
+    post('fri 0.7.0', tmp_path)
+    assert len(chat.sends) == 1 and server_record(tmp_path)['0.7.0']['parts'][0]['message_id'] == '1001'
+
+
+def test_an_earlier_post_without_a_changelog_still_finishes_and_pins(dm, tmp_path):
+    """Like 1.0.0: posted before changelogs, its record has none; a rerun with its exact notes only pins."""
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    chat.messages.append(said(1564587767155925144, '1.0.0 notes', BOT))
+    chunks = notes.parts('1.0.0 notes')
+    (tmp_path/'patch-notes-server.json').write_text(json.dumps({'versions': {'1.0.0': {
+        'sha256': notes.hashlib.sha256(json.dumps(chunks).encode()).hexdigest(), 'parts': [
+            {'attempted_at': 1793095990.0, 'sha256': notes.text_hash(chunks[0]),
+             'message_id': '1564587767155925144', 'channel_id': '888'}]}}}))
+    assert post('1.0.0 notes', tmp_path, version='1.0.0', changelog=None)[-1].endswith('is pinned in #fri-chat')
+    assert not chat.sends
+
+
+def test_preview_shows_the_message_and_the_attached_changelog(monkeypatch, capsys):
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(
+        f'fri 0.7.0\n{notes.CHANGELOG_MARK}\n{CHANGELOG}'.encode())))
+    assert notes.main(['preview', '0.7.0']) == 0
+    out = capsys.readouterr().out
+    assert '--- part 1 (9 chars)\nfri 0.7.0' in out and '--- attached fri-0.7.0-changelog.md' in out and CHANGELOG in out
+
+
+def test_a_draft_longer_than_one_message_is_refused():
+    with pytest.raises(notes.NotesRefused, match='more than one message'):
+        notes.drafted(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), 'completed')
+
+
+def test_an_attached_post_keeps_the_record_older_code_retries(dm, tmp_path):
+    """A rollback to code without changelogs must still finish an unconfirmed post from its summary: the version's
+    sha256 stays the summary's digest, which older code compares, and its nonce stays the same."""
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    chat.lost.add(1)  # the post lands, its reply doesn't
+    with pytest.raises(RuntimeError):
+        post('fri 0.7.0', tmp_path)
+    entry = server_record(tmp_path)['0.7.0']
+    legacy = notes.hashlib.sha256(json.dumps(notes.parts('fri 0.7.0')).encode()).hexdigest()
+    assert entry['sha256'] == legacy and entry['changelog'] == notes.text_hash(CHANGELOG)
+    assert chat.sends[0]['nonce'] == notes.nonce('0.7.0', legacy, 1, '#888')
+    with pytest.raises(notes.NotesRefused, match='goes out with its changelog attached'):
+        post('fri 0.7.0', tmp_path, changelog=None)  # this code never resends without the file
+    post('fri 0.7.0', tmp_path)
+    assert len(chat.sends) == 1 and server_record(tmp_path)['0.7.0']['parts'][0]['message_id'] == '1001'
