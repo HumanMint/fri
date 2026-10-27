@@ -417,7 +417,9 @@ class Fri(discord.Client):
                 # So does one it quotes or replies to: the answer would be about words taken back.
                 if any(mid in self.agent.unsent for mid in quoted):
                     raise commands.UserFeedbackCheckFailure(WITHDRAWN)
-                seen.update(carried)  # And a delete before delivery withholds what the model made of any of it.
+                # And a delete before delivery withholds what the model made of any of it: what it carries, that is,
+                # so a live-view row dropped just below (deleted before this request) doesn't count.
+                seen.update([*looked, *quoted, *read])
                 if 'recent' in context:
                     context['recent'] = [row for row in context['recent']
                                          if row.get('gene_error') or int(row['id']) not in self.agent.unsent]

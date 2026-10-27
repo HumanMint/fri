@@ -525,3 +525,39 @@ def test_a_reply_target_deleted_during_the_last_checks_never_reaches_the_model(m
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('address', ['fri', '<@99>'])
+@pytest.mark.parametrize('deleted_at', ['before_ready', 'turn_check'])
+def test_a_nearby_row_dropped_before_the_request_doesnt_withhold_an_unrelated_answer(monkeypatch, tmp_path, address, deleted_at):
+    """Only what a request carries counts at delivery: a row deleted before it went out was never shown."""
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        regret = message('unrelated nearby chatter', user=21)
+        trigger = message(address + ' what is 2 plus 2?')
+        requests, deleted = [], []
+        api = fri.api
+        async def delete_during_check(method, path, payload=None):
+            result = await api(method, path, payload)
+            if deleted_at == 'turn_check' and path == '/chat/turn/check' and not deleted:
+                deleted.append(True)
+                await delete(fri, rows, regret)
+            return result
+        fri.api = delete_during_check
+        async def respond(context, ready):
+            if deleted_at == 'before_ready' and not deleted:
+                deleted.append(True)
+                await delete(fri, rows, regret)
+            await ready()
+            requests.append([r['id'] for r in context.get('recent', [])])
+            return ChatResult(status='completed', reply='2 plus 2 is 4')
+        model(fri, tmp_path, respond)
+        try:
+            await heard(agent, regret)
+            await asyncio.wait_for(agent.handle(trigger), 10)
+            assert requests and str(regret.id) not in requests[-1] and regret.id in agent.unsent
+            assert [call.args[0] for call in trigger.reply.await_args_list] == ['2 plus 2 is 4']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
