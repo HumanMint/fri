@@ -61,8 +61,10 @@ def test_forgetting_a_member_drops_what_fri_saw_in_their_memes(harness):  # noqa
 def test_a_note_shows_only_while_the_author_and_the_post_are_as_they_were():
     edited = dt.datetime(2026, 10, 25, tzinfo=dt.timezone.utc)
     now = __import__('time').time()
-    notes = {5: {'author': '30', 'revision': 2, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None, 'at': now},
-             6: {'author': '30', 'revision': 2, 'emoji': '💀', 'note': 'a cat', 'edited': edited.isoformat(), 'at': now}}
+    notes = {5: {'author': '30', 'revision': 2, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None, 'at': now,
+                 'media': []},
+             6: {'author': '30', 'revision': 2, 'emoji': '💀', 'note': 'a cat', 'edited': edited.isoformat(), 'at': now,
+                 'media': []}}
     post = SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=None)
     assert reacted(notes, post, {'revision': 2}) == {'fri_reacted': {'emoji': '🗿', 'saw': 'gigachad at a desk'}}
     assert reacted(notes, SimpleNamespace(id=6, author=SimpleNamespace(id=30), edited_at=edited), {'revision': 2})
@@ -70,6 +72,8 @@ def test_a_note_shows_only_while_the_author_and_the_post_are_as_they_were():
     assert not reacted(notes, SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=edited), {'revision': 2})
     assert not reacted(notes, SimpleNamespace(id=5, author=SimpleNamespace(id=31), edited_at=None), {'revision': 2})
     assert not reacted(notes, SimpleNamespace(id=7, author=SimpleNamespace(id=30), edited_at=None), {'revision': 2})
+    assert not reacted(notes, SimpleNamespace(id=5, author=SimpleNamespace(id=30), edited_at=None,  # Its image changed.
+                                              attachments=[SimpleNamespace(url='https://cdn.test/new.png')]), {'revision': 2})
 
 
 def test_a_read_shows_fris_own_reaction_and_what_it_saw(monkeypatch, tmp_path):
@@ -79,7 +83,7 @@ def test_a_read_shows_fris_own_reaction_and_what_it_saw(monkeypatch, tmp_path):
         other = post('lol', user=40, age=300)
         agent.ensure_memes = lambda: SimpleNamespace(notes=lambda: {meme.id: {
             'author': '30', 'revision': 0, 'emoji': '🗿', 'note': 'gigachad at a desk', 'edited': None,
-            'at': __import__('time').time()}})
+            'at': __import__('time').time(), 'media': [str(a.url) for a in meme.attachments]}})
         actions = Actions(agent, 20, 999, False)
         actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
         try:
