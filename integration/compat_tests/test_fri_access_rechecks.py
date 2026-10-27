@@ -1,7 +1,9 @@
-"""The last check before each model request reads the turn's own channel from Discord, not only the cache."""
+"""The last check before each model request reads the turn's own channel from Discord, not only the cache:
+its author's access, and whether everyone can still read it before their words follow them elsewhere."""
 
 import asyncio
 import copy
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -9,9 +11,19 @@ import discord
 import pytest
 
 from compat_tests.test_fri_looking import loads, picture
+from compat_tests.test_fri_member_profiles import (
+    GAMING,
+    GENERAL,
+    model,
+    model_context,
+    note,
+    turns,
+    world,
+)
 from compat_tests.test_fri_mentions import environment
 from fri.fri import CONVERSATION_CHANGED
 from fri.fri_chat import ChatResult
+from fri.fri_memory import PROFILES
 
 
 def not_found():
@@ -72,6 +84,62 @@ def test_a_channel_message_needs_its_author_able_to_read_there_before_the_model(
                 assert reached == []
                 assert [item.args[0] for item in event.reply.await_args_list] == (
                     [CONVERSATION_CHANGED] if change == 'left' and target else [])
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def deny(channel, user):
+    """The channel as Discord has it now: one member kept out by an overwrite the cache hasn't seen."""
+    fetched = copy.copy(channel)
+    fetched.overwrites = {discord.Object(id=user): discord.PermissionOverwrite(view_channel=False)}
+    return fetched
+
+
+@pytest.mark.parametrize('denied', [False, True])
+def test_words_said_where_discord_keeps_someone_out_stay_there(monkeypatch, tmp_path, denied):
+    # The cache still shows #general open to everyone (fri #97).
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        general = w.channels[GENERAL]
+        if denied:
+            general.guild.fetch_channel.side_effect = lambda cid: (
+                deny(general, 30) if cid == GENERAL else w.channels[cid])
+
+        async def respond(text, context):
+            return ChatResult(status='completed', reply='noted', notes=note('I like private jazz', 'music')
+                              if 'jazz' in text else [])
+        model(w, respond)
+        try:
+            _, saved, _ = await w.say(GENERAL, 'fri I like private jazz')
+            assert turns(w)[-1]['audience'] == ('conversation' if denied else 'server')
+            assert saved['memory_scope'] == ('conversation' if denied else 'server')
+            await w.say(GAMING, 'fri recommend me something')
+            seen = json.dumps(model_context(w), default=str)
+            assert ('private jazz' in seen) is not denied  # Neither the note nor the raw elsewhere row.
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('denied', [False, True])
+def test_a_ping_where_discord_keeps_someone_out_keeps_its_words_there(monkeypatch, tmp_path, denied):
+    # A configured ping's own check read the channel already (Invitation.access): that read decides it.
+    async def scenario():
+        fri, agent, _, _, channel, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset({PROFILES})
+        channel.guild.default_role = SimpleNamespace(id=123)
+        channel.is_nsfw, channel.overwrites = (lambda: False), {}  # Open to everyone, as cached.
+        if denied:
+            channel.guild.fetch_channel.return_value = deny(channel, 30)
+        reached = answering(fri, tmp_path, lambda context: None)
+        event = message('<@99> I like private jazz')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert len(reached) == 1 and [item.args[0] for item in event.reply.await_args_list] == ['an answer']
+            assert [body['audience'] for path, body in calls if path == '/chat/turn'] == [
+                'conversation' if denied else 'server']
         finally:
             await fri.close()
     asyncio.run(scenario())

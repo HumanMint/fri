@@ -274,7 +274,10 @@ requests, and each member has one profile per server: up to 15 small preferences
 category) that follow them into every conversation in that server, DMs included. Fri decides where a
 note belongs when the turn is saved. Only a channel the server's default role can view counts, with a
 thread judged by its parent, and only public or news threads. Age-restricted channels never count,
-and neither does anything Fri can't resolve. Notes from DMs, the `/fri` panel, restricted channels,
+and neither does anything Fri can't resolve. Right before each model request Fri also reads the
+channel from Discord (fetched overwrites and roles, the ping's own check for a mention), so an
+overwrite the cache hasn't seen yet keeps the turn in that channel too. The same read confirms that a
+configured-channel message's author can still read the channel; if not, the request isn't sent. Notes from DMs, the `/fri` panel, restricted channels,
 private threads and outside invitations stay in that one conversation, and the controller refuses a
 profile write from a private conversation. Notes saved before this release stay where they were said.
 Background learning still keeps per channel.

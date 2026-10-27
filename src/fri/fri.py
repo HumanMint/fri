@@ -99,6 +99,12 @@ def summarized_elsewhere(context):
     return here.startswith('public:') and any(origin != here for origin in fence.get('summarized', ()))
 
 
+def audience(context):
+    """Where the turn's words may follow the member (see Fri.talk): no further than their channel, once a check
+    before a model request read it from Discord keeping anyone out, whatever the cache said (fri #97)."""
+    return 'conversation' if (context.get('fence') or {}).get('restricted') else context.get('audience')
+
+
 async def noop(stage):
     pass
 
@@ -426,12 +432,13 @@ class Fri(discord.Client):
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
             drop_unheard(self.get_channel, context)  # Nor a profile note said there (fri #98).
             # Fri's summary of the member, while it may still show here (their private chat, or a channel everyone
-            # can still read) and every channel it came from is still one everyone can read.
+            # can still read, as the gate above read it too) and every channel it came from is still one everyone
+            # can read.
             destination = (fence or {}).get('turn') or {}
             here, guild_id = destination.get('conversation_id', ''), destination.get('guild_id', 0)
             if context.get('member_summary'):
                 context['member_summary'] = self.member_summary(context['member_summary'], guild_id, here.startswith(
-                    'private:') or self.readable(here, guild_id) is not None)
+                    'private:') or (self.readable(here, guild_id) is not None and not (fence or {}).get('restricted')))
             if fence:  # Checked again before delivery, with where each profile note shown in public was said.
                 fence['shown'].update(row['conversation_id'] for row in context['elsewhere'])
                 fence['shown'].update(origin for origin in (context.get('profile_origins') or {}).values()
@@ -704,13 +711,19 @@ class Fri(discord.Client):
                             raise GateClosed(closed)
                     context['fence']['gate'] = gate  # Run with the other last checks (see chat_once).
                     context['fence']['dms'] = lambda: self.agent.config['support_dms']
-                elif self.agent and source.kind == 'discord_message' and not invitation:
+                elif self.agent and source.kind == 'discord_message':
                     async def gate():
-                        """A channel message's own gate: its author can still read the channel, from fetched
-                        overwrites and roles, not the cache (fri #31). A ping's own check reads that itself."""
-                        member = await self.agent.member(user_id, fresh=True, guild_id=guild_id)
-                        if not member or not await self.agent.can_read(event, member):
-                            raise GateClosed('member changed')
+                        """A channel message's own gates: its author can still read the channel (fri #31), and
+                        whether everyone can (fri #97), both from fetched overwrites and roles, not the cache.
+                        A ping's own check read the channel already (see Invitation.access)."""
+                        if invitation:
+                            fetched = invitation.fetched
+                        else:
+                            member = await self.agent.member(user_id, fresh=True, guild_id=guild_id)
+                            if not member or not (fetched := await self.agent.can_read(event, member)):
+                                raise GateClosed('member changed')
+                        if not server_wide(event.channel, fetched):
+                            context['fence']['restricted'] = True  # For the rest of the turn (see audience).
                     context['fence']['gate'] = gate
                 result = await self.chat_once(text, context)
                 # A ping's last check before sending (Agent.reply_once) covers it and its image, and a tool
@@ -795,7 +808,7 @@ class Fri(discord.Client):
                         'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
                                                                          result.post_preview or result.clarification),
                         'provenance': provenance, 'verbatim': stored == result.reply,
-                        **({'audience': context['audience']} if context.get('audience') else {})}
+                        **({'audience': audience(context)} if context.get('audience') else {})}
                     if len(result.turn['provenance']) > MAX_PROVENANCE:
                         return ChatResult(reply=unrecorded(receipts, reason='too many people were in that context to '
                                                            'track safely.'), status='completed')
@@ -852,7 +865,7 @@ class Fri(discord.Client):
             'notes': result.notes, 'input_tokens': 0 if model else result.counters.get('input_tokens'),
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
-            **({'audience': context['audience']} if context.get('audience') else {})}
+            **({'audience': audience(context)} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
             result.echo = self.echo(scope, context, provenance, reply)
         return result
