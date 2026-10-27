@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -288,6 +289,37 @@ def test_a_question_sent_inside_the_wait_is_answered_when_its_checks_finish_afte
             await asyncio.wait_for(asyncio.gather(*tasks), 10)
             question.reply.assert_awaited_once()  # Sent in time: answered, not dropped as unaddressed.
             assert fri.chat_once.await_count == 2
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('window', [None, 'an earlier reply'])
+def test_deleting_a_bare_ping_ends_the_window_it_opened(monkeypatch, tmp_path, window):
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        rest(monkeypatch, 2)
+        if window:  # Still open from a reply before the ping: deleting the ping leaves it alone.
+            agent.active[(1, 20)] = time.time()+120
+        bare = message('<@99>')
+        sentence = message('is the end portal under spawn')  # No "fri" in it.
+        tasks = [asyncio.create_task(agent.handle(bare))]
+        try:
+            async with asyncio.timeout(2):
+                while (1, 20) not in agent.summons:
+                    await asyncio.sleep(0)
+            del rows[bare.id]
+            await fri.on_raw_message_delete(SimpleNamespace(channel_id=1, message_id=bare.id))
+            tasks.append(asyncio.create_task(agent.handle(sentence)))
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            bare.reply.assert_not_awaited()
+            if window:
+                sentence.reply.assert_awaited_once()
+            else:  # Taken back: the next unaddressed line isn't answered through it.
+                fri.chat_once.assert_not_awaited()
+                sentence.reply.assert_not_awaited()
+                assert (1, 20) not in agent.summons and agent.active.get((1, 20), 0) <= time.time()
         finally:
             await asyncio.gather(*tasks, return_exceptions=True)
             await fri.close()

@@ -169,7 +169,9 @@ class Agent:
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
         self.looked = {}  # Messages a turn's model request carried -> when (monotonic), oldest first: see unsend.
-        self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
+        # (channel, member): (bare "fri" message ID, set once the rest of it comes in, the follow-up window it
+        # opened as (until, the one it replaced) or None in a DM).
+        self.summons = {}
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
 
     @property
@@ -331,6 +333,14 @@ class Agent:
             self.recent[channel] = deque((r for r in rows if r['gene_error'] or r['id'] not in gone), maxlen=30)
         for key in [key for key, latest in self.pending.items() if key[0] == channel and latest in ids]:
             del self.pending[key]  # Its burst is dropped below; nothing is pending for that member now.
+        for key in [key for key, (summoned, *_) in self.summons.items() if key[0] == channel and summoned in ids]:
+            # A bare "fri" taken back: what's said next isn't let in through it. A window it didn't open stays.
+            _, _, opened = self.summons.pop(key)
+            if opened and self.active.get(key) == opened[0]:
+                if opened[1] is None:
+                    del self.active[key]
+                else:
+                    self.active[key] = opened[1]
         self.bursts.unsend(channel, ids)
 
     def saw(self, ids):
@@ -1122,7 +1132,7 @@ class Agent:
             if reason := await self.erasure(message.author.id, forgotten, observed):
                 return await self.dropped(message, [message], reason, invitation, (forgotten, observed))
         # Open when it came in, even if the reads above outlasted it: a question sent just before a bare
-        # "fri" stopped waiting. A window withdrawn since (a privacy change) is gone from active.
+        # "fri" stopped waiting. A window withdrawn since (a privacy change, a deleted bare "fri") is gone.
         active = (self.active.get((channel, message.author.id), 0) > sent or
                   self.bursts.has(channel, message.author.id))
         if not active and directed is None and not dm and not message.author.bot:
@@ -1206,10 +1216,12 @@ class Agent:
     async def rest_of(self, key, message):
         """Wait up to REST_SECONDS for the member's next message here, letting it in without "fri". True
         if it came."""
-        came = asyncio.Event()
-        self.summons[key] = (message.id, came)
+        came, opened = asyncio.Event(), None
         if message.guild:  # In a DM every message is already to Fri.
-            self.active[key] = max(self.active.get(key, 0), time.time()+REST_SECONDS)
+            earlier = self.active.get(key)
+            self.active[key] = max(earlier or 0, time.time()+REST_SECONDS)
+            opened = (self.active[key], earlier)
+        self.summons[key] = (message.id, came, opened)
         waits = [asyncio.ensure_future(asyncio.sleep(REST_SECONDS)), asyncio.ensure_future(came.wait())]
         try:
             await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)

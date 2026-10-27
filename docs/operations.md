@@ -93,7 +93,9 @@ Fri's live view of a configured channel is its last 15 minutes (at most 30 messa
 message leaves it, and so does a reply of Fri's that someone deletes. Gene's error posts stay until
 they expire, so a quick delete can't hide one from the repair investigation. A deleted message
 also leaves a burst that is still gathering, and the burst's last message answers for the rest; if
-the last one is deleted, the whole burst is dropped. A deleted "forget me" or other privacy control
+the last one is deleted, the whole burst is dropped. A bare "fri" deleted during its 8 s wait stops
+letting the member's next message in without "fri"; a follow-up window from an earlier reply stays
+open. A deleted "forget me" or other privacy control
 isn't carried out: deleting it may be taking it back, and an erasure can't be undone. A reply
 still being composed for a deleted
 message is neither sent nor saved (`message deleted`), and one deleted before the model is
