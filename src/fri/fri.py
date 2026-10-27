@@ -72,6 +72,7 @@ UNAVAILABLE = '[an earlier fri reply whose sources are no longer available]'
 LINKED = ('Earlier answer about a post linked from another channel. Open the link again for details; '
           'nothing from it is retained here.')
 SUMMARIZED = 'Earlier answer drawing on what they talked about in other channels. Nothing from it is retained here.'
+SUMMARIZED_QUESTION = 'an earlier question drawing on other channels; nothing from it is kept here. ask what they meant.'
 LEGACY = '[an earlier fri reply from before fri tracked its sources]'
 CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
 CONVERSATION_CHANGED = 'the conversation changed while i was typing. ask again and i’ll catch up.'
@@ -765,8 +766,13 @@ class Fri(discord.Client):
                         stored += '. Fetch current evidence for follow-up details; no findings are retained here.'
                     elif crossed and not (result.clarification or result.settings_preview or result.post_preview):
                         stored = LINKED
-                    elif recalled and not (result.clarification or result.settings_preview or result.post_preview):
+                    elif recalled and not (result.clarification and actions.private_evidence or
+                                           result.settings_preview or result.post_preview):
+                        # Only the harness's fixed question (private evidence) derives nothing; a model-written
+                        # clarification can carry the summary, so its saved and pending copies go neutral too.
                         stored = SUMMARIZED
+                        if result.clarification:
+                            result.clarification = {**result.clarification, 'question': SUMMARIZED_QUESTION}
                     try:  # A fixed harness question over referenced evidence derives nothing from it.
                         provenance = ([] if result.clarification and actions.private_evidence
                                       else turn_provenance(context, user_id, actions))

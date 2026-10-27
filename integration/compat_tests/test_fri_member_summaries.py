@@ -513,3 +513,53 @@ def test_an_edited_summary_fences_delivery_on_where_it_shows(monkeypatch, tmp_pa
         finally:
             await w.fri.close()
     run(scenario)
+
+
+@pytest.mark.parametrize('followup_user', [20, 30])
+def test_a_clarification_drawing_on_a_summary_from_elsewhere_is_kept_neutral(monkeypatch, tmp_path, followup_user):
+    """Its saved reply and pending question go neutral: closing the summary's channel later leaves nothing behind,
+    for the member's own follow-up or for another member replying to the question."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri we are planning a violet dragon raid')
+            await w.say(GENERAL, 'fri which class for the violet dragon raid')
+            settled(w, 13*3600)
+            summarizer(monkeypatch, w, reply='they are planning a violet dragon raid')
+            assert await build(w.fri.agent) == {'kept': True}
+            w.fri.agent.state['web_search_enabled'] = True
+            text = 'fri look up raid builds'
+            event = w.message(GAMING, text)
+            w.channels[GAMING].fetch_message = AsyncMock(return_value=event)
+            question = 'for that violet dragon raid you are planning, which class?'
+
+            async def clarify(text, context):
+                assert context['member_summary']['text'] == 'they are planning a violet dragon raid'
+                assert 'clarify' in context['actions']
+                return ChatResult(status='completed', action={'kind': 'clarify', 'goal': 'web',
+                    'topic': 'raid builds', 'question': question})
+            model(w, clarify)
+            result, saved, sent = await w.say(GAMING, text, event=event)
+            assert saved and result.clarification
+            w.readable[GENERAL] = False
+
+            async def followup(text, context):
+                assert context.get('member_summary') is None
+                return ChatResult(status='completed', reply='which one?')
+            model(w, followup)
+            followup_text = 'fri what were we talking about'
+            followup_event = w.message(GAMING, followup_text, user=followup_user)
+            events = {event.id: event, followup_event.id: followup_event}
+            if followup_user != 20:
+                target = w.message(GAMING, question, user=99)
+                target.id = sent.id
+                target.author.bot = True
+                events[target.id] = target
+                followup_event.reference = SimpleNamespace(message_id=target.id, channel_id=GAMING)
+            w.channels[GAMING].fetch_message = AsyncMock(side_effect=lambda mid: events[mid])
+            await w.say(GAMING, followup_text, user=followup_user, event=followup_event)
+            context = model_context(w)
+            assert 'violet dragon' not in json.dumps(context, default=str)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
