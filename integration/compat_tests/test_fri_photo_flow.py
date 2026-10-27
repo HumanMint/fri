@@ -30,9 +30,9 @@ def test_informal_caption_reaches_model_with_pixels_and_no_image_persistence(api
         fri.api = call
         event = message()
         event.id, event.content = int(source(60, public=public).id), caption
-        event.guild = SimpleNamespace(id=123) if public else None
-        event.author.display_name = 'Member'
         channel = 456 if public else 999
+        event.guild = fri.get_channel(channel).guild if public else None  # Its REST copies match the cache.
+        event.author.display_name = 'Member'
         visibility = 'public' if public else 'private'
         event.channel = Mock(spec=discord.TextChannel if public else discord.DMChannel, id=channel)
         event.channel.fetch_message = AsyncMock(return_value=event)

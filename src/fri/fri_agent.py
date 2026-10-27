@@ -875,7 +875,8 @@ class Agent:
 
     async def can_read(self, message, member):
         """Whether `member` can read the message's channel now, from fetched overwrites and roles: the
-        cached channel can lag (see Invitation.access)."""
+        cached channel can lag (see Invitation.access). If so, that channel (a thread's parent) as fetched,
+        so whether everyone can is judged from the same read (see fri_memory.server_wide); else None."""
         guild = message.guild
         try:
             channel = await guild.fetch_channel(message.channel.id)
@@ -883,11 +884,11 @@ class Agent:
             fresh = copy.copy(guild)
             fresh._roles = {role.id: role for role in await guild.fetch_roles()}
         except discord.HTTPException:
-            return False
+            return None
         parent = copy.copy(parent)
         parent.guild = fresh
         permissions = parent.permissions_for(member)
-        return permissions.view_channel and permissions.read_message_history
+        return parent if permissions.view_channel and permissions.read_message_history else None
 
     async def unreadable(self, message, events, exc, invitation, forgotten, control=False):
         """A message whose author's privacy revision couldn't be read as it came in, other than in an
