@@ -5,6 +5,10 @@ import datetime as dt
 import json
 from types import SimpleNamespace
 
+import aiohttp
+import discord
+import pytest
+
 from compat_tests.test_fri_learning import learning as learning  # noqa: F401
 from compat_tests.test_fri_looking import picture, read_harness
 from compat_tests.test_fri_memes import attachment
@@ -207,6 +211,40 @@ def test_a_note_on_a_deleted_or_edited_post_goes_at_the_next_check_even_with_mem
         await h.agent.memes.verify(now=h.clock[0]+601)
         # Deleted or edited: dropped. Discord unreachable for now: kept for next time. Unchanged: kept.
         assert set(h.agent.memes.notes()) == {kept.id, unread.id}
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('error', [
+    aiohttp.ClientConnectionError('connection closed'), aiohttp.ServerDisconnectedError(), TimeoutError('timed out'),
+    ConnectionResetError(54, 'connection reset'), discord.RateLimited(40),
+    discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Access'),
+    discord.HTTPException(SimpleNamespace(status=503, reason='down'), 'down'),
+])
+def test_however_a_refetch_fails_every_notes_privacy_check_and_the_other_reads_still_run(tmp_path, error):
+    """An opted-out author's note goes at the next check whatever Discord does, and one post Discord can't
+    show keeps only its own note: the next post is still read."""
+    import time
+
+    async def scenario():
+        async def profile(channel, user):
+            return {'enabled': user not in (11, 12), 'revision': 0}  # 11 and 12 opted out outside Fri.
+        notes = ((1, '11'), (2, '12'), (3, '13'), (4, '14'))
+        read = []
+
+        async def fetch(mid):
+            read.append(mid)
+            if mid == 4:
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+            raise error
+        fri = SimpleNamespace(data=tmp_path, get_partial_messageable=lambda _: SimpleNamespace(fetch_message=fetch))
+        memes = Memes(SimpleNamespace(fri=fri, profile=profile))
+        now = time.time()
+        for mid, author in notes:
+            memes.noted[mid] = {'at': now, 'channel': 3, 'author': author, 'revision': 0, 'emoji': '🗿',
+                                'note': 'a desk', 'edited': None, 'media': []}
+        await memes.verify(now=now+601)
+        # Opted out: dropped, read or not. Unreadable for now: kept for next time. Deleted: dropped.
+        assert set(memes.noted) == {3} and 4 in read
     asyncio.run(scenario())
 
 

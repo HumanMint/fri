@@ -399,7 +399,9 @@ Calls whose result can't change what members see are skipped before inference.
   edit time still match, and drop it when they don't. Forgetting a member drops theirs; every heartbeat
   expires old ones (before it waits on the controller) and, every ten minutes, refetches each noted
   post and drops those whose post was deleted or edited or whose author changed privacy outside Fri,
-  whether or not meme checks are on.
+  whether or not meme checks are on. Every note's privacy is read from Gene before any post is
+  refetched, so an opt-out goes whatever Discord does; a post Discord can't show right now (refused,
+  rate-limited, connection failed) keeps its note until a later check.
 - **Chat meme channels.** In a meme channel that's also one of Fri's chat channels (like #fri-chat),
   the meme check still judges posts with images but never a post that's only text. A line of text is
   judged only once two other members laugh at it. A laugh is a whole message from a short fixed list

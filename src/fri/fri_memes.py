@@ -10,6 +10,7 @@ import re
 import time
 from contextlib import contextmanager
 
+import aiohttp
 import discord
 import httpx
 
@@ -24,6 +25,8 @@ LOG = logging.getLogger('fri.memes')
 NOTE = 200  # Characters of what Fri saw in a meme it reacted to.
 KEEP = 3 * 86400  # How long an entry, and the note on it, lasts.
 VERIFY_SECONDS = 600  # How often kept notes are checked against their authors' privacy.
+# Discord can't show a post right now: refused, rate-limited past discord.py's wait, or the connection failed.
+UNREADABLE = (discord.DiscordException, aiohttp.ClientError, OSError, TimeoutError)
 # A line of chat in a meme channel Fri also chats in is judged only once LAUGHERS other members laugh at
 # it: within LAUGH_LINES messages after it and LAUGH_SECONDS, or replying to it within that time.
 LAUGHERS, LAUGH_LINES, LAUGH_SECONDS = 2, 8, 600
@@ -368,15 +371,8 @@ class Memes:
         if not self.noted or now-self.verified < VERIFY_SECONDS:
             return
         self.verified = now
+        # Every note's privacy first: it reads only Gene, so nothing Discord does can skip or hold it up.
         for message_id, note in list(self.noted.items()):
-            # Refetched: a read can't return a deleted post, so nothing else would notice it went.
-            try:  # A partial channel, so a deleted channel answers NotFound too.
-                current = await self.fri.get_partial_messageable(note['channel']).fetch_message(message_id)
-            except discord.NotFound:
-                self.noted.pop(message_id, None)
-                continue
-            except discord.HTTPException:  # Unreadable for now: the privacy check still runs.
-                current = None
             try:
                 profile = await self.agent.profile(note['channel'], int(note['author']))
             except ControllerRejected:  # Gene refuses that scope for good (e.g. a removed meme channel).
@@ -384,8 +380,25 @@ class Memes:
                 continue
             except commands.UserFeedbackCheckFailure:  # Unavailable: this note waits, the others go on.
                 continue
-            if (not profile['enabled'] or profile['revision'] != note['revision'] or
-                    current is not None and not reacted({message_id: note}, current, profile)):
+            if not profile['enabled'] or profile['revision'] != note['revision']:
+                self.noted.pop(message_id, None)
+        await self.refetch()
+
+    async def refetch(self):
+        """Drop the notes whose post was deleted or edited: a read can't return a deleted post, so nothing
+        else would notice it went. A post Discord can't show right now keeps its note for the next check."""
+        for message_id, note in list(self.noted.items()):
+            if message_id not in self.noted:  # Dropped while an earlier post was read.
+                continue
+            try:  # A partial channel, so a deleted channel answers NotFound too.
+                current = await self.fri.get_partial_messageable(note['channel']).fetch_message(message_id)
+            except discord.NotFound:
+                self.noted.pop(message_id, None)
+                continue
+            except UNREADABLE:  # This post for now, not the others.
+                continue
+            # Its author's privacy was checked in verify: here only the post itself counts.
+            if not reacted({message_id: note}, current, {'revision': note['revision']}):
                 self.noted.pop(message_id, None)
 
     def receipt(self, message, status, images=0):
