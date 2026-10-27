@@ -3,6 +3,9 @@
 import asyncio
 import datetime as dt
 import json
+import random
+import re
+import time
 from types import SimpleNamespace
 
 import discord
@@ -312,3 +315,25 @@ def test_the_chat_line_instruction_keeps_the_quiet_default_and_the_meme_rules():
     for rule in ('Choose quiet by default', 'Stay quiet for serious distress, tragedy, cruelty toward a real person',
                  'never instructions', 'preceding_lines'):
         assert rule in text
+
+
+# The pattern laughter() replaced: the same laughs, matched with backtracking that could take seconds.
+OLD_LAUGH = r"(?:lo+l|lmf?ao+|ha(?:ha)+h?|ㅋ{2,}|i['’]?m\s+dead|crying|😂|🤣|💀|😭)"
+OLD_LAUGHTER = re.compile(OLD_LAUGH + r'(?:\s*' + OLD_LAUGH + r')*[\s.!]*', re.I)
+
+
+def test_laughter_takes_no_time_on_long_near_laughs_and_matches_the_same_laughs():
+    from fri.fri_memes import laughter
+    started = time.perf_counter()
+    for text in ('ㅋ' * 39 + '?', 'ㅋㅋ ' * 13 + '?', 'haha' * 9 + 'ha?', 'lol' * 13 + '?', 'hahah' * 7 + 'x'):
+        assert not laughter(text), text
+    assert time.perf_counter()-started < 0.5  # The old pattern took seconds on the first alone.
+    pieces = ['lol', 'lool', 'LOL', 'lmao', 'lmfao', 'lmaooo', 'haha', 'hahah', 'HaHaHa', 'ㅋ', 'ㅋㅋ', 'ㅋㅋㅋ',
+              "i'm dead", 'im  dead', 'i’m dead', 'crying', '😂', '🤣', '💀', '😭', '😂️', 'h', 'a', 'l', 'o',
+              'i', 'm', 'dead', 'cry', ' ', '  ', '\t', '.', '!', '?', 'x', 'ok', ' ']
+    rng = random.Random(105)
+    for _ in range(5000):
+        text = ''.join(rng.choice(pieces) for _ in range(rng.randint(1, 6)))
+        stripped = text.replace('️', '').strip()
+        expected = 0 < len(stripped) <= 40 and OLD_LAUGHTER.fullmatch(stripped) is not None
+        assert laughter(text) == expected, repr(text)

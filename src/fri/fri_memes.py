@@ -29,8 +29,8 @@ VERIFY_SECONDS = 600  # How often kept notes are checked against their authors' 
 LAUGHERS, LAUGH_LINES, LAUGH_SECONDS = 2, 8, 600
 CONTEXT_LINES = 5  # Lines before it the model sees, so it judges the bit, not the line alone.
 # A laugh is a whole short message of these and nothing else: a fixed list, never a model's call.
-LAUGH = r"(?:lo+l|lmf?ao+|ha(?:ha)+h?|ㅋ{2,}|i['’]?m\s+dead|crying|😂|🤣|💀|😭)"
-LAUGHTER = re.compile(LAUGH + r'(?:\s*' + LAUGH + r')*[\s.!]*', re.I)
+LAUGH = re.compile(r"lo+l|lmf?ao+|ha(?:ha)+h?|ㅋ{2,}|i['’]?m\s+dead|crying|😂|🤣|💀|😭", re.I)
+SPACE, TAIL = re.compile(r'\s*'), re.compile(r'[\s.!]*')
 
 EMOJIS = ('💩', '🤡', '🗿', '🫠', '🧂', '🍿', '👀', '🧠', '🪦', '🐐', '🐸', '🦆',
           '🐀', '🐒', '🍌', '🥔', '🍞', '🥚', '🧀', '🦀', '🐟', '🦴', '🪑', '🛒',
@@ -420,9 +420,15 @@ def reacted(notes, message, profile, stale=None):
 
 
 def laughter(text):
-    """Whether a message is only laughing (see LAUGH), matched whole, case-insensitive."""
+    """Whether a message is only laughing: laughs from LAUGH, maybe spaced, then maybe . or !, matched whole and
+    case-insensitive. One pass, a laugh at a time and never back: it runs as each message comes in."""
     text = (text or '').replace('\ufe0f', '').strip()  # The emoji presentation selector some keyboards add.
-    return 0 < len(text) <= 40 and LAUGHTER.fullmatch(text) is not None
+    if not 0 < len(text) <= 40:
+        return False
+    at = 0
+    while found := LAUGH.match(text, at):
+        at = SPACE.match(text, found.end()).end()
+    return at > 0 and TAIL.fullmatch(text, at) is not None
 
 
 def spoken(row):
