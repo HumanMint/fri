@@ -382,8 +382,10 @@ Calls whose result can't change what members see are skipped before inference.
   author, edits and deletes, receipts and kept notes. The model also gets up to 5 lines before it from
   Fri's privacy-fenced live view as untrusted context, but not who laughed. These checks share the
   daily check and reaction budgets and the hourly gap between reactions. Unlike a meme check, one
-  doesn't call the model while no reaction could follow. Each line is considered once, and Fri only
-  reacts, never posts.
+  doesn't call the model while no reaction could follow: that's checked before it reads anything and
+  again right before the model call, when every line it would show must also still be in the live view
+  as it was, from authors who still allow it. One runs at a time; a laugh while one runs starts nothing,
+  though a later member's laugh can. Each line is considered once, and Fri only reacts, never posts.
 
 ## Deployment boundary
 
