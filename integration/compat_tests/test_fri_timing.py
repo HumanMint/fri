@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import aiohttp
 import discord
 import pytest
 
@@ -146,7 +147,7 @@ def history_of(channel, rows):
     channel.history = history
 
 
-@pytest.mark.parametrize('later', [None, 'same author', 'bot', 'someone else', 'unreadable'])
+@pytest.mark.parametrize('later', [None, 'same author', 'bot', 'someone else', 'unreadable', 'disconnected'])
 def test_an_ambient_reply_is_dropped_once_someone_else_spoke(monkeypatch, tmp_path, later):
     async def scenario():
         fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
@@ -162,12 +163,14 @@ def test_an_ambient_reply_is_dropped_once_someone_else_spoke(monkeypatch, tmp_pa
                 message('[Gene] now playing', user=55).author.bot = True
             elif later == 'someone else':
                 message('yeah it is down, give it a minute', user=21)
-            elif later == 'unreadable':
+            elif later in ('unreadable', 'disconnected'):
                 channel.history = None  # Calling it fails like a refused read.
             return ChatResult(status='completed', reply='yeah, it went down a minute ago')
         fri.chat_once.side_effect = answer
-        if later == 'unreadable':
+        if later in ('unreadable', 'disconnected'):
             async def refused(*args, **kwargs):
+                if later == 'disconnected':  # The connection dropped: no HTTP status at all.
+                    raise aiohttp.ClientConnectionError('connection reset')
                 raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'no')
                 yield
             original = answer
@@ -179,7 +182,7 @@ def test_an_ambient_reply_is_dropped_once_someone_else_spoke(monkeypatch, tmp_pa
         try:
             await asyncio.wait_for(agent.respond(picked, picked.content, ambient=True), 5)
             assert log == ['model']  # No typing for a turn nobody asked for.
-            if later in ('someone else', 'unreadable'):
+            if later in ('someone else', 'unreadable', 'disconnected'):
                 picked.reply.assert_not_awaited()  # Someone answered first, or it can't tell: stays quiet.
                 assert not store.chat_context('123', 'public:1', '20')['turns']
             else:

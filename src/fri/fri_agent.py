@@ -13,6 +13,7 @@ import uuid
 from collections import Counter, defaultdict, deque
 from contextlib import AsyncExitStack, closing, nullcontext
 
+import aiohttp
 import discord
 from discord.ext import tasks
 
@@ -1253,14 +1254,15 @@ class Agent:
 
     async def moved_on(self, message):
         """Someone other than its author spoke after a message ambient attention is answering, as Discord
-        has the channel now (the live view leaves out members with memory off). Unreadable counts too."""
+        has the channel now (the live view leaves out members with memory off). Unreadable counts too,
+        a dropped connection included, so the attention pass goes on to its other channels."""
         try:
             async for later in message.channel.history(limit=20, after=message, oldest_first=True):
                 if (not later.author.bot and not getattr(later, 'webhook_id', None) and
                         later.author.id != message.author.id):
                     return True
             return False
-        except (discord.HTTPException, TimeoutError):
+        except (discord.HTTPException, aiohttp.ClientError, TimeoutError):
             return True
 
     def answer_directly(self, message):
