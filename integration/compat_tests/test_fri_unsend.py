@@ -207,6 +207,27 @@ def test_a_deleted_forget_me_is_not_carried_out(monkeypatch, tmp_path, waited):
     asyncio.run(scenario())
 
 
+def test_a_forget_me_deleted_during_its_last_check_is_not_carried_out(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        control = message('fri forget me')
+        async def fetch(mid):  # Discord answers with it, then its delete arrives before Fri goes on.
+            item = rows[mid]
+            if mid == control.id:
+                await delete(fri, rows, control)
+            return item
+        channel.fetch_message.side_effect = fetch
+        try:
+            await asyncio.wait_for(agent.handle(control), 5)
+            assert control.id in agent.unsent
+            assert store.chat_context('123', 'public:1', '20')['personal_memory']['enabled']
+            control.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('kind', ['reply', 'react', 'quiet'])
 def test_a_message_deleted_while_fri_composes_is_neither_answered_nor_saved(monkeypatch, tmp_path, kind):
     async def scenario():
