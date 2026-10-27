@@ -6,7 +6,7 @@ import discord
 import httpx
 
 from . import feedback as commands
-from .fri_meme_media import gif_previews, load_image, sources
+from .fri_meme_media import gif_previews, load_image, sources, unsigned
 
 CHANGED = ('The image request changed while I was checking it. Any earlier tool actions keep '
            'their recorded outcomes; check their status before retrying. Ask again with the current attachment.')
@@ -208,7 +208,7 @@ async def unchanged(context, event):
         return ((image.author.id == event.author.id or
                  (invitation and image.author.id == source.author.id)) and not getattr(image.author, 'bot', False) and not image.webhook_id and
                 image.channel.id == event.channel.id and image.content == source.content and
-                image.edited_at == source.edited_at and sources(image) == context['image_sources'])
+                image.edited_at == source.edited_at and unsigned(sources(image)) == unsigned(context['image_sources']))
     except discord.HTTPException:
         return False
 
@@ -231,7 +231,8 @@ async def looked_unchanged(context):
             # The same author as when read: the reads that call look() admit no bot but Fri itself.
             if (current.id != post.id or current.author.id != post.author.id or
                     current.webhook_id or current.channel.id != post.channel.id or current.content != post.content or
-                    current.edited_at != post.edited_at or sources(current, MAX_IMAGES, gifs=True) != read['sources']):
+                    current.edited_at != post.edited_at or
+                    unsigned(sources(current, MAX_IMAGES, gifs=True)) != unsigned(read['sources'])):
                 return False
         return True
     except discord.HTTPException:
@@ -245,7 +246,7 @@ async def still_there(message):
     except discord.HTTPException:
         return False
     return (current.edited_at == message.edited_at and current.content == message.content and
-            sources(current) == sources(message))
+            unsigned(sources(current)) == unsigned(sources(message)))
 
 
 async def require_current(context, event):

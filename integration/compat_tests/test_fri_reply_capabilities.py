@@ -12,6 +12,7 @@ from gene.fri_social_store import Social
 
 from compat_tests.test_fri_actions import harness
 from compat_tests.test_fri_chat import CONTEXT, response_event
+from compat_tests.test_fri_conversation_context import dated
 from compat_tests.test_fri_social import DM, PUBLIC, api, confirmed, future, source  # noqa: F401
 from fri import feedback as commands
 from fri.fri_actions import Actions
@@ -172,7 +173,7 @@ def test_text_provenance_and_images_coexist_in_the_same_billed_model_request():
             seen.append(payload)
             content = payload['input'][-1]['content']
             supplied = json.loads(content[0]['text'])
-            assert supplied['reply_target'] == target and supplied['message_burst'] == burst
+            assert supplied['reply_target'] == dated(target) and supplied['message_burst'] == dated(burst)
             assert content[1] == {'type': 'input_image', 'image_url': 'data:image/png;base64,aGVsbG8=', 'detail': 'auto'}
             return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps({
                 'reply': 'it shows an error', 'request_draft': None})))+'\n\n')

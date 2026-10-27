@@ -102,6 +102,44 @@ def test_a_meme_changed_during_sign_in_never_reaches_the_next_request(monkeypatc
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('change', ['renewed', 'replaced'])
+def test_a_renewed_cdn_signature_during_sign_in_is_the_same_meme_but_a_replaced_one_is_not(monkeypatch, tmp_path, change):
+    async def scenario():
+        w, post, rows, sent = image_world(monkeypatch, tmp_path)
+        upload = post.attachments[0].url
+        post.attachments[0].url = upload+'?ex=6720d7a1&is=671f8621&hm=a1'
+        sign_ins = 0
+
+        async def sign_in():
+            nonlocal sign_ins
+            sign_ins += 1
+            if sign_ins == 2:  # After the look, while Fri signs in for the next request: Discord's copy now.
+                current = copy.copy(post)
+                current.attachments = [copy.copy(post.attachments[0])]
+                if change == 'renewed':  # Only the signature: the same upload the model was shown.
+                    current.attachments[0].url = upload+'?ex=6720d7a1&is=671f8621&hm=b2'
+                else:  # The same file name, but another upload (its own attachment ID).
+                    current.attachments[0].url = (upload.replace('/1/original.png', '/2/original.png') +
+                                                  '?ex=6720d7a1&is=671f8621&hm=c3')
+                rows[post.id] = current
+            return {'Authorization': 'Bearer synthetic'}
+
+        w.fri.chat.headers = sign_in
+        text = 'fri pick the best meme in general'
+        try:
+            if change == 'renewed':
+                await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+                assert sign_ins == 2 and len(sent) == 2
+            else:
+                with pytest.raises(commands.UserFeedbackCheckFailure):
+                    await w.fri.talk(123, DM, 20, text, 'private', event=w.message(DM, text))
+                assert sign_ins == 2 and len(sent) == 1
+        finally:
+            await w.fri.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('revoked', [False, True])
 def test_access_is_judged_from_fetched_overwrites_before_the_next_request(monkeypatch, tmp_path, revoked):
     async def scenario():

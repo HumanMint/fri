@@ -15,6 +15,9 @@ from .fri_image_request import MAX_REQUEST
 from .fri_memory import CATEGORIES
 from .fri_responses import KINDS, REACTIONS, acknowledgment_allowed, validate_response
 from .fri_social import SOCIAL_ACTIONS
+from .fri_times import ASK as TIME_ASK
+from .fri_times import prose, render_tree, said_at
+from .fri_times import render as render_times
 from .privacy import clean, model_json
 from .subscription import RESOURCE, SubscriptionError
 
@@ -207,6 +210,15 @@ question for genuinely unclear AM/PM or missing details; a fresh same-member ans
 that clarification. plan_prepare prepares a current-channel game-night card; its organizer must
 check the exact dates and click Publish, then finalize one option. Neither tool grants future tools,
 code, music, deployment, recurring jobs, role pings, or unsolicited DMs.
+When someone asks what a time in the chat is for everyone, or in their time, find it: usually the post
+just before or the one they reply to, else further up (read_recent if offered). Never work out
+timestamps or type <t:...> yourself. In reply text, write [[time YYYY-MM-DDTHH:MM Zone]] for the time and
+[[reltime YYYY-MM-DDTHH:MM Zone]] for how far off it is, in the poster's local 24h time and IANA zone
+(ET/EST/EDT -> America/New_York, PT -> America/Los_Angeles, KST -> Asia/Seoul, CET -> Europe/Berlin,
+GMT/UTC -> UTC, or UTC+HH:MM): "that's [[time 2026-10-27T20:00 America/New_York]], so
+[[reltime 2026-10-27T20:00 America/New_York]]". The harness shows each reader their own time.
+Resolve "tomorrow" against that post's at. If nobody stated a zone for it, ask which one, briefly;
+never guess it or use server_default_timezone.
 Check channel_capabilities instead of guessing access. Read permission, ambient participation and
 a one-off owner-authorized post are distinct. From an actual owner DM, prepare_post can preview a
 saved draft for another server channel, including announcements. Only the owner Send once button
@@ -402,6 +414,34 @@ def request_view(row):
     return view
 
 
+def iso(value):
+    """An epoch as the UTC date the model reads, or None for one that isn't a time."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec='seconds')
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def recent_view(row):
+    """A live-view row with when it was heard as a date: "tomorrow at 8" resolves against it."""
+    view = {k: v for k, v in row.items() if k != 'provenance'}
+    if isinstance(view.get('at'), (int, float)):
+        view['at'] = iso(view['at'])
+    return view
+
+
+def posted_view(row):
+    """A post they replied to, linked or sent in their burst, with when it was posted, from its Discord id."""
+    source = row.get('source') if isinstance(row, dict) else None
+    if (not isinstance(source, dict) or 'at' in source or source.get('kind') != 'discord_message'
+            or not re.fullmatch(r'[0-9]{1,25}', str(source.get('id', '')))):
+        return row
+    at = iso(((int(source['id']) >> 22)+1420070400000)/1000)
+    return {**row, 'source': {**source, 'at': at}} if at else row
+
+
 def loops_view(loops, source=None):
     """The controller's open loops with times as dates, and reminder text cut down like other quoted words.
 
@@ -534,10 +574,9 @@ class Chat:
                                                     for note in memory.get('notes', [])]},
             **({'your_summary_of_speaker_untrusted': context['member_summary']['text']}
                if context.get('member_summary') else {}),
-            'recent_channel_context': [{k: v for k, v in row.items() if k != 'provenance'}
-                                       for row in context.get('recent', [])],
-            'message_burst': context.get('message_burst', []),
-            'reply_target': context.get('reply_target', []),
+            'recent_channel_context': [recent_view(row) for row in context.get('recent', [])],
+            'message_burst': [posted_view(row) for row in context.get('message_burst', [])],
+            'reply_target': [posted_view(row) for row in context.get('reply_target', [])],
             'invited_channel_context': context.get('invited_context', []),
             'inspected_image_source': context.get('image_provenance'),
             'inspected_images': context.get('inspected_images', []),
@@ -669,6 +708,14 @@ class Chat:
                                 allow_closing = False
                             if response_kind != 'reply' and not acknowledgment_allowed(context):
                                 raise ValueError('This turn needs a text response or action')
+                            # Every path's words pass here before delivery and saving: the reply, and what an
+                            # action or draft would post or save later (a clarifying question, a draft's body).
+                            if response_kind == 'reply':
+                                reply = render_times(reply, said_at(context))
+                            action, rendered_action = render_tree(action, said_at(context), prose(action))
+                            draft, rendered_draft = render_tree(draft, said_at(context))
+                            if not (rendered_action and rendered_draft):
+                                reply, draft, action, response_kind = TIME_ASK, None, None, 'reply'
                             result.reply, result.draft, result.notes, result.action = reply, draft, notes, action
                             result.response_kind, result.reaction = response_kind, reaction
                             result.allow_closing = allow_closing
