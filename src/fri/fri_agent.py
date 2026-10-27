@@ -50,6 +50,7 @@ DEFERRED = object()  # The burst holding this message answers, or explains, for 
 BUSY = object()  # A panel or ambient reply to the member started first; wait for it.
 QUEUE_SECONDS = 240  # How long after it was sent a message may wait behind an earlier reply.
 REST_SECONDS = 8  # How long a bare "fri" waits for the question that usually follows it.
+MOVED_ON_SCAN = 20  # Messages after an ambient pick read for someone else speaking; a full page counts as moved on.
 # Just the name, a hello, or both: "fri", "yo fri", "fri?", "hey fri", a bare ping (read as "hey").
 GREETING = r'(?:hey+|hi+|hello|yo+|oi+|ayo?|sup|psst|ok(?:ay)?|bro|um+|uh+)'
 SUMMONS = re.compile(rf'(?i)(?:{GREETING}\b[\s,.!?~-]*)*(?:fri\b[\s,.!?~-]*)?(?:{GREETING}\b[\s,.!?~-]*)*')
@@ -1005,6 +1006,7 @@ class Agent:
 
     async def receive(self, message):
         arrived = time.monotonic()  # Bursts group by arrival, even if this waits for an earlier reply.
+        sent = time.time()  # A follow-up window counts as of arrival too: see `active` below.
         if message.guild is not None:
             self.fri.hear(message)  # Who could read it, as it arrives.
         forgotten = self.forgotten.get(message.author.id, 0)
@@ -1119,7 +1121,9 @@ class Agent:
             # Erased meanwhile, here or through the panel, Gene or Red: drop it, as forget() drops a burst.
             if reason := await self.erasure(message.author.id, forgotten, observed):
                 return await self.dropped(message, [message], reason, invitation, (forgotten, observed))
-        active = (self.active.get((channel, message.author.id), 0) > time.time() or
+        # Open when it came in, even if the reads above outlasted it: a question sent just before a bare
+        # "fri" stopped waiting. A window withdrawn since (a privacy change) is gone from active.
+        active = (self.active.get((channel, message.author.id), 0) > sent or
                   self.bursts.has(channel, message.author.id))
         if not active and directed is None and not dm and not message.author.bot:
             pending = await self.fri.api('POST', '/chat/pending', {
@@ -1255,13 +1259,16 @@ class Agent:
     async def moved_on(self, message):
         """Someone other than its author spoke after a message ambient attention is answering, as Discord
         has the channel now (the live view leaves out members with memory off). Unreadable counts too,
-        a dropped connection included, so the attention pass goes on to its other channels."""
+        a dropped connection included, so the attention pass goes on to its other channels. So does a full
+        page of bot posts and the author's own lines: whoever spoke after those wasn't read."""
+        scanned = 0
         try:
-            async for later in message.channel.history(limit=20, after=message, oldest_first=True):
+            async for later in message.channel.history(limit=MOVED_ON_SCAN, after=message, oldest_first=True):
+                scanned += 1
                 if (not later.author.bot and not getattr(later, 'webhook_id', None) and
                         later.author.id != message.author.id):
                     return True
-            return False
+            return scanned >= MOVED_ON_SCAN
         except (discord.HTTPException, aiohttp.ClientError, TimeoutError):
             return True
 
