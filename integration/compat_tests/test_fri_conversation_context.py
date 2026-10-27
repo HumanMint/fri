@@ -229,6 +229,12 @@ def test_reply_context_has_actual_cross_member_author_and_fails_closed(monkeypat
     asyncio.run(scenario())
 
 
+def dated(rows):
+    """Posts as the model reads them: each with when it was posted, from its Discord id."""
+    return [{**row, 'source': {**row['source'], 'at': discord.utils.snowflake_time(
+        int(row['source']['id'])).isoformat(timespec='seconds')}} for row in rows]
+
+
 def test_conversation_model_receives_source_linked_burst_and_reply_without_misattribution():
     async def scenario():
         body = pair()
@@ -242,7 +248,7 @@ def test_conversation_model_receives_source_linked_burst_and_reply_without_misat
         chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(transport))
         await chat.respond(body['request_text'], {**CONTEXT, 'message_burst': rows, 'reply_target': target})
         supplied = json.loads(captured[0]['input'][-1]['content'])
-        assert supplied['reply_target'] == target and supplied['message_burst'] == rows
+        assert supplied['reply_target'] == dated(target) and supplied['message_burst'] == dated(rows)
         assert supplied['message'] == body['request_text']
         assert 'possibly by another person' in captured[0]['instructions']
     asyncio.run(scenario())
