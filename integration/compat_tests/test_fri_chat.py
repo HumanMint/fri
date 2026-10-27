@@ -191,3 +191,29 @@ def test_retention_expires_without_another_chat_and_keeps_only_six_turns(store):
     store.status()
     with store.connection() as db:
         assert db.execute('SELECT count(*) FROM chat_turns').fetchone()[0] == 0
+
+
+def test_model_input_carries_visible_text_raw_and_invisible_text_escaped():
+    from fri.fri_agent_model import SUMMARY, analyze
+    from fri.fri_web import lookup
+    payloads = []
+    def handler(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps({
+            'summary': 'ok', 'notes': []})))+'\n\n')
+    chat = Chat(SimpleNamespace(access_token=lambda: 'token'), httpx.MockTransport(handler))
+    said, hidden, escaped = 'its 한국 night 👀', 'ok\u200b\u202e\U000e0041', 'ok\\u200b\\u202e\\udb40\\udc41'
+    context = {**CONTEXT, 'turns': [{'input': said, 'reply': 'lol', 'response_kind': 'reply'},
+                                    {'input': hidden, 'response_kind': 'react', 'reaction': '👀'}],
+               'recent': [{'user_id': '1', 'name': 'Mïnt', 'text': hidden}]}
+    asyncio.run(chat.respond(said, context))
+    asyncio.run(analyze(chat, 'Summarize.', {'messages': [said, hidden]}, 'gpt-6-luna', 'low', SUMMARY))
+    asyncio.run(lookup(chat, said, 'gpt-6-luna', 'low'))
+    conversation, internal, web = [[m['content'] for m in payload['input']] for payload in payloads]
+    first, _, second, reaction, current = conversation
+    assert said in first and escaped in second and '"reaction": "👀"' in reaction
+    assert said in current and escaped in current and '"M\\u00efnt"' in current  # Other scripts stay escaped.
+    assert said in internal[0] and escaped in internal[0]
+    assert said in web[0]
+    for text in [*conversation, *internal, *web]:
+        assert not any(char in text for char in '\u200b\u202e\U000e0041')

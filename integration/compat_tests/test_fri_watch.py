@@ -12,6 +12,7 @@ import pytest
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_actions import harness
+from compat_tests.test_fri_mentions import burst as burst_of
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_runtime import configured, event
 from compat_tests.test_gene_controls import control_body, controls_api  # noqa: F401
@@ -1422,11 +1423,11 @@ def test_a_dead_controller_at_the_last_recheck_answers_the_whole_burst(monkeypat
         fri, agent, _, _, _, make_message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         first, second = make_message('<@99> you there?'), make_message('<@99> hello?')
         original = Invitation.current
-        async def current(self, *, check_evidence=True):
+        async def current(self, *, check_evidence=True, control=False):
             # Only reply_once's last check before it answers, after the burst has formed.
             if check_evidence and self.grant and sys._getframe(1).f_code.co_name in ('reply_once', 'withheld'):
                 raise ControllerUnavailable(UNREACHABLE)
-            return await original(self, check_evidence=check_evidence)
+            return await original(self, check_evidence=check_evidence, control=control)
         try:
             with patch.object(Invitation, 'current', current):  # Real waits, so the two pings form a burst.
                 await asyncio.gather(agent.handle(first), agent.handle(second), return_exceptions=True)
@@ -1462,7 +1463,7 @@ def test_a_mention_that_opened_the_burst_keeps_its_gates_for_the_notice(monkeypa
             return await api(method, path, value)
         fri.api = context_down
         try:
-            await asyncio.gather(agent.handle(first), agent.handle(second))  # Real waits form the burst.
+            await burst_of(agent, first, second)
             replies = [call.args for event in (first, second) for call in event.reply.await_args_list]
             if change:
                 assert not replies and not {first.id, second.id} & set(agent.responded)
@@ -1531,9 +1532,10 @@ def test_controller_dying_at_the_gene_receipt_recheck_gets_the_notice_not_an_acc
             if path == '/controls/recent':
                 return {'receipts': [paused]}
             frame = sys._getframe(1)
-            while frame and frame.f_code.co_qualname != 'Actions.valid':
+            while frame and frame.f_code.co_qualname not in ('Actions.valid', 'Invitation.current'):
                 frame = frame.f_back
-            if frame and not failed:  # Once, inside the recheck that guards a reply drawn from Gene receipts.
+            # Once, in the rechecks that guard a reply drawn from Gene receipts: the receipts', then the ping's last.
+            if frame and fri.chat_once.await_count and not failed:
                 failed.append(path)
                 if burst:  # The burst's first mention changed while the controller was down.
                     first.content, first.edited_at = '<@99> never mind', datetime.datetime.now(datetime.timezone.utc)
@@ -1541,8 +1543,8 @@ def test_controller_dying_at_the_gene_receipt_recheck_gets_the_notice_not_an_acc
             return await api(method, path, value)
         fri.api = recheck_down
         try:
-            if burst:  # Real waits, so the two pings form a burst.
-                await asyncio.gather(agent.handle(first), agent.handle(second))
+            if burst:
+                await burst_of(agent, first, second)
             else:
                 with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                     await agent.handle(first)

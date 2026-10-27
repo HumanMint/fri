@@ -14,6 +14,10 @@ posting or learning permission, and never adds a channel to an ambient allowlist
 The controller applies the existing member allowance. Disabled mode and in-progress
 reply notices keep their existing behavior. The runtime rechecks the current event,
 member roles, channel/thread permissions, source contents and privacy before output.
+After the model answers, a ping is rechecked before each tool acts, before the model hears
+the turn again, and once right before sending; checks repeated with nothing in between are
+gone. That last check reads the ping again after its privacy read, and also covers its image
+post, including a photo the author posted just before the ping.
 In configured channels, local privacy/usage utilities, exact controls and accepted
 operational follow-ups retain their existing admission before any social allowance.
 New conversation and on-demand surrounding context still need normal chat admission;
@@ -58,6 +62,20 @@ being handled. Separately, it remembers each event ID for an hour from its first
 (at most 10,000 IDs, oldest dropped first) and ignores copies in that time, so the first
 delivery answers or explains for every copy. A ping is logged at most once while it is among the last
 10,000 pings watched.
+
+A message to Fri waits 1.5 s for the rest of a burst before Fri answers. A message that is only
+Fri's name or a hello ("fri", "yo fri", "fri?", a bare ping) waits up to 8 s instead, because the
+question usually comes next, and in a channel that next message gets in without "fri". If it comes
+within the 5 s burst span, one reply answers both. If it comes later, it is answered on its own with
+the bare line in Fri's view, and a bare ping is logged as `rest came separately`. A reply to another
+message, or one with an image or sticker, doesn't wait.
+
+Fri shows typing only once words are coming: for a message addressed to it (its name, a ping, a
+reply to Fri, a DM), once the turn is admitted, so never before a cooldown, a privacy or music
+control, or the local closing reaction; for anything else (a follow-up without "fri", ambient
+attention), only once an action starts. A refused typing request never stops the reply. An ambient
+reply is dropped, unsaid and unsaved (`room moved on`), if anyone other than the member it answers
+spoke in the channel while Fri composed, or the channel can't be read to check.
 
 Fri's live view of a configured channel is its last 15 minutes (at most 30 messages). A deleted
 message leaves it, and so does a reply of Fri's that someone deletes. Gene's error posts stay until
@@ -176,6 +194,25 @@ advertises it, so the controller must be released first.
   speaker and their provenance. A reply leaves the view, and no later turn can inherit from it,
   once anyone it drew on erases or changes privacy. Fri's own rows never trigger background
   attention.
+- **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
+  research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
+  an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead
+  of six. Only a pinned allowlist is raw (`privacy.RAW`): Emoji_Presentation emoji from Unicode 14.0
+  except the regional indicators (🇫🇷 and Clipperton's 🇨🇵 are the same flag), plus ❤, Hangul
+  syllables and the modern Hangul compatibility jamo such as ㅋ. None of them looks like another or
+  like ASCII, alone or in a row, so a row of lookalikes can't spell bits a
+  person reading the log won't see. Everything else stays escaped exactly as before: other scripts
+  and symbols (Latin A and Cyrillic А, the Kelvin sign and K, look-alike combining marks, and ’”
+  and ”’ render alike), combining marks, every variation selector (even an emoji's own U+FE0F: 👍 and 👍️
+  look the same), controls, format and invisible characters, spaces and separators, surrogates,
+  private-use and unassigned code points. Widening the list needs the same test: no member may look
+  like another raw character. `json.dumps` still does the traversal, key conversion and errors. To
+  compare against the old escaping, run `python -m fri.fri_eval --suite model-text` with and without
+  `--baseline` (same cases and settings, model-graded: boundaries, attribution, tone, Korean and
+  Korean chat shorthand, and hidden carriers (thumbs, doubled shaddas, overlay order, Kelvin signs,
+  Cyrillic A, French-looking flags)). The baseline escapes all of Fri's own model input, internal tasks such as image
+  selection included; the graders pin `privacy.model_json`, so they read both runs the same way. A
+  case whose reply fails, or whose grade fails, fails the run.
 
 ## Members' own requests
 
@@ -197,6 +234,29 @@ controller doesn't mark a request a later rollback reverted), withdrawn isn't a 
 empty or unavailable lists aren't guessed, an open request isn't drafted again, and public banter
 leaves requests alone. Each reply must be a plain reply with no draft or action, then a rubric judge
 on the same model grades it.
+
+## Open loops
+
+Each turn's chat context also carries the speaker's own unfinished things that belong to that
+conversation (`your_open_loops` for the model), so Fri knows them without a tool call:
+
+- **Reminders**, only in the member's DM with Fri: upcoming ones and any due in the last day, with
+  their delivery state. A confirmed reminder that a later privacy change will stop at delivery shows as
+  `will_not_send`, not `scheduled`. The controller sends an empty list for any private conversation,
+  and Fri nulls it unless the turn came from a DM message, since the `/fri` panel is private too.
+- **Saved work**, only in the conversation it was saved in: open items' titles and last update.
+- **Game nights**, only in the card's channel: cards the member organized that haven't happened yet,
+  with the card's own counts and never who chose what.
+
+Each item already shows to the member in that same place through `reminder_list`, `work_list` or the
+posted card, so nothing reaches a new audience. A kind the conversation can never show is null, so
+an empty list there doesn't read as "none". Memory off sends none. Fri uses them when the member asks
+what's coming up or about one of them, and before preparing a duplicate, and doesn't bring them up
+unprompted. An older controller sends no `loops`, which the model reads as unavailable.
+`python -m fri.fri_eval --suite loops` checks these answers with the real model and a rubric judge:
+an existing reminder isn't set again, pending, `will_not_send` and uncertain aren't promised, a
+game night's time comes from the card without naming who's going, banter leaves loops alone, and
+reminders outside DMs aren't called none.
 
 ## Member profiles
 
@@ -406,12 +466,23 @@ Fri can't restart anything. It only notices and says so.
   heartbeat waits on that same pass.
 - **Tell reporter.** The owner's deployed DM for a repair a member reported (including one the owner
   finished after its checks handed it over) gets a **Tell reporter** button, when the controller
-  offers `requester-notices` and the report is still on record. A tap claims the controller's mark,
-  checks the report again (still there, still the member's, in a configured channel Fri can post in
-  and not an archived thread, or their DM while they're still in the server), and replies to it once
-  with a fixed line, mentions off and no request text. A send Discord refused (a 4xx, rate limits
-  included) can be tapped again. One that may have posted is never retried. The owner sees the
-  outcome privately, and the button goes away once the reply is sent.
+  offers `requester-notices` and the report is still on record. A tap first reads Discord: Fri must
+  be on with proactive posts on, the member still in the server, and the report still there and
+  still theirs, in a configured channel Fri can post in and not an archived thread, or in their DM
+  while support DMs are on. A thread Fri had to fetch is read again after the report, since no
+  archive update reaches an uncached copy, and the member is checked last of all. Fri then checks
+  the live release itself, and that no other release is going out (an older controller checks
+  neither), and claims the controller's mark, which refuses an erased report, a rollback
+  since the repair, any newer release now live, or another release still going out. It checks the
+  config and channel once more with nothing awaited before the send. Controller data of the wrong
+  shape, or a thread whose channel was deleted, gets the owner a plain "didn't send it" and frees
+  any claim. So a change while Discord answered stops
+  the reply. It replies to the report once with a fixed line, mentions off and no request text, and
+  records the outcome as the owner. A send Discord refused (a 4xx, rate limits included) can be
+  tapped again. One that may have posted is never retried. The owner sees the outcome privately, and
+  the button goes away once the reply is sent.
+- **The 👀.** Filing a Gene error waits up to 5 s on the reaction, then lets attention move on. A
+  reaction stuck in a Discord rate limit finishes on its own and is never cancelled.
 
 ## Existing installation migration
 
@@ -496,28 +567,38 @@ explicitly reviewed retirement step.
 
 ## Release patch notes
 
-After a release, the maintainer sends the owner that release's notes from Fri's account:
+After a release, Fri drafts that release's patch notes from the maintainer's facts and posts them in
+the server's #fri-chat, for everyone there. The owner's DM stays for owner-only notes (no release
+today, a rollback).
 
 ```sh
-docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.4.0 < notes.md
-docker exec -i fri-runtime-1 python -m fri.fri_patch_notes preview 0.4.0 < notes.md  # no send
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes draft 0.7.0 < facts.md > notes.md
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes preview 0.7.0 < notes.md  # no send
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 --channel fri-chat < notes.md
+docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md  # the owner's DM
 ```
 
-The recipient is always `GENE_OWNER_ID`; there is no way to name anyone else. It logs in over
-REST only, so the running Fri's gateway session is untouched, and sends with mentions and link
-embeds off. Notes are split at blank lines into at most four messages of 2000 characters,
-counted the way Discord counts them (UTF-16 units, so most emoji count 2).
-`/data/patch-notes.json` records each version's confirmed parts, so a rerun finishes a partial
-send and never repeats a part: a part whose send was attempted but never confirmed is looked for
-in the DM first (Fri's own messages since the attempt with exactly that text, skipping any the
-record already gives another part), and every part carries a fixed nonce. If two versions each
-have an unconfirmed part with the same text, the DM can't say whose a message is, so both are
-refused until someone checks the DM and fixes the record by hand.
+`draft` runs one model call with Fri's voice, the owner's voice notes and the controller's chat model:
+talk to the server, call the owner mint or bossman, use only the given facts, keep it brief. It prints
+the post and sends nothing; its usage is reported like an eval's. The maintainer checks every line
+against the facts before sending, and edits the file if a line isn't backed by them.
 
-Exit codes: 0 sent (or already sent); 2 refused: the same version with
-different notes (send a correction as a new version), notes that don't fit, a damaged record, or
-missing settings; 1 failed: Discord refused, answered badly or the connection dropped. Every confirmed part is on
-record, so rerunning the same command after a 1 is safe. Members see nothing.
+`send --channel <name>` posts in the one text channel of `GENE_GUILD_ID` with that name (refused if
+there are none or several); without `--channel` the recipient is `GENE_OWNER_ID`. There is no way to
+name anyone else. It logs in over REST only, so the running Fri's gateway session is untouched, and
+sends with mentions and link embeds off. Notes are split at blank lines into at most four messages of
+2000 characters, counted the way Discord counts them (UTF-16 units, so most emoji count 2).
+`/data/patch-notes-server.json` (the channel) and `/data/patch-notes.json` (the DM) record each
+version's confirmed parts, so a rerun finishes a partial send and never repeats a part: a part whose
+send was attempted but never confirmed is looked for there first (Fri's own messages since the attempt
+with exactly that text, skipping any the record already gives another part), and every part carries a
+fixed nonce. If two versions each have an unconfirmed part with the same text, the history can't say
+whose a message is, so both are refused until someone checks and fixes the record by hand.
+
+Exit codes: 0 sent (or already sent) or drafted; 2 refused: the same version with different notes
+(send a correction as a new version), notes that don't fit, a damaged record, a missing or doubled
+channel, or missing settings; 1 failed: Discord or the model refused, answered badly or the connection
+dropped. Every confirmed part is on record, so rerunning the same command after a 1 is safe.
 
 ## Background work and health
 
@@ -658,7 +739,8 @@ Each step records:
 - the observed route: local intercept, admission, model, tools, outcome, and how the turn was
   stored;
 - a context manifest: field sizes, offered actions, prompt version, model and effort, with no raw
-  member text;
+  member text; `input_chars` counts the characters of text the model reads, not the request's own
+  JSON escaping;
 - token usage.
 
 Production source is unchanged. Routes come from observable effects plus a pass-through spy on

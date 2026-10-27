@@ -12,6 +12,7 @@ from fri import fri_patch_notes as notes
 
 OWNER = 4242
 BOT = 99
+GUILD = 123
 
 
 class FakeDM:
@@ -35,9 +36,17 @@ class FakeDM:
             raise RuntimeError('reply lost')
         return message
 
-    async def history(self, *, limit, after, oldest_first):
-        assert oldest_first and after is not None
-        for message in [m for m in self.messages if m.created_at > after][:limit]:
+    async def history(self, *, limit, after=None, oldest_first=None):
+        if after is None and oldest_first is None:  # Discord's default: newest first.
+            for message in sorted(self.messages, key=lambda m: m.id, reverse=True)[:limit]:
+                yield message
+            return
+        assert oldest_first
+        if isinstance(after, discord.Object):
+            found = sorted((m for m in self.messages if m.id > after.id), key=lambda m: m.id)
+        else:
+            found = [m for m in self.messages if after is None or m.created_at > after]
+        for message in found[:limit]:
             yield message
 
 
@@ -68,6 +77,12 @@ class FakeClient:
             return FakeClient.dm
         return types.SimpleNamespace(id=user_id, create_dm=create_dm)
 
+    async def fetch_guild(self, guild_id):
+        assert guild_id == GUILD
+        async def fetch_channels():
+            return FakeClient.channels
+        return types.SimpleNamespace(id=guild_id, fetch_channels=fetch_channels)
+
     async def close(self):
         self.closed = True
 
@@ -77,6 +92,7 @@ def dm(monkeypatch):
     FakeClient.instances = []
     FakeClient.dm = FakeDM()
     FakeClient.login_error = None
+    FakeClient.channels = []
     monkeypatch.setattr(notes.discord, 'Client', FakeClient)
     return FakeClient.dm
 
@@ -220,6 +236,141 @@ def test_recovery_searches_from_now_when_the_attempt_time_is_ahead(dm, tmp_path)
     assert len(dm.sends) == 1
 
 
+def test_recovery_reads_from_discords_clock_not_the_hosts(dm, tmp_path, monkeypatch):
+    """A part sent while the host clock ran an hour fast, then rerun after the clock was corrected."""
+    text = paragraph(1500, 'a')
+    dm.messages.append(said(900, 'earlier dm', BOT))
+    real = notes.time.time
+    monkeypatch.setattr(notes.time, 'time', lambda: real() + 3600)
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert record['anchors']['0.4.0']['1']['after'] == '900'
+    monkeypatch.setattr(notes.time, 'time', lambda: real() + 7200)  # Corrected, then the rerun hours later.
+    run(text, tmp_path)
+    assert len(dm.sends) == 1 and [m.content for m in dm.messages] == ['earlier dm', text]
+
+
+def test_recovery_in_a_dm_that_was_empty_reads_it_all(dm, tmp_path):
+    text = paragraph(1500, 'a')
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert record['anchors']['0.4.0']['1']['after'] == ''
+    run(text, tmp_path)
+    assert len(dm.sends) == 1
+
+
+@pytest.mark.parametrize('damage', ['dropped', 'other-attempt', 'bad-id', 'not-a-dict'])
+def test_a_part_without_a_usable_anchor_still_recovers_by_time(dm, tmp_path, damage):
+    """Records written before anchors existed, or rewritten by that older code, find their part by time."""
+    text = paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b')
+    dm.lost.add(2)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    path = tmp_path / 'patch-notes.json'
+    record = json.loads(path.read_text())
+    if damage == 'dropped':
+        del record['anchors']
+    elif damage == 'other-attempt':
+        record['anchors']['0.4.0']['2'] = {'attempted_at': T, 'after': '1001'}  # Taken for an earlier try.
+    elif damage == 'bad-id':
+        record['anchors']['0.4.0']['2']['after'] = '0'
+    else:
+        record['anchors'] = []
+    path.write_text(json.dumps(record))
+    run(text, tmp_path)
+    assert len(dm.sends) == 2
+    assert [p['message_id'] for p in json.loads(path.read_text())['versions']['0.4.0']['parts']] == ['1001', '1002']
+
+
+@pytest.mark.parametrize('bad', [{'id': 0}, {'id': 'x'}, {'dm': 0}], ids=['zero-id', 'text-id', 'zero-dm'])
+def test_a_malformed_id_in_discords_reply_is_not_recorded(dm, tmp_path, monkeypatch, bad):
+    """Recording it would make every later send refuse the record; the send fails and the part stays tried."""
+    sent = dm.send
+    async def odd(*args, **kwargs):
+        message = await sent(*args, **kwargs)
+        return types.SimpleNamespace(**{**vars(message), 'id': bad.get('id', message.id)})
+    monkeypatch.setattr(dm, 'send', odd)
+    if 'dm' in bad:
+        monkeypatch.setattr(dm, 'id', bad['dm'], raising=False)
+    with pytest.raises(notes.SendFailed, match='message id'):
+        run(paragraph(10, 'a'), tmp_path)
+    state = notes.load(tmp_path / 'patch-notes.json')  # Still a sound record.
+    assert set(state['versions']['0.4.0']['parts'][0]) == notes.TRIED
+
+
+def test_cli_reports_a_malformed_reply_with_exit_1(monkeypatch, capsys, tmp_path, dm):
+    sent = dm.send
+    async def odd(*args, **kwargs):
+        message = await sent(*args, **kwargs)
+        return types.SimpleNamespace(**{**vars(message), 'id': '0'})
+    monkeypatch.setattr(dm, 'send', odd)
+    monkeypatch.setenv('DISCORD_TOKEN', 'secret-token')
+    monkeypatch.setenv('GENE_OWNER_ID', str(OWNER))
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'notes')))
+    assert notes.main(['send', '0.4.0']) == 1
+    assert 'SendFailed' in capsys.readouterr().err
+
+
+def test_records_stay_readable_by_the_code_before_anchors(dm, tmp_path):
+    """Rollback keeps patch-notes.json: parts keep the older field sets, and anchors sit beside versions."""
+    text = paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b')
+    dm.lost.add(2)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert [set(p) for p in record['versions']['0.4.0']['parts']] == [notes.SENT, notes.TRIED]
+    assert set(record) == {'versions', 'anchors'} and list(record['anchors']['0.4.0']) == ['2']
+    run(text, tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert [set(p) for p in record['versions']['0.4.0']['parts']] == [notes.SENT] * 2
+    assert record['anchors'] == {}  # Confirmed parts keep no anchor.
+
+
+def test_an_untrustworthy_newest_id_is_not_kept_as_an_anchor(dm, tmp_path):
+    dm.messages.append(said(0, 'earlier message', BOT))
+    dm.lost.add(1)
+    with pytest.raises(RuntimeError, match='lost'):
+        run(paragraph(10, 'a'), tmp_path)
+    record = json.loads((tmp_path / 'patch-notes.json').read_text())
+    assert record['anchors'] == {}
+    run(paragraph(10, 'a'), tmp_path)  # Found by time, not resent; the record still loads.
+    assert len(dm.sends) == 1
+
+
+def test_a_retry_keeps_the_first_attempts_boundary(dm, tmp_path, monkeypatch):
+    """The first send's outcome is unknown and it shows up only after the rerun's search: a later rerun still finds it."""
+    dm.messages.append(said(900, 'earlier dm', BOT))
+    dm.lost.add(1)
+    hidden = []
+    sent = dm.send
+    async def unseen(*args, **kwargs):
+        try:
+            return await sent(*args, **kwargs)
+        finally:
+            if len(dm.sends) == 1:
+                hidden.append(dm.messages.pop())  # Not visible in history yet.
+    monkeypatch.setattr(dm, 'send', unseen)
+    with pytest.raises(RuntimeError, match='lost'):
+        run('notes', tmp_path)
+    search = dm.history
+    def late(**kwargs):
+        if kwargs.get('limit') == 1 and hidden:
+            dm.messages.append(hidden.pop())  # Lands between the rerun's search and its anchor read.
+        return search(**kwargs)
+    monkeypatch.setattr(dm, 'history', late)
+    dm.refused.add(2)
+    with pytest.raises(RuntimeError, match='refused'):
+        run('notes', tmp_path)
+    assert json.loads((tmp_path / 'patch-notes.json').read_text())['anchors']['0.4.0']['1']['after'] == '900'
+    run('notes', tmp_path)
+    assert len(dm.sends) == 2 and [m.content for m in dm.messages] == ['earlier dm', 'notes']
+
+
 def test_two_unfinished_releases_with_the_same_text_are_refused_not_guessed(dm, tmp_path):
     """0.3.9's part never reached Discord and 0.4.0's identical part did: the DM can't say whose it is."""
     text = paragraph(1500, 's')
@@ -309,6 +460,9 @@ def record(*parts, more=None):
     pytest.param(record(TRIED, SENT), id='sent-after-tried'),
     pytest.param(record(TRIED, TRIED), id='two-tried'),
     pytest.param(record(SENT, more={'0.3.1': {'sha256': H, 'parts': [SENT]}}), id='one-message-two-parts'),
+    pytest.param(record({}), id='nothing-tried'),
+    pytest.param(record({}, {}), id='nothing-tried-two-parts'),
+    pytest.param(record({**TRIED, 'after': '4'}), id='after-in-part'),
 ])
 def test_a_damaged_entry_is_refused_with_exit_2_before_login(monkeypatch, capsys, tmp_path, dm, record):
     """Truncated or nested JSON, a malformed entry or part, or a state send() never writes, anywhere in the record."""
@@ -385,3 +539,118 @@ def test_cli_reports_a_refusal_with_exit_code_2(monkeypatch, capsys, tmp_path, d
     assert notes.main(['send', '0.4.0']) == 0
     assert dm.sends[0]['content'] == '**fri 0.4.0**'
     assert 'secret-token' not in capsys.readouterr().out
+
+
+def channel(name, kind=discord.ChannelType.text, id=888):
+    room = FakeDM()
+    room.id, room.name, room.type = id, name, kind
+    return room
+
+
+def post(text, tmp_path, version='0.7.0', name='fri-chat'):
+    lines = []
+    asyncio.run(notes.send(version, text, token='secret-token', owner_id=OWNER, data=tmp_path, out=lines.append,
+                           guild_id=GUILD, channel=name))
+    return lines
+
+
+def test_a_channel_post_goes_to_the_named_text_channel_once(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [channel('fri-chat', discord.ChannelType.voice, 1), channel('general', id=2), chat]
+    post('fri 0.7.0\n\n**added**\n- things', tmp_path)
+    assert [m.content for m in chat.messages] == ['fri 0.7.0\n\n**added**\n- things'] and not dm.messages
+    assert chat.sends[0]['mentions'] == notes.NO_MENTIONS
+    assert json.loads((tmp_path/'patch-notes-server.json').read_text())['versions']['0.7.0']['parts'][0]['channel_id'] == '888'
+    assert not (tmp_path/'patch-notes.json').exists()
+    assert post('fri 0.7.0\n\n**added**\n- things', tmp_path) == ['0.7.0: all 1 parts were already sent']
+    assert len(chat.sends) == 1
+
+
+def test_the_owners_dm_and_the_channel_each_get_a_version_once(dm, tmp_path):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    run('fri 0.7.0', tmp_path, version='0.7.0')
+    post('fri 0.7.0, for everyone', tmp_path)
+    assert [m.content for m in dm.messages] == ['fri 0.7.0']
+    assert [m.content for m in chat.messages] == ['fri 0.7.0, for everyone']
+
+
+@pytest.mark.parametrize('rooms', [[], ['fri-chat', 'fri-chat']])
+def test_a_channel_post_needs_exactly_one_text_channel_with_the_name(dm, tmp_path, rooms):
+    FakeClient.channels = [channel(name, id=i+1) for i, name in enumerate(rooms)]
+    with pytest.raises(notes.NotesRefused, match='text channels named #fri-chat'):
+        post('fri 0.7.0', tmp_path)
+    assert not any(room.sends for room in FakeClient.channels)
+
+
+def test_fri_drafts_the_post_for_the_server_from_the_facts_only(monkeypatch):
+    seen = {}
+
+    async def analyze(chat, instruction, data, model, effort, schema):
+        seen.update(instruction=instruction, data=data, model=model, effort=effort, schema=schema)
+        return {'notes': '  fri 0.7.0\n\n**added**\n- replies come faster  '}, {'input_tokens': 9}, 'completed'
+    monkeypatch.setattr('fri.fri_agent_model.analyze', analyze)
+    text, counters, status = asyncio.run(notes.draft('0.7.0', '- faster replies to pings', chat=None,
+                                                     model='m', effort='e', voice_notes='less sass on mondays'))
+    assert (text, counters, status) == ('fri 0.7.0\n\n**added**\n- replies come faster', {'input_tokens': 9}, 'completed')
+    assert seen['data'] == {'version': '0.7.0', 'facts': '- faster replies to pings'}
+    assert seen['instruction'].startswith(notes_voice()) and 'less sass on mondays' in seen['instruction']
+    for words in ('#fri-chat', 'Talk to the server', 'mint, or bossman', 'Use only the facts given'):
+        assert words in seen['instruction']
+    assert seen['schema'] == notes.DRAFT and (seen['model'], seen['effort']) == ('m', 'e')
+
+
+def notes_voice():
+    from fri.fri_chat import VOICE
+    return VOICE
+
+
+def test_a_draft_that_failed_or_wont_send_is_refused():
+    assert notes.drafted('fri 0.7.0', 'completed') == 'fri 0.7.0'
+    with pytest.raises(notes.SendFailed):
+        notes.drafted('', 'completed')
+    with pytest.raises(notes.SendFailed):
+        notes.drafted('fri 0.7.0', 'incomplete')
+    with pytest.raises(notes.NotesRefused):
+        notes.drafted('x' * 2001, 'completed')
+
+
+@pytest.mark.parametrize('argv', [['preview', '0.7.0', '--channel', 'fri-chat'], ['send', '0.7.0', '--channel', '#fri chat']])
+def test_channel_is_a_plain_name_and_only_for_send(argv):
+    with pytest.raises(SystemExit) as raised:
+        notes.main(argv)
+    assert raised.value.code == 2
+
+
+def test_a_channel_posts_nonces_differ_from_the_dms_for_the_same_text(dm, tmp_path):
+    """Discord dedupes nonces per author, so the same version and text in the DM must not confirm the channel."""
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    run('fri 0.7.0', tmp_path, version='0.7.0')
+    post('fri 0.7.0', tmp_path)
+    assert dm.sends[0]['nonce'] == notes.nonce('0.7.0', notes.hashlib.sha256(json.dumps(['fri 0.7.0']).encode()).hexdigest(), 1)
+    assert chat.sends[0]['nonce'] != dm.sends[0]['nonce']
+
+
+def test_a_drafts_usage_survives_a_failed_report(monkeypatch, tmp_path):
+    import httpx
+
+    async def analyze(*args, **kwargs):
+        return {'notes': 'fri 0.7.0'}, {'input_tokens': 9}, 'completed'
+    monkeypatch.setattr('fri.fri_agent_model.analyze', analyze)
+    monkeypatch.setenv('FRI_DATA', str(tmp_path))
+    monkeypatch.setenv('GENE_FRI_TOKEN', 'synthetic')
+    monkeypatch.setattr('fri.subscription.Subscription', lambda path: None)
+
+    def controller(request):
+        if request.url.path == '/status':
+            return httpx.Response(200, json={'chat_model': 'm', 'chat_effort': 'e'})
+        if request.url.path == '/agent/state':
+            return httpx.Response(200, json={'config': {'voice_notes': ''}})
+        raise httpx.ConnectError('controller went away')
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: real(transport=httpx.MockTransport(controller), **kw))
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(notes.draft_from_controller('0.7.0', '- facts'))
+    [receipt] = (tmp_path/'usage').iterdir()
+    assert json.loads(receipt.read_text())['counters'] == {'input_tokens': 9}

@@ -6,19 +6,21 @@ import discord
 
 from .privacy import clean
 
-CATEGORIES = ('nickname', 'games', 'music', 'hobbies', 'conversation')
+CATEGORIES = ('nickname', 'games', 'music', 'hobbies', 'conversation', 'projects')  # Gene keeps projects where said.
 MAX_NOTES = 10
 PER_CATEGORY = 3
 TTL = 90 * 86400
 PROFILES = 'member-profiles'  # The controller keeps one profile per member across readable channels.
+MOVES = 'memory-moves'  # The controller moves a note into or out of the profile on the member's press.
 PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_thread)
 
 
 def server_wide(channel):
-    """Everyone in the server can read it, now. Only such a channel feeds a member's profile.
+    """Everyone in the server can read it and its history, now. Only such a channel feeds a member's profile.
 
-    A private thread, an age-restricted channel, or one the default role can't view keeps what was
-    said in it to itself. Anything Fri can't resolve counts as restricted.
+    A private thread, an age-restricted channel, one the default role can't view or read back, or one that
+    keeps out any role or member keeps what was said in it to itself: the default role alone doesn't prove
+    everyone can read it (fri #45). Anything Fri can't resolve counts as restricted.
     """
     guild = getattr(channel, 'guild', None)
     if guild is None:
@@ -31,9 +33,16 @@ def server_wide(channel):
     if channel is None or not callable(is_nsfw) or is_nsfw():
         return False
     try:
-        return bool(channel.permissions_for(guild.default_role).view_channel)
+        everyone = channel.permissions_for(guild.default_role)
+        if not (everyone.view_channel and everyone.read_message_history):
+            return False
+        for overwrite in channel.overwrites.values():
+            deny = overwrite.pair()[1]
+            if deny.view_channel or deny.read_message_history:
+                return False
     except (AttributeError, TypeError):
         return False
+    return True
 
 
 def place_notes(get_channel, context, conversation):
@@ -94,7 +103,11 @@ def personal_note(candidate, text):
     before = text[:text.index(evidence)].rstrip()
     if before.endswith(('"', "'", '“', '‘', '>', '`')):
         return None
-    if not re.match(r"(?i)^(?:i (?:like|love|prefer|enjoy|play|usually|mostly)|my (?:favorite|favourite|nickname)|call me)\b", evidence):
+    # What a member is doing is only ever a projects note, and a projects note only ever says what they're doing.
+    if candidate['category'] == 'projects':
+        if not re.match(r"(?i)^(?:i(?:['’]m| am) (?:working on|building)|i main|i['’]ve been playing)\b", evidence):
+            return None
+    elif not re.match(r"(?i)^(?:i (?:like|love|prefer|enjoy|play|usually|mostly)|my (?:favorite|favourite|nickname)|call me)\b", evidence):
         return None
     # Defense in depth; notes are still untrusted data even after validation.
     if re.search(r'(?i)\b(?:ignore|instructions?|system|developer|password|token|secret|address|diagnos\w*|'
@@ -164,10 +177,12 @@ def describe_profile(enabled, groups, private):
     """
     if not enabled:
         return 'memory’s off, so i’m not keeping anything. say “remember me again” to turn it back on.'
-    footer = ('\n\nserver stuff follows you everywhere in the server, the rest stays where you said it. notes last '
+    footer = ('\n\nserver stuff follows you everywhere in the server, the rest stays where you said it, what you’re '
+              'working on included. notes last '
               '90 days, recent chats a week. My memory edits or removes one. “forget me” wipes all of it and turns '
               'memory off.' if private else
-              '\n\nwhat you tell me in channels everyone here can read follows you around the server and into DMs. '
+              '\n\nwhat you tell me in channels everyone here can read follows you around the server and into DMs, '
+              'except what you’re working on. '
               'DMs, the /fri panel and restricted channels stay where they were said. ask in DMs or /fri for the full list. '
               '“forget me” wipes all of it and turns memory off.')
     if not any(notes for _, notes in groups):

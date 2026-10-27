@@ -166,7 +166,9 @@ def test_ping_after_another_members_meme_gets_text_without_ambient_expansion(mon
             context = fri.chat_once.await_args.args[1]
             assert context['force_text_reply'] and not context['acknowledgments_enabled']
             assert context['invited_context'][0]['source']['user_id'] == '30'
-            assert context['image_event'].id == meme.id and context['images']
+            assert [read['event'].id for read in context['image_reads']] == [meme.id] and context['images']
+            assert context['inspected_images'] == [{'images': [1], 'source': context['invited_context'][0]['source']}]
+            assert context['invited_context'][0]['attachments'] == ['image']
             saved = store.chat_context('123', f'public:{channel.id}', '20')
             assert not saved['personal_memory']['notes']
             assert 'public meme caption' not in str(saved)
@@ -255,12 +257,12 @@ def test_a_discord_refusal_names_the_mention_it_dropped(monkeypatch, tmp_path, c
         async def typing():
             raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
             yield
-        channel.typing = typing
+        channel.typing = typing  # Only cosmetic: the reply itself is what Discord refuses.
         event = message('<@99> you there?')
+        event.reply.side_effect = discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await fri.on_message(event)
-            event.reply.assert_not_awaited()
             assert f'Mention {channel.id}/{event.id} not answered: Forbidden' in caplog.messages
             assert not any('Missing Permissions' in line or 'you there' in line for line in caplog.messages)
         finally:
@@ -1041,10 +1043,21 @@ def test_a_controller_that_goes_down_while_a_ping_waits_says_so(monkeypatch, tmp
 @pytest.mark.parametrize('queued', [False, True])
 @pytest.mark.parametrize('channel_id', [1, 8])
 def test_an_erasure_during_the_typing_call_stops_the_reply(monkeypatch, tmp_path, caplog, channel_id, queued):
-    # Before Fri reads the context its reply is fenced against, queued or not.
+    # Typing starts once the turn is admitted, queued or not; the request never goes out after it.
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, store, _, channel, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        from fri.fri import Fri
+        asked = []
+        async def signed_in(text, context, ready=None):  # Only the model is replaced: Fri's last checks run.
+            await ready()
+            asked.append(text)
+            return ChatResult(status='completed', reply='the marker is blue')
+        async def model(text, context):
+            return await Fri.chat_once(fri, text, context)
+        fri.data, fri.flush_usage = tmp_path, AsyncMock()
+        fri.chat = SimpleNamespace(respond=signed_in)
+        fri.chat_once = AsyncMock(side_effect=model)
         event = message('<@99> remember the private marker?')
         event.reply.return_value = SimpleNamespace(delete=AsyncMock())
         @asynccontextmanager
@@ -1061,10 +1074,11 @@ def test_an_erasure_during_the_typing_call_stops_the_reply(monkeypatch, tmp_path
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
-            fri.chat_once.assert_not_awaited()
+            assert typing.erased and not asked
             assert not any(path == '/chat/turn' for path, _ in calls)
             assert all(item.args[0] == str(ReplyInProgress()) for item in event.reply.await_args_list)
-            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+            assert [line.split(': ', 1)[0] for line in mention_lines(caplog)] == [
+                f'Mention {channel_id}/{event.id} not answered']  # Gene's fence on the erasure, never its content.
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -1210,28 +1224,38 @@ def test_a_stale_cached_row_does_not_drop_a_message_sent_after_the_erasure(monke
 
 @pytest.mark.parametrize('channel_id,erasure', [(1, 'local'), (8, 'local'), (8, 'gene')])
 def test_an_erasure_during_a_pings_last_checks_stops_the_reply(monkeypatch, tmp_path, caplog, channel_id, erasure):
-    # The last Discord read after the controller's checks: the ping in a configured channel, where
-    # Gene's grant fence catches its own erasures, and a nearby message outside one.
+    # Fri's own last Discord look, after talk's checks: the ping in a configured channel, where Gene's
+    # grant fence catches its own erasures, and a nearby message outside one.
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=channel_id)
         nearby = message('another member nearby', user=30, age=60)
         event = message()
-        last, seen = event if channel_id == 1 else nearby, []
+        last, seen, talked = event if channel_id == 1 else nearby, [], []
+        talk = fri.talk
+        async def talking(*args, **kwargs):
+            result = await talk(*args, **kwargs)
+            talked.append(True)
+            return result
+        fri.talk = talking
         def fetch(mid):
-            if mid == last.id and fri.chat_once.await_count:
+            if mid == last.id and talked:
                 seen.append(mid)
-                if len(seen) == 2:  # Fri's own last look, after talk's.
+                if len(seen) == 1:
                     agent.forget(20) if erasure == 'local' else store.clear_chats('20')
             return rows[mid]
         channel.fetch_message.side_effect = fetch
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
-            assert len(seen) >= 2
+            assert seen
             event.reply.assert_not_awaited()
             assert not any(path == '/chat/turn' for path, _ in calls)
-            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: author privacy changed']
+            # A Gene erasure during the last look outside a configured channel is now caught by the
+            # nearby authors' privacy check that runs after the refetches: Gene refuses the fenced grant.
+            reason = ('reply withheld: check failed: ControllerRejected' if (channel_id, erasure) == (8, 'gene')
+                      else 'author privacy changed')
+            assert mention_lines(caplog) == [f'Mention {channel_id}/{event.id} not answered: {reason}']
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -2344,8 +2368,9 @@ def test_a_burst_that_fails_names_its_earlier_mention(monkeypatch, tmp_path, cap
         async def typing():
             raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
             yield
-        channel.typing = typing
+        channel.typing = typing  # Only cosmetic: the reply itself is what Discord refuses.
         first, second = message('<@99> hey', age=1), message('you around?')
+        second.reply.side_effect = discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
         try:
             task = asyncio.create_task(agent.handle(first))
             while not agent.bursts.has(1, 20):
@@ -2457,13 +2482,28 @@ def test_a_redelivery_while_the_first_copy_is_handled_is_ignored(monkeypatch, tm
     asyncio.run(scenario())
 
 
+async def burst(agent, first, second):
+    """`second` sent while `first` is still in its debounce, so one reply answers both."""
+    released, debounce, grouped = gated_debounce()
+    try:
+        with patch('fri.fri_agent.asyncio.sleep', new=debounce):
+            task = asyncio.create_task(agent.handle(first))
+            await asyncio.wait_for(grouped(agent, first), 5)
+            later = asyncio.create_task(agent.handle(second))
+            await asyncio.wait_for(grouped(agent, second), 5)
+            released.set()
+            await asyncio.wait_for(asyncio.gather(task, later), 5)
+    finally:
+        released.set()
+
+
 def test_a_burst_message_redelivered_after_its_answer_is_ignored(monkeypatch, tmp_path, caplog):
     caplog.set_level(logging.INFO, logger='fri')
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         first, second = message('<@99> hey', age=1), message('you around?')
         try:
-            await asyncio.gather(agent.handle(first), agent.handle(second))
+            await burst(agent, first, second)
             second.reply.assert_awaited_once()
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(copy.copy(first))  # Its own invitation is unspent, but it was answered.
@@ -2483,7 +2523,7 @@ def test_an_answered_mention_logs_nothing(monkeypatch, tmp_path, caplog):
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(alone)
             alone.reply.assert_awaited_once()
-            await asyncio.gather(agent.handle(first), agent.handle(second))  # One reply answers both.
+            await burst(agent, first, second)  # One reply answers both.
             second.reply.assert_awaited_once()
             assert mention_lines(caplog) == [] and agent.misses == {}
         finally:
@@ -2656,17 +2696,17 @@ def test_configured_complete_requests_keep_existing_capabilities(monkeypatch, tm
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('mode', ['optout', 'ambiguous', 'reference', 'old'])
-def test_context_images_keep_privacy_age_reference_and_ambiguity_limits(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize('mode', ['optout', 'several', 'reference', 'old'])
+def test_context_images_keep_privacy_age_and_reference_limits(monkeypatch, tmp_path, mode):
     async def scenario():
         fri, agent, store, _, channel, message, _, _ = environment(monkeypatch, tmp_path)
         meme = message('caption is not proof of image contents', user=30,
-            age=3*86400 if mode == 'reference' else 31*60 if mode == 'old' else 60,
+            age=3*86400 if mode == 'reference' else 6*3600+60 if mode == 'old' else 60,
             attachments=[attachment(channel.id)])
         if mode == 'optout':
             store.personal_control('30', 'disable')
-        elif mode == 'ambiguous':
-            message('a second image', user=40, age=30, attachments=[attachment(channel.id)])
+        elif mode == 'several':
+            second = message('a second image', user=40, age=30, attachments=[attachment(channel.id)])
         event = message('<@99> you support the protests in france')
         if mode == 'reference':
             event.reference = SimpleNamespace(message_id=meme.id, channel_id=channel.id)
@@ -2675,11 +2715,15 @@ def test_context_images_keep_privacy_age_reference_and_ambiguity_limits(monkeypa
         try:
             await agent.handle(event)
             context = fri.chat_once.await_args.args[1]
-            assert bool(context.get('images')) == (mode == 'reference')
-            assert context['ambiguous_context_images'] == (mode == 'ambiguous')
+            assert len(context.get('images', [])) == {'several': 2, 'reference': 1}.get(mode, 0)
+            assert 'ambiguous_context_images' not in context
             if mode == 'reference':
-                assert context['image_provenance']['user_id'] == '30'
-            elif mode != 'ambiguous':
+                assert context['image_provenance']['user_id'] == '30' and not context.get('inspected_images')
+            elif mode == 'several':  # Newest first, each image with its own post and author.
+                assert [(row['images'], row['source']['id'], row['source']['user_id']) for row in context['inspected_images']] == [
+                    ([1], str(second.id), '40'), ([2], str(meme.id), '30')]
+                assert context.get('image_provenance') is None
+            else:
                 assert not context['invited_context']
             event.reply.assert_awaited_once()
         finally:
@@ -2775,7 +2819,7 @@ def test_on_demand_meme_read_checks_sources_before_reply_and_prevents_persistenc
                 assert not context['invited_context'] and not context.get('images')
                 assert 'work_save' in context['actions']
                 return ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': '1'})
-            assert context['images'] and context['image_provenance']['user_id'] == '30'
+            assert context['images'] and context['inspected_images'][0]['source']['user_id'] == '30'
             assert not {'work_save', 'prepare_post', 'preview_voice', 'reminder_prepare', 'plan_prepare', 'image_search'} & set(context['actions'])
             if change == 'privacy':
                 store.personal_control('30', 'disable')
@@ -2888,6 +2932,38 @@ def test_new_chat_stays_socially_bounded_after_operational_bypass_fix(monkeypatc
             paths = [path for path, _ in calls]
             assert ('/chat/mentions/admit' if prefix == '<@99>' else '/agent/admit') in paths
             assert '/chat/operations/admit' not in paths
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('paused', [False, True])
+@pytest.mark.parametrize('text,path,logged', [
+    ('<@99> forget me', '/agent/context', 'check failed: ControllerRejected'),  # Its arrival read.
+    ('<@99> forget me', '/chat/memory/control', 'check failed: ControllerRejected'),  # The control itself.
+    ('<@99> show my memory', '/chat/context', 'check failed: ControllerRejected'),
+])
+def test_a_privacy_control_ping_refused_by_the_controller_hears_why_even_if_fri_pauses(monkeypatch, tmp_path, caplog,
+                                                                                     paused, text, path, logged):
+    # fri #64: a privacy control works with Fri paused, so its notice must not stop at the pause either.
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message(text)
+        api = fri.api
+        async def refused(method, called, payload=None):
+            if called == path:
+                if paused:  # The owner pauses Fri while that call is out.
+                    agent.config['enabled'] = False
+                raise ControllerRejected('nope', 400)
+            return await api(method, called, payload)
+        fri.api = refused
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            # The same notice either way: what it says doesn't depend on the pause.
+            assert [item.args[0] for item in event.reply.await_args_list] == [CONTEXT_CHANGED]
+            assert mention_lines(caplog) == [f'Mention 1/{event.id} not answered, told why: {logged}']
         finally:
             await fri.close()
     asyncio.run(scenario())

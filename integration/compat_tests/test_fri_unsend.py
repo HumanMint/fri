@@ -278,7 +278,7 @@ def test_attention_moves_on_when_its_pick_was_deleted():
         agent.state['config']['enabled'] = True
         agent.state['channels'] = ['457']
         agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
-        agent.run = AsyncMock(side_effect=lambda role, instruction, data, schema: (
+        agent.run = AsyncMock(side_effect=lambda role, instruction, data, schema, **_: (
             {'action': 'reply', 'source_id': data['fresh_ids'][0]}, {}, 'completed'))
         agent.respond = AsyncMock()
         agent.recent[456].append(row(100, user='11', text='help? is it broken'))
@@ -378,6 +378,11 @@ def test_a_message_deleted_while_typing_starts_never_reaches_the_model(monkeypat
             async def __aexit__(self, *exc):
                 pass
         channel.typing = Typing
+        def fetch(mid):  # As Discord answers for a deleted message.
+            if mid not in rows:
+                raise GONE
+            return rows[mid]
+        channel.fetch_message.side_effect = fetch
         try:
             await asyncio.wait_for(agent.handle(trigger), 10)
             assert not asked  # A ping's invitation already refetches it before the request; a name has this.

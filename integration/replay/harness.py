@@ -235,13 +235,23 @@ def size(value):
     return value
 
 
+def characters(messages):
+    """Characters of text the model reads, not the request's own JSON escaping of them."""
+    total = 0
+    for message in messages:
+        content = message.get('content', '')
+        parts = content if isinstance(content, list) else [{'type': 'input_text', 'text': content}]
+        total += sum(len(part.get('text', '')) for part in parts if part.get('type') == 'input_text')
+    return total
+
+
 def manifest(payload, kind):
     """Context shape and versions without raw member text."""
     instructions = payload.get('instructions', '')
     result = {'kind': kind, 'model': payload.get('model'),
               'effort': (payload.get('reasoning') or {}).get('effort'),
               'prompt_version': hashlib.sha256(instructions.encode()).hexdigest()[:12],
-              'input_chars': len(json.dumps(payload.get('input', [])))}
+              'input_chars': characters(payload.get('input', []))}
     if kind != 'conversation':
         return result
     messages = payload['input']
@@ -395,6 +405,17 @@ class ControllerSession:
         pass
 
 
+class Overwrites:
+    """A channel's permission overwrites as Discord reports them: one per denied role or member, read live."""
+
+    def __init__(self, world, cid):
+        self.world, self.cid = world, cid
+
+    def values(self):
+        return [discord.PermissionOverwrite(view_channel=False, read_message_history=False)
+                for cid, _ in self.world.denied if cid == self.cid]
+
+
 class World:
     """Fake Discord guild, channels, members and messages with virtual-clock snowflakes."""
 
@@ -445,7 +466,8 @@ class World:
             return discord.Permissions.none() if denied else discord.Permissions.all()
 
         channel = SimpleNamespace(id=cid, guild=self.guild, parent_id=None, nsfw=False, is_nsfw=lambda: False,
-                                  name=name, typing=typing, history=history, permissions_for=permissions_for)
+                                  name=name, typing=typing, history=history, permissions_for=permissions_for,
+                                  overwrites=Overwrites(world, cid))
         async def send(content=None, **kwargs):
             return await world._sent(None, channel, content, kwargs)
 

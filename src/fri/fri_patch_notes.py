@@ -1,12 +1,17 @@
-"""Owner-only release patch notes, sent from the maintainer side after a release.
+"""Release patch notes, drafted by Fri and sent from the maintainer side after a release.
 
-    docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.4.0 < notes.md
-    python -m fri.fri_patch_notes preview 0.4.0 < notes.md
+    docker exec -i fri-runtime-1 python -m fri.fri_patch_notes draft 0.7.0 < facts.md > notes.md
+    python -m fri.fri_patch_notes preview 0.7.0 < notes.md
+    docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 --channel fri-chat < notes.md
+    docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md   # the owner's DM
 
-The only recipient is GENE_OWNER_ID; nothing names anyone else. It logs in over REST only, with no
-gateway session, so the running Fri is untouched. Each version reaches the owner once: every part
-has a fixed nonce, FRI_DATA/patch-notes.json lists the parts Discord confirmed, and a part whose
-send was attempted but never confirmed is looked for in the DM before it is sent again.
+`draft` has Fri's own model write the post from the maintainer's facts, in Fri's voice, to the server.
+`send` posts to one named text channel of GENE_GUILD_ID, or with no --channel DMs GENE_OWNER_ID; nothing
+names anyone else. It logs in over REST only, with no gateway session, so the running Fri is untouched.
+Each version reaches each place once: every part has a fixed nonce, FRI_DATA/patch-notes.json (the DM)
+or patch-notes-server.json (the channel) lists the parts Discord confirmed, and a part whose send was
+attempted but never confirmed is looked for there, after the newest message from before that attempt
+(kept under `anchors`), before it is sent again.
 Exit codes: 0 sent (or already sent), 2 refused (fix the notes or the record), 1 Discord or the
 network failed (a rerun is safe)."""
 
@@ -25,6 +30,7 @@ from pathlib import Path
 
 import discord
 
+from .fri_agent_model import STRING, obj
 from .private_files import private_json
 
 LIMIT = 2000  # Discord's message length, in UTF-16 units.
@@ -40,6 +46,10 @@ NO_MENTIONS = discord.AllowedMentions.none()
 
 class NotesRefused(Exception):
     """Notes that shouldn't reach the owner as given."""
+
+
+class SendFailed(Exception):
+    """Discord answered a send with something that can't be recorded; the part stays tried."""
 
 
 def length(text):
@@ -67,8 +77,9 @@ def parts(text):
     return chunks
 
 
-def nonce(version, digest, index):
-    seed = f'patch-notes/{version}/{digest}/{index}'.encode()
+def nonce(version, digest, index, place=''):
+    """Fixed per part and place: Discord dedupes nonces per author, not per channel, so a channel's are its own."""
+    seed = f'patch-notes/{version}/{digest}/{index}{place}'.encode()
     return int.from_bytes(hashlib.sha256(seed).digest()[:7], 'big')
 
 
@@ -101,14 +112,20 @@ def recorded(part):
             all(isinstance(part[key], str) and pattern.fullmatch(part[key]) for key, pattern in patterns.items() if key in part))
 
 
+def stage(part):
+    """0 before its send, 1 tried, 2 confirmed."""
+    return 2 if 'message_id' in part else 1 if part else 0
+
+
 def entry_ok(entry):
-    """A version's notes hash and parts: sends go in order, so sent parts come first, then at most one tried."""
+    """A version's notes hash and parts: sends go in order, so sent parts come first, then at most one tried.
+    send() first saves a version with its first part tried, so a saved version with nothing tried is damage."""
     states = entry.get('parts') if isinstance(entry, dict) else None
     if not (isinstance(states, list) and 1 <= len(states) <= MAX_PARTS and all(recorded(part) for part in states) and
             isinstance(entry.get('sha256'), str) and HASH.fullmatch(entry['sha256'])):
         return False
-    sizes = [len(part) for part in states]
-    return sizes == sorted(sizes, reverse=True) and sizes.count(len(TRIED)) <= 1
+    stages = [stage(part) for part in states]
+    return stages == sorted(stages, reverse=True) and stages.count(1) <= 1 and stages[0] > 0
 
 
 def sent_ids(state):
@@ -137,23 +154,71 @@ def load(path):
     return state
 
 
-async def landed(dm, me, chunk, attempted_at, taken):
+async def anchor(dm, attempted_at):
+    """Where recovery of this attempt starts reading: the DM's newest message id before it ('' for an
+    empty DM), or None when Discord gave one the record couldn't trust, so recovery falls back to time."""
+    async for message in dm.history(limit=1):
+        after = str(message.id)
+        return {'attempted_at': attempted_at, 'after': after} if ID.fullmatch(after) else None
+    return {'attempted_at': attempted_at, 'after': ''}
+
+
+def search_from(state, version, index, part):
+    """The message after which an attempt's own message would be: its anchor, which is Discord's clock,
+    so a host clock that was fast or was corrected since can't start the search past the part. Anchors
+    sit beside `versions`, which older code ignores and keeps, and count only for the attempt they were
+    taken for. Without one, a minute before the attempt (or before now, if the clock stepped back)."""
+    anchors = state.get('anchors')
+    mark = anchors.get(version, {}).get(str(index)) if isinstance(anchors, dict) and isinstance(anchors.get(version), dict) else None
+    if (isinstance(mark, dict) and mark.get('attempted_at') == part['attempted_at'] and
+            isinstance(mark.get('after'), str) and (mark['after'] == '' or ID.fullmatch(mark['after']))):
+        return discord.Object(id=int(mark['after'])) if mark['after'] else None
+    return dt.datetime.fromtimestamp(min(part['attempted_at'], time.time()) - 60, dt.timezone.utc)
+
+
+def set_anchor(state, version, index, mark):
+    """Keeps one anchor per tried part, and none once it's confirmed or Discord's id was untrustworthy."""
+    if not isinstance(state.get('anchors'), dict):
+        state['anchors'] = {}
+    marks = state['anchors'].setdefault(version, {})
+    if not isinstance(marks, dict):
+        marks = state['anchors'][version] = {}
+    if mark:
+        marks[str(index)] = mark
+    else:
+        marks.pop(str(index), None)
+    if not marks:
+        del state['anchors'][version]
+
+
+async def landed(dm, me, chunk, after, taken):
     """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
-    Every message since a minute before the attempt (or before now, if the clock has stepped back) is
-    read. Only Fri's own messages with exactly this text count, and never one the record already gives
-    a part: Discord keeps no nonce in history, so that is what tells identical parts and releases apart."""
-    after = dt.datetime.fromtimestamp(min(attempted_at, time.time()) - 60, dt.timezone.utc)
+    Every message after `after` is read (the whole DM if it was empty). Only Fri's own messages with
+    exactly this text count, and never one the record already gives a part: Discord keeps no nonce in
+    history, so that is what tells identical parts and releases apart."""
     async for message in dm.history(limit=None, after=after, oldest_first=True):
         if message.author.id == me and message.content == chunk and str(message.id) not in taken:
             return message
     return None
 
 
-async def send(version, text, *, token, owner_id, data, out=print):
+async def destination(client, *, owner_id, guild_id, channel):
+    """The owner's DM, or the one text channel of the guild with this name: two with the name is a refusal."""
+    if channel is None:
+        owner = await client.fetch_user(owner_id)
+        return await owner.create_dm()
+    guild = await client.fetch_guild(guild_id)
+    found = [c for c in await guild.fetch_channels() if c.type == discord.ChannelType.text and c.name == channel]
+    if len(found) != 1:
+        raise NotesRefused(f'the server has {len(found)} text channels named #{channel}; need exactly one')
+    return found[0]
+
+
+async def send(version, text, *, token, owner_id, data, out=print, guild_id=None, channel=None):
     chunks = parts(text)
     digest = hashlib.sha256(json.dumps(chunks).encode()).hexdigest()  # The split, not just the text.
     hashes = [text_hash(chunk) for chunk in chunks]
-    path = data / 'patch-notes.json'
+    path = data / ('patch-notes.json' if channel is None else 'patch-notes-server.json')
     with locked(data):
         state = load(path)
         entry = state['versions'].get(version)
@@ -166,46 +231,120 @@ async def send(version, text, *, token, owner_id, data, out=print):
         if all(part.get('message_id') for part in entry['parts']):
             out(f'{version}: all {len(chunks)} parts were already sent')
             return
-        tried = next((part['sha256'] for part in entry['parts'] if set(part) == TRIED), None)
+        tried = next((part['sha256'] for part in entry['parts'] if stage(part) == 1), None)
         twins = sorted(other for other, e in state['versions'].items() if other != version
-                       for part in e['parts'] if set(part) == TRIED and part['sha256'] == tried)
+                       for part in e['parts'] if stage(part) == 1 and part['sha256'] == tried)
         if twins:
             raise NotesRefused(f'{version} and {", ".join(twins)} each have a part with this text that was tried but '
-                               f'never confirmed, and the DM can\'t say whose a message is; check it, then fix {path.name}')
+                               f'never confirmed, and the history can\'t say whose a message is; check it, then fix {path.name}')
         client = discord.Client(intents=discord.Intents.none())
         try:
             await client.login(token)
-            owner = await client.fetch_user(owner_id)
-            dm = await owner.create_dm()
+            dm = await destination(client, owner_id=owner_id, guild_id=guild_id, channel=channel)
             for index, (chunk, part) in enumerate(zip(chunks, entry['parts']), 1):
                 if part.get('message_id'):
                     out(f'part {index}/{len(chunks)}: already sent')
                     continue
                 taken = set(sent_ids(state))
-                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, part['attempted_at'], taken)
+                start = 'attempted_at' in part and search_from(state, version, index, part)
+                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, start, taken)
                 if not message:
-                    part.update(attempted_at=time.time(), sha256=hashes[index - 1])
+                    attempted_at = time.time()
+                    mark = await anchor(dm, attempted_at)
+                    if not isinstance(start, (bool, dt.datetime)):
+                        # A retry keeps the earlier boundary: the earlier send may still land behind a new one.
+                        mark = {'attempted_at': attempted_at, 'after': str(start.id) if start else ''}
+                    set_anchor(state, version, index, mark)
+                    part.update(attempted_at=attempted_at, sha256=hashes[index - 1])
                     private_json(path, state)
-                    message = await dm.send(chunk, nonce=nonce(version, digest, index),
+                    message = await dm.send(chunk, nonce=nonce(version, digest, index, '' if channel is None else f'#{dm.id}'),
                                             allowed_mentions=NO_MENTIONS, suppress_embeds=True)
                     if str(message.id) in taken:
                         raise NotesRefused(f'Discord answered part {index} with message {message.id}, which '
                                            f'{path.name} already gives another part')
+                if not (ID.fullmatch(str(message.id)) and ID.fullmatch(str(dm.id))):
+                    # Recording it would make load() refuse every later send; a rerun looks for it instead.
+                    raise SendFailed(f'Discord answered part {index} with message id {message.id!r} in DM {dm.id!r}')
                 part.update(message_id=str(message.id), channel_id=str(dm.id))
+                set_anchor(state, version, index, None)
                 private_json(path, state)
                 out(f'part {index}/{len(chunks)}: sent as message {message.id} ({length(chunk)} chars)')
         finally:
             await client.close()
 
 
+DRAFT = obj({'notes': STRING})
+PATCH_NOTES = '''
+Now you're writing a release's patch notes, which you'll post yourself in the server's #fri-chat for
+everyone there. Talk to the server, not to one person. The owner is mint, or bossman; mention them in
+the third person if at all ("mint finally shipped it"). Use only the facts given: never invent a
+feature, fix, number, date or name, and leave out anything members wouldn't notice. Plain words a
+member gets: no PR numbers, file names, or words like controller, heartbeat, pin or release script.
+Shape: one version line, then **added** and **fixed** as short "- " lists (group small fixes into one
+line), then one **next** line. Keep it brief: under 1200 characters, or under 2500 when the facts say
+it's the first patch notes the server has seen. Same voice as always: lowercase, deadpan, a jab or two,
+no exclamation marks, no hype, never cheerful or salesy, no em dashes, few emojis.
+Return the whole post as Discord text in `notes`.'''
+
+
+async def draft(version, facts, *, chat, model, effort, voice_notes=''):
+    """Fri's own wording of the maintainer's facts, as the post it would make; nothing is sent."""
+    from .fri_agent_model import analyze
+    from .fri_chat import VOICE
+    instruction = VOICE + ('\nOwner voice notes:\n' + voice_notes if voice_notes else '') + PATCH_NOTES
+    result, counters, status = await analyze(chat, instruction, {'version': version, 'facts': facts},
+                                             model, effort, DRAFT)
+    return (result.get('notes') or '').strip(), counters, status
+
+
+def drafted(text, status):
+    """A draft that came back whole and would send as it is."""
+    if status != 'completed' or not text:
+        raise SendFailed(f'the draft came back {status}')
+    parts(text)  # Refused here if it wouldn't send.
+    return text
+
+
+async def draft_from_controller(version, facts):
+    """Model, effort and the owner's voice notes as the controller has them; usage is reported like an eval's."""
+    import uuid
+
+    import httpx
+
+    from .fri_chat import Chat
+    from .subscription import Subscription
+    url = os.getenv('GENE_CONTROLLER_URL', 'http://controller:8787').rstrip('/')
+    headers = {'Authorization': 'Bearer '+os.environ['GENE_FRI_TOKEN']}
+    chat = Chat(Subscription(os.getenv('FRI_CHATGPT_AUTH', '/auth/session.json')))
+    async with httpx.AsyncClient(timeout=30, trust_env=False, headers=headers) as client:
+        status, settings = await client.get(url+'/status'), await client.get(url+'/agent/state')
+        status.raise_for_status()
+        settings.raise_for_status()
+        status, config = status.json(), settings.json()['config']
+        text, counters, done = await draft(version, facts, chat=chat, model=status['chat_model'],
+                                           effort=status['chat_effort'], voice_notes=config.get('voice_notes') or '')
+        report = {'attempt_id': uuid.uuid4().hex, 'model': status['chat_model'], 'effort': status['chat_effort'],
+                  'status': done, 'counters': counters, 'role': 'evaluation'}
+        path = Path(os.getenv('FRI_DATA', '/data'))/'usage'/(report['attempt_id']+'.json')
+        private_json(path, report)  # Kept until the controller has it; the live outbox delivers it otherwise.
+        posted = await client.post(url+'/chat/usage/report', json=report)
+        posted.raise_for_status()
+        path.unlink(missing_ok=True)
+    return drafted(text, done)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='python -m fri.fri_patch_notes',
-                                     description='DM the owner one release\'s patch notes, read from stdin.')
-    parser.add_argument('command', choices=('send', 'preview'))
+                                     description='Draft, preview or send one release\'s patch notes, read from stdin.')
+    parser.add_argument('command', choices=('draft', 'send', 'preview'))
     parser.add_argument('version', help='the release version, like 0.4.0')
+    parser.add_argument('--channel', help='post in this text channel of the server (like fri-chat) instead of '
+                                          'the owner\'s DM')
     args = parser.parse_args(argv)
     if not VERSION.fullmatch(args.version):
         parser.error('version must look like 0.4.0')
+    if args.channel is not None and (args.command != 'send' or not re.fullmatch(r'[a-z0-9_-]{1,100}', args.channel)):
+        parser.error('--channel takes a channel name like fri-chat, with send')
     try:
         try:
             text = sys.stdin.buffer.read().decode('utf-8')
@@ -215,10 +354,18 @@ def main(argv=None):
             for index, chunk in enumerate(parts(text), 1):
                 print(f'--- part {index} ({length(chunk)} chars)\n{chunk}')
             return 0
-        token, owner = os.getenv('DISCORD_TOKEN', ''), os.getenv('GENE_OWNER_ID', '')
+        if args.command == 'draft':
+            if not text.strip():
+                raise NotesRefused('the facts are empty')
+            print(asyncio.run(draft_from_controller(args.version, text)))
+            return 0
+        token, owner, guild = os.getenv('DISCORD_TOKEN', ''), os.getenv('GENE_OWNER_ID', ''), os.getenv('GENE_GUILD_ID', '')
         if not token or not ID.fullmatch(owner):
             raise NotesRefused('DISCORD_TOKEN and GENE_OWNER_ID must be set')
-        asyncio.run(send(args.version, text, token=token, owner_id=int(owner), data=Path(os.getenv('FRI_DATA', '/data'))))
+        if args.channel is not None and not ID.fullmatch(guild):
+            raise NotesRefused('GENE_GUILD_ID must be set to post in a channel')
+        asyncio.run(send(args.version, text, token=token, owner_id=int(owner), data=Path(os.getenv('FRI_DATA', '/data')),
+                         guild_id=int(guild) if args.channel is not None else None, channel=args.channel))
     except NotesRefused as exc:
         print(f'refused: {exc}', file=sys.stderr)
         return 2

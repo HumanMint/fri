@@ -7,11 +7,11 @@ import discord
 
 from . import feedback as commands
 from .fri_context import discord_source
-from .fri_memory import clip, note_place, profiled, units
+from .fri_memory import MOVES, clip, note_place, profiled, units
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
-COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit):[a-f0-9]{32}$')
+COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit|share|confirm|keep):[a-f0-9]{32}$')
 
 
 def memory_component(interaction, bot_id):
@@ -48,7 +48,7 @@ async def allowed(cog, interaction, scope, *, message=True):
     return True
 
 
-async def show(cog, interaction, scope=None, *, state=None, selected=None, notice=''):
+async def show(cog, interaction, scope=None, *, state=None, selected=None, notice='', confirm=False):
     scope = profiled(cog, scope or scope_for(cog, interaction))
     if not await allowed(cog, interaction, scope, message=False):
         return
@@ -56,7 +56,8 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
     profiles = getattr(cog, 'profiles', False)
     lines = [notice] if notice else []
     lines += ['Memory is '+('on.' if state['enabled'] else 'off.'),
-              'Server-wide preferences follow you around the server; the rest stay where you said them. '
+              'Server-wide preferences follow you around the server; the rest stay where you said them, and what '
+              'you’re working on always starts there. '
               'At most three per category. Each expires after 90 days.' if profiles else
               'Up to ten preferences here, at most three per category. Each expires after 90 days.']
     listed = []
@@ -77,7 +78,13 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
                  'Editing or removing a preference clears recent saved context here. Discord posts and backups are separate.')
     from .fri_panel import card, reply
     await reply(cog, interaction, embed=card('My memory', '\n\n'.join(lines)),
-                view=MemoryView(cog, scope, state, selected))
+                view=MemoryView(cog, scope, state, selected, confirm=confirm))
+
+
+def movable(cog, scope):
+    """A note moves only from a private chat, where the member sees all of it, and only if the controller can."""
+    return (getattr(cog, 'profiles', False) and MOVES in getattr(cog, 'capabilities', ()) and
+            scope.get('profiles') and scope['conversation_id'].startswith('private:'))
 
 
 def place(cog, scope, entry):
@@ -102,7 +109,7 @@ class MemoryLauncher(discord.ui.View):
 
 
 class MemoryView(MemoryLauncher):
-    def __init__(self, cog, scope, state, selected=None):
+    def __init__(self, cog, scope, state, selected=None, *, confirm=False):
         super().__init__(cog, scope)
         self.clear_items()
         self.state = state
@@ -127,6 +134,18 @@ class MemoryView(MemoryLauncher):
             replace = discord.ui.Button(label='Edit selected', custom_id='fri:memory:replace:'+uuid.uuid4().hex)
             replace.callback = self.replace
             self.add_item(replace)
+            if movable(cog, scope):
+                # Only the member's press moves a note between their profile and this private chat.
+                # Sharing widens who sees a note, so it takes a second press; keeping it here narrows, so it doesn't.
+                server = self.selected.get('scope') == 'server'
+                action = 'keep' if server else 'confirm' if confirm else 'share'
+                move = discord.ui.Button(label={'keep': 'Keep here only', 'share': 'Share server-wide',
+                                                'confirm': 'Yes, share server-wide'}[action],
+                                         style=discord.ButtonStyle.danger if action == 'confirm' else
+                                         discord.ButtonStyle.secondary,
+                                         custom_id=f'fri:memory:{action}:'+uuid.uuid4().hex)
+                move.callback = {'keep': self.keep, 'share': self.ask_share, 'confirm': self.share}[action]
+                self.add_item(move)
 
     async def remove(self, interaction):
         if not await self.interaction_check(interaction):
@@ -140,6 +159,31 @@ class MemoryView(MemoryLauncher):
         except commands.UserFeedbackCheckFailure as exc:
             await show(self.cog, interaction, self.scope, notice=str(exc))
 
+    async def ask_share(self, interaction):
+        if await self.interaction_check(interaction):
+            await show(self.cog, interaction, self.scope, selected=self.selected['id'], confirm=True,
+                       notice='Share it server-wide? Fri could then bring it up in any channel of the server, '
+                              'where others can read it. Press Yes, share server-wide to go ahead.')
+
+    async def share(self, interaction):
+        await self.move(interaction, 'share', 'Shared that preference across the server.')
+
+    async def keep(self, interaction):
+        await self.move(interaction, 'keep', 'That preference stays here now, out of the server.')
+
+    async def move(self, interaction, action, notice):
+        if not await self.interaction_check(interaction):
+            return
+        try:
+            state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
+                **self.scope, 'source': discord_source(interaction).model_dump(), 'revision': self.state['revision'],
+                'action': action})
+            if action == 'keep':  # It no longer shows in the server, so nothing Fri holds there may keep it.
+                self.cog.agent.forget(interaction.user.id)
+            await show(self.cog, interaction, self.scope, state=state, notice=notice)
+        except commands.UserFeedbackCheckFailure as exc:
+            await show(self.cog, interaction, self.scope, notice=str(exc))
+
     async def replace(self, interaction):
         if await self.interaction_check(interaction):
             await interaction.response.send_modal(EditMemory(self))
@@ -149,7 +193,8 @@ class EditMemory(discord.ui.Modal):
     def __init__(self, view):
         super().__init__(title='Edit saved preference', custom_id='fri:memory:edit:'+uuid.uuid4().hex, timeout=600)
         self.view = view
-        self.preference = discord.ui.TextInput(label='A first-person preference, e.g. I like chess',
+        self.preference = discord.ui.TextInput(label='What you’re doing, e.g. I’m working on a mod' if
+            view.selected['category'] == 'projects' else 'A first-person preference, e.g. I like chess',
             default=view.selected['evidence'], min_length=5, max_length=180)
         self.add_item(self.preference)
 
