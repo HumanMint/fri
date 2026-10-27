@@ -461,6 +461,32 @@ def test_a_reply_to_a_message_withdrawn_during_signin_is_refused_before_the_requ
     asyncio.run(scenario())
 
 
+def test_a_fresh_reply_to_a_message_withdrawn_earlier_is_answered_from_its_current_text(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        earlier = message('fri original caption '+MARKER, user=20)
+        cache(agent, channel, earlier)
+        edited = copy.copy(earlier)
+        edited.content, edited.edited_at = 'current safe caption', dt.datetime.now(dt.timezone.utc)
+        rows[earlier.id] = edited
+        await fri.on_raw_message_edit(SimpleNamespace(channel_id=1, message=edited))
+        assert not await agent.unedited([earlier])  # A queued message's recheck withdraws it.
+        assert str(earlier.id) in agent.withdrawn
+        later = message('fri explain the current caption?', user=40)  # Sent after the edit, replying to it.
+        later.reference = SimpleNamespace(message_id=earlier.id, channel_id=1)
+        requests = []
+        model(fri, requests)
+        fri.chat_once = type(fri).chat_once.__get__(fri)
+        try:
+            await fri.talk(123, 1, 40, later.content, 'public', event=later)
+            assert len(requests) == 1
+            assert 'current safe caption' in json.dumps(requests) and MARKER not in json.dumps(requests)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('change', ['edited', 'deleted'])
 @pytest.mark.parametrize('consumer', ['direct', 'attention'])
 def test_every_withdrawn_message_of_a_ping_burst_leaves_the_live_view(monkeypatch, tmp_path, change, consumer):
