@@ -524,8 +524,9 @@ class Fri(discord.Client):
                                 for note in profile['notes']]
             return ChatResult(reply=describe_memory(profile), status='completed', memory_scope=scope)
         if intent in ('disable', 'enable'):
-            # Deleted after its last check: deleting it may be taking it back, and an erasure can't be undone.
-            if self.agent and getattr(event, 'id', None) in self.agent.unsent:
+            # Deleted or edited after its last check: either may be taking it back, and an erasure can't be undone.
+            if self.agent and (getattr(event, 'id', None) in self.agent.unsent or
+                               str(getattr(event, 'id', '')) in self.agent.withdrawn):
                 raise GateClosed('message deleted')
             await self.api('POST', '/chat/memory/control', {**scope, 'action': intent})
             if self.agent:

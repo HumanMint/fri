@@ -1337,6 +1337,16 @@ class Agent:
         # `since`: the author's (local erasures, privacy revision) as the message came in. A ping's
         # error or a low battery doesn't go out once they erased after it.
         events = [message, *(event for _, event, _ in burst if event is not message)]  # This turn answers for all.
+        began = time.time()  # A nearby post edited before this was read as it is now (see changed).
+
+        def changed(ids):
+            """Those of `ids` deleted, or edited since this turn began: what the model saw of them may be gone."""
+            edited = {int(i) for i, at in self.withdrawn.items() if at >= began and i.isdigit()}
+            return (self.unsent.keys() | edited) & set(ids)
+
+        def taken(event):  # One this turn answers, deleted or edited (an edit may take it back) while it ran.
+            return event.id in self.unsent or str(event.id) in self.withdrawn
+
         def missed(reason):
             for event in events:
                 self.miss(event, reason)
@@ -1416,15 +1426,15 @@ class Agent:
         def taken_back():
             """Why what the model made can't go out, or be saved, now: a message it answers or one it was shown,
             deleted since. Checked again after each wait below, up to the save (the delivered part stays)."""
-            if any(event.id in self.unsent for event in events):
+            if any(taken(event) for event in events):
                 return 'message deleted'
-            return 'nearby message deleted' if self.unsent.keys() & result.shown else None
+            return 'nearby message deleted' if changed(result.shown) else None
 
-        if any(event.id in self.unsent for event in events):  # Taken back while Fri composed.
+        if any(taken(event) for event in events):  # Taken back while Fri composed.
             missed('message deleted')
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        if self.unsent.keys() & result.shown:
+        if changed(result.shown):
             # Someone took back a message the model was shown: the reply may repeat it, and a reaction or a quiet
             # decision answers it. None goes out or is saved; only a reply's words are worth saying why.
             if ambient:
