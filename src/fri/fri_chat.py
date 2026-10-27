@@ -17,7 +17,7 @@ from .fri_responses import KINDS, REACTIONS, acknowledgment_allowed, validate_re
 from .fri_social import SOCIAL_ACTIONS
 from .fri_times import ASK as TIME_ASK
 from .fri_times import render as render_times
-from .fri_times import render_tree, said_at
+from .fri_times import PROSE, render_tree, said_at
 from .privacy import clean, model_json
 from .subscription import RESOURCE, SubscriptionError
 
@@ -704,7 +704,7 @@ class Chat:
                             # action or draft would post or save later (a clarifying question, a draft's body).
                             if response_kind == 'reply':
                                 reply = render_times(reply, said_at(context))
-                            action, rendered_action = render_tree(action, said_at(context))
+                            action, rendered_action = render_tree(action, said_at(context), PROSE)
                             draft, rendered_draft = render_tree(draft, said_at(context))
                             if not (rendered_action and rendered_draft):
                                 reply, draft, action, response_kind = TIME_ASK, None, None, 'reply'

@@ -282,3 +282,26 @@ def test_a_drafts_body_renders_its_times_before_it_is_saved():
         assert result.status == 'completed' and result.action['body'].startswith('game night is <t:')
         assert '[[' not in result.action['body']
     asyncio.run(scenario())
+
+
+
+def test_a_topic_or_query_stays_an_exact_excerpt_of_the_message():
+    """Only an action's prose is rendered; a clarify topic or a web query keeps the member's own words."""
+    topic = 'does [[time 2026-10-28T20:00 UTC]] refer to the chess final or semifinal?'
+    outputs = [{'kind': 'clarify', 'goal': 'web', 'topic': topic,
+                'question': 'final or semifinal, at [[time 2026-10-28T20:00 UTC]]?'},
+               {'kind': 'web_search', 'query': 'what is [[Time]] in wiki markup'}]
+
+    def model_reply(request):
+        output = {'reply': '', 'request_draft': None, 'action': outputs.pop(0), 'notes': []}
+        return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(output)))+'\n\n')
+
+    async def scenario():
+        chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(model_reply))
+        context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high',
+                   'actions': {'clarify': {'goals': ['web']}, 'web_search': {}}}
+        clarify = await chat.respond(topic, context)
+        assert clarify.action['topic'] == topic and clarify.action['question'] == 'final or semifinal, at <t:1793217600:F>?'
+        search = await chat.respond('what is [[Time]] in wiki markup', context)
+        assert search.action == {'kind': 'web_search', 'query': 'what is [[Time]] in wiki markup'}  # Not dropped.
+    asyncio.run(scenario())

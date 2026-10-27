@@ -113,18 +113,24 @@ def render(text, now=None):
     return ASK if broken or OPENING.search(rendered) else rendered
 
 
-def render_tree(value, now=None):
-    """Every string in a model's structured output (an action's question, a draft's body) rendered the same
-    way, and whether all of them could be: a broken one there can't fall back to the ask in place."""
+PROSE = frozenset({'question', 'title', 'body'})  # What an action shows people later, as Fri wrote it.
+
+
+def render_tree(value, now=None, keys=None):
+    """A model's structured output with its prose rendered the same way as a reply (a clarifying question, a
+    draft's title or body), and whether all of it could be: a broken one there can't fall back to the ask in
+    place. `keys`: render only these fields of a dict; the rest (a topic or query that must stay an exact
+    excerpt of the member's message) stays verbatim."""
     if isinstance(value, str):
         if not OPENING.search(value):
             return value, True
         rendered = render(value, now)
         return rendered, rendered != ASK
     if isinstance(value, list):
-        items = [render_tree(item, now) for item in value]
+        items = [render_tree(item, now, keys) for item in value]
         return [item for item, _ in items], all(ok for _, ok in items)
     if isinstance(value, dict):
-        items = {key: render_tree(item, now) for key, item in value.items()}
+        items = {key: render_tree(item, now) if keys is None or key in keys else (item, True)
+                 for key, item in value.items()}
         return {key: item for key, (item, _) in items.items()}, all(ok for _, ok in items.values())
     return value, True
