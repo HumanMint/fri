@@ -61,6 +61,8 @@ class Invitation:
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
         self.revision = None  # The author's privacy revision as Fri first read it for this ping.
+        self.fetched = None  # Its channel (a thread's parent) as the last access check read it (see access).
+        self.checked = 0  # Full checks passed, so a later check can tell one just ran (see Fri.chat_once).
 
     @property
     def image(self):
@@ -116,6 +118,7 @@ class Invitation:
         fresh_guild._roles = {role.id: role for role in await guild.fetch_roles()}
         parent = copy.copy(parent)
         parent.guild = fresh_guild
+        self.fetched = parent  # Whether everyone can read it is judged from this read too (see Fri.talk).
         for user in (event.author.id, self.fri.user.id):
             member = await guild.fetch_member(user)
             if member.id != user or (user == event.author.id and member.bot):
@@ -185,6 +188,7 @@ class Invitation:
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
+            self.checked += check_evidence
             return True
         except ControllerUnavailable:
             raise  # Nothing changed; the controller is down, and the caller's outage handling says so.

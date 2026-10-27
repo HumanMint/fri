@@ -16,12 +16,15 @@ SUMMARIES = 'member-summaries'  # The controller keeps Fri's own short summary o
 PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_thread)
 
 
-def server_wide(channel):
+def server_wide(channel, fetched=None):
     """Everyone in the server can read it and its history, now. Only such a channel feeds a member's profile.
 
     A private thread, an age-restricted channel, one the default role can't view or read back, or one that
     keeps out any role or member keeps what was said in it to itself: the default role alone doesn't prove
     everyone can read it (fri #45). Anything Fri can't resolve counts as restricted.
+
+    `fetched`: the channel (a thread's parent) as Discord has it, with the server's fetched roles (see
+    Agent.can_read), judged instead of the cache, which can lag a new overwrite (fri #97).
     """
     guild = getattr(channel, 'guild', None)
     if guild is None:
@@ -30,6 +33,8 @@ def server_wide(channel):
         if channel.type not in PUBLIC_THREADS:
             return False
         channel = channel.parent
+    if fetched is not None:
+        channel, guild = fetched, getattr(fetched, 'guild', None)
     is_nsfw = getattr(channel, 'is_nsfw', None)
     if channel is None or not callable(is_nsfw) or is_nsfw():
         return False

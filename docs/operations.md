@@ -15,7 +15,8 @@ The controller applies the existing member allowance. Disabled mode and in-progr
 reply notices keep their existing behavior. The runtime rechecks the current event,
 member roles, channel/thread permissions, source contents and privacy before output.
 After the model answers, a ping is rechecked before each tool acts, before the model hears
-the turn again, and once right before sending; checks repeated with nothing in between are
+the turn again (once signed in for that request, with every nearby post its read showed, text-only
+included), and once right before sending; checks repeated with nothing in between are
 gone. That last check reads the ping again after its privacy read, and also covers its image
 post, including a photo the author posted just before the ping.
 In configured channels, local privacy/usage utilities, exact controls and accepted
@@ -274,7 +275,10 @@ requests, and each member has one profile per server: up to 15 small preferences
 category) that follow them into every conversation in that server, DMs included. Fri decides where a
 note belongs when the turn is saved. Only a channel the server's default role can view counts, with a
 thread judged by its parent, and only public or news threads. Age-restricted channels never count,
-and neither does anything Fri can't resolve. Notes from DMs, the `/fri` panel, restricted channels,
+and neither does anything Fri can't resolve. Right before each model request Fri also reads the
+channel from Discord (fetched overwrites and roles, the ping's own check for a mention), so an
+overwrite the cache hasn't seen yet keeps the turn in that channel too. The same read confirms that a
+configured-channel message's author can still read the channel; if not, the request isn't sent. Notes from DMs, the `/fri` panel, restricted channels,
 private threads and outside invitations stay in that one conversation, and the controller refuses a
 profile write from a private conversation. Notes saved before this release stay where they were said.
 Background learning still keeps per channel.
