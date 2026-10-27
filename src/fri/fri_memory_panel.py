@@ -56,7 +56,8 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
     profiles = getattr(cog, 'profiles', False)
     lines = [notice] if notice else []
     lines += ['Memory is '+('on.' if state['enabled'] else 'off.'),
-              'Server-wide preferences follow you around the server; the rest stay where you said them. '
+              'Server-wide preferences follow you around the server; the rest stay where you said them, and what '
+              'you’re working on always starts there. '
               'At most three per category. Each expires after 90 days.' if profiles else
               'Up to ten preferences here, at most three per category. Each expires after 90 days.']
     listed = []
@@ -192,7 +193,8 @@ class EditMemory(discord.ui.Modal):
     def __init__(self, view):
         super().__init__(title='Edit saved preference', custom_id='fri:memory:edit:'+uuid.uuid4().hex, timeout=600)
         self.view = view
-        self.preference = discord.ui.TextInput(label='A first-person preference, e.g. I like chess',
+        self.preference = discord.ui.TextInput(label='What you’re doing, e.g. I’m working on a mod' if
+            view.selected['category'] == 'projects' else 'A first-person preference, e.g. I like chess',
             default=view.selected['evidence'], min_length=5, max_length=180)
         self.add_item(self.preference)
 
