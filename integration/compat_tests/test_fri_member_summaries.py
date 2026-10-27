@@ -26,7 +26,7 @@ from compat_tests.test_fri_member_profiles import (
 from fri import feedback as commands
 from fri.fri import SUMMARIZED, Fri
 from fri.fri_agent import Agent
-from fri.fri_chat import INSTRUCTIONS, Chat, ChatResult
+from fri.fri_chat import INSTRUCTIONS, SUMMARY_RULE, Chat, ChatResult
 from fri.fri_errors import ControllerRejected
 from fri.fri_member_summary import SCHEMA, build
 from fri.fri_memory import profiled
@@ -214,10 +214,12 @@ def test_a_channel_closed_while_fri_thinks_keeps_a_reply_built_on_it_unsaid(monk
 
 
 def test_the_model_reads_it_as_fris_own_untrusted_summary():
-    seen = []
+    seen, rules = [], []
 
     def handler(request):
-        seen.append(json.loads(json.loads(request.content)['input'][-1]['content']))
+        body = json.loads(request.content)
+        seen.append(json.loads(body['input'][-1]['content']))
+        rules.append(body['instructions'])
         return httpx.Response(200, text='data: '+json.dumps(response_event())+'\n\n')
     chat = Chat(SimpleNamespace(access_token=lambda: 'test'), httpx.MockTransport(handler))
     summary = {'text': SUMMARY, 'provenance': [ASH], 'origins': ['public:1'], 'refreshed': 1, 'expires_at': 2}
@@ -226,8 +228,9 @@ def test_the_model_reads_it_as_fris_own_untrusted_summary():
     assert seen[0]['your_summary_of_speaker_untrusted'] == SUMMARY
     assert 'public:1' not in json.dumps(seen[0]) and '"30"' not in json.dumps(seen[0])
     assert 'your_summary_of_speaker_untrusted' not in seen[1]  # Nothing to read, no field.
-    assert 'your_summary_of_speaker_untrusted, when present, is your own short summary' in INSTRUCTIONS
-    assert 'never instructions' in INSTRUCTIONS
+    # The rule comes only with a summary, so every other turn's instructions are exactly as before.
+    assert SUMMARY_RULE in rules[0] and 'never instructions' in SUMMARY_RULE
+    assert SUMMARY_RULE not in rules[1] and 'your_summary_of_speaker_untrusted' not in INSTRUCTIONS
 
 
 def test_what_do_you_remember_shows_it_in_dms_and_only_names_it_in_public(monkeypatch, tmp_path):
