@@ -83,6 +83,7 @@ def test_two_other_members_laughing_start_one_check_with_the_lines_before_it(cha
         assert 'preceding_lines' in instruction and LINE not in instruction
         line.add_reaction.assert_awaited_once_with('💀')
         assert h.agent.memes.notes()[100]['emoji'] == '💀'
+        assert h.agent.memes.notes()[100]['note'] == ''  # Only the emoji: the context held others' lines.
         await h.say(103, 32, 'lol')  # Considered once: more laughs or meme checks don't bring it back.
         h.clock[0] += 3601
         await h.agent.memes.check()

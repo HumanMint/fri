@@ -382,7 +382,9 @@ class Memes:
             latest = await self.agent.profile(message.channel.id, message.author.id)
             if (self.agent.forgotten.get(message.author.id, 0) == forgotten and latest['enabled'] and
                     latest['revision'] == profile['revision']):
-                self.remember(current, result['reaction'], result['observation'], profile['revision'])
+                # A chat line's note keeps only the emoji: what the model saw there can draw on others' lines.
+                self.remember(current, result['reaction'], '' if before is not None else result['observation'],
+                              profile['revision'])
 
 
 def carried(message):
@@ -414,7 +416,7 @@ def reacted(notes, message, profile, stale=None):
         if stale is not None:
             stale.append(message.id)
         return {}
-    return {'fri_reacted': {'emoji': note['emoji'], 'saw': note['note']}}
+    return {'fri_reacted': {'emoji': note['emoji'], **({'saw': note['note']} if note['note'] else {})}}
 
 
 def laughter(text):
