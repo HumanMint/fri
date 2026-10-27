@@ -15,7 +15,7 @@ import httpx
 
 from . import feedback as commands
 from .fri_agent_model import STRING, obj
-from .fri_errors import ControllerRejected
+from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_meme_media import load_image, sources
 from .privacy import clean
 from .private_files import private_json
@@ -274,12 +274,19 @@ class Memes:
             """After the model slot and sign-in, right before the model sees them: each line shown, this one
             too, is still in Fri's live view as it was, from authors who still allow it at that revision (a
             forget or delete takes their rows out of the view), and a reaction could still follow."""
-            if not await self.agent.unwithdrawn(channel_id, shown):
+            try:  # The controller or Discord down here means no model call, and a receipt that says so.
+                if not await self.agent.unwithdrawn(channel_id, shown):
+                    return True
+                live = {row['id']: row for row in self.agent.recent.get(channel_id, ())}
+                with self.state(write=False) as state:
+                    if (full(state, self.agent.config, time.time()) or
+                            any(live[row['id']]['text'] != row['text'] for row in shown)):
+                        return True
+                # The whole line, not the live view's first 500 characters: an edit past them counts too.
+                current = await channel.fetch_message(int(post_id))
+                return current.edited_at is not None or current.content != message.content
+            except (ControllerUnavailable, ControllerRejected, discord.HTTPException):
                 return True
-            live = {row['id']: row for row in self.agent.recent.get(channel_id, ())}
-            with self.state(write=False) as state:
-                return (full(state, self.agent.config, time.time()) or
-                        any(live[row['id']]['text'] != row['text'] for row in shown))
 
         message = await channel.fetch_message(int(post_id))
         if message.edited_at is not None or sources(message) != [] or not message.content.strip():

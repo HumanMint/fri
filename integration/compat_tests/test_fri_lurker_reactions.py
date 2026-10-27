@@ -16,6 +16,7 @@ from compat_tests.test_fri_learning import learning as learning  # noqa: F401
 from compat_tests.test_fri_memes import attachment, build
 from compat_tests.test_fri_memes import harness as harness  # noqa: F401
 from fri.fri_agent import Agent
+from fri.fri_errors import ControllerUnavailable
 
 BIT = [(90, 12, 'who left the oven on'), (91, 13, 'not me'), (92, 12, 'the smoke alarm says otherwise'),
        (93, 13, 'that alarm lies'), (94, 14, 'it lied about the toast too'), (95, 12, 'ok but who')]
@@ -454,7 +455,8 @@ def test_a_spent_budget_stops_a_laugh_check_before_it_reads_anything(chat, spent
 
 
 @pytest.mark.parametrize('change', ['opted_out', 'forgotten', 'deleted', 'edited', 'line_deleted', 'line_edited',
-                                    'author_opted_out', 'during_fetch'])
+                                    'author_opted_out', 'during_fetch', 'line_edited_past_the_live_view',
+                                    'controller_down'])
 def test_every_line_the_model_would_see_is_checked_again_after_the_slot_and_sign_in(chat, monkeypatch, change):
     async def scenario():
         h = chat
@@ -470,7 +472,12 @@ def test_every_line_the_model_would_see_is_checked_again_after_the_slot_and_sign
         changes = {'opted_out': lambda: h.store.personal_control('14', 'disable'),  # Line 94's author.
                    'forgotten': lambda: h.agent.forget(14), 'deleted': lambda: h.agent.unsend(3, [94]),
                    'edited': lambda: edit(94), 'line_deleted': lambda: h.agent.unsend(3, [100]),
-                   'line_edited': lambda: edit(100), 'author_opted_out': lambda: h.store.personal_control('11', 'disable')}
+                   'line_edited': lambda: edit(100), 'author_opted_out': lambda: h.store.personal_control('11', 'disable'),
+                   # Discord has the edit, past the live view's first 500 characters, so its row looks the same.
+                   'line_edited_past_the_live_view': lambda: (
+                       setattr(message[100], 'content', message[100].content + ' and my old address'),
+                       setattr(message[100], 'edited_at', dt.datetime.fromtimestamp(h.clock[0], dt.timezone.utc))),
+                   'controller_down': lambda: setattr(h.agent, 'profile', AsyncMock(side_effect=ControllerUnavailable('down')))}
         if change == 'during_fetch':  # After the lines were read, while the line itself is fetched.
             async def fetch(mid):
                 h.store.personal_control('14', 'disable')
