@@ -113,7 +113,14 @@ def render(text, now=None):
     return ASK if broken or OPENING.search(rendered) else rendered
 
 
-PROSE = frozenset({'question', 'title', 'body'})  # What an action shows people later, as Fri wrote it.
+# The one action field Fri writes for the member to read: a clarifying question. Every other field (a plan's
+# title, a saved draft's body, a topic, a query) must stay an exact excerpt of the member's own words for Gene.
+PROSE = {'clarify': frozenset({'question'})}
+
+
+def prose(action):
+    """Which of this action's fields may be rendered."""
+    return PROSE.get(action.get('kind'), frozenset()) if isinstance(action, dict) else frozenset()
 
 
 def render_tree(value, now=None, keys=None):

@@ -265,8 +265,8 @@ def test_a_clarifying_question_renders_its_times_like_a_reply(monkeypatch, tmp_p
     asyncio.run(scenario())
 
 
-def test_a_drafts_body_renders_its_times_before_it_is_saved():
-    """What a work_save would save (and later post) is rendered in Chat.respond, like the reply."""
+def test_a_drafts_body_stays_the_members_exact_words():
+    """A work_save body (and a plan title) must stay an exact excerpt for Gene, so it isn't rendered."""
     wall = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)).strftime('%Y-%m-%dT20:00')
     action = {'kind': 'work_save', 'work_id': '', 'version': 0, 'title': 'Game night',
               'body': f'game night is [[time {wall} UTC]]', 'state': 'open'}
@@ -279,8 +279,7 @@ def test_a_drafts_body_renders_its_times_before_it_is_saved():
         chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(model_reply))
         context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high', 'actions': {'work_save': {}}}
         result = await chat.respond('draft and save the game night time for everyone', context)
-        assert result.status == 'completed' and result.action['body'].startswith('game night is <t:')
-        assert '[[' not in result.action['body']
+        assert result.status == 'completed' and result.action['body'] == action['body']
     asyncio.run(scenario())
 
 
