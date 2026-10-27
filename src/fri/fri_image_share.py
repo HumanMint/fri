@@ -235,13 +235,14 @@ class ImageShare:
                 'candidates_checked': attempts}
 
 
-async def send_reply(message, result, **kwargs):
-    """One reply, current event only. Never retry an ambiguous file send."""
+async def send_reply(message, result, *, still=None, **kwargs):
+    """One reply, current event only. Never retry an ambiguous file send. `still()`: whether the reply may still
+    go out, checked after the image's own check waits."""
     media = result.media
     if media is None:
         return await message.reply(result.reply[:1950], **kwargs)
     try:
-        if not await media.guard.current():
+        if not await media.guard.current() or (still and not still()):
             return None  # No send at all after access is revoked or the request is removed.
         attribution = media.attribution()
         content = result.reply[:1800-len(attribution)].rstrip()+'\n\n'+attribution
@@ -257,7 +258,7 @@ async def send_reply(message, result, **kwargs):
             except discord.HTTPException as exc:
                 if exc.status not in (400, 403, 413):
                     raise  # A timeout/server failure can mean sent; no duplicate retry.
-                if not await media.guard.current():
+                if not await media.guard.current() or (still and not still()):
                     return None
                 return await message.reply('discord rejected the image upload. '+attribution, **kwargs)
             finally:

@@ -12,6 +12,7 @@ import time
 import uuid
 from collections import Counter, defaultdict, deque
 from contextlib import AsyncExitStack, closing, nullcontext
+from types import SimpleNamespace
 
 import aiohttp
 import discord
@@ -172,9 +173,10 @@ class Agent:
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
         self.looked = {}  # Messages a turn's model request carried -> when (monotonic), oldest first: see unsend.
-        # (channel, member): (bare "fri" message ID, set once the rest of it comes in, the follow-up window it
-        # opened as (until, the one it replaced) or None in a DM).
-        self.summons = {}
+        self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
+        # Bare "fri" message ID -> ((channel, member), the follow-up window it opened, the one it replaced), oldest
+        # first. Kept past its wait: a message that came in during it is let in by when it arrived (see receive).
+        self.windows = {}
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
 
     @property
@@ -336,14 +338,18 @@ class Agent:
             self.recent[channel] = deque((r for r in rows if r['gene_error'] or r['id'] not in gone), maxlen=30)
         for key in [key for key, latest in self.pending.items() if key[0] == channel and latest in ids]:
             del self.pending[key]  # Its burst is dropped below; nothing is pending for that member now.
-        for key in [key for key, (summoned, *_) in self.summons.items() if key[0] == channel and summoned in ids]:
-            # A bare "fri" taken back: what's said next isn't let in through it. A window it didn't open stays.
-            _, _, opened = self.summons.pop(key)
-            if opened and self.active.get(key) == opened[0]:
-                if opened[1] is None:
+        for summoned in [i for i in ids if self.windows.get(i, ((None,),))[0][0] == channel]:
+            # A bare "fri" taken back: what's said next isn't let in through it, even once its wait is over, as a
+            # message that came in during it may still be coming in. A window it didn't open stays.
+            key, until, replaced = self.windows.pop(summoned)
+            for later, (other, opened, kept) in self.windows.items():
+                if other == key and kept == until:  # A later bare "fri" kept this one's window: not any more.
+                    self.windows[later] = (key, opened, replaced)
+            if self.active.get(key) == until:
+                if replaced is None:
                     del self.active[key]
                 else:
-                    self.active[key] = opened[1]
+                    self.active[key] = replaced
         self.bursts.unsend(channel, ids)
 
     def saw(self, ids):
@@ -359,7 +365,12 @@ class Agent:
 
     def edit(self, channel, message):
         """A member's edit shows in Fri's live view as they left it. Fri's and Gene's rows keep what they
-        said, and in-flight bursts and reply fences keep comparing against what arrived."""
+        said, and in-flight bursts and reply fences keep comparing against what arrived. A member's message
+        still being handled is withdrawn instead: what handles it holds what it said before, maybe with no
+        row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once)."""
+        if (self.handling[message.id] and getattr(message, 'edited_at', None) is not None and
+                not getattr(getattr(message, 'author', None), 'bot', True)):  # Not an embed or pin update.
+            return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
         rows = self.recent.get(channel)
         author = getattr(getattr(message, 'author', None), 'id', None)
         for row in list(rows or ()):
@@ -979,10 +990,14 @@ class Agent:
                 return False
         try:
             current = await message.channel.fetch_message(message.id)
+        except discord.NotFound:
+            self.withdraw(message)  # Out of the live view too, so a later turn can't show it.
+            return False
         except discord.HTTPException:
             return False
         if getattr(current, 'edited_at', None) is not None or current.content != message.content:
-            return False  # Edited since it was sent, maybe to take it back.
+            self.withdraw(message)  # Edited since it was sent, maybe to take it back.
+            return False
         return answering or message.guild is None or await addressed_text(current, self.fri.user.id) is not None
 
     async def listen(self, message):
@@ -1059,8 +1074,9 @@ class Agent:
             if not message.author.bot and not dm and self.config['enabled'] and media(message):
                 # An uncaptioned meme or pic still belongs in the live view, or "the memes above" is empty.
                 profile = await self.profile(parent, message.author.id)
-                # Deleted while the profile read waited: like a text post, it stays out.
-                if profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent:
+                # Deleted or edited while the profile read waited: like a text post, it stays out.
+                if (profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent and
+                        str(message.id) not in self.withdrawn):
                     self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                         'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
                         'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
@@ -1096,9 +1112,9 @@ class Agent:
             if not privacy and self.forgotten.get(message.author.id, 0) != forgotten:
                 return self.miss(message, 'author privacy changed')  # During that read: it may be from after.
             observed = profile.get('revision', 0)
-            # Not if it was deleted while its profile was read.
+            # Not if it was deleted or edited while its profile was read.
             if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
-                    message.id not in self.unsent):
+                    message.id not in self.unsent and str(message.id) not in self.withdrawn):
                 if directed is not None or channel == self.dedicated:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
@@ -1220,12 +1236,14 @@ class Agent:
     async def rest_of(self, key, message):
         """Wait up to REST_SECONDS for the member's next message here, letting it in without "fri". True
         if it came."""
-        came, opened = asyncio.Event(), None
+        came = asyncio.Event()
         if message.guild:  # In a DM every message is already to Fri.
             earlier = self.active.get(key)
             self.active[key] = max(earlier or 0, time.time()+REST_SECONDS)
-            opened = (self.active[key], earlier)
-        self.summons[key] = (message.id, came, opened)
+            self.windows[message.id] = (key, self.active[key], earlier)
+            while time.time()-next(iter(self.windows.values()))[1] > REDELIVERY_SECONDS:
+                del self.windows[next(iter(self.windows))]  # Long over: nothing still coming in came during it.
+        self.summons[key] = (message.id, came)
         waits = [asyncio.ensure_future(asyncio.sleep(REST_SECONDS)), asyncio.ensure_future(came.wait())]
         try:
             await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
@@ -1319,6 +1337,16 @@ class Agent:
         # `since`: the author's (local erasures, privacy revision) as the message came in. A ping's
         # error or a low battery doesn't go out once they erased after it.
         events = [message, *(event for _, event, _ in burst if event is not message)]  # This turn answers for all.
+        began = time.time()  # A nearby post edited before this was read as it is now (see changed).
+
+        def changed(ids):
+            """Those of `ids` deleted, or edited since this turn began: what the model saw of them may be gone."""
+            edited = {int(i) for i, at in self.withdrawn.items() if at >= began and i.isdigit()}
+            return (self.unsent.keys() | edited) & set(ids)
+
+        def taken(event):  # One this turn answers, deleted or edited (an edit may take it back) while it ran.
+            return event.id in self.unsent or str(event.id) in self.withdrawn
+
         def missed(reason):
             for event in events:
                 self.miss(event, reason)
@@ -1395,33 +1423,49 @@ class Agent:
                       'author privacy changed' if self.forgotten.get(message.author.id, 0) != since[0] else None)
             if reason:
                 return await self.dropped(message, events, reason, invitation, since, burst)
-        if any(event.id in self.unsent for event in events):  # Taken back while Fri composed.
+        def taken_back():
+            """Why what the model made can't go out, or be saved, now: a message it answers or one it was shown,
+            deleted since. Checked again after each wait below, up to the save (the delivered part stays)."""
+            if any(taken(event) for event in events):
+                return 'message deleted'
+            return 'nearby message deleted' if changed(result.shown) else None
+
+        if any(taken(event) for event in events):  # Taken back while Fri composed.
             missed('message deleted')
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        if result.response_kind not in ('react', 'quiet') and self.unsent.keys() & result.shown:
-            # Someone took back a message the model was shown: the reply may repeat it.
+        if changed(result.shown):
+            # Someone took back a message the model was shown: the reply may repeat it, and a reaction or a quiet
+            # decision answers it. None goes out or is saved; only a reply's words are worth saying why.
             if ambient:
                 return missed('nearby message deleted')
+            if result.response_kind in ('react', 'quiet'):
+                missed('nearby message deleted')
+                await self.fri.waiting_notices.clear(message.author.id)
+                return
             return await self.withheld(message, events, 'nearby message changed', invitation,
                                        fenced=since is not None, control=since is None, logged='nearby message deleted')
         if result.response_kind in ('react', 'quiet'):
+            async def stop():  # Last before the reaction, after its wait for its turn.
+                return bool(since and await self.erasure(message.author.id, *since)) or taken_back() is not None
             if (result.status == 'completed' and result.response_kind == 'react' and await self.acknowledge(
-                    message, result.reaction, (lambda: self.erasure(message.author.id, *since)) if since else None)):
+                    message, result.reaction, stop)):
                 self.answered(events)
-            elif any(event.id in self.unsent for event in events):  # While the reaction waited its turn.
-                missed('message deleted')
+            elif reason := taken_back():  # While the reaction waited its turn.
+                missed(reason)
                 await self.fri.waiting_notices.clear(message.author.id)
                 return
             else:
                 missed('reaction withheld' if result.response_kind == 'react' else 'chose quiet')
-            await self.fri.record_turn(result)  # Records the decision, never claimed reaction delivery.
+            if not taken_back():  # Deleted while the reaction went out: it stays, but isn't saved.
+                await self.fri.record_turn(result)  # Records the decision, never claimed reaction delivery.
             # Neither outcome renews active attention or the ambient reply timer.
             await self.fri.waiting_notices.clear(message.author.id)
             return
         async def delivered():  # A preview is answered once posted, even if binding it fails next.
             self.answered(events)
-            await self.fri.record_turn(result)
+            if not taken_back():  # Deleted while it posted: the card stays, but isn't saved.
+                await self.fri.record_turn(result)
 
         if result.post_preview:
             from .fri_workspace import show_preview
@@ -1458,16 +1502,17 @@ class Agent:
         recorded = self.recording[key] = asyncio.Event()
         sent = None
         try:
-            sent = await send_reply(message, result, view=view, mention_author=False,
-                                    allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+            sent = await send_reply(message, result, view=view, mention_author=False, allowed_mentions=NO_MENTIONS,
+                                    suppress_embeds=True, still=lambda: taken_back() is None)
             if sent is None:  # Nothing was delivered, so nothing is recorded as said.
-                missed('image share withdrawn')
+                missed(taken_back() or 'image share withdrawn')
                 await self.fri.waiting_notices.clear(message.author.id)
                 return
             self.saving.add(getattr(sent, 'id', None))  # So a delete while it saves is noticed (see unsend).
             self.answered(events)
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
-            saved = await self.fri.record_turn(result, sent)
+            # Deleted while it was sent: the reply stays, but isn't saved or echoed.
+            saved = None if taken_back() else await self.fri.record_turn(result, sent)
             # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory,
             # or a save that failed, whose reply may carry exactly what the controller would have refused.
             if (echo and saved is not None and saved.get('kept', True) and message.guild and
@@ -1488,7 +1533,7 @@ class Agent:
 
     async def acknowledge(self, message, emoji, erased=None):
         """Only react to the triggering message, once, within the existing write scope. True once added.
-        `erased`: whether its author erased since, checked last."""
+        `erased`: whether it mustn't go out now, e.g. its author erased since, checked last."""
         if emoji not in REACTIONS or not self.config['enabled']:
             return
         async with self.reaction_lock:

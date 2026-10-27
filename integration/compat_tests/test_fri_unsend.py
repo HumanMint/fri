@@ -207,6 +207,27 @@ def test_a_deleted_forget_me_is_not_carried_out(monkeypatch, tmp_path, waited):
     asyncio.run(scenario())
 
 
+def test_a_forget_me_deleted_during_its_last_check_is_not_carried_out(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        control = message('fri forget me')
+        async def fetch(mid):  # Discord answers with it, then its delete arrives before Fri goes on.
+            item = rows[mid]
+            if mid == control.id:
+                await delete(fri, rows, control)
+            return item
+        channel.fetch_message.side_effect = fetch
+        try:
+            await asyncio.wait_for(agent.handle(control), 5)
+            assert control.id in agent.unsent
+            assert store.chat_context('123', 'public:1', '20')['personal_memory']['enabled']
+            control.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('kind', ['reply', 'react', 'quiet'])
 def test_a_message_deleted_while_fri_composes_is_neither_answered_nor_saved(monkeypatch, tmp_path, kind):
     async def scenario():
@@ -362,6 +383,127 @@ def test_another_members_deleted_message_never_reaches_the_model_or_the_reply(mo
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('kind', ['react', 'quiet'])
+def test_another_members_message_deleted_after_the_model_saw_it_stops_a_reaction_or_quiet(monkeypatch, tmp_path, kind):
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        regret = message('my landlord is ezra kim on 5th street lol', user=21)
+        trigger = message('fri lmaooo')
+        trigger.reactions, trigger.add_reaction = [], AsyncMock()
+        async def respond(context, ready):
+            await ready()
+            assert any('ezra' in r['text'] for r in context.get('recent', []))
+            await delete(fri, rows, regret)  # Deleted while the model decided.
+            return (ChatResult(status='completed', response_kind='react', reaction='😭') if kind == 'react' else
+                    ChatResult(status='completed', response_kind='quiet'))
+        model(fri, tmp_path, respond)
+        record = AsyncMock(wraps=fri.record_turn)
+        monkeypatch.setattr(fri, 'record_turn', record)
+        try:
+            await heard(agent, regret)
+            await asyncio.wait_for(agent.handle(trigger), 10)
+            fri.chat_once.assert_awaited_once()
+            trigger.add_reaction.assert_not_awaited()
+            trigger.reply.assert_not_awaited()
+            record.assert_not_awaited()  # The decision drew on it, so it isn't saved either.
+            assert not store.chat_context('123', 'public:1', '20')['turns']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_message_the_model_saw_deleted_during_the_image_check_stops_the_share(monkeypatch, tmp_path):
+    from fri.fri_image_share import PreparedImage
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        regret = message('my landlord is ezra kim on 5th street lol', user=21)
+        trigger = message('fri show me a cat about that')
+        async def current():  # The share's own last check awaits; the delete lands meanwhile.
+            await delete(fri, rows, regret)
+            return True
+        async def respond(context, ready):
+            await ready()
+            return ChatResult(status='completed', reply='here', media=PreparedImage(
+                b'png', 'cat.png', 'https://example.test/posts/1', 'artist', SimpleNamespace(current=current)))
+        model(fri, tmp_path, respond)
+        record = AsyncMock(wraps=fri.record_turn)
+        monkeypatch.setattr(fri, 'record_turn', record)
+        try:
+            await heard(agent, regret)
+            await asyncio.wait_for(agent.handle(trigger), 10)
+            trigger.reply.assert_not_awaited()  # Neither the image nor the words that may repeat it.
+            record.assert_not_awaited()
+            assert not store.chat_context('123', 'public:1', '20')['turns']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('whose', ['own', 'nearby'])
+def test_a_message_deleted_while_its_reply_is_sent_is_not_saved(monkeypatch, tmp_path, whose):
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        regret = message('my landlord is ezra kim on 5th street lol', user=21)
+        trigger = message('fri what do you think of that')
+        async def respond(context, ready):
+            await ready()
+            return ChatResult(status='completed', reply='bold of them')
+        model(fri, tmp_path, respond)
+        async def sending(text, **kwargs):  # Discord takes the reply; the delete lands before the send returns.
+            await delete(fri, rows, trigger if whose == 'own' else regret)
+            return SimpleNamespace(id=trigger.id+100, content=text)
+        trigger.reply.side_effect = sending
+        record = AsyncMock(wraps=fri.record_turn)
+        monkeypatch.setattr(fri, 'record_turn', record)
+        try:
+            await heard(agent, regret)
+            await asyncio.wait_for(agent.handle(trigger), 10)
+            trigger.reply.assert_awaited_once()  # The delivered reply stays.
+            record.assert_not_awaited()  # The save doesn't: it would keep what was taken back.
+            assert not store.chat_context('123', 'public:1', '20')['turns']
+            assert str(trigger.id+100) not in {r['id'] for r in agent.recent[1]}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_burst_message_deleted_while_the_reaction_waits_its_turn_is_neither_reacted_to_nor_saved(monkeypatch,
+                                                                                                    tmp_path):
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        first = message('fri my landlord is ezra kim on 5th street')
+        latest = message('lmaooo')
+        latest.reactions, latest.add_reaction = [], AsyncMock()
+        burst = [(time.monotonic(), item, item.content) for item in (first, latest)]
+        agent.handling[first.id] += 1  # As receive() holds a burst's earlier messages until its reply answers them.
+        fri.chat_once.return_value = ChatResult(status='completed', response_kind='react', reaction='😭')
+        record = AsyncMock(wraps=fri.record_turn)
+        monkeypatch.setattr(fri, 'record_turn', record)
+        await agent.reaction_lock.acquire()  # Another reaction is going out.
+        task = asyncio.create_task(agent.reply_once(latest, latest.content, burst=burst, since=(0, 0)))
+        try:
+            for _ in range(200):
+                if fri.chat_once.await_count:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            await delete(fri, rows, first)
+            agent.reaction_lock.release()
+            await asyncio.wait_for(task, 10)
+            latest.add_reaction.assert_not_awaited()
+            record.assert_not_awaited()
+            assert not store.chat_context('123', 'public:1', '20')['turns']
+        finally:
+            if agent.reaction_lock.locked():
+                agent.reaction_lock.release()
+            await asyncio.gather(task, return_exceptions=True)
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_message_deleted_while_typing_starts_never_reaches_the_model(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
@@ -456,6 +598,41 @@ def test_deleted_messages_never_come_back_into_the_live_view(monkeypatch, tmp_pa
             await asyncio.wait_for(agent.handle(trigger), 10)
             trigger.reply.assert_awaited_once()
             assert {r['id'] for r in agent.recent[1]} == {str(trigger.id)}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('whose', ['nearby', 'own'])
+def test_a_message_edited_while_it_comes_in_never_shows_the_model_its_old_words(monkeypatch, tmp_path, whose):
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        if whose == 'own':
+            agent.dedicated = 1  # Fri's own channel: every message there is to Fri, "fri" or not.
+        requests = []
+        async def respond(context, ready):
+            await ready()
+            requests.append(json.dumps(context, default=str))
+            return ChatResult(status='completed', reply='sure')
+        model(fri, tmp_path, respond)
+        regret = message('ok fine i cheated on the quiz', user=21)
+        incoming = agent.incoming
+        async def slow_profile(item, *args, **kwargs):  # Edited while its author's profile is read.
+            if item is regret:
+                current = SimpleNamespace(id=regret.id, channel=regret.channel, content='ok fine',
+                    author=regret.author, attachments=[], edited_at=discord.utils.utcnow())
+                rows[regret.id] = current
+                await fri.on_raw_message_edit(SimpleNamespace(channel_id=1, message=current))
+            return await incoming(item, *args, **kwargs)
+        agent.incoming = slow_profile
+        try:
+            await asyncio.wait_for(agent.handle(regret), 10)
+            assert not any('cheated' in r['text'] for r in agent.recent[1])
+            if whose == 'nearby':  # Someone else's turn, with it in view.
+                await asyncio.wait_for(agent.handle(message('fri hey')), 10)
+                assert len(requests) == 1
+            assert not any('cheated' in request for request in requests)
         finally:
             await fri.close()
     asyncio.run(scenario())
