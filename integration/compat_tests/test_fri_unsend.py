@@ -461,6 +461,41 @@ def test_deleted_messages_never_come_back_into_the_live_view(monkeypatch, tmp_pa
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('whose', ['nearby', 'own'])
+def test_a_message_edited_while_it_comes_in_never_shows_the_model_its_old_words(monkeypatch, tmp_path, whose):
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        if whose == 'own':
+            agent.dedicated = 1  # Fri's own channel: every message there is to Fri, "fri" or not.
+        requests = []
+        async def respond(context, ready):
+            await ready()
+            requests.append(json.dumps(context, default=str))
+            return ChatResult(status='completed', reply='sure')
+        model(fri, tmp_path, respond)
+        regret = message('ok fine i cheated on the quiz', user=21)
+        incoming = agent.incoming
+        async def slow_profile(item, *args, **kwargs):  # Edited while its author's profile is read.
+            if item is regret:
+                current = SimpleNamespace(id=regret.id, channel=regret.channel, content='ok fine',
+                    author=regret.author, attachments=[], edited_at=discord.utils.utcnow())
+                rows[regret.id] = current
+                await fri.on_raw_message_edit(SimpleNamespace(channel_id=1, message=current))
+            return await incoming(item, *args, **kwargs)
+        agent.incoming = slow_profile
+        try:
+            await asyncio.wait_for(agent.handle(regret), 10)
+            assert not any('cheated' in r['text'] for r in agent.recent[1])
+            if whose == 'nearby':  # Someone else's turn, with it in view.
+                await asyncio.wait_for(agent.handle(message('fri hey')), 10)
+                assert len(requests) == 1
+            assert not any('cheated' in request for request in requests)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_message_the_model_saw_then_pushed_out_of_the_live_view_still_withholds_the_reply(monkeypatch, tmp_path):
     """fri #67, #88: the live view keeps 30 rows; a row the request carried is marked when deleted even once it's gone."""
     async def scenario():

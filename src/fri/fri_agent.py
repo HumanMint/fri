@@ -12,6 +12,7 @@ import time
 import uuid
 from collections import Counter, defaultdict, deque
 from contextlib import AsyncExitStack, closing, nullcontext
+from types import SimpleNamespace
 
 import aiohttp
 import discord
@@ -364,7 +365,12 @@ class Agent:
 
     def edit(self, channel, message):
         """A member's edit shows in Fri's live view as they left it. Fri's and Gene's rows keep what they
-        said, and in-flight bursts and reply fences keep comparing against what arrived."""
+        said, and in-flight bursts and reply fences keep comparing against what arrived. A member's message
+        still being handled is withdrawn instead: what handles it holds what it said before, maybe with no
+        row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once)."""
+        if (self.handling[message.id] and getattr(message, 'edited_at', None) is not None and
+                not getattr(getattr(message, 'author', None), 'bot', True)):  # Not an embed or pin update.
+            return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
         rows = self.recent.get(channel)
         author = getattr(getattr(message, 'author', None), 'id', None)
         for row in list(rows or ()):
@@ -1064,8 +1070,9 @@ class Agent:
             if not message.author.bot and not dm and self.config['enabled'] and media(message):
                 # An uncaptioned meme or pic still belongs in the live view, or "the memes above" is empty.
                 profile = await self.profile(parent, message.author.id)
-                # Deleted while the profile read waited: like a text post, it stays out.
-                if profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent:
+                # Deleted or edited while the profile read waited: like a text post, it stays out.
+                if (profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent and
+                        str(message.id) not in self.withdrawn):
                     self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                         'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
                         'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
@@ -1101,9 +1108,9 @@ class Agent:
             if not privacy and self.forgotten.get(message.author.id, 0) != forgotten:
                 return self.miss(message, 'author privacy changed')  # During that read: it may be from after.
             observed = profile.get('revision', 0)
-            # Not if it was deleted while its profile was read.
+            # Not if it was deleted or edited while its profile was read.
             if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
-                    message.id not in self.unsent):
+                    message.id not in self.unsent and str(message.id) not in self.withdrawn):
                 if directed is not None or channel == self.dedicated:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
