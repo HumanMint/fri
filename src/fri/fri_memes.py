@@ -81,7 +81,7 @@ class Memes:
         # restart or a rollback leaves none of it behind and erasing it never depends on that file.
         self.noted = {}
         self.verified = 0
-        self.replies = {}  # A laugh's message ID -> (ID of the message it replies to, when), for LAUGH_SECONDS.
+        self.replies = {}  # A reply's message ID -> (ID of the message it replies to, when), for LAUGH_SECONDS.
         self.lurking = set()  # Chat lines whose laugh-started check is running (see heard).
         self.tasks = set()
 
@@ -216,13 +216,16 @@ class Memes:
             return
         rows = list(self.agent.recent.get(channel, ()))  # Never index: that would add a channel to the view.
         at = next((i for i in range(len(rows)-1, -1, -1) if rows[i].get('id') == str(message.id)), None)
-        if at is None or not laughing(rows[at]):
+        if at is None:
             return
         now = time.time()
         self.replies = {key: value for key, value in self.replies.items() if value[1] > now-LAUGH_SECONDS}
+        # Every reply's, laugh or not: one edited into a laugh later still laughs at what it replied to.
         target = getattr(getattr(message, 'reference', None), 'message_id', None)
         if target:
             self.replies[str(message.id)] = (str(target), now)
+        if not laughing(rows[at]):
+            return
         replies = {key: value[0] for key, value in self.replies.items()}
         post = laughed_at(rows, replies, at)
         if post is None or not said(rows[post]) or rows[post]['id'] in self.lurking:

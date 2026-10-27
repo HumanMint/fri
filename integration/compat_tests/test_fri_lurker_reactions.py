@@ -317,6 +317,23 @@ def test_the_chat_line_instruction_keeps_the_quiet_default_and_the_meme_rules():
         assert rule in text
 
 
+def test_a_reply_edited_into_a_laugh_still_laughs_at_what_it_replied_to(chat):
+    async def scenario():
+        h = chat
+        await h.say(80, 12, 'the oven is self aware now')
+        line = await h.say(81, 13, 'it asked me to stop opening it')
+        typo = await h.say(82, 30, 'lmoa', reference=reply_to(80))  # Not a laugh when it came in.
+        typo.content, typo.edited_at = 'lmao', dt.datetime.fromtimestamp(h.clock[0], dt.timezone.utc)
+        h.agent.edit(3, typo)
+        await h.say(83, 31, 'lol')  # One member laughing at the newer line, the other at the older one.
+        h.agent.run.assert_not_awaited()
+        line.add_reaction.assert_not_awaited()
+        await h.say(84, 32, 'lmao', reference=reply_to(80))  # A second at the older one is what it needs.
+        h.agent.run.assert_awaited_once()
+        assert h.agent.run.await_args.args[2]['caption'] == 'the oven is self aware now'
+    asyncio.run(scenario())
+
+
 # The pattern laughter() replaced: the same laughs, matched with backtracking that could take seconds.
 OLD_LAUGH = r"(?:lo+l|lmf?ao+|ha(?:ha)+h?|ㅋ{2,}|i['’]?m\s+dead|crying|😂|🤣|💀|😭)"
 OLD_LAUGHTER = re.compile(OLD_LAUGH + r'(?:\s*' + OLD_LAUGH + r')*[\s.!]*', re.I)
