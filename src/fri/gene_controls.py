@@ -148,6 +148,47 @@ def quick_control(text, *, music_context=False):
 
 
 
+FILLER = r"(?:(?:no|nah|nope|oops|sorry|bro|yo|fri|lol|wait|actually)[\s,.!]*)*"
+MARKER = r"(?:not (?:that|this|the) (?:one|song|track)|wrong (?:one|song|track)|that'?s not (?:it|the one|the song|the track))"
+LINK = r"(?:i meant|it'?s|its|it was)"
+# The whole message is one correction: a marker, then a separator or "i meant"/"it's", then the song (or just
+# "i meant <song>"). Nothing before it but a filler word, so a quote, an example, someone else's words or a
+# question never fits, and the song is what follows, whatever words its title uses.
+CORRECTION = re.compile(
+    rf"^{FILLER}(?:{MARKER}(?:\s+(?:lol|lmao|bro))?\s*(?:[,:;.!—–-]+\s*(?:{LINK}\s+)?|\s+{LINK}\s+)|i meant\s+)"
+    r"(?!(?:i meant\s+)?to\b|don'?t\b|do not\b)(?P<song>\S.*?)(?:\s+(?:lol|lmao|pls|please|thx))*[\s.!?]*$")
+CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
+
+
+def correction_text(text):
+    """A message as its author wrote it: no code, no quoted lines (">>>" quotes the rest), no mentions."""
+    text = re.sub(r'(?s)```.*?```|``.*?``|`[^`\n]*`', ' ', text)
+    text = re.sub(r'(?ms)^>>>.*', ' ', text)
+    text = re.sub(r'(?m)^>[^\n]*', ' ', text)
+    text = re.sub(r'<@!?\d+>', ' ', text)
+    return ' '.join(text.casefold().replace('’', "'").split())
+
+
+def correction(text, argument):
+    """A member putting right a song Gene just played for them ("not that one, X", "i meant X"): the song is
+    the argument, in their own words after the correction. Whether there was such a play is checked by Gene's
+    control store (Controls.enqueue)."""
+    match = CORRECTION.match(correction_text(text))
+    if not match or not argument:
+        return False
+    song = match.group('song').strip(' "\'“”')
+    named = set(re.findall(r"[\w']+", argument.casefold()))
+    return bool(named) and (argument.casefold() in song or named <= set(re.findall(r"[\w']+", song)))
+
+
+def just_played(receipts):
+    """A play Gene finished for this member in this conversation within the correction window, by the
+    controller's own receipts (never Fri's claims)."""
+    import time
+    return any(row.get('action') == 'play' and row.get('state') == 'finished' and
+               -5 <= time.time()-row.get('at', 0) <= CORRECTION_SECONDS for row in receipts)
+
+
 def current_music_context(receipts):
     """Use only controller-supplied same-conversation receipts, never assistant claims."""
     import time
