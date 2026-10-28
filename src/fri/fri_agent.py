@@ -983,6 +983,14 @@ class Agent:
             task = asyncio.get_running_loop().create_task(self.rerun(self.reanswer.pop(i), i))
             self.reruns.add(task)
             task.add_done_callback(self.reruns.discard)
+            task.add_done_callback(lambda task, i=i: self.rerun_cancelled(task, i))
+
+    def rerun_cancelled(self, task, i):
+        """A re-run cancelled before its first step never reaches its own cleanup (rerun's finally), so its marks go
+        here (fri #132). Only teardown cancels one; one that ran has already cleaned up, and this finds nothing."""
+        if task.cancelled():
+            self.rerunning.pop(i, None)
+            self.edit_seen.pop(i, None)
 
     async def rerun(self, channel_id, message_id):
         """A message edited while Fri answered it, fetched again and handled as if it just came in, so every

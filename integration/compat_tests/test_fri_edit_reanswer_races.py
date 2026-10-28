@@ -374,3 +374,22 @@ def test_meme_signin_cannot_revalidate_same_id_replacement(chat, monkeypatch):
         analyze.assert_not_awaited()
         line.add_reaction.assert_not_awaited()
     asyncio.run(scenario())
+
+
+def test_a_rerun_cancelled_before_it_starts_leaves_no_bookkeeping(monkeypatch, tmp_path):
+    """fri #132: a re-run cancelled before its first step never reaches its own cleanup; its marks still go."""
+    async def scenario():
+        fri, agent, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+        try:
+            agent.reanswer[700] = 1
+            agent.saw_edit(700, discord.utils.utcnow())
+            agent.answer_edits()
+            [task] = agent.reruns
+            assert 700 in agent.rerunning and 700 in agent.edit_seen
+            task.cancel()  # Before it ran at all, as teardown cancels it.
+            await asyncio.gather(task, return_exceptions=True)
+            assert task.cancelled() and not agent.reruns
+            assert 700 not in agent.rerunning and 700 not in agent.edit_seen
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
