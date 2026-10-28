@@ -191,6 +191,9 @@ class MemoryView(discord.ui.View):
                 self.add_item(move)
 
     async def interaction_check(self, interaction):
+        from .fri_buttons import answers
+        if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
+            return False
         return await allowed(self.cog, interaction, self.scope)
 
     async def remove(self, interaction):

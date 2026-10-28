@@ -395,8 +395,15 @@ class Fri(discord.Client):
             read = [mid for entry in getattr((fence or {}).get('actions'), 'reads', ()) for mid in entry['shown']]
             carried = [*looked, *quoted, *read, *(int(row['id']) for row in context.get('recent', [])
                                                   if not row.get('gene_error') and str(row.get('id', '')).isdigit())]
+            # Fri's own among them, its cached replies and a reply target it wrote: an update with no author for one
+            # is no member's edit, even once it's out of the live view (see Agent.edit).
+            me = str(getattr(self.user, 'id', ''))
+            ours = [int(row['id']) for row in context.get('recent', [])
+                    if row.get('fri') and str(row.get('id', '')).isdigit()]
+            ours += [int(row['source']['id']) for row in context.get('reply_target', []) + context.get('invited_context', [])
+                     if me and row.get('source', {}).get('user_id') == me and str(row['source'].get('id', '')).isdigit()]
             if self.agent:  # Before the checks below refetch them: a delete after that is marked (see unsend).
-                self.agent.saw(carried)
+                self.agent.saw(carried, ours)
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.

@@ -306,3 +306,111 @@ def test_a_reply_hands_its_view_the_message_it_went_out_on(monkeypatch, tmp_path
             await fri.close()
     asyncio.run(scenario())
 
+
+
+class Once(Response):
+    """As Discord has it: an interaction is answered once, and discord.py raises on a second response."""
+
+    def once(self):
+        if self.calls:
+            raise discord.InteractionResponded(None)
+
+    async def send_message(self, *args, **kwargs):
+        self.once()
+        await super().send_message(*args, **kwargs)
+
+    async def edit_message(self, **kwargs):
+        self.once()
+        await super().edit_message(**kwargs)
+
+    async def defer(self, **kwargs):
+        self.once()
+        await super().defer(**kwargs)
+
+
+def raced(fri, state, custom_id, **kwargs):
+    """A click as discord.py hands it to every responder: one Interaction, with its own extras."""
+    interaction = click(fri, SimpleNamespace(id=1, parent_id=None), custom_id=custom_id,
+                        message=posted(state, [custom_id]), **kwargs)
+    interaction.response, interaction.extras = Once(), {}
+    return interaction
+
+
+def test_a_click_racing_its_views_expiry_gets_one_answer():
+    """fri #175: the click reaches discord.py while the draft's view is live, so the fallback and the view's own
+    callback are both queued; the view ends before either runs. The fallback answers, and the view stays out."""
+    async def scenario():
+        state, views = store()
+        fri = SimpleNamespace(user=state.user, _connection=SimpleNamespace(_view_store=views))
+        cog, _ = drafts()
+        view = DraftView(cog, 20, 'Add a queue command', reviewed=True)
+        custom_id = f'fri:request:{view.source_id}:cancel'
+        views.add_view(view, 500)
+        interaction = raced(fri, state, custom_id)
+        views.dispatch_view(2, custom_id, interaction)  # Both queued, with the view still live.
+        view.stop()  # Then it ends, as a timeout ends it, before either has run.
+        while tasks := list(views._ViewStore__tasks):
+            await asyncio.gather(*tasks)
+        assert interaction.followup.send.await_count == 1  # Not also "that request action did not finish".
+        assert interaction.response.calls == [('edit', None, {'view': None})]
+        assert said(interaction) == ['that one expired. ask again.']
+        assert not view.finished  # Its Cancel never ran.
+    asyncio.run(scenario())
+
+
+def test_a_click_its_live_view_took_is_left_to_it_even_once_the_view_ends():
+    """fri #175, the other order: the view took the click first. It ended before the fallback looked, so the
+    fallback would think it expired; it stays out, since the view answers."""
+    from fri.fri_buttons import Ended
+    async def scenario():
+        state, views = store()
+        fri = SimpleNamespace(user=state.user, _connection=SimpleNamespace(_view_store=views))
+        cog, _ = drafts()
+        view = DraftView(cog, 20, 'Add a queue command', reviewed=True)
+        custom_id = f'fri:request:{view.source_id}:cancel'
+        views.add_view(view, 500)
+        interaction = raced(fri, state, custom_id)
+        assert await view.interaction_check(interaction)
+        view.stop()
+        await Ended(discord.ui.Button(custom_id=custom_id)).callback(interaction)
+        assert interaction.response.calls == [] and said(interaction) == []
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('kind', ['draft', 'preview', 'settings', 'memory'])
+def test_every_view_the_fallback_covers_stays_out_of_a_click_it_answered(monkeypatch, tmp_path, kind):
+    """fri #175: each view the fallback stands in for declines a click the fallback answered, before any other
+    check, and says nothing, not even "not your button"."""
+    from fri.fri_agent import BehaviorPreview
+    from fri.fri_buttons import answers
+    from fri.fri_memory_panel import MemoryView
+    async def scenario():
+        state, views = store()
+        fri = SimpleNamespace(user=state.user, _connection=SimpleNamespace(_view_store=views))
+        cog, _ = drafts()
+        cog.agent.member = AsyncMock(return_value=object())
+        closing = None
+        if kind == 'settings':
+            closing, agent, _, _ = harness(monkeypatch, tmp_path)
+            closing._connection.user = SimpleNamespace(id=FRI)
+            closing.owner_id = 20
+            agent.member = cog.agent.member
+            view = BehaviorPreview(agent, {'voice_notes': 'brief'}, 1)
+        elif kind == 'memory':
+            view = MemoryView(cog, {'guild_id': '123', 'user_id': '20', 'channel_id': '1',
+                                    'conversation_id': 'public:1'}, {'entries': [], 'revision': 0})
+        else:
+            view = DraftView(cog, 20, 'Add a queue command', reviewed=kind == 'preview')
+        try:
+            for user in (20, 30):  # Its member's click, and a stranger's.
+                interaction = raced(fri, state, 'fri:behavior:next', user=user)
+                interaction.channel.permissions_for = lambda _: SimpleNamespace(view_channel=True,
+                                                                              read_message_history=True)
+                assert answers(interaction, 'ended')
+                assert not await view.interaction_check(interaction)
+                assert interaction.response.calls == [] and said(interaction) == []
+            cog.agent.member.assert_not_awaited()
+        finally:
+            if closing:
+                await closing.close()
+    asyncio.run(scenario())

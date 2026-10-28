@@ -83,9 +83,11 @@ class BehaviorPreview(PagedPreview):
                          'Apply settings', 'fri:behavior:', self.apply)
 
     async def interaction_check(self, interaction):
+        from .fri_buttons import answers, not_yours
         fri = self.agent.fri
+        if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
+            return False
         if interaction.user.id != fri.owner_id:
-            from .fri_buttons import not_yours
             await not_yours(interaction)
             return False
         return (interaction.message.author.id == fri.user.id and
@@ -194,7 +196,9 @@ class Agent:
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
-        self.looked = {}  # Messages a turn's model request carried -> when (monotonic), oldest first: see unsend.
+        # Messages a turn's model request carried -> (when (monotonic), whether Fri or Gene wrote it), oldest first:
+        # see unsend and edit.
+        self.looked = {}
         self.summons = {}  # (channel, member): (bare "fri" message ID, set once the rest of it comes in).
         # Bare "fri" message ID -> ((channel, member), the follow-up window it opened, the one it replaced), oldest
         # first. Kept past its wait: a message that came in during it is let in by when it arrived (see receive).
@@ -379,15 +383,16 @@ class Agent:
         self.saved_turns.withdraw(ids)  # Their saved exchanges too, so their words don't come back as history.
         self.receipts.withdraw(ids)  # And Fri's outside answers that drew on them, or were them.
 
-    def saw(self, ids):
+    def saw(self, ids, ours=()):
         """Messages a turn's model request carries, wherever they came from (the live view, a reply target, a
         read, a look): a delete is marked for an hour, past any reply still running, even once one leaves the
-        live view, so the turn's last checks and its delivery notice it (see unsend)."""
-        now = time.monotonic()
+        live view, so the turn's last checks and its delivery notice it (see unsend). `ours`: those Fri or Gene
+        wrote, kept as long, so an update with no author for one is still no member's edit (fri #149)."""
+        now, ours = time.monotonic(), set(ours)
         for i in ids:
-            self.looked.pop(i, None)
-            self.looked[i] = now
-        while self.looked and now-next(iter(self.looked.values())) > REDELIVERY_SECONDS:
+            _, own = self.looked.pop(i, (None, False))
+            self.looked[i] = (now, own or i in ours)
+        while self.looked and now-next(iter(self.looked.values()))[0] > REDELIVERY_SECONDS:
             del self.looked[next(iter(self.looked))]
 
     def edit(self, channel, message):
@@ -401,9 +406,11 @@ class Agent:
         A partial update has no author, so whose it is and what it says now are unknown: it counts as a
         member's edit, and a row it drops is withdrawn (fri #135). One Fri never had in hand marks nothing."""
         sender = getattr(message, 'author', None)
-        # Fri's or Gene's own row in the live view is no member's edit, even with no author (fri #140 review).
-        ours = sender is None and any(r['id'] == str(message.id) and (r.get('fri') or r['gene_error'])
-                                      for r in self.recent.get(channel, ()))
+        # Fri's or Gene's own row in the live view is no member's edit, even with no author (fri #140 review), nor
+        # one a model request carried, once it's out of the view (fri #149).
+        ours = sender is None and (any(r['id'] == str(message.id) and (r.get('fri') or r['gene_error'])
+                                       for r in self.recent.get(channel, ())) or
+                                   self.looked.get(message.id, (None, False))[1])
         edited = (getattr(message, 'edited_at', None) is not None and not ours and
                   (sender is None or not getattr(sender, 'bot', True)))  # Not an embed or pin update.
         if getattr(message, 'edited_at', None) is not None:  # Anyone's edit, Fri's too, ends an outside answer's
@@ -590,6 +597,8 @@ class Agent:
             return ERASED if await erased() else False
         if await erased():
             return ERASED
+        if message.guild is None and not self.config['support_dms']:  # Gone off during those reads (fri #170).
+            return 'dms off'
         if self.control_queue[0] != message.id:  # An earlier request is still deciding or preparing.
             await message.reply('one settings preview at a time, give me a moment.', allowed_mentions=NO_MENTIONS)
             return True
@@ -624,8 +633,12 @@ class Agent:
                     await message.reply('that change is too large for one preview. please change one behavior at a time.', allowed_mentions=NO_MENTIONS)
                 else:
                     view = BehaviorPreview(self, changes, state['version'])
-                    await message.reply(view.content, view=view, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+                    # Its buttons come off that reply when it times out (fri #176).
+                    view.message = await message.reply(view.content, view=view, allowed_mentions=NO_MENTIONS,
+                                                       suppress_embeds=True)
         except (ValueError, KeyError, TypeError):
+            if message.guild is None and not self.config['support_dms']:  # It may have raised after they went off.
+                return 'dms off'
             await message.reply('i couldn’t parse that settings preview. nothing was saved.', allowed_mentions=NO_MENTIONS)
         return True
 
@@ -1207,8 +1220,13 @@ class Agent:
             return
         dm = message.guild is None
         if dm:
-            if message.author.bot or not self.config['support_dms'] or not await self.member(message.author.id, fresh=True):
-                return  # Fresh: someone who just left mustn't hear server context through a cached lookup.
+            if message.author.bot:
+                return
+            if not self.config['support_dms']:
+                return self.forward_dropped(message, 'dms off')  # Counted, like a forward at any later gate.
+            if not await self.member(message.author.id, fresh=True):
+                # Fresh: someone who just left mustn't hear server context through a cached lookup.
+                return self.forward_dropped(message, 'not a member')
         elif not self.allowed(message.channel):
             self.memory_controls.leave(message.author.id, message.id)  # Outside, it's chat (see Fri.talk).
             # An outside ping is one event, never a new ambient/active channel.

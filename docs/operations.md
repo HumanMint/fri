@@ -655,7 +655,7 @@ Fri can't restart anything. It only notices and says so.
    without network access. Auth and state mounts retain their separate permissions.
 
 3. Create `/srv/fri/install.json`, owned by the trusted maintainer and mode `0600`.
-   On the current installation the values are:
+   With Gene's default `/srv/gene` layout the values are:
 
    ```json
    {
