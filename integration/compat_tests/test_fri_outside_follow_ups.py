@@ -13,7 +13,7 @@ import discord
 import pytest
 
 from compat_tests.test_fri_mentions import environment
-from fri.fri import UNAVAILABLE
+from fri.fri import UNAVAILABLE, Fri
 from fri.fri_agent import Agent
 from fri.fri_chat import ChatResult
 from fri.fri_errors import ControllerRejected
@@ -423,6 +423,120 @@ def test_a_dm_reads_no_invited_context(monkeypatch, tmp_path):
             context, _ = await handled(w, event, AGAIN)
             assert 'invited_context' not in context and ANSWER not in json.dumps(context, default=str)
             assert event.reply.await_args.args[0] == AGAIN
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+# Review round 1: a withdrawal or expiry during a check's last wait still stops the answer reaching the model or a reply.
+
+def taking_back(w, target, post, active):
+    """Its API, with `post` taken back (`target`: how) during the second privacy read of a check while `active`."""
+    api, reads, done = w.fri.api, [0], [False]
+
+    async def watched(method, path, payload=None):
+        result = await api(method, path, payload)
+        if active[0] and path == '/chat/mentions/profiles':
+            reads[0] += 1
+            if reads[0] == 2:  # The check's last wait, after every refetch.
+                if target == 'delete':
+                    w.rows.pop(post.id)
+                    w.agent.unsend(w.channel.id, [post.id])
+                else:
+                    changed = copy.copy(post)
+                    changed.content = 'TAKEN BACK'
+                    changed.edited_at = dt.datetime.now(dt.timezone.utc)
+                    w.rows[post.id] = changed
+                    w.agent.edit(w.channel.id, changed)
+                done[0] = True
+        return result
+    return watched, done
+
+
+@pytest.mark.parametrize('target', ['old-delete', 'old-edit', 'answer-edit', 'answer-delete'])
+@pytest.mark.parametrize('phase', ['model', 'delivery'])
+def test_a_withdrawal_during_the_last_check_stops_the_answer(monkeypatch, tmp_path, target, phase):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        w.fri.data = tmp_path
+        try:
+            old, _, answer = await opened(w)
+            event = follow_up(w, answer)
+            event.reply.return_value = w.fri_post(AGAIN)
+            active, shown = [False], []
+            post = answer if target.startswith('answer') else old
+            w.fri.api, done = taking_back(w, target.split('-')[1], post, active)
+
+            async def model(text, context, *, ready=None):
+                active[0] = phase == 'model'
+                await ready()
+                shown.extend(own(context))
+                active[0] = phase == 'delivery'
+                return ChatResult(status='completed', reply=AGAIN)
+            w.fri.chat_once = Fri.chat_once.__get__(w.fri, Fri)
+            w.fri.chat = SimpleNamespace(respond=model)
+            w.fri.flush_usage = AsyncMock()
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await w.agent.handle(event)
+            assert done[0]
+            if phase == 'model':
+                assert not shown  # Refused before the request.
+            assert AGAIN not in [item.args[0] for item in event.reply.await_args_list]
+            assert w.agent.receipts.get(answer.id) is None
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('phase', ['model', 'delivery'])
+def test_an_answer_expiring_while_fri_replies_stops_the_reply(monkeypatch, tmp_path, phase):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        w.fri.data = tmp_path
+        try:
+            _, _, answer = await opened(w)
+            w.clock[0] = 15*60-1
+            event = follow_up(w, answer)
+            event.reply.return_value = w.fri_post(AGAIN)
+            shown = []
+
+            async def model(text, context, *, ready=None):
+                if phase == 'model':
+                    w.clock[0] = 15*60+1
+                await ready()
+                shown.extend(own(context))
+                w.clock[0] = 15*60+1
+                return ChatResult(status='completed', reply=AGAIN)
+            w.fri.chat_once = Fri.chat_once.__get__(w.fri, Fri)
+            w.fri.chat = SimpleNamespace(respond=model)
+            w.fri.flush_usage = AsyncMock()
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await w.agent.handle(event)
+            assert bool(shown) == (phase == 'delivery')  # In date when the request went out.
+            assert AGAIN not in [item.args[0] for item in event.reply.await_args_list]
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_answers_fifteen_minutes_start_when_it_goes_out(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            old = w.message(OLD, user=30, age=7*3600)
+            event = reply_to(w.message('<@99> which one is better', age=120), old)
+            api = w.fri.api
+
+            async def saving(method, path, payload=None):
+                if path == '/chat/turn':
+                    w.clock[0] = 30  # A slow save, after delivery.
+                return await api(method, path, payload)
+            w.fri.api = saving
+            _, answer = await handled(w, event, ANSWER, age=110)
+            w.clock[0] = 15*60-1
+            assert w.agent.receipts.get(answer.id) is not None
+            w.clock[0] = 15*60+1  # Fifteen minutes from delivery, not from the save.
+            assert w.agent.receipts.get(answer.id) is None
         finally:
             await w.fri.close()
     asyncio.run(scenario())

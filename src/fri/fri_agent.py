@@ -1604,7 +1604,8 @@ class Agent:
             deleted since. Checked again after each wait below, up to the save (the delivered part stays)."""
             if any(taken(event) for event in events):
                 return 'message deleted'
-            return 'nearby message deleted' if changed(result.shown) else None
+            # Fri's earlier answer a ping read, taken back or out of date since (see Invitation.standing).
+            return 'nearby message deleted' if changed(result.shown) or (invitation and not invitation.standing()) else None
 
         if any(taken(event) for event in events):  # Taken back while Fri composed.
             if again():
@@ -1618,7 +1619,7 @@ class Agent:
                 missed('message deleted')
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        if changed(result.shown):
+        if changed(result.shown) or (invitation and not invitation.standing()):
             # Someone took back a message the model was shown: the reply may repeat it, and a reaction or a quiet
             # decision answers it. None goes out or is saved; only a reply's words are worth saying why.
             if ambient:
@@ -1693,6 +1694,8 @@ class Agent:
         try:
             sent = await send_reply(message, result, view=view, mention_author=False, allowed_mentions=NO_MENTIONS,
                                     suppress_embeds=True, still=lambda: taken_back() is None)
+            if invitation:
+                invitation.delivered()  # An outside answer's receipt lasts from here (see Invitation.answered).
             if sent is None:  # Nothing was delivered, so nothing is recorded as said.
                 missed(taken_back() or 'image share withdrawn')
                 await self.fri.waiting_notices.clear(message.author.id)

@@ -121,6 +121,8 @@ class Invitation:
         # message ID -> (message, kind, version), checked with the nearby posts but never shown (see answer).
         self.carried = {}
         self.inherited = None  # That answer's receipt, so one for this ping's answer keeps its ancestry.
+        self.answer_id = None  # That answer's message ID, while this ping reads it.
+        self.out = None  # When Fri's answer to this ping went out (time.monotonic()), once it did.
 
     @property
     def image(self):
@@ -257,6 +259,8 @@ class Invitation:
                 profiles = await self.profile_sources(self.evidence())
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
+            if not self.standing():  # After the last wait: a withdrawal during the reads above counts too.
+                return self.refuse('nearby message changed')
             self.checked += check_evidence
             return True
         except ControllerUnavailable:
@@ -317,6 +321,17 @@ class Invitation:
 
     def granted_scope(self):
         return {**self.scope, 'mention_grant': self.grant, 'source': self.source}
+
+    def standing(self):
+        """Fri's earlier answer this ping reads, if any, may still be read, as of now: its receipt is the one Fri
+        read, still kept (a delete or edit of the answer or a post it drew on, or a privacy control of an author,
+        drops it at once, see Receipts) and in date, and nothing it carries was marked taken back since. No waits,
+        so it holds up to the model request or the send that runs it last."""
+        if self.inherited is None:
+            return True
+        return (self.agent.receipts.entries.get(self.answer_id) is self.inherited and
+                self.inherited['until'] > time.monotonic() and
+                not any(mid in self.agent.unsent or str(mid) in self.agent.withdrawn for mid in self.carried))
 
     def evidence(self):
         """Every member's post this ping reads or its answer draws on, once each, for their authors' privacy."""
@@ -383,7 +398,7 @@ class Invitation:
                 for user in receipt['authors']:
                     self.profiles[user] = profiles[user]  # Checked again with the nearby authors (see current).
                 self.carried.update(carried)
-                self.inherited = receipt
+                self.inherited, self.answer_id = receipt, reference_id
                 self.agent.saw(list(carried))  # So a delete while Fri replies is noticed (see Agent.unsend).
                 self.rows = [row for row in self.rows if row['source']['id'] != str(item.id)]
                 self.rows.append({'source': discord_source(item).evidence(), 'text': clean(item.content, 1800),
@@ -439,13 +454,18 @@ class Invitation:
                 (current.author.id == self.fri.user.id if kind == 'fri' else not current.author.bot) and
                 version(current, kind) == before)
 
+    def delivered(self):
+        self.out = time.monotonic()
+
     def answered(self, sent):
         """`sent`, Fri's answer to this outside ping, went out and was saved: keep its receipt, so a direct reply
         to it here reads it (see answer). Its sources are every post this ping read, the ping too, and what an
         answer it read drew on in turn; its authors, everyone who wrote them, at the privacy revision Fri read.
-        It lasts 15 minutes, never past the answer it read. Kept only if one later privacy read can carry it all."""
+        It lasts 15 minutes from when it went out (see delivered), never past the answer it read. Kept only if one
+        later privacy read can carry it all."""
         try:
-            if not (self.outside and self.grant and self.revision is not None and isinstance(sent, discord.Message) and
+            if not (self.outside and self.grant and self.revision is not None and self.out is not None and
+                    isinstance(sent, discord.Message) and
                     sent.channel.id == self.event.channel.id and sent.author.id == self.fri.user.id):
                 return
             if self.image is not None and self.image.id != self.event.id and self.image.id not in self.events:
@@ -463,11 +483,12 @@ class Invitation:
                 if authors.setdefault(user, revision) != revision:
                     return
             if (sum(kind != 'fri' for kind, _ in sources.values()) > MAX_EVIDENCE or len(authors) > MAX_AUTHORS or
-                    any(mid in self.agent.unsent or str(mid) in self.agent.withdrawn for mid in [*sources, sent.id])):
+                    any(mid in self.agent.unsent or str(mid) in self.agent.withdrawn for mid in [*sources, sent.id]) or
+                    not self.standing()):
                 return
             self.agent.receipts.keep(sent.id, {
                 'channel': self.event.channel.id, 'version': version(sent, 'fri'), 'sources': sources,
-                'authors': authors, 'until': min(time.monotonic()+RECEIPT_SECONDS, inherited['until'])})
+                'authors': authors, 'until': min(self.out+RECEIPT_SECONDS, inherited['until'])})
         except (AttributeError, KeyError, TypeError, ValueError):
             return  # Delivered all the same; a reply to it reads as before.
 
