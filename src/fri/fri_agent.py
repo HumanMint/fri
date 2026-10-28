@@ -1565,11 +1565,11 @@ class Agent:
         a usage report, or anything Gene's request grammar reads as asking for a control or a song correction
         (see Actions.command_requested), which keep their own paths. A turn taking a line and the line both are."""
         from .fri_pending import cancelled
-        from .gene_controls import COMMANDS, CORRECTION, correction_text, quick_control, requested
+        from .gene_controls import COMMANDS, OPENING, correction_text, quick_control, requested
         return not (media(event) or getattr(event, 'reference', None) or links(event) or
                     explicit_mention(event, self.fri.user.id) or memory_intent(text) or cancelled(text) or
                     usage_requested(text) or quick_control(text, music_context=True) or
-                    any(requested(text, action) for action in COMMANDS) or CORRECTION.match(correction_text(text)))
+                    any(requested(text, action) for action in COMMANDS) or OPENING.match(correction_text(text)))
 
     def summoning(self, message, directed, privacy):
         """Just Fri's name or a hello, on its own: what they want usually comes in the next message."""
