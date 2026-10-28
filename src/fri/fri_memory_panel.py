@@ -11,8 +11,9 @@ from .fri_memory import MOVES, clip, note_place, profiled, units
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
-COMPONENT = re.compile(r'^fri:memory:(?:open|choose|remove|replace|edit|share|confirm|keep|summary|clear|rewrite):'
-                       r'[a-f0-9]{32}$')
+COMPONENT = re.compile(r'^fri:memory:(?:(?:open|choose|remove|replace|edit|share|confirm|keep|summary|clear|rewrite):'
+                       r'[a-f0-9]{32}|open:[0-9]{1,20})$')
+OPEN = r'fri:memory:open:(?P<member>[0-9]{1,20})'
 
 
 def memory_component(interaction, bot_id):
@@ -27,6 +28,16 @@ def scope_for(cog, interaction):
     return {'guild_id': str(interaction.guild_id or cog.guild_id), 'user_id': str(interaction.user.id),
             'channel_id': str(parent if interaction.guild_id else cog.workshop_id),
             'conversation_id': 'private:'+str(interaction.channel_id)}
+
+
+def launched(cog, interaction):
+    """The scope of the conversation an Edit my memory button sits in, rebuilt from the click as Fri.talk built
+    its reply's: a DM is the member's private chat, a server channel or thread its public one."""
+    if interaction.guild_id is None:
+        return scope_for(cog, interaction)
+    parent = getattr(interaction.channel, 'parent_id', None) or interaction.channel_id
+    return {'guild_id': str(interaction.guild_id), 'user_id': str(interaction.user.id), 'channel_id': str(parent),
+            'conversation_id': 'public:'+str(interaction.channel_id)}
 
 
 async def allowed(cog, interaction, scope, *, message=True):
@@ -99,26 +110,43 @@ def place(cog, scope, entry):
                       public=scope['conversation_id'].startswith('public:'))
 
 
+class MemoryOpen(discord.ui.DynamicItem[discord.ui.Button], template=OPEN):
+    """Edit my memory, under a reply that showed it. Found again by its custom ID, so a timeout or a restart doesn't
+    kill it. It opens only the clicker's own memory, for the conversation it sits in, after every check the panel
+    makes (see allowed)."""
+
+    def __init__(self, member):
+        self.member = int(member)
+        super().__init__(discord.ui.Button(label='Edit my memory', custom_id=f'fri:memory:open:{self.member}'))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match['member'])
+
+    async def callback(self, interaction):
+        from .fri_buttons import not_yours, tell
+        cog = interaction.client
+        if interaction.user.id != self.member:
+            return await not_yours(interaction)
+        scope = launched(cog, interaction)
+        if not await allowed(cog, interaction, scope):
+            return await tell(interaction, 'can’t open that from here anymore.')
+        await show(cog, interaction, scope)
+
+
 class MemoryLauncher(discord.ui.View):
+    """A reply's Edit my memory button (see MemoryOpen). No timeout: discord.py drops a dynamic item's
+    registration when a view holding one stops."""
+
     def __init__(self, cog, scope):
+        super().__init__(timeout=None)
+        self.add_item(MemoryOpen(scope['user_id']))
+
+
+class MemoryView(discord.ui.View):
+    def __init__(self, cog, scope, state, selected=None, *, confirm=False):
         super().__init__(timeout=600)
         self.cog, self.scope = cog, scope
-        button = discord.ui.Button(label='Edit my memory', custom_id='fri:memory:open:'+uuid.uuid4().hex)
-        button.callback = self.open
-        self.add_item(button)
-
-    async def interaction_check(self, interaction):
-        return await allowed(self.cog, interaction, self.scope)
-
-    async def open(self, interaction):
-        if await self.interaction_check(interaction):
-            await show(self.cog, interaction, self.scope)
-
-
-class MemoryView(MemoryLauncher):
-    def __init__(self, cog, scope, state, selected=None, *, confirm=False):
-        super().__init__(cog, scope)
-        self.clear_items()
         self.state = state
         self.selected = next((row for row in state['entries'] if row['id'] == selected), None)
         if state['entries']:
@@ -161,6 +189,9 @@ class MemoryView(MemoryLauncher):
                                          custom_id=f'fri:memory:{action}:'+uuid.uuid4().hex)
                 move.callback = {'keep': self.keep, 'share': self.ask_share, 'confirm': self.share}[action]
                 self.add_item(move)
+
+    async def interaction_check(self, interaction):
+        return await allowed(self.cog, interaction, self.scope)
 
     async def remove(self, interaction):
         if not await self.interaction_check(interaction):

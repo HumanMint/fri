@@ -84,7 +84,11 @@ class BehaviorPreview(PagedPreview):
 
     async def interaction_check(self, interaction):
         fri = self.agent.fri
-        return (interaction.user.id == fri.owner_id and interaction.message.author.id == fri.user.id and
+        if interaction.user.id != fri.owner_id:
+            from .fri_buttons import not_yours
+            await not_yours(interaction)
+            return False
+        return (interaction.message.author.id == fri.user.id and
                 (interaction.guild_id is None or (interaction.guild_id == fri.guild_id and
                                                   self.agent.allowed(interaction.channel))) and
                 bool(await self.agent.member(interaction.user.id, fresh=True)))
@@ -1717,6 +1721,8 @@ class Agent:
                 missed(taken_back() or 'image share withdrawn')
                 await self.fri.waiting_notices.clear(message.author.id)
                 return
+            if view is not None:
+                view.message = sent  # A draft's or preview's controls come off it when it times out.
             self.saving.add(getattr(sent, 'id', None))  # So a delete while it saves is noticed (see unsend).
             self.answered(events)
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.

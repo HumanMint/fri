@@ -13,7 +13,7 @@ from gene.store import Conflict, Store
 from compat_tests.test_api import headers
 from compat_tests.test_fri_actions import harness
 from compat_tests.test_gene_controls import control_body, controls_api  # noqa: F401
-from fri.fri_memory_panel import EditMemory, MemoryLauncher, MemoryView, allowed, memory_component
+from fri.fri_memory_panel import EditMemory, MemoryView, allowed, memory_component
 
 
 def remember(store, text='I like Minecraft', category='games', user='20', scope='public:1', revision=0):
@@ -144,10 +144,9 @@ def test_memory_controls_bind_member_audience_and_modal_and_send_exact_evidence(
         interaction = Mock(spec=discord.Interaction, id=int(source()['id']), guild_id=123, channel_id=1,
             channel=channels[1], user=SimpleNamespace(id=20, display_name='friend'),
             message=SimpleNamespace(author=fri.user), response=SimpleNamespace(send_modal=AsyncMock()))
-        launcher = MemoryLauncher(fri, scope)
         view = MemoryView(fri, scope, state, selected=7)
         try:
-            assert await launcher.interaction_check(interaction)
+            assert await view.interaction_check(interaction)  # The reply's own button: test_fri_live_buttons.py.
             wrong = copy.copy(interaction)
             wrong.user = SimpleNamespace(id=30)
             assert not await view.interaction_check(wrong)
