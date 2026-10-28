@@ -33,7 +33,7 @@ PATTERNS = {
     'hosting provider': re.compile(rf'(?i)\b{re.escape(PROVIDER)}\b'),
     'machine or account name': re.compile(r'(?i)\bmac ?mini\b|\bmacbook\b'),
     # "the Mac" or "the mac", but not the MAC acronym ("verify the MAC", "the MAC address").
-    'owner topology': re.compile(r'\b[Tt]he [Mm]ac\b(?!\s+address)|(?i:\bMac (relay|audio|agents?|Tailscale)\b|\bMac-offline\b'
+    'owner topology': re.compile(r'\b[Tt]he [Mm]ac\b(?!\s+(?i:address))|(?i:\bMac (relay|audio|agents?|Tailscale)\b|\bMac-offline\b'
                                  r'|\bhome[- ](relay|network|connection|machine)\b)'),
     'workstation path': re.compile(r'/Users/\w|/private/tmp/|/var/folders/|/tmp/claude'),
     'launch-agent label': re.compile(r'\blocal\.dan\.'),
@@ -65,7 +65,8 @@ def private_patterns(environ=os.environ):
             raise ValueError
     except Exception:
         raise RuntimeError(f'{RULES} must name a readable JSON object of lists of non-empty names') from None
-    return [re.compile(r'(?i)(?<![\w-])(?:' + '|'.join(re.escape(name.strip()).replace(r'\ ', r'\s+') for name in names)
+    # One \s+ between a name's words however they're spaced, so no two \s+ sit side by side.
+    return [re.compile(r'(?i)(?<![\w-])(?:' + '|'.join(r'\s+'.join(map(re.escape, name.split())) for name in names)
                        + r')(?![\w-])') for names in lists]
 
 
@@ -133,6 +134,7 @@ def test_tracked_files_name_no_private_deployment_details():
     'Lavalink 3.7.13+red.5 and yt-dlp 2026.8.19 are pinned.',
     'Reads the MAC address column, then the home directory.',
     'Verify the MAC before decrypting the packet.',
+    'Verify the Mac Address first.',
 ])
 def test_generic_text_passes(line):
     assert not list(findings(line, []))
@@ -178,6 +180,16 @@ def test_a_bad_rules_file_fails_without_naming_its_path_or_contents(tmp_path, co
         private_patterns({RULES: str(rules)})
     assert 'synthetic-private-account' not in str(failure.value) and 'toyservice' not in str(failure.value)
     assert failure.value.__cause__ is None and failure.value.__suppress_context__
+
+
+def test_a_private_name_with_runs_of_spaces_is_scanned_in_linear_time(tmp_path):
+    rules = tmp_path / 'rules.json'
+    rules.write_text(json.dumps({'synthetic': ['toy    box']}))
+    private = private_patterns({RULES: str(rules)})
+    started = time.perf_counter()
+    assert not list(findings('toy' + ' ' * 1000 + 'cat', private))
+    assert list(findings('toy box', private)) == [PRIVATE_LABEL]
+    assert time.perf_counter() - started < 1
 
 
 def test_a_long_word_is_scanned_in_linear_time():
