@@ -163,6 +163,7 @@ class Agent:
         self.reanswered = {}  # Message ID -> times it was answered again, oldest first (see reply_once).
         self.acted = {}  # Discord message ID -> when a turn for it ran a tool that may change something.
         self.reruns = set()  # Those answers again still going (see answer_edits).
+        self.rerunning = {}  # Message ID -> the newest edited_at seen while it waits to be answered again.
         self.last_attention = {}
         self.last_spoke = {}
         self.acknowledged = {}
@@ -382,8 +383,11 @@ class Agent:
         said, and in-flight bursts and reply fences keep comparing against what arrived. A member's message
         still being handled is withdrawn instead: what handles it holds what it said before, maybe with no
         row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once)."""
-        if (self.handling[message.id] and getattr(message, 'edited_at', None) is not None and
+        if ((self.handling[message.id] or message.id in self.rerunning) and
+                getattr(message, 'edited_at', None) is not None and
                 not getattr(getattr(message, 'author', None), 'bot', True)):  # Not an embed or pin update.
+            if message.id in self.rerunning:  # Its refetch must show this edit, or a later one (see rerun).
+                self.rerunning[message.id] = max(filter(None, (self.rerunning[message.id], message.edited_at)))
             return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
         rows = self.recent.get(channel)
         author = getattr(getattr(message, 'author', None), 'id', None)
@@ -896,25 +900,39 @@ class Agent:
         """Answer, once more and as they read now, the messages whose turns their own edit refused, once
         nothing is handling them any more (see reply_once)."""
         for i in [i for i in self.reanswer if not self.handling[i]]:
+            self.rerunning[i] = None  # From now, an edit to it is marked as if it were handled (see edit).
             task = asyncio.get_running_loop().create_task(self.rerun(self.reanswer.pop(i), i))
             self.reruns.add(task)
             task.add_done_callback(self.reruns.discard)
 
     async def rerun(self, channel_id, message_id):
         """A message edited while Fri answered it, fetched again and handled as if it just came in, so every
-        gate runs on what it says now: an edit that drops Fri's name or takes it back gets nothing."""
+        gate runs on what it says now: an edit that drops Fri's name or takes it back gets nothing. The fetch
+        counts only if no edit came during it and it shows the newest edit seen (Discord's copy can lag the
+        edit event); it's tried a few times, then dropped. It's then taken in as of when that fetch began, so
+        an edit after is withdrawn like any other, and alone, so it never joins a burst sent after it."""
         try:
-            message = await self.fri.get_channel(channel_id).fetch_message(message_id)
-        except (AttributeError, discord.HTTPException):
-            return  # Deleted meanwhile, or the channel's gone: nothing left to answer.
-        if self.memory_control(message):
-            return  # Not a privacy control: it was refused for the edit (see Fri.chat_once), and they send it again.
-        self.delivered.pop(message.id, None)
-        self.watched.pop(message.id, None)
-        try:
-            await self.handle(message)
+            for _ in range(3):
+                began = time.time()
+                try:
+                    message = await self.fri.get_channel(channel_id).fetch_message(message_id)
+                except (AttributeError, discord.HTTPException):
+                    return  # Deleted meanwhile, or the channel's gone: nothing left to answer.
+                newest = self.rerunning.get(message_id)
+                if not self.taken_back(message_id, began) and (
+                        newest is None or (message.edited_at is not None and message.edited_at >= newest)):
+                    break
+            else:
+                return  # Still changing, or Discord's copy lags: they can ask again.
+            if self.memory_control(message):
+                return  # Not a privacy control: it was refused for the edit (see Fri.chat_once), and they send it again.
+            self.delivered.pop(message.id, None)
+            self.watched.pop(message.id, None)
+            await self.handle(message, read=began)
         except Exception:
             LOG.exception('Answering an edited message again failed')
+        finally:
+            self.rerunning.pop(message_id, None)
 
     async def excluded(self, message, dm, invitation=None, privacy=None, text=''):
         """Why a message that waited (its turn, or another control) is no longer one Fri answers, by
@@ -975,7 +993,7 @@ class Agent:
         for event in events:
             self.miss(event, reason)
 
-    async def handle(self, message):
+    async def handle(self, message, read=None):
         # Discord can deliver an event again, e.g. after a resume. Its first delivery answers, or
         # explains, for every copy: while it or the burst holding it is still being handled, and
         # for an hour after, in a bounded record the in-flight checks don't rely on.
@@ -992,7 +1010,7 @@ class Agent:
             self.edits.pop(oldest, None)
             del self.delivered[oldest]
         self.delivered[message.id] = now
-        self.arrived[message.id] = time.time()
+        self.arrived[message.id] = time.time() if read is None else read  # `read`: when a refetch began.
         if edited := getattr(message, 'edited_at', None):  # Fetched again after an edit (see rerun).
             self.edits[message.id] = edited
         else:
@@ -1143,7 +1161,7 @@ class Agent:
                 profile = await self.profile(parent, message.author.id)
                 # Deleted or edited while the profile read waited: like a text post, it stays out.
                 if (profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent and
-                        not self.taken_back(message.id, sent)):
+                        not self.taken_back(message.id, self.arrived.get(message.id, sent))):
                     self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                         'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
                         'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
@@ -1181,7 +1199,7 @@ class Agent:
             observed = profile.get('revision', 0)
             # Not if it was deleted or edited while its profile was read.
             if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
-                    message.id not in self.unsent and not self.taken_back(message.id, sent)):
+                    message.id not in self.unsent and not self.taken_back(message.id, self.arrived.get(message.id, sent))):
                 if directed is not None or channel == self.dedicated:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
@@ -1244,7 +1262,8 @@ class Agent:
         key = (channel, message.author.id)
         self.answer_directly(message)
         try:
-            if not self.bursts.add(message, arrived, None if privacy else (forgotten, observed), alone=bool(privacy)):
+            if not self.bursts.add(message, arrived, None if privacy else (forgotten, observed),
+                                   alone=bool(privacy) or message.id in self.rerunning):
                 return DEFERRED  # Dropped, and said why, as from before an erasure.
         except ValueError as exc:
             self.pending.pop(key, None)
@@ -1753,14 +1772,15 @@ class Agent:
         return receipt
 
     async def unwithdrawn(self, channel, records):
-        """Every row of `records` is still in the live view and each author it draws on still allows it,
+        """Every row of `records` is still in the live view, as the same version (an edited message answered
+        again comes back under its ID with new words), and each author it draws on still allows it,
         at the revision it was collected under (the check context_messages ran, rerun after a wait)."""
-        live = {r['id'] for r in self.recent.get(channel, ())}
+        live = self.versions(channel)
         source = self.fri.get_channel(channel)
         parent = getattr(source, 'parent_id', None) or channel
         authors = set()
         for row in records:
-            if row['id'] not in live:
+            if not self.current(row, live):
                 return False
             if row['gene_error']:
                 continue
@@ -1774,8 +1794,16 @@ class Agent:
         if any(not profiles[user]['enabled'] or profiles[user]['revision'] != revision for user, revision in authors):
             return False
         # Again after those reads: a row withdrawn or forgotten during them must not go out either.
-        live = {r['id'] for r in self.recent.get(channel, ())}
-        return all(row['id'] in live for row in records)
+        live = self.versions(channel)
+        return all(self.current(row, live) for row in records)
+
+    def versions(self, channel):
+        """The live view's rows by ID, as when each was taken in."""
+        return {r['id']: r.get('at') for r in self.recent.get(channel, ())}
+
+    def current(self, row, live):
+        """A copied row is still the live view's version: not replaced under its ID, nor taken back since."""
+        return row['id'] in live and live[row['id']] == row.get('at') and not self.taken_back(row['id'], row.get('at', 0))
 
     def unsee(self, channel, before, newest):
         """An attention call that didn't decide: its batch is offered again (a Gene error still gets its
