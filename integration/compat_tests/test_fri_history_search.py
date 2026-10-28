@@ -65,7 +65,12 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'find that game Dipper recommended last month', 'who recommended Minecraft?',
                  'what did we talk about?', 'what did Dipper mention in chat?',
                  'what was that song kev mentioned', 'whats that game jo recommended',
-                 'what’s the link sam dropped', 'which was the meme you posted'):
+                 'what’s the link sam dropped', 'which was the meme you posted',
+                 'what was the link sam posted in #general', 'what was the link sam posted in this channel?',
+                 'what’s the link sam dropped in chat?', 'which was the meme you posted on #memes?',
+                 'what was the song he mentioned on monday', 'find the clips jo posted in <#123>', 'what was that song kev mentioned in here?',
+                 'which was the meme you posted on this server', 'what was that game jo recommended in a thread',
+                 'what was the link sam posted in this channel yesterday?'):
         assert requested(text)
     for text in ('hey fri', 'play Sad Machine', 'do not search chat', '> find old messages',
                  'what do you recommend?', 'what should I say to a friend who is upset?',
@@ -78,7 +83,11 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'what is the difference between shared and dedicated hosting?',
                  'what is the best dermatologist recommended sunscreen?',
                  'what is the average doctor recommended dose of vitamin D?',
-                 'what was that'):
+                 'what was that', 'what is the maximum file size shared on Discord?',
+                 'what is the data rate recommended in the spec?',
+                 'what is the data rate recommended in <https://example.com/spec>?',
+                 'what is the data rate recommended in server documentation?',
+                 'what is the data rate recommended in <#123oops>?'):
         assert not requested(text)
     assert valid_action(query())
     assert not valid_action(query(cursor='invented'))
