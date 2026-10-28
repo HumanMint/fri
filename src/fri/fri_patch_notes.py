@@ -35,6 +35,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import discord
 
@@ -103,14 +104,20 @@ def release_link(version):
     """The line a channel post ends with: a clickable link to the version's release page (FRI_RELEASE_NOTES_URL, with
     {version}, points it elsewhere, for a fork). The post goes out with embeds suppressed, so it shows no preview."""
     url = (os.getenv('FRI_RELEASE_NOTES_URL') or RELEASE_PAGE).replace('{version}', version)
-    if not re.fullmatch(r'https://[^\s()<>]+', url):
-        raise NotesRefused('FRI_RELEASE_NOTES_URL must be an https URL with no spaces or brackets')
+    parsed = urlsplit(url) if re.fullmatch(r'[^\s()<>]+', url) else None
+    host = parsed.hostname if parsed else None
+    if not (parsed and parsed.scheme == 'https' and host and re.fullmatch(r'[a-z0-9-]+(\.[a-z0-9-]+)+', host)):
+        raise NotesRefused('FRI_RELEASE_NOTES_URL must be an https URL with a host name, and no spaces or brackets')
     return f'for more detailed patch notes: [click here]({url})'
 
 
 def channel_post(version, text):
-    """What a channel post says: the summary, then the release page link on its own line."""
-    return f'{summary_only(text).rstrip()}\n\n{release_link(version)}'
+    """What a channel post says: the summary, then the release page link on its own line. Empty notes are refused
+    rather than posted (and pinned) as a link alone."""
+    summary = summary_only(text).strip()
+    if not summary:
+        raise NotesRefused('the notes are empty')
+    return f'{summary}\n\n{release_link(version)}'
 
 
 def nonce(version, digest, index, place=''):

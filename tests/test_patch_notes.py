@@ -1010,9 +1010,10 @@ def test_the_release_link_can_point_at_a_fork_and_must_be_plain_https(dm, tmp_pa
     monkeypatch.setenv('FRI_RELEASE_NOTES_URL', 'https://example.org/forks/fri/releases/v{version}')
     post('fri 0.7.0', tmp_path)
     assert chat.sends[0]['content'].endswith('[click here](https://example.org/forks/fri/releases/v0.7.0)')
-    for bad in ('http://example.org/v{version}', 'https://example.org/a b', 'https://example.org/(x)'):
+    for bad in ('http://example.org/v{version}', 'https://example.org/a b', 'https://example.org/(x)',
+                'https:///releases/v{version}', 'https://localhost/v{version}', 'https://exa_mple.org/v{version}'):
         monkeypatch.setenv('FRI_RELEASE_NOTES_URL', bad)
-        with pytest.raises(notes.NotesRefused, match='must be an https URL'):
+        with pytest.raises(notes.NotesRefused, match='must be an https URL with a host name'):
             post('fri 0.7.1', tmp_path, version='0.7.1')
 
 
@@ -1068,3 +1069,16 @@ def test_preview_with_a_channel_shows_the_post_exactly_and_refuses_a_changelog(m
 def test_a_draft_longer_than_one_message_is_refused():
     with pytest.raises(notes.NotesRefused, match='more than one message'):
         notes.drafted(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), 'completed')
+
+
+@pytest.mark.parametrize('text', ['', '   \n\n  '])
+def test_empty_notes_are_refused_not_posted_as_a_link_alone(dm, tmp_path, monkeypatch, capsys, text):
+    """Review: empty notes once became a link-only post, pinned, that used up the version."""
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    with pytest.raises(notes.NotesRefused, match='the notes are empty'):
+        post(text, tmp_path)
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(text.encode())))
+    assert notes.main(['preview', '0.7.0', '--channel', 'fri-chat']) == 2
+    assert 'the notes are empty' in capsys.readouterr().err
+    assert not chat.sends and not (tmp_path/'patch-notes-server.json').exists()
