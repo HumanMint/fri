@@ -173,6 +173,12 @@ REFUSED = re.compile(
     # "i meant to say thanks" is chat, not a title; "To The Moon" can be one.
     r"|\bi meant to\s+(?:say|type|write|ask|tell|send|reply|respond|answer|post|text|put|do|pick|choose|search|look"
     r"|check|mention|link|ping|go|be|get|make|have|add|play|queue)\b|\bi meant to[\s.!?]*$")
+# After the song, a change of heart withdraws it: "wrong song, Love Story, actually no". Checked after the correction
+# only, since "actually no, wrong song, X" opens a correction.
+WITHDRAWN = re.compile(r"\b(?:actually,?\s+no(?:pe|t that)?|no,?\s+wait|wait,?\s+no|(?:i\s+)?change[ds]?\s+my\s+mind"
+                       r"|on second thought|never\s+mind|leave it)\b")
+# Between a title and its artist: "Love Story by Taylor Swift" may be named "Love Story Taylor Swift".
+CONNECTORS = {'by', 'from', 'ft', 'feat', 'featuring'}
 CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
 
 
@@ -190,6 +196,22 @@ def song_words(text):
     return [word.strip("'") for word in re.findall(r"[\w']+", text) if word.strip("'")]
 
 
+def grounded(said, named):
+    """The named song is the start of what they said, word for word: never words picked from a later clause
+    ("To The Moon, not To Be With You"). Only a leading article may be left out, and only connectors between a
+    title and its artist skipped."""
+    if said[:1] in (['the'], ['a'], ['an']) and named[:1] != said[:1]:
+        said = said[1:]  # "the X" may be named just "X".
+    at = 0
+    for word in named:
+        while at < len(said) and said[at] != word and said[at] in CONNECTORS:
+            at += 1
+        if at >= len(said) or said[at] != word:
+            return False
+        at += 1
+    return True
+
+
 def correction(text, argument):
     """A member putting right a song Gene just played for them ("not that one, X", "i meant X"): the song is
     the argument, in their own words, starting the replacement right after the correction. Whether there was
@@ -200,13 +222,11 @@ def correction(text, argument):
     if not opening or not named or REFUSED.search(QUOTED.sub(' " ', text)):
         return False
     song = text[opening.end():]
+    if WITHDRAWN.search(QUOTED.sub(' " ', song)):
+        return False
     lead = LEAD.match(song)
-    for replacement in (song, song[lead.end():] if lead else ''):
-        said = song_words(replacement)
-        first = said[1:2] if said[:1] in (['the'], ['a'], ['an']) else []  # "the X" may be named just "X".
-        if said and named[0] in said[:1]+first and set(named) <= set(said):
-            return True
-    return False
+    return any(grounded(song_words(replacement), named)
+               for replacement in (song, song[lead.end():] if lead else '') if replacement)
 
 
 def just_played(receipts):

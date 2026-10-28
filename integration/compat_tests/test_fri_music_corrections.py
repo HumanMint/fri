@@ -14,6 +14,18 @@ FIX = 'not the one, i meant join us for a bite'
 
 
 @pytest.mark.parametrize('text,argument,expected', [
+    # Review of #98/#157: the song is the start of the replacement, never words from a later clause, and a
+    # change of heart after it withdraws it.
+    ('wrong song, To The Moon, not To Be With You', 'To Be With You', False),
+    ('wrong song, To The Moon, not To Be With You', 'To The Moon', True),
+    ('i meant to skip To The Moon', 'To The Moon', False),
+    ('wrong song, Love Story, actually no', 'Love Story', False),
+    ('wrong song, Love Story... i changed my mind', 'Love Story', False),
+    ('not that one, Love Story, no wait', 'Love Story', False),
+    ('actually no, wrong song, Love Story', 'Love Story', True),
+    ('not that one, Love Story by Taylor Swift', 'Love Story Taylor Swift', True),
+    ('not that one, Love Story by Taylor Swift', 'Taylor Swift', False),
+    ('wrong song, "Actually No" by someone', 'Actually No', True),
     (FIX, 'join us for a bite', True), ('join us for a bite', 'join us for a bite', False),
     (FIX, 'someone else song', False), ('for example ' + FIX, 'join us for a bite', False),
     ('not that one\n> alex: Never Gonna Give You Up', 'Never Gonna Give You Up', False),
