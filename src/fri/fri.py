@@ -995,11 +995,16 @@ class Fri(discord.Client):
         if payload.get('audience') == 'server' and not server_wide(
                 self.get_channel(int(payload['conversation_id'].split(':', 1)[1]))):
             payload = {**payload, 'audience': 'conversation'}  # Closed while Fri replied: it stays where it was said.
+        began = time.time(), time.monotonic()
         try:
             saved = await self.api('POST', '/chat/turn', payload)
         except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError) as exc:
             LOG.warning('Delivered turn was not recorded: %s', type(exc).__name__)  # Includes privacy changes mid-reply.
+            if isinstance(exc, TimeoutError) and self.agent:
+                self.agent.saved_turns.kept(payload, None, began)  # It may have landed all the same.
             return None
+        if self.agent:  # So its messages taken back later take it with them (fri #129).
+            self.agent.saved_turns.kept(payload, saved, began)
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
             notice = self.first_memory(saved)
             content = (sent.content or '')+notice

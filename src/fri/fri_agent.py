@@ -37,6 +37,7 @@ from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
 from .fri_reports import report_message
 from .fri_responses import REACTIONS
+from .fri_turn_withdrawal import SavedTurns
 from .fri_turns import Arrivals, Turns
 from .fri_usage import usage_requested
 from .previews import PagedPreview
@@ -195,6 +196,7 @@ class Agent:
         # first. Kept past its wait: a message that came in during it is let in by when it arrived (see receive).
         self.windows = {}
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
+        self.saved_turns = SavedTurns(self)  # Members' messages Fri saved exchanges with, dropped if taken back.
 
     @property
     def config(self):
@@ -368,6 +370,7 @@ class Agent:
                 else:
                     self.active[key] = replaced
         self.bursts.unsend(channel, ids)
+        self.saved_turns.withdraw(ids)  # Their saved exchanges too, so their words don't come back as history.
 
     def saw(self, ids):
         """Messages a turn's model request carries, wherever they came from (the live view, a reply target, a
@@ -416,6 +419,7 @@ class Agent:
         # Kept an hour, as withdrawn is: longer than any turn that could still hold a copy runs.
         while self.revised and (next(iter(self.revised.values())) < now-3600 or len(self.revised) > 100000):
             del self.revised[next(iter(self.revised))]
+        self.saved_turns.withdraw([mid])  # What it said before goes from its author's saved exchange too.
 
     def forget(self, user, erased=False):
         """The member used a privacy control through Fri: their messages still waiting for a reply
@@ -898,6 +902,7 @@ class Agent:
         # Kept an hour, longer than any turn that could still hold a copy runs; the cap only bounds memory.
         while self.withdrawn and (next(iter(self.withdrawn.values())) < now-3600 or len(self.withdrawn) > 100000):
             del self.withdrawn[next(iter(self.withdrawn))]
+        self.saved_turns.withdraw([message.id])  # And from its author's saved exchange (fri #129).
 
     def taken_back(self, i, since):
         """Whether message `i` was edited or deleted at or after `since`, the time.time() its words were read.

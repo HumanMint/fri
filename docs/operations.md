@@ -231,6 +231,16 @@ advertises it, so the controller must be released first.
   window, rebuilt from the live view. An unreachable controller fails the attention stage, as before.
   An older controller gets the per-author profile reads, which an erasure through Gene during them
   can still slip past.
+- **Withdrawn messages' saved exchanges.** When a member's message Fri saved an exchange with is
+  withdrawn (edited while handled or while a model request carried it, or deleted), Fri asks a
+  controller that offers `turn-withdrawal` to drop that exchange through `/chat/turn/withdraw`, so the
+  old words stop coming back as history (fri #129). A message withdrawn while its save was on the
+  way is caught once the save returns. Fri remembers which messages it saved exchanges with for as
+  long as the controller keeps them, in memory only, so a message saved before a restart isn't asked
+  about. A failed call is logged with the message ID and error type only, and the turn goes on. An
+  older controller is never asked. Not covered yet (fri #101): Fri's own saved replies and echo rows,
+  and other members' exchanges, that drew on the message record authors and revisions, not message
+  IDs, so they stay.
 - **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
   research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
   an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead
