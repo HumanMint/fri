@@ -393,3 +393,124 @@ def test_a_question_that_waited_out_its_turn_after_a_line_joined_says_nothing_of
         finally:
             await finish(fri, tasks)
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('how', ['as the line', 'after a line'])
+def test_a_gene_control_is_never_let_in_as_a_line(monkeypatch, tmp_path, how):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        if how == 'as the line':
+            no_debounce(monkeypatch)  # Its turn is under way: the control would have to come in as a line.
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        api = fri.api
+        async def offered(method, path, payload=None):
+            if path == '/controls/catalog':
+                return {'actions': ['skip']}
+            return await api(method, path, payload)
+        fri.api = offered
+        execute = AsyncMock(return_value={'done': True, 'output': 'skipped'})
+        monkeypatch.setattr(Actions, 'execute', execute)
+        question = message(QUESTION)
+        tasks = [asyncio.create_task(agent.handle(question))]
+        try:
+            await asyncio.wait_for(model.reached[1].wait(), 5)
+            if how == 'after a line':  # A line reopened its burst, still gathering: the control can't join that either.
+                detail = message(DETAIL)
+                tasks.append(asyncio.create_task(agent.handle(detail)))
+                await until(lambda: tasks[-1].done() or agent.bursts.group(detail) is not None)
+            control = message('skip track')
+            tasks.append(asyncio.create_task(agent.handle(control)))
+            await until(lambda: tasks[-1].done() or control.id in agent.replying or
+                        agent.bursts.group(control) is not None)
+            model.hold[1].set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            execute.assert_not_awaited()
+            control.reply.assert_not_awaited()
+            assert all('skip track' not in burst_of(context) for _, context in model.requests)
+            assert [burst_of(context) for _, context in model.requests][-1] == (
+                [QUESTION, DETAIL] if how == 'after a line' else [])
+        finally:
+            model.hold[1].set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['deleted', 'edited'])
+@pytest.mark.parametrize('stage', ['gathering', 'its turn composing'])
+def test_a_line_taken_back_after_the_question_gave_way_leaves_the_question_answered_alone_once(
+        monkeypatch, tmp_path, change, stage):
+    async def scenario():
+        fri, agent, _, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        if stage == 'its turn composing':
+            no_debounce(monkeypatch)
+        model = Model(fri, tmp_path, waits={1: 'before', 2: 'before'})
+        question = message(QUESTION)
+        tasks = [asyncio.create_task(agent.handle(question))]
+        try:
+            await asyncio.wait_for(model.reached[1].wait(), 5)
+            detail = message(DETAIL)
+            tasks.append(asyncio.create_task(agent.handle(detail)))
+            await until(lambda: tasks[1].done() or detail.id in agent.replying or
+                        agent.bursts.group(detail) is not None)
+            model.hold[1].set()
+            await asyncio.wait_for(tasks[0], 5)  # The question gave way to the burst the line reopened.
+            question.reply.assert_not_awaited()
+            if stage == 'its turn composing':  # That burst's turn, before its request.
+                await asyncio.wait_for(model.reached[2].wait(), 5)
+            if change == 'deleted':
+                deleted(channel, rows, detail)
+                agent.unsend(1, [detail.id])
+            else:
+                agent.edit(1, edited(rows, detail))
+            model.hold[2].set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            await until(lambda: not agent.reruns)
+            question.reply.assert_awaited_once()  # Answered alone after all, once...
+            assert question.reply.await_args.args[0] == ANSWER
+            detail.reply.assert_not_awaited()  # ...and nothing for the line, not even a notice.
+            assert [text for text, _ in model.requests] == [QUESTION]  # Its words never reached the model.
+            assert burst_of(model.requests[0][1]) == []
+            assert all(row['id'] != str(detail.id) for row in model.requests[0][1]['recent'])
+            [turn] = saved(calls)
+            assert turn['source']['id'] == str(question.id) and not turn['burst']
+        finally:
+            for hold in model.hold.values():
+                hold.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+def test_one_exchange_spends_one_allowance_when_a_line_joins_during_its_admission(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        no_debounce(monkeypatch)
+        model = Model(fri, tmp_path)
+        reached, hold = asyncio.Event(), asyncio.Event()
+        api, first = fri.api, [True]
+        async def paused(method, path, payload=None):  # The question's admission answer is on its way back.
+            result = await api(method, path, payload)
+            if path == '/agent/admit' and first[0]:
+                first[0] = False
+                reached.set()
+                await hold.wait()
+            return result
+        fri.api = paused
+        question = message(QUESTION)
+        tasks = [asyncio.create_task(agent.handle(question))]
+        try:
+            await asyncio.wait_for(reached.wait(), 5)
+            detail = message(DETAIL)
+            tasks.append(asyncio.create_task(agent.handle(detail)))
+            await until(lambda: tasks[1].done() or detail.id in agent.replying)
+            hold.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            [(text, context)] = model.requests
+            assert text == DETAIL and burst_of(context) == [QUESTION, DETAIL]
+            assert sum(path == '/agent/admit' for path, _ in calls) == 1
+        finally:
+            hold.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())

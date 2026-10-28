@@ -89,6 +89,8 @@ class Burst(list):
         self.since, self.alone, self.anchors = since, alone, frozenset(anchors)
         self.taken = False  # Taken to be answered (see Agent.receive), not just dropped.
         self.origin = None  # The turn a short line reopened this burst from (see Continuation).
+        self.continued = False  # Begun by such a line, reopening or after that turn: a line joins it on the same terms.
+        self.voided = False  # A line in it was taken back before its turn committed (see Continuations.withdraw).
 
 
 class Bursts:
@@ -103,8 +105,12 @@ class Bursts:
         self.dropped = dropped or (lambda events, reason: None)  # Told of events no reply will answer.
 
     def has(self, channel, user):
+        return self.gathering(channel, user) is not None
+
+    def gathering(self, channel, user):
+        """Their burst a message coming in now joins, if any."""
         groups = self.rows.get((channel, user), [])
-        return bool(groups and time.monotonic()-groups[-1][0][0] <= BURST_SECONDS)
+        return groups[-1] if groups and time.monotonic()-groups[-1][0][0] <= BURST_SECONDS else None
 
     def add(self, message, arrived=None, since=None, alone=False):
         """`since`: the author's erasure baseline as it came in. `alone`: a privacy control, which
@@ -144,15 +150,25 @@ class Bursts:
         with the line newest, so its newest message answers for all of it as usual."""
         key = (message.channel.id, message.author.id)
         group = Burst(since, anchors=(row[1].id for row in rows))
+        group.continued = True
         group.extend(rows)
         group.append((arrived, message, message.content))
         self.rows.setdefault(key, []).append(group)
         return group
 
     def held(self, group):
-        """Whether a burst is still gathering, or was taken to be answered: not dropped."""
+        """Whether a burst is still gathering, or was taken to be answered: not dropped or voided."""
         key = (group[-1][1].channel.id, group[-1][1].author.id)
-        return group.taken or any(rows is group for rows in self.rows.get(key, []))
+        return not group.voided and (group.taken or any(rows is group for rows in self.rows.get(key, [])))
+
+    def discard(self, group, reason):
+        """Drop a burst still gathering, if it is: none of it is answered from it."""
+        key = (group[-1][1].channel.id, group[-1][1].author.id)
+        if any(rows is group for rows in self.rows.get(key, [])):
+            self.rows[key] = [rows for rows in self.rows[key] if rows is not group]
+            if not self.rows[key]:
+                del self.rows[key]
+            self.dropped([row[1] for row in group], reason)
 
     def group(self, message):
         return next((rows for rows in self.rows.get((message.channel.id, message.author.id), [])
@@ -213,14 +229,19 @@ class Continuation:
     The line has to come within the turn's burst window, from its first message (never renewed), with nobody else
     speaking in between (see Agent.continuing). Until the turn commits, just before its model request or anything
     it does goes out, the line reopens the turn's burst and the turn gives way: the reopened burst is answered
-    once, from the line, as any burst is. After that, one line is answered on its own once this reply is done.
-    A line carries no authority of its own: a reopened burst never completes a request (see Actions)."""
+    once, from the line, as any burst is. A line taken back before that burst's turn commits voids it, and the
+    turn that gave way answers its own messages alone after all (see Agent.answer_alone). After this turn commits,
+    one line is answered on its own once this reply is done. A line carries no authority of its own: a reopened
+    burst never completes a request (see Actions), and a line is plain words only (see Agent.plain)."""
 
-    def __init__(self, message, rows, since, *, addressed=False, admitted=False):
-        self.message, self.rows, self.since = message, list(rows), since
+    def __init__(self, message, text, rows, since, *, addressed=False, origin=None):
+        self.message, self.text, self.rows, self.since = message, text, list(rows), since
         self.key = (message.channel.id, message.author.id)
         self.addressed = addressed  # Someone spoke to Fri, so the burst it reopens was spoken to Fri too.
-        self.admitted = admitted  # The member's allowance was spent on this exchange (see Fri.talk).
+        self.origin = origin  # The turn that gave way to this one, if a line reopened its burst.
+        # Whether the exchange spent the member's allowance (see Fri.talk), shared by every turn it passes through.
+        # Their turns go one at a time (see Turns), so an earlier one's admission is settled before a later one asks.
+        self.spent = origin.spent if origin is not None else [False]
         self.joined = None  # The burst a line reopened before this turn committed.
         self.committed = self.gave_way = self.followed = self.closed = False
 
@@ -259,6 +280,10 @@ class Continuation:
         self.joined.origin = self
         return 'reopen'
 
+    def lines(self):
+        """The messages its reopened burst holds besides its own."""
+        return {row[1].id for row in self.joined} - self.joined.anchors if self.joined is not None else set()
+
 
 class Continuations:
     """The explicit turns still open to a short line (see Continuation), and who spoke where lately."""
@@ -274,9 +299,15 @@ class Continuations:
         while len(self.said) > MOST_CHANNELS:
             del self.said[next(iter(self.said))]
 
-    def open(self, message, rows, since, **options):
-        token = self.turns[message.id] = Continuation(message, rows, since, **options)
+    def open(self, message, text, rows, since, **options):
+        token = self.turns[message.id] = Continuation(message, text, rows, since, **options)
         return token
+
+    def prune(self, bursts):
+        """Turns that gave way to a burst dropped since without being answered: e.g. their author erased."""
+        for token in [t for t in self.turns.values() if t.gave_way and t.joined is not None and
+                      not bursts.held(t.joined)]:
+            self.close(token)
 
     def close(self, token):
         if self.turns.get(token.message.id) is token:
@@ -302,18 +333,33 @@ class Continuations:
             return None
         return token
 
-    def withdraw(self, ids):
-        """Messages edited or deleted. A turn whose own message went takes no line now. The bursts a line reopened
-        that hold one and are still gathering, for the caller to drop (Bursts.unsend drops deleted ones itself):
-        until its turn commits, a line taken back is as if it never joined, and the turn answers alone."""
-        ids, reopened = set(ids), []
-        for token in self.turns.values():
+    def withdraw(self, ids, bursts):
+        """Messages edited or deleted. A turn whose own message went takes no line now, and a burst a line reopened
+        from it that's still gathering goes. A line taken back before the turn it reopened committed voids that:
+        the reopened burst goes quietly (its turn gives way too, if it began), and nothing the line said reaches
+        the model. A turn that already gave way to it is returned, to answer its own messages alone after all."""
+        ids, alone = set(ids), []
+        for token in list(self.turns.values()):
             if any(row[1].id in ids for row in token.rows):
                 token.closed = True
-            if (token.joined is not None and not token.joined.taken and
-                    any(row[1].id in ids for row in token.joined)):
-                reopened.append(token.joined)
-        return reopened
+                if token.joined is not None and not token.joined.taken:
+                    bursts.discard(token.joined, 'message changed')
+                continue
+            if token.joined is None or token.joined.voided or not token.lines() & ids:
+                continue
+            after = next((t for t in self.turns.values() if t.origin is token), None)  # The reopened burst's turn.
+            if after is not None and after.committed:
+                continue  # Its request went out: the line is withdrawn like any message a turn carries.
+            token.joined.voided = True
+            bursts.discard(token.joined, 'message changed')
+            if after is not None:
+                after.gave_way = True
+            if token.gave_way:
+                self.close(token)
+                alone.append(token)
+            else:
+                token.joined = None  # It hasn't given way yet: it answers alone when it commits.
+        return alone
 
     def forget(self, user):
         for token in self.turns.values():
