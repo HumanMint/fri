@@ -7,7 +7,7 @@ import asyncio
 import copy
 import json
 from types import MethodType, SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 import httpx
@@ -26,7 +26,12 @@ from fri.fri_images import attach, unchanged
 from fri.fri_mentions import Invitation
 
 QUESTION = 'whats 12 times 12'
-MEDIA_ONLY = ('thoughts?', 'lmao', 'rate this', 'which one', 'is this ai', 'what do you think of this clip', '😭')
+# Reactions and pointers at the media: no model call.
+MEDIA_ONLY = ('thoughts?', 'lmao', 'rate this', 'which one', 'is this ai', 'what do you think of this clip', '😭',
+              'what song is this', 'lol what', 'is it good', 'translate this', 'who is this', 'how do i look')
+# Questions and requests the text carries on its own, however short: the model answers them.
+QUESTIONS = (QUESTION, 'what is recursion?', 'who is gandalf?', 'tell me a joke', 'how are you', 'what time is it',
+             'which one should i wear', 'explain recursion', 'help me pick a laptop')
 FORMAT_WORDS = ('png', 'jpeg', 'webp', 'mb', 'attach', 'resend', 're-upload', 'supported')
 
 
@@ -58,12 +63,13 @@ def loader(monkeypatch, **kwargs):
 
 
 @pytest.mark.parametrize('case', CASES)
-def test_a_text_question_goes_on_with_the_media_marked_unseen(monkeypatch, case):
+@pytest.mark.parametrize('ask', QUESTIONS)
+def test_a_text_question_goes_on_with_the_media_marked_unseen(monkeypatch, case, ask):
     async def scenario():
         load = loader(monkeypatch)
         event, context = message(), {}
-        event.content, (event.attachments, reason) = QUESTION, media(case)
-        await attach(context, event, QUESTION)
+        event.content, (event.attachments, reason) = ask, media(case)
+        await attach(context, event, ask)
         load.assert_not_awaited()  # Declined media is never downloaded, spoilers and big ones included.
         assert 'images' not in context and 'image_sources' not in context
         from fri.fri_images import media as kinds
@@ -140,6 +146,50 @@ def test_a_repeated_attach_keeps_what_an_earlier_call_inspected_or_declined(monk
         first = dict(context)
         await attach(context, gif, QUESTION)
         assert context == first
+    asyncio.run(scenario())
+
+
+def test_a_failed_load_stays_declined_for_the_rest_of_the_turn(monkeypatch):
+    async def scenario():
+        event, context = message(), {}
+        event.content = QUESTION
+        loader(monkeypatch, side_effect=httpx.ConnectError('cdn down'))
+        await attach(context, event, QUESTION)
+        first = dict(context)
+        retry = loader(monkeypatch)  # The CDN is back by the time a read tool attaches again.
+        await attach(context, event, QUESTION)
+        # What the model was told stands: no image beside a "did not load" status, and no second download.
+        assert context == first and 'images' not in context
+        retry.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_a_read_tool_after_a_failed_load_never_shows_the_image_beside_the_unseen_status(monkeypatch, tmp_path):
+    async def scenario():
+        from compat_tests.test_fri_mentions import attachment
+        from fri.fri_chat import ChatResult
+        fri, agent, _, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message('<@99> '+QUESTION, attachments=[attachment(channel.id)])
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='sent')
+        loads = AsyncMock(side_effect=[httpx.ConnectError('cdn down'), 'data:image/png;base64,aGVsbG8='])
+        monkeypatch.setattr('fri.fri_images.load_image', loads)
+        contexts = []
+
+        async def respond(_, context):
+            contexts.append({key: context.get(key) for key in ('images', 'own_media_not_inspected')})
+            if not context.get('action_result'):
+                return ChatResult(status='completed', action={'kind': 'read_recent', 'channel_id': str(channel.id)})
+            return ChatResult(status='completed', reply='144')
+        fri.chat_once.side_effect = respond
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            event.reply.assert_awaited_once()
+            unseen = {'attachments': ['image'], 'reason': 'did not load'}
+            assert contexts == [{'images': None, 'own_media_not_inspected': unseen}] * 2
+            assert loads.await_count == 1
+        finally:
+            await fri.close()
     asyncio.run(scenario())
 
 

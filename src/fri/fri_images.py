@@ -21,19 +21,18 @@ LIMITS = {'spoiler': 'i don’t open spoilers.', 'video': 'can’t watch videos,
           'gif': 'can’t watch gifs, only still pics.', 'more than two images': 'i only look at two pics per post.',
           'image too large': 'that pic’s too big for me to open.',
           'unsupported': 'can’t open that one, only plain still pics.', 'did not load': 'couldn’t load that just now.'}
-# Words that only react to media or point at it. An ask with at most one other word ("thoughts?", "lmao",
-# "rate this", "is this ai") needs the media itself; anything more is a question its text carries alone.
-ABOUT_MEDIA = frozenset('''
-fri yo hey hi bro bruh dude lol lmao lmfao haha hahaha xd omg wow damn ok okay oh ah uh hm hmm fr ngl tbh
-pls plz please rn so just really actually lowkey kinda now too also
-this that these those it its them here there above one ones attached
-clip clips video videos vid gif gifs pic pics picture pictures photo photos image images meme memes
-screenshot file post thing
-what whats who whos which how hows why is are was does do did can could would will you u ur your yours
-i im me my mine think of about on at in the a an and or to for any
-thoughts thought opinion opinions take rate rating look see watch check out tell say describe explain
-good bad funny real fake mid cursed guess like cute nice cool crazy wild
-'''.split())
+# What an ask about the media itself is made of: reactions and pointers at it ("thoughts?", "lmao", "is it
+# good"), or a pointer and one word of its own ("what song is this"). Any other question or request, however
+# short ("what is recursion?", "tell me a joke"), is the text's own and goes to the model (see about_media).
+REACTIONS = frozenset('''lol lmao lmfao haha hahaha xd omg wow damn bruh bro dude fr ngl tbh thoughts thought
+opinion opinions take rate rating think look see watch check good bad funny real fake true mid cursed cute nice
+cool crazy wild like guess'''.split())
+POINTERS = frozenset('''this that these those above attached clip clips video videos vid gif gifs pic pics
+picture pictures photo photos image images meme memes screenshot file post'''.split())
+VAGUE = frozenset('it its them here there one ones thing'.split())  # Pointers only with no word of the ask's own.
+FILLER = frozenset('''fri yo hey hi ok okay oh ah uh um hm hmm so just really actually lowkey kinda now too also
+pls plz please rn what whats who whos which how hows why is are was does do did can could would will you u ur
+your yours i im me my mine of about on at in out the a an and or to for any tell say describe explain'''.split())
 
 
 def media(message):
@@ -191,6 +190,8 @@ async def attach(context, event, text, *, source=None, invitation=None):
         await invitation.require_current()
         if source is not event and source is not invitation.image:
             raise commands.UserFeedbackCheckFailure(CHANGED)
+    if context.get('image_declined') and context['image_event'].id == source.id:
+        return  # Declined earlier this turn (a read tool attaches again): what the model was told stands, no retry.
     attachments = source.attachments
     # In normal chat accept only the requester's own attachments, not arbitrary
     # external embeds, referenced posts, or images from recent channel context.
@@ -232,9 +233,13 @@ def declined(source):
 
 
 def about_media(text):
-    """An ask that needs the media itself to answer: at most one word beyond reacting to it or pointing at it."""
+    """An ask that needs the media itself to answer: only reactions and pointers at it, or a pointer at it and
+    one word of its own. Emoji alone count; greetings and questions with nothing pointing at it don't."""
     words = re.findall(r"[^\W_]+", re.sub(r"<[^>]*>|['’]", '', text.casefold()))
-    return sum(word not in ABOUT_MEDIA for word in words) <= 1
+    own = [word for word in words if word not in REACTIONS | POINTERS | VAGUE | FILLER]
+    if any(word in POINTERS for word in words):
+        return len(own) <= 1
+    return not own and (not words or any(word in REACTIONS or word in VAGUE for word in words))
 
 
 def decline(context, event, source, reason, text, invitation):
