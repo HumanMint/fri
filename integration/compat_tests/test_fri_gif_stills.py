@@ -20,7 +20,7 @@ from fri import feedback as commands
 from fri.fri import Fri
 from fri.fri_actions import Actions
 from fri.fri_chat import Chat
-from fri.fri_images import looked_unchanged
+from fri.fri_images import looked_unchanged, stills
 from fri.fri_meme_media import allowed_url, load_image, sources
 from fri.fri_mentions import Invitation
 
@@ -74,6 +74,22 @@ def test_a_gif_links_preview_gets_the_pixel_limit_attachments_get(size, looked):
             **embed.to_dict()['thumbnail'], 'width': size[0], 'height': size[1]}})
     link = SimpleNamespace(attachments=[], content='https://tenor.com/view/dance-123', embeds=[embed])
     assert sources(link, gifs=True) == ([PREVIEW] if looked else None)
+
+
+@pytest.mark.parametrize('width,height,looked', [
+    ('5000', 4000, False), ('5000', '4000', False), (0, 4000, False), (4000, 0, False), (-1, 4000, False),
+    (-5000, -4000, False), (True, True, False), (4000, False, False), (1.5, 100, False), ('100', None, False),
+    (5000, None, True), (None, None, True)])
+def test_a_gif_links_preview_size_must_be_positive_integers(width, height, looked):
+    """fri #160: a size Discord gives is checked as positive integers before the pixel limit multiplies it, so
+    malformed metadata skips the preview instead of crashing the read. A size it leaves out keeps the fallback."""
+    thumbnail = {'proxy_url': PREVIEW, 'url': 'https://media.tenor.com/x/dance.png'}
+    thumbnail.update({key: side for key, side in (('width', width), ('height', height)) if side is not None})
+    embed = discord.Embed.from_dict({**tenor_embed().to_dict(), 'thumbnail': thumbnail})
+    link = SimpleNamespace(attachments=[], content='https://tenor.com/view/dance-123', embeds=[embed],
+                           author=SimpleNamespace(bot=False), webhook_id=None)
+    assert sources(link, gifs=True) == ([PREVIEW] if looked else None)
+    assert stills(link) == (([PREVIEW], 'gif preview') if looked else (None, None))
 
 
 @pytest.mark.parametrize('fmt,mime', [('GIF', 'image/gif'), ('PNG', 'image/png'), ('WEBP', 'image/webp')])
