@@ -155,9 +155,9 @@ async def look(context, posts, *, invitation=None):
             inspected.append({'images': list(range(len(images)+1, len(images)+len(loaded)+1)),
                               'source': discord_source(post).evidence(), **({'still': still} if still else {})})
             images += loaded
-            # A link card's picture is checked on its own refetch (see looked_unchanged), not an invitation's
-            # snapshot of its posts: a card unfurling late on a post Fri didn't look at changes nothing it saw.
-            reads.append({'event': post, 'sources': urls, 'invitation': None if still == 'link preview' else invitation})
+            if invitation is not None:  # Its own check covers what it looked at (see Invitation.current).
+                invitation.inspected(post, urls)
+            reads.append({'event': post, 'sources': urls, 'invitation': invitation})
             budget -= len(urls)
             looked += 1
     skipped += len(queue)
@@ -311,11 +311,12 @@ def lookable(post):
     return bool(attachments or gif_previews(post) or stills(post)[0])
 
 
-async def own_links(context, event):
+async def own_links(context, event, *, invitation=None):
     """The speaker's own post as Discord has it now, for the link cards it unfurled after it came in: the
     event that arrived usually has none yet. Their text goes beside the message (message_link_cards), and a
-    card's picture or a GIF link's preview is looked at like a nearby post's, checked again on its own
-    refetch before each request. Never their attachments: attach() has those. Only a turn that may look."""
+    card's picture or a GIF link's preview is looked at like a nearby post's, checked again as Discord has it
+    before each request and before delivery: by a ping's `invitation`, else on its own refetch. Never their
+    attachments: attach() has those. Only a turn that may look."""
     from .fri_conversation import LINK
     content = LINK.sub('', str(getattr(event, 'content', '') or ''))  # Discord unfurls no message link.
     if (not isinstance(event, discord.Message) or has_attachments(event) or
@@ -332,4 +333,4 @@ async def own_links(context, event):
     if cards := link_cards(current):
         context['message_link_cards'] = cards
     if lookable(current):
-        await look(context, [current])
+        await look(context, [current], invitation=invitation)

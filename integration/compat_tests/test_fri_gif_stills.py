@@ -79,7 +79,7 @@ def test_an_animated_preview_is_refused_without_decoding(fmt, mime):
 def tenor(post, *, preview=PREVIEW, kind='gifv'):
     item = post('https://tenor.com/view/dance-123')
     item.embeds = [SimpleNamespace(type=kind, video=None if kind != 'gifv' else SimpleNamespace(url='x.mp4'),
-                                   image=SimpleNamespace(proxy_url=preview) if kind == 'article' else None,
+                                   image=SimpleNamespace(proxy_url=preview, width=600, height=315) if kind == 'article' else None,
                                    thumbnail=SimpleNamespace(proxy_url=preview))]
     return item
 

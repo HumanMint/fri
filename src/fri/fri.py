@@ -723,10 +723,15 @@ class Fri(discord.Client):
                 if inspect_images:
                     await attach_images(context, event, text, source=image_source, invitation=invitation)
                     from .fri_images import look, lookable, own_links
-                    await own_links(context, event)  # Their own link's card, unfurled after it came in.
+                    await own_links(context, event, invitation=invitation)  # Their own link's card, unfurled after it came in.
                     if targets and not context.get('unattributed_reference'):
                         # The meme they replied to or linked: a still image, a GIF link's preview or a link card's picture.
+                        before = len(context.get('image_reads', []))
                         await look(context, [post for post in targets if lookable(post)])
+                        for read in context.get('image_reads', [])[before:] if invitation else ():
+                            # Checked on their own refetch before each request; a ping's delivery check is its
+                            # invitation's, so that finds them again too (see Actions.valid).
+                            invitation.inspected(read['event'], read['sources'])
                 if actions:
                     from .fri_images import image_context
                     actions.image_context = image_context(context)
@@ -1061,7 +1066,7 @@ class Fri(discord.Client):
                 actions.private_evidence = True
                 context['actions'] = await actions.available()
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
-                await own_links(context, event)  # The ping's own link card, before the nearby posts' pictures.
+                await own_links(context, event, invitation=invitation)  # The ping's own card, before the nearby posts' pictures.
                 await invitation.look(context)  # Up front: an outside ping has no read to decide on.
                 actions.image_context = image_context(context)
                 context['fence'] = {'invitation': invitation, 'shown': set()}  # See chat_once.

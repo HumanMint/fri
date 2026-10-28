@@ -10,7 +10,7 @@ from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import AuthorErased, ControllerUnavailable
-from .fri_images import details, lookable
+from .fri_images import details, lookable, stills
 from .fri_meme_media import gif_previews, sources, unsigned
 from .fri_memes import reacted
 from .privacy import clean
@@ -59,6 +59,7 @@ class Invitation:
         self.rows, self.events, self.profiles, self.snapshots = [], {}, {}, {}
         self.image = None  # The ping's own image post, the one it replies to, or their photo just before (see current).
         self.images = []  # Otherwise, nearby posts with attachments, for look() to choose from.
+        self.pictures = {}  # Every post whose images the turn showed the model: ID -> (post, unsigned images).
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
         self.revision = None  # The author's privacy revision as Fri first read it for this ping.
@@ -89,6 +90,11 @@ class Invitation:
             return None
         agent.miss(message, reason)
         return None
+
+    def inspected(self, post, urls):
+        """The turn showed the model these images of a post (see fri_images.look): each check from here on,
+        before every request and before delivery, finds them again as Discord shows the post now."""
+        self.pictures[post.id] = (post, unsigned(urls))
 
     def refuse(self, reason):
         self.refusal = reason
@@ -169,10 +175,10 @@ class Invitation:
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
-                changed = False  # Every one is checked, so each edited or deleted leaves the live view.
+                changed, fetched = False, {}  # Every one is checked, so each edited or deleted leaves the live view.
                 for mid, event in self.events.items():
                     try:
-                        current = await self.event.channel.fetch_message(mid)
+                        current = fetched[mid] = await self.event.channel.fetch_message(mid)
                     except discord.NotFound:
                         self.agent.withdraw(event)
                         changed = True
@@ -182,6 +188,16 @@ class Invitation:
                         changed = True
                 if changed:
                     return self.refuse('nearby message changed')
+                # Every image Fri looked at, as Discord shows it now: a link card's picture isn't in the
+                # snapshots above (a card unfurling late on a post Fri didn't look at changes nothing it saw),
+                # and the ping's own isn't a nearby post. Suppressing a card changes no text or edit time.
+                for mid, (post, urls) in self.pictures.items():
+                    try:
+                        current = fetched.get(mid) or await post.channel.fetch_message(mid)  # A link's, from its channel.
+                    except discord.NotFound:
+                        return self.refuse('image changed')
+                    if current.id != mid or unsigned(stills(current)[0]) != urls:
+                        return self.refuse('image changed')
                 # The ping again, as an edit during the privacy read would otherwise go unseen.
                 if not await self.ping_unchanged():
                     return self.refuse('message changed')

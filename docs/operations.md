@@ -54,10 +54,13 @@ site's and never instructions. Card text isn't part of any recheck: a card that 
 suppressed changes no fingerprint, and the next read shows it as it is then. On a member's post with no
 attachment or GIF link, the card's picture (a video's thumbnail, an X or Reddit card's image, a pasted
 image link) counts as one image, labelled `still="link preview"`, from the first two cards, through
-Discord's own `/external/` proxy only and within the image limits above (a picture Discord sized over
-twenty million pixels is skipped). The picture is checked on its own refetch before each later model
-request, so a swapped or suppressed one stops the turn. A post with both an attachment and a card's
-picture is still not looked at, and history search rows don't show cards yet.
+Discord's own `/external/` proxy only and within the image limits above. Discord must have sized it within
+twenty million pixels, and the bytes' own header must agree (any preview through that proxy, a GIF link's
+too); a size that's missing or unreadable skips it. Every picture a turn showed the model is found again,
+as Discord shows its post then, before each later model request and before delivery (a ping's own check
+does it, outside channels too), so a swapped or suppressed one stops the turn. A card that unfurls late on
+a post Fri didn't look at changes nothing. A post with both an attachment and a card's picture is still
+not looked at, and history search rows don't show cards yet.
 
 Context from other members keeps its actual author and privacy revision and stays
 ephemeral. Saved conversation uses a neutral breadcrumb; no derived personal notes,

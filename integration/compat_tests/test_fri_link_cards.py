@@ -8,6 +8,7 @@ import copy
 import datetime as dt
 import json
 from types import MethodType, SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 import httpx
@@ -20,6 +21,7 @@ from fri.fri import Fri
 from fri.fri_actions import Actions
 from fri.fri_chat import CARDS_RULE, INSTRUCTIONS, Chat
 from fri.fri_images import link_cards, looked_unchanged
+from fri.fri_meme_media import link_previews, load_image
 from fri.fri_mentions import Invitation
 
 THUMB = 'https://images-ext-1.discordapp.net/external/yt/https/i.ytimg.com/vi/xyz/maxresdefault.jpg'
@@ -258,9 +260,12 @@ def test_a_pings_nearby_card_picture_is_checked_on_its_own_refetch(monkeypatch, 
             elif change == 'text only':
                 rows[link.id] = copy.copy(link)
                 rows[link.id].embeds = [youtube(title='Retitled')]
-            # The invitation's own snapshot holds no card text or picture, so only what Fri saw can stop it.
-            assert await invitation.current()
+            # The invitation's own check covers the picture Fri looked at, never card text or another post's
+            # late card, and it's what an outside ping's requests and its delivery run (fri #150 review B1).
+            assert await invitation.current() == (change != 'swapped')
             assert await looked_unchanged(context) == (change != 'swapped')
+            if change == 'swapped':
+                assert invitation.refusal == 'image changed'
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -421,3 +426,169 @@ def test_the_images_suite_checks_fri_reads_a_card_and_takes_no_orders_from_it(re
     assert CARDS_RULE not in body['instructions']
     body, = requests(cards[0])
     assert CARDS_RULE in body['instructions']
+
+
+PRIVATE = 'https://images-ext-1.discordapp.net/external/abc/https/site.test/private.png'
+
+
+def private_card(part='image', **size):
+    """A card whose picture is its big image, or a small thumbnail: one the row's media kinds don't name."""
+    return discord.Embed.from_dict({'type': 'article', 'url': 'https://site.test/page', 'title': 'A page',
+        part: {'url': 'https://site.test/private.png', 'proxy_url': PRIVATE, **size}})
+
+
+@pytest.mark.parametrize('part', ['image', 'thumbnail'])
+@pytest.mark.parametrize('where,channel_id', [('nearby', 8), ('own', 8), ('own', 1)])
+@pytest.mark.parametrize('when', ['never', 'sign-in', 'inference'])
+def test_a_suppressed_card_picture_never_reaches_the_model_or_the_reply(monkeypatch, tmp_path, where, channel_id, when,
+                                                                        part):
+    """fri #150 review B1: a ping's card pictures, nearby or its own, outside or configured, are checked before
+    every request and before delivery. Suppressing an embed changes neither the text nor the edit time."""
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        fri.data = tmp_path
+        if where == 'nearby':
+            source = message('https://site.test/page', user=30, age=60)
+            source.embeds = [private_card(part, width=100, height=100)]
+            event = message('<@99> what is in that picture?')
+        else:
+            event = message('<@99> what is in this picture https://site.test/page')
+            source = copy.copy(event)  # Discord's copy has the card; the event that arrived doesn't.
+            source.embeds = [private_card(part, width=100, height=100)]
+            rows[event.id] = source
+        loads(monkeypatch)
+        sent = []
+
+        def suppress():
+            changed = copy.copy(rows[source.id])
+            changed.embeds = []
+            rows[source.id] = changed
+
+        def access_token():
+            if when == 'sign-in':
+                suppress()
+            return 'synthetic'
+
+        def handler(request):
+            content = json.loads(request.content)['input'][-1]['content']
+            seen = isinstance(content, list) and any(part['type'] == 'input_image' for part in content)
+            sent.append(seen)
+            if when == 'inference':
+                suppress()
+            answer = {'response_kind': 'reply', 'reaction': None, 'reply': 'CAPTION' if seen else 'no picture',
+                      'request_draft': None, 'action': None, 'notes': [], 'allow_closing': False}
+            return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(answer)))+'\n\n')
+        fri.chat = Chat(SimpleNamespace(access_token=access_token), httpx.MockTransport(handler))
+        del fri.chat_once
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            replies = [call.args[0] for call in event.reply.await_args_list]
+            if when == 'never':
+                assert sent == [True] and replies == ['CAPTION']
+                return
+            assert 'CAPTION' not in replies
+            assert sent == ([] if when == 'sign-in' else [True])
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('size', [{}, {'width': 0, 'height': 100}, {'width': 100, 'height': -1},
+                                  {'width': '100', 'height': '100'}, {'width': 5000, 'height': 4001}])
+def test_a_card_picture_needs_a_size_within_the_pixel_limit(size):
+    """fri #150 review F2: a picture Discord gave no valid size is refused before anything is fetched."""
+    post = SimpleNamespace(content='https://site.test/page', embeds=[private_card(**size)])
+    assert link_previews(post) is None
+    assert link_previews(SimpleNamespace(content='x', embeds=[private_card(width=100, height=100)])) == [PRIVATE]
+
+
+def png(width, height):
+    import io
+
+    from PIL import Image
+    out = io.BytesIO()
+    Image.new('RGB', (width, height), 'white').save(out, format='PNG')
+    return out.getvalue()
+
+
+def test_a_card_picture_without_a_size_is_never_looked_at(monkeypatch):
+    """The reviewer's probe: a 25-megapixel PNG of 84 KB behind a card that gives no size."""
+    from fri.fri_images import look
+    fetched = []
+
+    async def load(url, channel, **kwargs):
+        fetched.append(url)
+        return await load_image(url, channel, transport=serve(png(5000, 5000)), **kwargs)
+    monkeypatch.setattr('fri.fri_images.load_image', load)
+    post = Mock(spec=discord.Message, id=10, content='https://site.test/page', attachments=[],
+                embeds=[private_card()], edited_at=None, webhook_id=None, channel=SimpleNamespace(id=8),
+                author=SimpleNamespace(id=30, bot=False, display_name='member'), guild=SimpleNamespace(id=123))
+    context = {}
+    assert asyncio.run(look(context, [post])) == {'images_inspected': 0, 'images_not_inspected': 1}
+    assert not context and fetched == []
+
+
+def serve(body, mime='image/png'):
+    return httpx.MockTransport(lambda request: httpx.Response(200, content=body, headers={'content-type': mime}))
+
+
+@pytest.mark.parametrize('width,height,ok', [(100, 100, True), (5000, 5000, False), (4000, 5000, True)])
+def test_a_preview_bigger_than_its_card_says_is_refused_from_its_own_header(width, height, ok):
+    """A site can serve the proxy something else than what Discord sized: the bytes' own size counts too."""
+    async def scenario():
+        result = load_image(PRIVATE, 8, transport=serve(png(width, height)), previews=True)
+        if ok:
+            assert (await result).startswith('data:image/png;base64,')
+        else:
+            with pytest.raises(ValueError):
+                await result
+    asyncio.run(scenario())
+
+
+def test_a_preview_whose_size_cant_be_read_is_refused():
+    async def scenario():
+        with pytest.raises(ValueError):  # PNG magic, no readable header.
+            await load_image(PRIVATE, 8, transport=serve(b'\x89PNG\r\n\x1a\n'+b'image bytes'), previews=True)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('part', ['image', 'thumbnail'])
+@pytest.mark.parametrize('how', ['reply', 'link'])
+@pytest.mark.parametrize('when', ['never', 'inference'])
+def test_a_configured_pings_target_card_picture_is_found_again_before_delivery(monkeypatch, tmp_path, how, when, part):
+    """The post a configured-channel ping replies to or links: its card picture is checked by the ping's
+    delivery check too, not only before each request. A thumbnail adds no media kind to the target's row,
+    so the row comparison alone doesn't notice it go."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        source = message('https://site.test/page', user=30, age=60)
+        source.embeds = [private_card(part, width=100, height=100)]
+        if how == 'reply':
+            event = message('<@99> what is in that picture?')
+            event.reference = SimpleNamespace(message_id=source.id, channel_id=1)
+        else:
+            event = message(f'<@99> what is in https://discord.com/channels/123/1/{source.id}')
+        loads(monkeypatch)
+
+        def handler(request):
+            content = json.loads(request.content)['input'][-1]['content']
+            seen = isinstance(content, list) and any(part['type'] == 'input_image' for part in content)
+            if when == 'inference':
+                changed = copy.copy(rows[source.id])
+                changed.embeds = []  # Suppressed: same text, same edit time.
+                rows[source.id] = changed
+            answer = {'response_kind': 'reply', 'reaction': None, 'reply': 'CAPTION' if seen else 'no picture',
+                      'request_draft': None, 'action': None, 'notes': [], 'allow_closing': False}
+            return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(answer)))+'\n\n')
+        fri.chat = Chat(SimpleNamespace(access_token=lambda: 'synthetic'), httpx.MockTransport(handler))
+        del fri.chat_once
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            replies = [call.args[0] for call in event.reply.await_args_list]
+            assert ('CAPTION' in replies) == (when == 'never')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
