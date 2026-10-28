@@ -12,6 +12,7 @@ import httpx
 from .fri_agent_model import STRING, analyze, obj
 from .fri_chat import Chat, ChatResult
 from .fri_image_eval import cases as image_cases
+from .fri_image_eval import link_cases
 from .privacy import model_json
 from .subscription import Subscription, private_json
 
@@ -239,7 +240,7 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
         async for case, result in times(chat, model, effort, voice_notes):
             yield case, result
         return
-    for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': image_cases, 'sass': sass_cases, 'model-text': model_text_cases}[suite]():
+    for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': lambda: [*image_cases(), *link_cases()], 'sass': sass_cases, 'model-text': model_text_cases}[suite]():
         name = case.get('display_name', 'Mint')
         context = {'model': model, 'effort': effort, 'facts': [],
             'turns': case.get('turns', []), 'recent': case.get('recent', []),
@@ -249,6 +250,8 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
             'personal_memory': {'enabled': suite == 'foundation', 'notes': []},
             'display_name': name, 'speaker': {'user_id': '101', 'display_name': name},
             'source': source(name=name)}
+        if case.get('invited_context'):
+            context['invited_context'] = case['invited_context']
         context['acknowledgments_enabled'] = suite == 'endings'
         context['images'] = case.get('images', [])
         context['inspected_images'] = case.get('inspected_images', [])

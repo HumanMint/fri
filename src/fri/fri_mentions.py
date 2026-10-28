@@ -10,7 +10,7 @@ from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import AuthorErased, ControllerUnavailable
-from .fri_images import details
+from .fri_images import details, lookable, stills
 from .fri_meme_media import gif_previews, sources, unsigned
 from .fri_memes import reacted
 from .privacy import clean
@@ -59,6 +59,7 @@ class Invitation:
         self.rows, self.events, self.profiles, self.snapshots = [], {}, {}, {}
         self.image = None  # The ping's own image post, the one it replies to, or their photo just before (see current).
         self.images = []  # Otherwise, nearby posts with attachments, for look() to choose from.
+        self.pictures = {}  # Every post whose images the turn showed the model: ID -> (post, unsigned images).
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
         self.revision = None  # The author's privacy revision as Fri first read it for this ping.
@@ -89,6 +90,25 @@ class Invitation:
             return None
         agent.miss(message, reason)
         return None
+
+    def inspected(self, post, urls):
+        """The turn showed the model these images of a post (see fri_images.look): each check from here on,
+        before every request and before delivery, finds them again as Discord shows the post now."""
+        self.pictures[post.id] = (post, unsigned(urls))
+
+    async def pictures_unchanged(self):
+        """Every image the turn showed the model (see inspected), as Discord shows its post now. A link card's
+        picture isn't in the nearby snapshots (a card unfurling late on a post Fri didn't look at changes
+        nothing it saw), the ping's own isn't a nearby post, and suppressing a card changes no text or edit
+        time. Before the privacy reads, so the last of those still comes after every Discord read."""
+        for mid, (post, urls) in self.pictures.items():
+            try:
+                current = await post.channel.fetch_message(mid)  # A linked post's from its own channel.
+            except discord.NotFound:
+                return False
+            if current.id != mid or unsigned(stills(current)[0]) != urls:
+                return False
+        return True
 
     def refuse(self, reason):
         self.refusal = reason
@@ -165,6 +185,9 @@ class Invitation:
                 return False
             if not await self.ping_unchanged():
                 return self.refuse('message changed')
+            # With or without a grant: a ping answering a pending clarification skips the mention admission.
+            if check_evidence and not await self.pictures_unchanged():
+                return self.refuse('image changed')
             if check_evidence and self.grant:
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
@@ -303,8 +326,9 @@ class Invitation:
         elif referenced and referenced.attachments:
             self.image = referenced
         # Without one image the ping points at, "which of these" needs all of them; look() keeps the newest that fit.
-        self.images = [] if self.image else [m for m in self.events.values() if m.attachments or gif_previews(m)]
-        # Contextual images use attachments, or a GIF link's Discord-made preview. Never other embeds or URLs.
+        self.images = [] if self.image else [m for m in self.events.values() if lookable(m)]
+        # Contextual images use attachments, a GIF link's Discord-made preview or a link card's picture (see
+        # fri_images.stills). Never a page a link points at.
         if self.image and sources(self.image) != [str(a.url) for a in self.image.attachments]:
             self.image = None
         await self.require_current()
