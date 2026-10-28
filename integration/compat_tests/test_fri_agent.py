@@ -199,8 +199,11 @@ def test_behavior_preview_rejects_nonowner_and_spoofed_message():
                                 member=AsyncMock(return_value=object()))
         view = BehaviorPreview(agent, {'voice_notes': 'brief'}, 1)
         event = SimpleNamespace(user=SimpleNamespace(id=11), guild_id=None,
-                                message=SimpleNamespace(author=SimpleNamespace(id=99)))
+                                message=SimpleNamespace(author=SimpleNamespace(id=99)),
+                                response=SimpleNamespace(is_done=lambda: False, send_message=AsyncMock()))
         assert not await view.interaction_check(event)
+        assert event.response.send_message.await_args.kwargs['content'] == 'not your button.'  # Told, privately.
+        assert event.response.send_message.await_args.kwargs['ephemeral'] is True
         event.user.id = 10
         assert await view.interaction_check(event)
         event.message.author.id = 11
