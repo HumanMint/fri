@@ -196,7 +196,7 @@ def song_words(text):
     return [word.strip("'") for word in re.findall(r"[\w']+", text) if word.strip("'")]
 
 
-def grounded(said, named):
+def grounded_song(said, named):
     """The named song is the start of what they said, word for word: never words picked from a later clause
     ("To The Moon, not To Be With You"). Only a leading article may be left out, and only connectors between a
     title and its artist skipped."""
@@ -225,7 +225,7 @@ def correction(text, argument):
     if WITHDRAWN.search(QUOTED.sub(' " ', song)):
         return False
     lead = LEAD.match(song)
-    return any(grounded(song_words(replacement), named)
+    return any(grounded_song(song_words(replacement), named)
                for replacement in (song, song[lead.end():] if lead else '') if replacement)
 
 
