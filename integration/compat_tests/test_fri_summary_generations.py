@@ -4,6 +4,7 @@ is withheld, as for other withdrawn evidence. Against the real controller; an ol
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -222,6 +223,27 @@ def test_the_model_reads_the_summary_but_never_its_generation(monkeypatch, tmp_p
             carried = json.loads(requests[-1]['input'][-1]['content'])
             assert carried['your_summary_of_speaker_untrusted'] == SUMMARY
             assert 'generation' not in json.dumps(requests)  # What the model reads is unchanged.
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_summary_withdrawn_after_delivery_keeps_the_reply_unsaved(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await summarized_from(monkeypatch, w)
+
+            async def respond(text, context):
+                return ChatResult(status='completed', reply=CONTINUATION)
+            model(w, respond)
+            event = w.message(GAMING, 'fri what were we on about')
+            result = await w.fri.talk(123, GAMING, 20, event.content, 'public', 'member 20', event=event)
+            assert result.reply == CONTINUATION  # Checked and delivered; then its source is deleted.
+            await deleted(w, events[0])
+            assert await w.fri.record_turn(result, SimpleNamespace(id=event.id+1, content=CONTINUATION)) is None
+            with w.store.connection() as db:
+                assert CONTINUATION not in str(db.execute('SELECT * FROM chat_turns').fetchall())
         finally:
             await w.fri.close()
     run(scenario)
