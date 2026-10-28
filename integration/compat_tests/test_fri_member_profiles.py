@@ -724,10 +724,11 @@ ASH = {'user_id': '30', 'revision': 0}
 
 
 def quoting_note(w):
-    """A preference saved from a message quoting ash, whose exchange has since expired."""
-    w.store.save_chat('123', 'public:1', '20', 0, 'ash said: I like Minecraft modpacks', 'noted', 'model', 'high',
+    """A preference of the member's saved while ash's words were in view, whose exchange has since expired. (Their
+    own words: Gene keeps no note from words they report someone else said, gene #77.)"""
+    w.store.save_chat('123', 'public:1', '20', 0, 'same, I like Minecraft modpacks', 'noted', 'model', 'high',
                       notes=note('I like Minecraft modpacks'), audience='server', provenance=[ASH],
-                      source=discord_source(w.message(GENERAL, 'ash said: I like Minecraft modpacks')).model_dump())
+                      source=discord_source(w.message(GENERAL, 'same, I like Minecraft modpacks')).model_dump())
     with w.store.connection() as db:
         db.execute('DELETE FROM chat_turns')
 

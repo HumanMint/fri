@@ -31,7 +31,7 @@ from .fri_errors import (
     ControllerUnavailable,
     GateClosed,
 )
-from .fri_images import media
+from .fri_images import forwarded, media
 from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
@@ -84,7 +84,11 @@ class BehaviorPreview(PagedPreview):
 
     async def interaction_check(self, interaction):
         fri = self.agent.fri
-        return (interaction.user.id == fri.owner_id and interaction.message.author.id == fri.user.id and
+        if interaction.user.id != fri.owner_id:
+            from .fri_buttons import not_yours
+            await not_yours(interaction)
+            return False
+        return (interaction.message.author.id == fri.user.id and
                 (interaction.guild_id is None or (interaction.guild_id == fri.guild_id and
                                                   self.agent.allowed(interaction.channel))) and
                 bool(await self.agent.member(interaction.user.id, fresh=True)))
@@ -607,6 +611,8 @@ class Agent:
                 return closed
             if await erased():
                 return ERASED
+            if message.guild is None and not self.config['support_dms']:  # Gone off during that read (fri #136).
+                return 'dms off'
             changes = {r['key']: json.loads(r['json_value']) for r in result.get('changes', [])}
             if status != 'completed' or set(changes)-set(DEFAULTS):
                 await message.reply('i couldn’t prepare that settings change. nothing was saved.', allowed_mentions=NO_MENTIONS)
@@ -626,6 +632,13 @@ class Agent:
     def miss(self, event, reason):
         if event.id in self.misses and self.misses[event.id] is None:
             self.misses[event.id] = reason
+
+    def forward_dropped(self, message, reason):
+        """A member's forward, which Fri can't read yet, logged as it's dropped so they can be counted: the
+        channel and message IDs (none for a DM's channel) and the gate, never content or names."""
+        if not message.author.bot and forwarded(message):
+            LOG.info('Forward %s/%s not read: %s', 'dm' if message.guild is None else message.channel.id,
+                     message.id, reason)
 
     def answered(self, events):
         for event in events:
@@ -1200,6 +1213,8 @@ class Agent:
             self.memory_controls.leave(message.author.id, message.id)  # Outside, it's chat (see Fri.talk).
             # An outside ping is one event, never a new ambient/active channel.
             if message.guild.id != self.fri.guild_id or not explicit_mention(message, self.fri.user.id):
+                if message.guild.id == self.fri.guild_id:
+                    self.forward_dropped(message, 'not a visible user mention')
                 return self.miss(message, 'outside the main server' if message.guild.id != self.fri.guild_id
                                  else 'not a visible user mention')
             from .fri_mentions import Invitation
@@ -1230,6 +1245,7 @@ class Agent:
                     self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                         'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
                         'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
+            self.forward_dropped(message, 'no text')
             return self.miss(message, 'no text')
         directed = text if dm else await addressed_text(message, self.fri.user.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
@@ -1707,6 +1723,8 @@ class Agent:
                 missed(taken_back() or 'image share withdrawn')
                 await self.fri.waiting_notices.clear(message.author.id)
                 return
+            if view is not None:
+                view.message = sent  # A draft's or preview's controls come off it when it times out.
             self.saving.add(getattr(sent, 'id', None))  # So a delete while it saves is noticed (see unsend).
             self.answered(events)
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.

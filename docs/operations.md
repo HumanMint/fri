@@ -732,20 +732,23 @@ docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md 
 
 `draft` runs one model call with Fri's voice, the owner's voice notes and the controller's chat model:
 talk to the server, call the owner mint or bossman, use only the given facts, and aim for one message
-(under 1,500 characters) with only the highlights, since the full changelog is attached; a draft that
+(under 1,500 characters) with only the highlights, since the release page has the full notes; a draft that
 needs more than one message is refused. It prints
 the post and sends nothing; its usage is reported like an eval's. The maintainer checks every line
 against the facts before sending, and edits the file if a line isn't backed by them.
 
 `send --channel <name>` posts in the one text channel of `GENE_GUILD_ID` with that name (refused if
 there are none or several); without `--channel` the recipient is `GENE_OWNER_ID`. A channel post is one
-message (owner request, 2026-10-27): the notes file holds that short summary, then a `<!-- changelog -->`
-line, then the full changelog, which goes out attached to the same message as `fri-<version>-changelog.md`.
-A summary that needs two messages, or a new channel post without a changelog, is refused before login; a
-changelog in the owner's DM is refused too. The version's `sha256` stays the summary's digest, as older
-code computes it, so a rollback can still finish an unconfirmed post from its summary; the changelog's hash
-is kept beside it, so the same summary with another changelog counts as different notes, a retry that
-might resend refuses to go without the changelog, and recovery only takes a message that carries the file. A version posted before this (1.0.0) keeps working without one. There is no way to
+message (owner request, 2026-10-27): the short summary, then a line linking that version's GitHub release
+page, where the full notes live (owner request, 2026-10-28): `for more detailed patch notes: [click here](...)`,
+pointing at `https://github.com/HumanMint/fri/releases/tag/v<version>` (`FRI_RELEASE_NOTES_URL`, with
+`{version}`, points a fork elsewhere; it must be a plain https URL). The send adds the line, so the notes file
+holds the summary alone, and the post goes out with link embeds off, so the link shows no preview. Publish
+the release page first. A summary that doesn't fit one message with the link, or notes that still carry a
+`<!-- changelog -->` section (the attached changelog file of 2026-10-27 is gone), are refused before login.
+`preview <version> --channel <name>` prints the post exactly as it goes out. Versions posted earlier keep
+their records: 1.0.0 (no changelog) and 1.0.1 (changelog attached) both pin from their record with `pin`,
+and a new post never matches an older code's unfinished attached post, so it is refused rather than resent. There is no way to
 name anyone else. It logs in over REST only, so the running Fri's gateway session is untouched, and
 sends with mentions and link embeds off. Notes are split at blank lines into at most four messages of
 2000 characters, counted the way Discord counts them (UTF-16 units, so most emoji count 2).
