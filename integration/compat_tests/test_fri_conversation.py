@@ -15,7 +15,7 @@ from compat_tests.test_fri_runtime import configured, event
 from fri.fri_addressing import addressed_text
 from fri.fri_agent_model import SUMMARY
 from fri.fri_chat import INSTRUCTIONS, SCHEMA, ChatResult
-from fri.fri_memory import CATEGORIES, memory_intent, personal_note
+from fri.fri_memory import CATEGORIES, memory_intent
 
 
 @pytest.mark.parametrize('text,expected', [
@@ -78,7 +78,7 @@ def test_profile_is_persistent_scoped_and_updates_only_current_speaker(tmp_path)
     ({'category': 'games', 'evidence': 'I like https://example.com'}, 'I like https://example.com'),
 ])
 def test_notes_are_exact_bounded_disclosures_not_permission(candidate, text):
-    assert personal_note(candidate, text) is None
+    assert controller_memory.personal_note(candidate, text) is None  # The controller alone decides what's kept.
 
 
 def test_note_categories_and_prefixes_match_the_controller():
@@ -87,17 +87,6 @@ def test_note_categories_and_prefixes_match_the_controller():
         assert schema['properties']['notes']['items']['properties']['category']['enum'] == list(CATEGORIES)
     for prefix in ('conversation, projects', "I'm working on", "I'm building", 'I main', "I've been playing"):
         assert prefix in INSTRUCTIONS
-
-
-@pytest.mark.parametrize('category,evidence', [
-    ('projects', "I'm working on a Factorio mod"), ('projects', 'I’m building a synth'), ('projects', 'I am building a deck'),
-    ('projects', 'I main Mercy'), ('projects', 'I’ve been playing Hades'), ('projects', "I'm working on my health"),
-    ('projects', 'I like chess'), ('games', "I've been playing Hades"), ('hobbies', 'I am working on a quilt'),
-    ('projects', 'I have been playing Hades'), ('games', 'I like chess'), ('nickname', 'Call me Ash'),
-])
-def test_fri_and_the_controller_keep_the_same_notes(category, evidence):
-    candidate = {'category': category, 'evidence': evidence}
-    assert personal_note(candidate, evidence) == controller_memory.personal_note(candidate, evidence)
 
 
 def test_notes_expire_on_idle_health_and_erasure(store):

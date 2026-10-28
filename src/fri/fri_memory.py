@@ -4,8 +4,6 @@ import re
 
 import discord
 
-from .privacy import clean
-
 CATEGORIES = ('nickname', 'games', 'music', 'hobbies', 'conversation', 'projects')  # Gene keeps projects where said.
 MAX_NOTES = 10
 PER_CATEGORY = 3
@@ -114,31 +112,6 @@ def open_to_everyone(channel):
 def before_removal(message_id, profile):
     """Sent before the member last edited their memory, so Fri keeps it nowhere (the controller's removed_at)."""
     return discord.utils.snowflake_time(int(message_id)).timestamp() <= (profile.get('removed_at') or 0)
-
-
-def personal_note(candidate, text):
-    """Keep a short exact self-disclosure, not a model-written biography/instruction."""
-    if not isinstance(candidate, dict) or candidate.get('category') not in CATEGORIES:
-        return None
-    evidence = candidate.get('evidence', '')
-    if not isinstance(evidence, str) or not 5 <= len(evidence) <= 180 or evidence not in text:
-        return None
-    if clean(evidence, 180) != evidence or any(s in evidence for s in ('\n', '`', '<@', '://')):
-        return None
-    before = text[:text.index(evidence)].rstrip()
-    if before.endswith(('"', "'", '“', '‘', '>', '`')):
-        return None
-    # What a member is doing is only ever a projects note, and a projects note only ever says what they're doing.
-    if candidate['category'] == 'projects':
-        if not re.match(r"(?i)^(?:i(?:['’]m| am) (?:working on|building)|i main|i['’]ve been playing)\b", evidence):
-            return None
-    elif not re.match(r"(?i)^(?:i (?:like|love|prefer|enjoy|play|usually|mostly)|my (?:favorite|favourite|nickname)|call me)\b", evidence):
-        return None
-    # Defense in depth; notes are still untrusted data even after validation.
-    if re.search(r'(?i)\b(?:ignore|instructions?|system|developer|password|token|secret|address|diagnos\w*|'
-                 r'politic\w*|religio\w*|sexual\w*|health|medical|permission|approv\w*|deploy|execute)\b', evidence):
-        return None
-    return candidate['category'], evidence
 
 
 def memory_intent(text):
