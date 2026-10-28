@@ -391,7 +391,10 @@ class Agent:
         A partial update has no author, so whose it is and what it says now are unknown: it counts as a
         member's edit, and a row it drops is withdrawn (fri #135). One Fri never had in hand marks nothing."""
         sender = getattr(message, 'author', None)
-        edited = (getattr(message, 'edited_at', None) is not None and
+        # Fri's or Gene's own row in the live view is no member's edit, even with no author (fri #140 review).
+        ours = sender is None and any(r['id'] == str(message.id) and (r.get('fri') or r['gene_error'])
+                                      for r in self.recent.get(channel, ()))
+        edited = (getattr(message, 'edited_at', None) is not None and not ours and
                   (sender is None or not getattr(sender, 'bot', True)))  # Not an embed or pin update.
         if edited and message.id in self.looked:
             self.revise(message.id)

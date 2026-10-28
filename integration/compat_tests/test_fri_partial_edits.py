@@ -8,7 +8,7 @@ import discord
 import pytest
 
 from compat_tests.test_fri_mentions import environment
-from compat_tests.test_fri_unsend import heard, model, no_debounce
+from compat_tests.test_fri_unsend import heard, model, no_debounce, row
 from fri.fri_chat import ChatResult
 
 MARKER = 'synthetic-private-marker'  # Synthetic words a withdrawal must keep from going anywhere.
@@ -116,6 +116,33 @@ def test_a_partial_edit_of_a_message_fri_never_saw_marks_nothing(monkeypatch, tm
             await agent.handle(trigger)
             assert str(unseen.id) not in agent.withdrawn and unseen.id not in agent.revised
             assert trigger.reply.await_args.args[0] == 'safe reply'
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('kind', ['fri', 'gene_error'])
+def test_a_partial_update_to_fris_or_genes_own_row_leaves_an_ordinary_answer_alone(monkeypatch, tmp_path, kind):
+    """Sol r1 of fri #140, S3: whose row it is is known, so it's no member's edit to withhold a reply for."""
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        bot = message('earlier bot line', user=99 if kind == 'fri' else 77)
+        bot.author.bot = True
+        cached = row(bot.id, user=str(bot.author.id), **({'fri': True, 'provenance': [{'user_id': '21', 'revision': 0}]}
+                                                          if kind == 'fri' else {'gene_error': True}))
+        agent.recent[1].append(cached)
+        trigger = message('fri hello there')
+        trigger.reply.return_value = SimpleNamespace(id=trigger.id+100, content='safe answer', edit=AsyncMock())
+        async def respond(context, ready):
+            await ready()
+            await partially_edited(fri, rows, channel, bot, 'bot added a notice')
+            assert cached in agent.recent[1]
+            return ChatResult(status='completed', reply='safe answer')
+        model(fri, tmp_path, respond)
+        try:
+            await agent.handle(trigger)
+            assert trigger.reply.await_args.args[0].startswith('safe answer')
         finally:
             await fri.close()
     asyncio.run(scenario())
