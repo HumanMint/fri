@@ -569,14 +569,14 @@ def channel(name, kind=discord.ChannelType.text, id=888):
     return room
 
 
-CHANGELOG = '**fri 0.7.0, everything**\n\n**added**\n- things\n- more things\n'
+def linked(text, version='0.7.0'):
+    """A channel post as it goes out: the summary, then the line linking the version's release page."""
+    return f'{text}\n\nfor more detailed patch notes: [click here](https://github.com/HumanMint/fri/releases/tag/v{version})'
 
 
-def post(text, tmp_path, version='0.7.0', name='fri-chat', changelog=CHANGELOG):
-    """A channel post: the summary, then its full changelog after the mark, as the release agent writes it."""
+def post(text, tmp_path, version='0.7.0', name='fri-chat'):
+    """A channel post: the short summary, as Fri drafts it; the release page link is added when it goes out."""
     lines = []
-    if changelog is not None:
-        text = f'{text}\n{notes.CHANGELOG_MARK}\n{changelog}'
     asyncio.run(notes.send(version, text, token='secret-token', owner_id=OWNER, data=tmp_path, out=lines.append,
                            guild_id=GUILD, channel=name))
     return lines
@@ -586,7 +586,7 @@ def test_a_channel_post_goes_to_the_named_text_channel_once(dm, tmp_path):
     chat = channel('fri-chat')
     FakeClient.channels = [channel('fri-chat', discord.ChannelType.voice, 1), channel('general', id=2), chat]
     post('fri 0.7.0\n\n**added**\n- things', tmp_path)
-    assert [m.content for m in chat.messages] == ['fri 0.7.0\n\n**added**\n- things'] and not dm.messages
+    assert [m.content for m in chat.messages] == [linked('fri 0.7.0\n\n**added**\n- things')] and not dm.messages
     assert chat.sends[0]['mentions'] == notes.NO_MENTIONS
     assert json.loads((tmp_path/'patch-notes-server.json').read_text())['versions']['0.7.0']['parts'][0]['channel_id'] == '888'
     assert not (tmp_path/'patch-notes.json').exists()
@@ -600,7 +600,7 @@ def test_the_owners_dm_and_the_channel_each_get_a_version_once(dm, tmp_path):
     run('fri 0.7.0', tmp_path, version='0.7.0')
     post('fri 0.7.0, for everyone', tmp_path)
     assert [m.content for m in dm.messages] == ['fri 0.7.0']
-    assert [m.content for m in chat.messages] == ['fri 0.7.0, for everyone']
+    assert [m.content for m in chat.messages] == [linked('fri 0.7.0, for everyone')]
 
 
 @pytest.mark.parametrize('rooms', [[], ['fri-chat', 'fri-chat']])
@@ -643,8 +643,8 @@ def test_a_draft_that_failed_or_wont_send_is_refused():
         notes.drafted('x' * 2001, 'completed')
 
 
-@pytest.mark.parametrize('argv', [['preview', '0.7.0', '--channel', 'fri-chat'], ['send', '0.7.0', '--channel', '#fri chat']])
-def test_channel_is_a_plain_name_and_only_for_send(argv):
+@pytest.mark.parametrize('argv', [['draft', '0.7.0', '--channel', 'fri-chat'], ['send', '0.7.0', '--channel', '#fri chat']])
+def test_channel_is_a_plain_name_and_only_for_send_pin_or_preview(argv):
     with pytest.raises(SystemExit) as raised:
         notes.main(argv)
     assert raised.value.code == 2
@@ -965,44 +965,61 @@ def test_an_unreadable_channel_after_posting_reports_posted_not_pinned(monkeypat
     assert len(chat.sends) == 1
 
 
-def test_a_channel_post_is_one_message_with_its_full_changelog_attached(dm, tmp_path):
+def test_a_channel_post_is_one_message_linking_its_release_page_without_a_preview(dm, tmp_path):
+    """Owner request, 2026-10-28: the GitHub release page holds the full notes, so the post links it instead of
+    attaching a changelog file, and goes out with embeds suppressed so the link shows no preview."""
     chat = channel('fri-chat')
     FakeClient.channels = [chat]
     post('fri 0.7.0\n\n**added**\n- things', tmp_path)
     [sent] = chat.sends
-    assert sent['content'] == 'fri 0.7.0\n\n**added**\n- things' and notes.CHANGELOG_MARK not in sent['content']
-    assert sent['file'] == {'filename': 'fri-0.7.0-changelog.md', 'content': CHANGELOG}
+    assert sent['content'] == linked('fri 0.7.0\n\n**added**\n- things')
+    assert sent['content'].endswith('[click here](https://github.com/HumanMint/fri/releases/tag/v0.7.0)')
+    assert sent['file'] is None and sent['suppress_embeds'] is True
     entry = server_record(tmp_path)['0.7.0']
-    assert entry['changelog'] == notes.text_hash(CHANGELOG) and entry['pinned'] == '1001'
+    assert 'changelog' not in entry and entry['pinned'] == '1001'
 
 
-def test_a_summary_that_needs_two_messages_or_a_post_without_its_changelog_is_refused_before_login(dm, tmp_path):
+def test_the_owners_dm_gets_the_note_alone_without_a_link(dm, tmp_path):
+    run('fri 0.7.0, no release today', tmp_path, version='0.7.0')
+    assert [m.content for m in dm.messages] == ['fri 0.7.0, no release today']
+
+
+def test_notes_with_a_changelog_or_a_summary_needing_two_messages_are_refused_before_login(dm, tmp_path):
     chat = channel('fri-chat')
     FakeClient.channels = [chat]
     with pytest.raises(notes.NotesRefused, match='one message, and this summary needs 2'):
         post(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), tmp_path)
-    with pytest.raises(notes.NotesRefused, match='attaches its full changelog'):
-        post('fri 0.7.0', tmp_path, changelog=None)
-    with pytest.raises(notes.NotesRefused, match='the changelog after the mark is empty'):
-        post('fri 0.7.0', tmp_path, changelog='  \n')
-    with pytest.raises(notes.NotesRefused, match='goes with a channel post'):
-        run(f'fri 0.7.0\n{notes.CHANGELOG_MARK}\n{CHANGELOG}', tmp_path, version='0.7.0')
+    with pytest.raises(notes.NotesRefused, match='no longer attach a changelog'):
+        post(f'fri 0.7.0\n{notes.CHANGELOG_MARK}\nthe full changelog\n', tmp_path)
+    with pytest.raises(notes.NotesRefused, match='no longer attach a changelog'):
+        run(f'fri 0.7.0\n{notes.CHANGELOG_MARK}\nthe full changelog\n', tmp_path, version='0.7.0')
     assert not chat.sends and not dm.sends and not FakeClient.instances
 
 
-def test_the_same_summary_with_another_changelog_is_another_post(dm, tmp_path):
+def test_a_summary_that_fits_until_the_link_is_added_is_refused(dm, tmp_path):
     chat = channel('fri-chat')
     FakeClient.channels = [chat]
+    with pytest.raises(notes.NotesRefused, match='one message'):
+        post(paragraph(1980, 'a'), tmp_path)
+    assert not chat.sends
+
+
+def test_the_release_link_can_point_at_a_fork_and_must_be_plain_https(dm, tmp_path, monkeypatch):
+    chat = channel('fri-chat')
+    FakeClient.channels = [chat]
+    monkeypatch.setenv('FRI_RELEASE_NOTES_URL', 'https://example.org/forks/fri/releases/v{version}')
     post('fri 0.7.0', tmp_path)
-    with pytest.raises(notes.NotesRefused, match='already sent with different notes'):
-        post('fri 0.7.0', tmp_path, changelog='a different full changelog\n')
-    assert len(chat.sends) == 1
+    assert chat.sends[0]['content'].endswith('[click here](https://example.org/forks/fri/releases/v0.7.0)')
+    for bad in ('http://example.org/v{version}', 'https://example.org/a b', 'https://example.org/(x)'):
+        monkeypatch.setenv('FRI_RELEASE_NOTES_URL', bad)
+        with pytest.raises(notes.NotesRefused, match='must be an https URL'):
+            post('fri 0.7.1', tmp_path, version='0.7.1')
 
 
-def test_recovery_finds_the_post_only_with_its_changelog_attached(dm, tmp_path):
+def test_recovery_finds_the_post_by_its_text_link_included(dm, tmp_path):
     chat = channel('fri-chat')
     FakeClient.channels = [chat]
-    chat.messages.append(said(900, 'fri 0.7.0', BOT))  # the same words, without the file: not the post
+    chat.messages.append(said(900, 'fri 0.7.0', BOT))  # the same summary without the link: not the post
     chat.lost.add(1)  # the post lands, but its reply is lost
     with pytest.raises(RuntimeError):
         post('fri 0.7.0', tmp_path)
@@ -1010,46 +1027,44 @@ def test_recovery_finds_the_post_only_with_its_changelog_attached(dm, tmp_path):
     assert len(chat.sends) == 1 and server_record(tmp_path)['0.7.0']['parts'][0]['message_id'] == '1001'
 
 
-def test_an_earlier_post_without_a_changelog_still_finishes_and_pins(dm, tmp_path):
-    """Like 1.0.0: posted before changelogs, its record has none; a rerun with its exact notes only pins."""
+def test_a_post_older_code_attached_a_changelog_to_still_pins_and_isnt_resent(monkeypatch, capsys, dm, tmp_path):
+    """Like 1.0.1: posted with a changelog file, its record keeps the changelog's hash. `pin` still pins it from the
+    record, a rerun of `send` with new notes is refused as different notes, and an unfinished one isn't resent."""
     chat = channel('fri-chat')
     FakeClient.channels = [chat]
-    chat.messages.append(said(1564587767155925144, '1.0.0 notes', BOT))
-    chunks = notes.parts('1.0.0 notes')
-    (tmp_path/'patch-notes-server.json').write_text(json.dumps({'versions': {'1.0.0': {
-        'sha256': notes.hashlib.sha256(json.dumps(chunks).encode()).hexdigest(), 'parts': [
-            {'attempted_at': 1793095990.0, 'sha256': notes.text_hash(chunks[0]),
-             'message_id': '1564587767155925144', 'channel_id': '888'}]}}}))
-    assert post('1.0.0 notes', tmp_path, version='1.0.0', changelog=None)[-1].endswith('is pinned in #fri-chat')
+    chat.messages.append(said(1564983982083280976, '1.0.1 notes', BOT))
+    chunks = notes.parts('1.0.1 notes')
+    record = {'1.0.1': {'sha256': notes.hashlib.sha256(json.dumps(chunks).encode()).hexdigest(),
+                        'changelog': notes.text_hash('the full changelog\n'), 'parts': [
+        {'attempted_at': 1793190300.0, 'sha256': notes.text_hash(chunks[0]),
+         'message_id': '1564983982083280976', 'channel_id': '888'}]},
+              '1.0.2': {'sha256': notes.hashlib.sha256(json.dumps(['1.0.2 notes']).encode()).hexdigest(),
+                        'changelog': notes.text_hash('another changelog\n'), 'parts': [
+        {'attempted_at': 1793190300.0, 'sha256': notes.text_hash('1.0.2 notes')}]}}
+    (tmp_path/'patch-notes-server.json').write_text(json.dumps({'versions': record}))
+    assert pin_cli(monkeypatch, tmp_path, '1.0.1', '--channel', 'fri-chat') == 0
+    assert chat.pinned == {1564983982083280976} and not chat.sends
+    with pytest.raises(notes.NotesRefused, match='already sent with different notes'):
+        post('1.0.1 notes', tmp_path, version='1.0.1')
+    with pytest.raises(notes.NotesRefused, match='already sent with different notes'):
+        post('1.0.2 notes', tmp_path, version='1.0.2')  # older code's unfinished attached post: never resent here
     assert not chat.sends
 
 
-def test_preview_shows_the_message_and_the_attached_changelog(monkeypatch, capsys):
-    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(
-        f'fri 0.7.0\n{notes.CHANGELOG_MARK}\n{CHANGELOG}'.encode())))
-    assert notes.main(['preview', '0.7.0']) == 0
+def test_preview_with_a_channel_shows_the_post_exactly_and_refuses_a_changelog(monkeypatch, capsys):
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'fri 0.7.0')))
+    assert notes.main(['preview', '0.7.0', '--channel', 'fri-chat']) == 0
     out = capsys.readouterr().out
-    assert '--- part 1 (9 chars)\nfri 0.7.0' in out and '--- attached fri-0.7.0-changelog.md' in out and CHANGELOG in out
+    assert out == f'--- part 1 ({notes.length(linked("fri 0.7.0"))} chars)\n{linked("fri 0.7.0")}\n'
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(b'fri 0.7.0')))
+    assert notes.main(['preview', '0.7.0']) == 0
+    assert capsys.readouterr().out == '--- part 1 (9 chars)\nfri 0.7.0\n'
+    monkeypatch.setattr('sys.stdin', types.SimpleNamespace(buffer=io.BytesIO(
+        f'fri 0.7.0\n{notes.CHANGELOG_MARK}\nthe changelog\n'.encode())))
+    assert notes.main(['preview', '0.7.0', '--channel', 'fri-chat']) == 2
+    assert 'no longer attach a changelog' in capsys.readouterr().err
 
 
 def test_a_draft_longer_than_one_message_is_refused():
     with pytest.raises(notes.NotesRefused, match='more than one message'):
         notes.drafted(paragraph(1500, 'a') + '\n\n' + paragraph(1500, 'b'), 'completed')
-
-
-def test_an_attached_post_keeps_the_record_older_code_retries(dm, tmp_path):
-    """A rollback to code without changelogs must still finish an unconfirmed post from its summary: the version's
-    sha256 stays the summary's digest, which older code compares, and its nonce stays the same."""
-    chat = channel('fri-chat')
-    FakeClient.channels = [chat]
-    chat.lost.add(1)  # the post lands, its reply doesn't
-    with pytest.raises(RuntimeError):
-        post('fri 0.7.0', tmp_path)
-    entry = server_record(tmp_path)['0.7.0']
-    legacy = notes.hashlib.sha256(json.dumps(notes.parts('fri 0.7.0')).encode()).hexdigest()
-    assert entry['sha256'] == legacy and entry['changelog'] == notes.text_hash(CHANGELOG)
-    assert chat.sends[0]['nonce'] == notes.nonce('0.7.0', legacy, 1, '#888')
-    with pytest.raises(notes.NotesRefused, match='goes out with its changelog attached'):
-        post('fri 0.7.0', tmp_path, changelog=None)  # this code never resends without the file
-    post('fri 0.7.0', tmp_path)
-    assert len(chat.sends) == 1 and server_record(tmp_path)['0.7.0']['parts'][0]['message_id'] == '1001'
