@@ -39,4 +39,9 @@ def cases():
          'visual_words': ('red', 'circle'), 'expect': 'Identify the red circle from pixels, without claiming the photo is missing.'},
         {'name': 'informal_photo_right', 'text': 'color and shape on the right', 'images': [image()],
          'visual_words': ('blue', 'square'), 'expect': 'Identify the blue square from pixels, without claiming the photo is missing.'},
+        # A clip Fri never watched: answer the question it came with, without rating or describing the clip.
+        {'name': 'unseen_clip_with_question', 'text': 'rate my clip, also whats 12 times 12',
+         'own_media_not_inspected': {'attachments': ['video'], 'reason': 'video'}, 'max_chars': 300,
+         'needs': ('144',), 'banned': ('/10', 'out of 10', 'png', 'jpeg', 'webp', 'resend', 're-upload', 'reupload'),
+         'expect': 'Answer 144 and say briefly the clip went unwatched, without rating or describing it.'},
     ]

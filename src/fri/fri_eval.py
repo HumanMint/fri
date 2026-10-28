@@ -252,6 +252,8 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
         context['acknowledgments_enabled'] = suite == 'endings'
         context['images'] = case.get('images', [])
         context['inspected_images'] = case.get('inspected_images', [])
+        if case.get('own_media_not_inspected'):
+            context['own_media_not_inspected'] = case['own_media_not_inspected']
         result = await chat.respond(case['text'], context)
         if 'expected_modes' in case:
             case['passed'] = result.status == 'completed' and result.response_kind in case['expected_modes']
