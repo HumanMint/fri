@@ -1673,11 +1673,13 @@ class Agent:
                 return False
             if authors:
                 try:
-                    await self.fri.api('POST', '/agent/authors/check', {
+                    checked = await self.fri.api('POST', '/agent/authors/check', {
                         'guild_id': str(self.channel_guild(parent)), 'channel_id': str(parent),
                         'authors': [{'user_id': str(user), 'revision': revision} for user, revision in sorted(authors)]})
                 except ControllerRejected:
                     return False
+                if not isinstance(checked, dict) or checked.get('ok') is not True:
+                    return False  # Only Gene's explicit yes lets the batch go; anything else stays quiet.
         else:
             # Read together, so one author's answer doesn't age while another's is awaited.
             users = sorted({user for user, _ in authors})

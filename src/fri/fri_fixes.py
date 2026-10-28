@@ -311,6 +311,8 @@ async def live(fri, job):
         raise Unreachable('a newer release is live now, so "fixed" might not hold')
     if (status.get('jobs') or {}).get('deploying'):
         raise Unreachable('another release is going out right now. tap again once it lands')
+    if status.get('runtime_unknown'):  # A rollback failed after the claim: what's running isn't known.
+        raise Unreachable("gene can't confirm what's running right now, so \"fixed\" might not hold")
 
 
 async def report(fri, job):
