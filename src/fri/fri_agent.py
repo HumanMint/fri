@@ -387,9 +387,12 @@ class Agent:
         row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once).
         One a model request carried is also marked revised, for the other turns that carried it: one still
         running may hold what it said before, so its reply, reaction or save stops (see reply_once), while a
-        later read gets the edit. A turn's own messages go by withdrawn and arrived instead (see taken_back)."""
+        later read gets the edit. A turn's own messages go by withdrawn and arrived instead (see taken_back).
+        A partial update has no author, so whose it is and what it says now are unknown: it counts as a
+        member's edit, and a row it drops is withdrawn (fri #135). One Fri never had in hand marks nothing."""
+        sender = getattr(message, 'author', None)
         edited = (getattr(message, 'edited_at', None) is not None and
-                  not getattr(getattr(message, 'author', None), 'bot', True))  # Not an embed or pin update.
+                  (sender is None or not getattr(sender, 'bot', True)))  # Not an embed or pin update.
         if edited and message.id in self.looked:
             self.revise(message.id)
         if (self.handling[message.id] or message.id in self.rerunning) and edited:
@@ -401,6 +404,8 @@ class Agent:
             if row['id'] != str(message.id) or row['gene_error'] or row.get('fri'):
                 continue
             if author is None:  # A partial update can't show what they left, so the row goes.
+                if edited:  # And a turn's copy of it, as a handled message's (see withdraw).
+                    return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
                 rows.remove(row)
             elif row['user_id'] == str(author):
                 text = clean(getattr(message, 'content', '') or '', 4000)[:500]  # As receive() stores it.
