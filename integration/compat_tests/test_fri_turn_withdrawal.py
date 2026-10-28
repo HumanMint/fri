@@ -209,3 +209,31 @@ def test_the_panel_and_mentions_ask_nothing(capable):
     turns.kept({**scope, 'source': {'kind': 'discord_message', 'id': '6'}, 'mention_grant': 'a'*64}, {'ok': True}, (0, 0))
     turns.kept({**scope, 'source': {'kind': 'discord_message', 'id': '7'}}, {'ok': True, 'kept': False}, (0, 0))
     assert not turns.saved
+
+
+@pytest.mark.parametrize('how', ['edit', 'delete'])
+def test_the_issues_scenario_a_message_taken_back_after_its_turn_was_saved(monkeypatch, tmp_path, how):
+    """fri #129 as reported: the member's message was answered and its exchange saved, nothing was handling or
+    carrying it any more, and then its author edited or deleted it. A later unrelated turn's request, and the
+    controller's copy of their exchanges, no longer hold the old words."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = w.said('fri explain '+MARKER)
+            await w.agent.handle(earlier)
+            await settled(w)
+            assert MARKER in saved(w) and not w.agent.handling[earlier.id]
+            if how == 'edit':
+                current = copy.copy(earlier)
+                current.content, current.edited_at = 'fri explain the safe caption', discord.utils.utcnow()
+                w.rows[earlier.id] = current
+                await w.fri.on_raw_message_edit(SimpleNamespace(channel_id=1, message=current))
+            else:
+                del w.rows[earlier.id]
+                await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=1, message_id=earlier.id))
+            assert MARKER not in await later_unrelated_request(w)
+            assert MARKER not in saved(w)
+            assert [p for p, _ in w.calls].count(WITHDRAW) == 1
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())

@@ -85,3 +85,11 @@ def test_turn_withdrawal_is_offered_and_optional():
     # still runs Fri, which then asks nothing.
     assert 'turn-withdrawal' in contract()['capabilities'] and 'turn-withdrawal' not in CAPABILITIES
     assert compatible({**contract(), 'capabilities': [c for c in contract()['capabilities'] if c != 'turn-withdrawal']})
+
+
+def test_summary_generations_are_offered_and_optional():
+    # Fri carries the member summary's generation on a turn that drew on it when offered (gene #91); an older
+    # controller still runs Fri, which then sends nothing new.
+    assert 'summary-generations' in contract()['capabilities'] and 'summary-generations' not in CAPABILITIES
+    assert compatible({**contract(), 'capabilities': [c for c in contract()['capabilities']
+                                                      if c != 'summary-generations']})
