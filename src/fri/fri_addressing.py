@@ -17,6 +17,11 @@ def visible_content(content):
     return re.sub(r'"[^"\n]*"|“[^”\n]*”|(?<!\w)\'[^\'\n]*\'', '', visible)
 
 
+def named(content):
+    """Fri's name as a word in what Discord shows: not quoted, in code or a URL, and not "Friday"."""
+    return bool(re.search(r'(?<![\w@/#])fri(?!\w)', visible_content(content or ''), re.IGNORECASE))
+
+
 def explicit_mention(message, bot_id):
     mentions = getattr(message, 'mentions', ())
     return bool(bot_id and isinstance(mentions, (list, tuple)) and bot_id in {user.id for user in mentions} and
@@ -36,11 +41,10 @@ async def addressed_text(message, bot_id):
     content = message.content or ''
     explicit = explicit_mention(message, bot_id)
     # Quoted messages, code, URLs and Friday should not wake Fri by accident.
-    visible = visible_content(content)
-    named = re.search(r'(?<![\w@/#])fri(?!\w)', visible, re.IGNORECASE)
+    name = named(content)
     reference = getattr(message, 'reference', None)
     responding = False
-    if not explicit and not named and reference and reference.message_id:
+    if not explicit and not name and reference and reference.message_id:
         original = reference.resolved
         if original is None:
             try:
@@ -48,6 +52,6 @@ async def addressed_text(message, bot_id):
             except discord.HTTPException:
                 return None
         responding = getattr(getattr(original, 'author', None), 'id', None) == bot_id
-    if not (explicit or named or responding):
+    if not (explicit or name or responding):
         return None
     return addressed_content(content, bot_id) or 'hey'
