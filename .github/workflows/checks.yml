@@ -1,5 +1,15 @@
 name: checks
-on: [push, pull_request]
+# Private repos get a monthly allowance of Actions minutes: test each change once (a pull request, then its
+# merge to main), skip docs-only changes, and let a newer push to the same pull request cancel the older run.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 permissions:
   contents: read
 jobs:
@@ -13,6 +23,11 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install uv==0.11.30
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-
       - run: uv sync --frozen
       - run: uv run --no-sync pytest -q
       - run: uv run --no-sync ruff check .
