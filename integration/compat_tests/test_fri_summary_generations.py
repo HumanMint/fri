@@ -11,8 +11,24 @@ import pytest
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import response_event
-from compat_tests.test_fri_member_profiles import DM, GAMING, GENERAL, STAFF, model, run, turns, world
-from compat_tests.test_fri_member_summaries import CONTINUATION, SUMMARY, settled, signed_in_chat, summarized, summarizer
+from compat_tests.test_fri_member_profiles import (
+    DM,
+    GAMING,
+    GENERAL,
+    STAFF,
+    model,
+    run,
+    turns,
+    world,
+)
+from compat_tests.test_fri_member_summaries import (
+    CONTINUATION,
+    SUMMARY,
+    settled,
+    signed_in_chat,
+    summarized,
+    summarizer,
+)
 from fri.fri_chat import ChatResult
 from fri.fri_errors import ControllerRejected
 from fri.fri_member_summary import build
@@ -184,6 +200,28 @@ def test_an_older_controller_runs_as_before(monkeypatch, tmp_path):
             assert result.reply == CONTINUATION and saved  # As before gene #91: the controller can't tell.
             assert not any(generation is not None for generation in generations(w))
             assert not any('summary_generation' in body for path, body in w.calls if path in (CHECK, '/chat/turn'))
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_the_model_reads_the_summary_but_never_its_generation(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await summarized_from(monkeypatch, w)
+            requests = []
+
+            def handler(request):
+                requests.append(json.loads(request.content))
+                return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(
+                    {'reply': CONTINUATION, 'request_draft': None})))+'\n\n')
+            signed_in_chat(w, handler)
+            _, saved, _ = await w.say(GAMING, 'fri what were we on about')
+            assert saved and sent(w, '/chat/turn')[-1]['summary_generation'] == 0
+            carried = json.loads(requests[-1]['input'][-1]['content'])
+            assert carried['your_summary_of_speaker_untrusted'] == SUMMARY
+            assert 'generation' not in json.dumps(requests)  # What the model reads is unchanged.
         finally:
             await w.fri.close()
     run(scenario)
