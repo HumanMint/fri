@@ -41,12 +41,6 @@ def media(message):
     return kinds[:10]
 
 
-def started_a_thread(message):
-    """Discord's "started a thread" notice in the parent channel. Its text is the thread's name, not something
-    the member who opened it said."""
-    return getattr(message, 'type', None) == discord.MessageType.thread_created
-
-
 def details(message):
     """What a reader sees around a post's text: what it carries, its link cards, its reactions, the post it
     answers, whether it's pinned.
@@ -104,6 +98,12 @@ def label(emoji):
     """A unicode emoji as itself, a server emoji by its name."""
     from .privacy import clean
     return clean(emoji, 16) if isinstance(emoji, str) else ':'+clean(str(getattr(emoji, 'name', None) or 'emoji'), 32)+':'
+
+
+def started_a_thread(message):
+    """Discord's "started a thread" notice in the parent channel. Its text is the thread's name, not something
+    the member who opened it said."""
+    return getattr(message, 'type', None) == discord.MessageType.thread_created
 
 
 def image_context(context):
