@@ -81,6 +81,58 @@ FIX = 'not the one, i meant join us for a bite'
     ("not that one, '93 Til Infinity, don't play rockin' robin", '93 Til Infinity', False),
     ("wrong song, 'Til I Collapse", "'Til I Collapse", True),
     ("not that one, alex said 'Never Gonna Give You Up'", 'Never Gonna Give You Up', False),
+    # gene #111 (1): only the title they quoted is protected, so a quoted refusal elsewhere still counts, and a
+    # quote that might not close (a dropped letter with more words after it) protects nothing.
+    ("wrong song, Love Story, 'don't play it' is what I said", 'Love Story', False),
+    ('wrong song, Love Story, "don\'t play it" is what I said', 'Love Story', False),
+    ("wrong song, 'Love Story, don't play rockin' robin", 'Love Story', False),
+    ("wrong song, 'Love Story, don't play rockin' robin", "Love Story, don't play rockin'", False),
+    ("wrong song, 'Love Story' 'nope'", 'Love Story', False),
+    ("wrong song, 'Love Story, 'nope'", 'Love Story Nope', False),  # A second quote opening inside: ambiguous.
+    ("wrong song, 'Love Story ' nope'", 'Love Story Nope', False),  # So is a loose mark.
+    ("wrong song, 'Rockin' Robin'", "Rockin' Robin", True),
+    ("wrong song, 'Rockin' Robin' by Bobby Day", "Rockin' Robin Bobby Day", True),
+    ("wrong song, 'Don't Stop Believin'", "Don't Stop Believin'", True),
+    ('wrong song, https://youtu.be/dont-nope', 'https://youtu.be/dont-nope', True),  # A link keeps every word too.
+    ('wrong song, https://youtu.be/abc, nope', 'https://youtu.be/abc', False),
+    ('wrong song, https://youtu.be/x', 'https://youtu.be', False),
+    # gene #111 (2): a withdrawal word right after "by" names the artist.
+    ('wrong song, Love Story by Nope', 'Love Story', True),
+    ('wrong song, Love Story by Nope', 'Love Story by Nope', True),
+    ('wrong song, Love Story by Nope', 'Love Story Nope', True),
+    ('wrong song, Love Story by Taylor Swift, nope', 'Love Story Taylor Swift', False),
+    ('wrong song, Love Story by Taylor Swift nope', 'Love Story', False),
+    ('wrong song, Love Story by. no', 'Love Story by', False),  # "by." ends a sentence.
+    ('not that one, ft. nope', 'ft nope', False),  # An artist follows a title, never starts one.
+    # gene #111 (3): punctuation and closing filler don't hide a withdrawal.
+    ('wrong song, Love Story, no thanks', 'Love Story', False),
+    ('wrong song, Love Story, nah, lol', 'Love Story', False),
+    ('wrong song, Love Story. no, lol', 'Love Story', False),
+    ('not that one, Love Story... nah thanks', 'Love Story', False),
+    ('wrong song, Love Story, actually nah', 'Love Story', False),
+    ('wrong song, "Love Story" no', 'Love Story', False),
+    ('wrong song, "No Thanks"', 'No Thanks', True),
+    # gene #111 (4): a quoted title keeps every word, and only the connector before an artist may be skipped.
+    ('wrong song, "Stand By Me"', 'Stand Me', False),
+    ("wrong song, 'Stand By Me'", 'Stand Me', False),
+    ('wrong song, Stand By Me', 'Stand Me', False),
+    ('wrong song, Stand By Me', 'Stand By Me', True),
+    ('wrong song, "Stand By Me" by Ben E. King', 'Stand By Me Ben E. King', True),
+    ('wrong song, "Love Story" by Taylor Swift', 'Love Story Taylor Swift', True),
+    ('wrong song, "Love Story by Taylor Swift"', 'Love Story Taylor Swift', False),
+    ('wrong song, "The One"', 'One', False),
+    # gene #111 (5): after the song, an example or someone else's words take it back; their own words don't.
+    ("wrong song, 'Love Story' was an example", 'Love Story', False),
+    ("wrong song, 'Love Story' is what I heard Alex say", 'Love Story', False),
+    ('wrong song, Love Story was just an example', 'Love Story', False),
+    ('wrong song, "Love Story", alex said', 'Love Story', False),
+    ('wrong song, Love Story is what alex wants', 'Love Story', False),
+    ('wrong song, Love Story according to alex', 'Love Story', False),
+    ("wrong song, 'Love Story' is what i said", 'Love Story', True),
+    ('wrong song, Love Story, like i said', 'Love Story', True),
+    ("wrong song, Love Story, i've literally just said", 'Love Story', True),
+    ('wrong song, Love Story by Example', 'Love Story', True),
+    ('wrong song, Simon Says', 'Simon Says', True),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
