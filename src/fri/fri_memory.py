@@ -15,6 +15,8 @@ MOVES = 'memory-moves'  # The controller moves a note into or out of the profile
 SUMMARIES = 'member-summaries'  # The controller keeps Fri's own short summary of each member's readable chats.
 # It returns the summary's generation, which a withdrawal dropping that summary moves (gene #91).
 GENERATIONS = 'summary-generations'
+# It also takes that generation on writes of the model's words (saved work, reminders) and refuses a moved one (fri #171).
+GENERATION_WRITES = 'summary-generation-writes'
 PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_thread)
 
 
