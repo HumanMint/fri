@@ -19,7 +19,12 @@ def test_fri_and_gene_hold_the_same_correction_rule():
                            (FIX, 'someone else song'), ('for example ' + FIX, 'join us for a bite'),
                            ('not that one\n> alex: Never Gonna Give You Up', 'Never Gonna Give You Up'),
                            ('i meant to say thanks', 'thanks'), ('not the one i wanted lol', 'the one'),
-                           ('wrong song, "join us for a bite"', 'join us for a bite')]:
+                           ('wrong song, "join us for a bite"', 'join us for a bite'),
+                           ('not that one, i meant to say thanks', 'thanks'), ('wrong song, The One', 'The One'),
+                           ('wrong song, i meant All I Got by Said The Sky', 'All I Got by Said The Sky'),
+                           ('"wrong song, Never Gonna Give You Up"\nnot that one, i meant Join Us For A Bite',
+                            'Never Gonna Give You Up'),
+                           ('not that one\n>>> alex said\nNever Gonna Give You Up', 'Never Gonna Give You Up')]:
         assert correction(text, argument) is genes(text, argument)
 
 

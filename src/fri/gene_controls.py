@@ -148,29 +148,37 @@ def quick_control(text, *, music_context=False):
 
 
 
-CORRECTION = re.compile(r"\b(?:not (?:that|this|the) (?:one|song|track)|wrong (?:one|song|track)|i meant(?! to\b)|"
-                        r"that'?s not (?:it|the one|the song|the track))\b")
-# Words of the correction itself, never the song on their own ("not the one i wanted" names none).
-CORRECTION_WORDS = {'the', 'one', 'song', 'track', 'that', 'this', 'it', 'its', "it's", 'a', 'i', 'meant',
-                    'not', 'wrong', 'was', 'is', 'lol'}
+FILLER = r"(?:(?:no|nah|nope|oops|sorry|bro|yo|fri|lol|wait|actually)[\s,.!]*)*"
+MARKER = r"(?:not (?:that|this|the) (?:one|song|track)|wrong (?:one|song|track)|that'?s not (?:it|the one|the song|the track))"
+LINK = r"(?:i meant|it'?s|its|it was)"
+# The whole message is one correction: a marker, then a separator or "i meant"/"it's", then the song (or just
+# "i meant <song>"). Nothing before it but a filler word, so a quote, an example, someone else's words or a
+# question never fits, and the song is what follows, whatever words its title uses.
+CORRECTION = re.compile(
+    rf"^{FILLER}(?:{MARKER}(?:\s+(?:lol|lmao|bro))?\s*(?:[,:;.!—–-]+\s*(?:{LINK}\s+)?|\s+{LINK}\s+)|i meant\s+)"
+    r"(?!(?:i meant\s+)?to\b|don'?t\b|do not\b)(?P<song>\S.*?)(?:\s+(?:lol|lmao|pls|please|thx))*[\s.!?]*$")
 CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
 
 
+def correction_text(text):
+    """A message as its author wrote it: no code, no quoted lines (">>>" quotes the rest), no mentions."""
+    text = re.sub(r'(?s)```.*?```|``.*?``|`[^`\n]*`', ' ', text)
+    text = re.sub(r'(?ms)^>>>.*', ' ', text)
+    text = re.sub(r'(?m)^>[^\n]*', ' ', text)
+    text = re.sub(r'<@!?\d+>', ' ', text)
+    return ' '.join(text.casefold().replace('’', "'").split())
+
+
 def correction(text, argument):
-    """A member putting right a song Gene just played for them ("not that one, X", "i meant X"), with the
-    right one after it in their own lines: not a blockquote or code, though a title they put in quotes counts.
-    Gene's control store holds the same rule and checks there was such a play."""
-    visible = request_text(text).replace('\u2019', "'")
-    if not argument or not CORRECTION.search(visible):
+    """A member putting right a song Gene just played for them ("not that one, X", "i meant X"): the song is
+    the argument, in their own words after the correction. Whether there was such a play is checked by Gene's
+    control store (Controls.enqueue)."""
+    match = CORRECTION.match(correction_text(text))
+    if not match or not argument:
         return False
-    if re.search(r"\b(?:for example|hypothetically|if i|used to|dont|don't|do not|said|says|saying|told|asked|"
-                 r"(?:can|could|would|should) (?:i|you|we))\b", visible):
-        return False  # An example, someone else's words, or a question about it: not a request.
-    own = re.sub(r'```[\s\S]*?```|`[^`]*`|(?m:^>[^\n]*)', '', text).casefold().replace('\u2019', "'")
-    marker = CORRECTION.search(own)
-    after = own[marker.end():] if marker else ''
+    song = match.group('song').strip(' "\'“”')
     named = set(re.findall(r"[\w']+", argument.casefold()))
-    return bool(named - CORRECTION_WORDS) and (argument.casefold() in after or named <= set(re.findall(r"[\w']+", after)))
+    return bool(named) and (argument.casefold() in song or named <= set(re.findall(r"[\w']+", song)))
 
 
 def just_played(receipts):
