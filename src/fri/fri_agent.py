@@ -833,6 +833,8 @@ class Agent:
                     pass  # Told below, unless they erased meanwhile.
                 recheck = True
             if recheck:
+                if self.gave_way(message):  # A short line joined it while it waited: the reopened burst answers.
+                    return
                 if reason := await self.erasure(user, *since):
                     return await self.dropped(message, events, reason, invitation, since, burst)
                 # Each message as Discord has it now: one edited or deleted while it waited, maybe to take
@@ -841,6 +843,8 @@ class Agent:
                     return self.missed(events, 'message changed')
                 if reason := await self.excluded(message, dm, invitation, privacy, text):
                     return self.missed(events, reason)
+                if self.gave_way(message):  # During those checks: it's told nothing, its burst is answered.
+                    return
                 if time.time() >= until:
                     return await self.withheld(message, events, 'stale event', self.pings(events, since, invitation),
                                                logged='earlier reply still running')

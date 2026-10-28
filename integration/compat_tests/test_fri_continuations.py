@@ -365,3 +365,31 @@ def test_a_reopened_burst_completes_no_request(monkeypatch, tmp_path):
     actions.reopened = True  # A line let in while Fri composed: no new authority from it.
     assert actions.burst_permission(action) is None
 
+
+
+def test_a_question_that_waited_out_its_turn_after_a_line_joined_says_nothing_of_its_own(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        no_debounce(monkeypatch)
+        monkeypatch.setattr('fri.fri_agent.QUEUE_SECONDS', 3)
+        model = Model(fri, tmp_path)
+        agent.turns.take(20, 1)  # Another reply of theirs (a panel's, say) holds their turn.
+        question = message(QUESTION, age=2.5)  # Its queue deadline passes while it waits; the line's doesn't.
+        tasks = [asyncio.create_task(agent.handle(question))]
+        try:
+            await until(lambda: question.id in agent.replying)
+            detail = message(DETAIL)
+            tasks.append(asyncio.create_task(agent.handle(detail)))
+            await until(lambda: tasks[1].done() or detail.id in agent.replying)
+            await asyncio.wait_for(tasks[0], 5)  # Past its deadline, after the line joined: no stale notice.
+            question.reply.assert_not_awaited()
+            agent.turns.release(20)
+            await asyncio.wait_for(asyncio.gather(*tasks), 5)
+            [(text, context)] = model.requests
+            assert text == DETAIL and burst_of(context) == [QUESTION, DETAIL]
+            detail.reply.assert_awaited_once()
+            assert len(saved(calls)) == 1
+        finally:
+            await finish(fri, tasks)
+    asyncio.run(scenario())
