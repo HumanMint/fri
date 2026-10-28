@@ -96,4 +96,4 @@ Contract changes land in Gene first. A Fri change that needs them pins the Gene 
 - DMs stay private. Context from other members keeps its author and privacy revision, and a change
   while Fri is replying withholds the reply instead of relabeling it.
 
-[operations.md](operations.md) describes each behavior and fence in detail.
+The [operator runbook](operations.md) describes each behavior and fence in detail.

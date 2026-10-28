@@ -111,8 +111,8 @@ reviews. This repository is public: never commit tokens, session files, real IDs
 - [Quickstart](docs/quickstart.md): run Fri in your own test server.
 - [Architecture](docs/architecture.md): the pieces, a message's path, the contract, trust boundaries.
 - [Contributing](docs/contributing.md): the integration pin, offline checks, CI and pull requests.
-- [Operations](docs/operations.md): every behavior and fence in detail, plus the production install,
-  releases and rollback (maintainers).
+- [Operator runbook](docs/operations.md): every behavior and fence in detail, plus the production
+  install, releases and rollback (maintainers).
 - [Integration pair](docs/integration-pair.json): the Gene commit Fri is tested against.
 - [Extraction provenance](docs/extraction.json): Fri was split out of Gene at commit `7bdf6af`.
 - [Gene's README](https://github.com/HumanMint/gene#readme): the controller, Red and Gene's own setup.

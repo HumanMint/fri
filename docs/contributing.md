@@ -58,8 +58,8 @@ scripts/offline-checks.sh check    # tests, integration suites and ruff, network
 
 Every scenario uses invented members and messages, and Discord, the model provider and the network
 are substituted. Passing checks don't prove live Discord rendering, audible music or how the real
-model answers. [operations.md](operations.md#integration-checks) has the details and the overrides
-(`GENE_SHA`, `GENE_REPO`, `FRI_VENV`, `FRI_OFFLINE_CACHE`, `OFFLINE_ISOLATION`).
+model answers. The [operator runbook](operations.md#integration-checks) has the details and the
+overrides (`GENE_SHA`, `GENE_REPO`, `FRI_VENV`, `FRI_OFFLINE_CACHE`, `OFFLINE_ISOLATION`).
 
 ## CI
 

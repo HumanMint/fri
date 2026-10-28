@@ -16,8 +16,8 @@ setup aren't part of it; see [What's left out](#whats-left-out).
 
 **About model access.** Fri calls OpenAI's Responses API with a *Sign in with ChatGPT* plan token,
 never an API key. `scripts/connect_chatgpt.py` registers Fri as an agent on your ChatGPT account
-through a browser sign-in. That is how the maintainer's installation runs; whether every account or
-plan can authorize a self-hosted agent this way isn't established. If yours can't, the script saves
+through a browser sign-in. That's the only supported path; whether every account or plan can
+authorize a self-hosted agent this way isn't established. If yours can't, the script saves
 nothing and says so. Without a sign-in Fri still logs in, reaches the controller and answers
 `fri show settings`, but every reply that needs the model fails: members get a short notice, and the
 owner gets one DM. Fri asks for `gpt-6.1-sol` for conversation and `gpt-6-luna` for background work,
@@ -116,10 +116,9 @@ uv run --no-sync python scripts/connect_chatgpt.py
 It opens a browser page to sign in with ChatGPT and approve Fri, and waits up to 10 minutes for the
 answer on a local `127.0.0.1` port. On success it saves three private files in `.secrets/`:
 `fri-chatgpt.json` (the session Fri reads), `fri-chatgpt-registration.json` and
-`fri-hostinger-id.json` (Fri's agent registration and host identity, kept for reconnecting; the host
-file's name is historical and works on any machine). Fri renews the session itself and rotates its
-refresh token, so never run two Fri processes on copies of the same session. Fri sets no token budget:
-use counts against your plan's limits.
+`fri-hostinger-id.json` (Fri's agent registration and host identity, kept for reconnecting). Fri
+renews the session itself and rotates its refresh token, so never run two Fri processes on copies of
+the same session. Fri sets no token budget: use counts against your plan's limits.
 
 ## 5. Check everything and invite Fri
 
@@ -180,9 +179,8 @@ env). Elsewhere in the server, an @mention gets a single reply in a channel Fri 
   README covers running Red locally.
 - **Public web research** is a controller setting (`FRI_WEB_SEARCH_ENABLED` in Gene's env) and uses
   the same ChatGPT plan.
-- **Production.** Releases, the host layout, rollbacks and the maintenance window are maintainer
-  operations in [operations.md](operations.md) and Gene's `ops/maintainer/`. Nothing here deploys
-  anything.
+- **Production.** Server installs, releases and rollbacks are maintainer operations in the
+  [operator runbook](operations.md) and Gene's `ops/maintainer/`. Nothing here deploys anything.
 
 ## Troubleshooting
 
