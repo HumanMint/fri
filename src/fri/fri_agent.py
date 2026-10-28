@@ -612,6 +612,8 @@ class Agent:
                 return closed
             if await erased():
                 return ERASED
+            if message.guild is None and not self.config['support_dms']:  # Gone off during that read (fri #136).
+                return 'dms off'
             changes = {r['key']: json.loads(r['json_value']) for r in result.get('changes', [])}
             if status != 'completed' or set(changes)-set(DEFAULTS):
                 await message.reply('i couldn’t prepare that settings change. nothing was saved.', allowed_mentions=NO_MENTIONS)

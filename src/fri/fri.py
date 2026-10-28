@@ -29,6 +29,7 @@ from .fri_errors import (
 from .fri_images import CHANGED as IMAGES_CHANGED
 from .fri_images import unchanged as images_unchanged
 from .fri_memory import (
+    GENERATIONS,
     PROFILES,
     SUMMARIES,
     describe_memory,
@@ -425,7 +426,7 @@ class Fri(discord.Client):
                 if fence.get('gate'):
                     await fence['gate']()
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
-                    context, fence['turn']['user_id'], fence['actions'])})
+                    context, fence['turn']['user_id'], fence['actions']), **self.summary_generation(context)})
             # A message its author edited or deleted since the live view was copied: its old words stay out.
             # A row read again after that, as an edited message answered again is, holds what it says now.
             # So does one the live view no longer holds as copied: pushed out by newer lines while the turn
@@ -478,6 +479,8 @@ class Fri(discord.Client):
                     origins = context['member_summary'].get('origins', [])
                     fence['shown'].update([*origins, *([here] if here.startswith('public:') else [])])
                     fence.setdefault('summarized', set()).update(origins)  # What the reply drew on (see stage_turn).
+                    if GENERATIONS in self.capabilities:  # The one this request carries (see summary_generation).
+                        fence.setdefault('summary_generation', context['member_summary'].get('generation'))
             if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
                 source = context.get('source') or {}
                 asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),
@@ -802,7 +805,7 @@ class Fri(discord.Client):
                     if await typing('action'):  # Checked before typing started: again, before the tool sees anything.
                         await as_read()
                         await self.api('POST', '/chat/turn/check', {**context['fence']['turn'], 'provenance': turn_provenance(
-                            context, user_id, actions)})
+                            context, user_id, actions), **self.summary_generation(context)})
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
                     result.shown = context['fence'].get('messages', set())  # A summary of the steps may still draw on them.
@@ -864,7 +867,7 @@ class Fri(discord.Client):
                         'burst': context.get('message_burst', []),
                         'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
                                                                          result.post_preview or result.clarification),
-                        'provenance': provenance, 'verbatim': stored == result.reply,
+                        'provenance': provenance, 'verbatim': stored == result.reply, **self.summary_generation(context),
                         **({'audience': audience(context)} if context.get('audience') else {})}
                     if len(result.turn['provenance']) > MAX_PROVENANCE:
                         return ChatResult(reply=unrecorded(receipts, reason='too many people were in that context to '
@@ -922,6 +925,7 @@ class Fri(discord.Client):
             'notes': result.notes, 'input_tokens': 0 if model else result.counters.get('input_tokens'),
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
+            **(self.summary_generation(context) if derived else {}),
             **({'audience': audience(context)} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
             result.echo = self.echo(scope, context, provenance, reply)
@@ -952,10 +956,25 @@ class Fri(discord.Client):
         return kept
 
     def member_summary(self, summary, guild_id, shown):
-        """Fri's own summary of the member where it may show, while every channel it came from is still readable."""
+        """Fri's own summary of the member where it may show, while every channel it came from is still readable.
+        From a controller offering summary generations, only with one a turn can carry (see summary_generation)."""
         if not summary or not shown or not all(self.readable(origin, guild_id) for origin in summary.get('origins', [])):
             return None
+        if GENERATIONS in self.capabilities and not (type(summary.get('generation')) is int and summary['generation'] >= 0):
+            return None
         return summary
+
+    def summary_generation(self, context):
+        """What a turn's checks and save carry for Fri's summary of the member its model request had (gene #91): that
+        summary's generation, from the same /chat/context response. A withdrawal dropping the summary since moves it,
+        so the controller refuses the turn and its reply is withheld. The first one a request carried (see chat_once),
+        else the summary the next request is about to carry, for the check right before it. Nothing when no summary
+        reached the model, or from a controller without summary generations."""
+        if GENERATIONS not in self.capabilities:
+            return {}
+        fence = context.get('fence') or {}
+        generation = fence.get('summary_generation', (context.get('member_summary') or {}).get('generation'))
+        return {'summary_generation': generation} if type(generation) is int else {}
 
     async def memory_overview(self, scope, profile, private, summary=None):
         """Everything for the member's own eyes in private; in public, only what that channel can see."""

@@ -574,3 +574,32 @@ def test_a_dm_settings_preview_needs_the_owner_still_there_when_it_posts(monkeyp
             assert handled == ('not a member' if change == 'left' else 'dms off')
         await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_dm_settings_preview_rechecks_dms_after_its_last_erasure_read(monkeypatch, tmp_path):
+    """fri #136: the DM gate after the Sol call is followed by an awaited erasure read. DMs went off during that
+    read: nothing posts, and the request ends as the DM gate's would."""
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True, 'support_dms': True},
+                                          'version': 3})
+        reads = []
+        async def profile(scope, user):
+            if agent.run.await_count:  # The erasure read after the DM gate.
+                reads.append(scope)
+                await asyncio.sleep(0)
+                agent.state['config']['support_dms'] = False
+            return {'enabled': True, 'revision': 0, 'summary': ''}
+        agent.profile = AsyncMock(side_effect=profile)
+        gate(monkeypatch)
+        agent.record = AsyncMock()
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=10))
+        agent.run = AsyncMock(return_value=(
+            {'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'))
+        message = owner_message()
+        handled = await agent.owner_control(message, 'set heartbeat to 10 minutes')
+        assert agent.run.await_count == 1 and reads
+        message.reply.assert_not_awaited()
+        assert handled == 'dms off'
+        await fri.close()
+    asyncio.run(scenario())
