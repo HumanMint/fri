@@ -406,9 +406,11 @@ class Fri(discord.Client):
                 self.agent.saw(carried, ours)
             # Fri's own replies in view that drew on a member's summary, while Gene still holds them as said: it
             # retires one once that summary goes (fri #187). First, so nothing waits between the checks below and
-            # the request.
+            # the request. Reading the context didn't ask (see Agent.extra_context): this does, with the turn's
+            # budget (fri #193).
             if self.agent and context.get('recent'):
-                retired = await self.agent.retired(context['recent'], ((fence or {}).get('turn') or {}).get('guild_id'))
+                retired = await self.agent.retired(context['recent'], ((fence or {}).get('turn') or {}).get('guild_id'),
+                                                   turn=self.agent.rechecks(fence))
                 context['recent'] = [row for row in context['recent'] if row.get('id') not in retired]
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
@@ -947,8 +949,10 @@ class Fri(discord.Client):
     async def echoes_standing(self, context):
         """Before delivery: Fri's own earlier replies the request carried that drew on a member's summary are still
         held as said. One Gene retired since, as that summary went, may be what the answer repeats (fri #187)."""
-        guild = ((context.get('fence') or {}).get('turn') or {}).get('guild_id')
-        if self.agent and context.get('recent') and await self.agent.retired(context['recent'], guild):
+        fence = context.get('fence')
+        guild = ((fence or {}).get('turn') or {}).get('guild_id')
+        if self.agent and context.get('recent') and await self.agent.retired(context['recent'], guild,
+                                                                             turn=self.agent.rechecks(fence)):
             raise commands.UserFeedbackCheckFailure(CONVERSATION_CHANGED)
 
     def still_open(self, context):

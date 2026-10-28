@@ -70,6 +70,8 @@ RECHARGING = '🪫'
 ERASED = 'erased'  # owner_control: the author erased their chats while it waited.
 CHECK_SECONDS = 10  # A slower owner settings check gives way to the Sol settings call.
 MEMORY_CONTROLS = ('disable', 'enable')  # "forget me", "remember me again": they change what Fri keeps.
+RECHECK_TIMEOUT = 3  # Seconds one recheck of Fri's summary-derived replies waits on the controller (see Agent.retired).
+RECHECK_BUDGET = 6  # And all of one turn's rechecks together: a full wait before its request and one before delivery.
 STALE_CONTROL = 'skipped that one. a newer memory request of yours already went through. send it again if you still mean it.'
 
 
@@ -144,6 +146,16 @@ class Typing:
 
     async def __aexit__(self, *exc):
         await self.stack.aclose()
+
+
+class Rechecks:
+    """One turn's rechecks of Fri's summary-derived replies (see Agent.retired), kept with its fence. One Gene retired
+    stays retired for the rest of the turn, unasked. Once a recheck gets no answer, or the turn's time for them is
+    spent, none is asked again and every one counts as retired: a controller that doesn't answer costs the turn one
+    short wait, not one at every check (fri #193)."""
+
+    def __init__(self):
+        self.retired, self.spent, self.failed = set(), 0.0, False
 
 
 class Agent:
@@ -313,7 +325,10 @@ class Agent:
         self.recent[channel] = deque((r for r in self.recent[channel] if r['at'] > now-900), maxlen=30)
         return list(self.recent[channel])
 
-    async def context_messages(self, channel, raw_errors=False):
+    async def context_messages(self, channel, raw_errors=False, recheck=True):
+        """The channel's live view, as far as everyone it drew on still allows. recheck=False: the caller rechecks Fri's
+        summary-derived replies itself right before its request (a turn's, see Fri.chat_once), so they aren't asked
+        about twice."""
         rows = self.messages(channel)
         source = self.fri.get_channel(channel)
         parent = getattr(source, 'parent_id', None) or channel
@@ -344,7 +359,7 @@ class Agent:
             else:
                 self.uncache(int(user))
         # And one that drew on a member's summary only while Gene still holds it as said (fri #187).
-        if retired := await self.retired(accepted, channel=parent):
+        if recheck and (retired := await self.retired(accepted, channel=parent)):
             stale |= retired
             accepted = [row for row in accepted if row['id'] not in retired]
         if stale:  # Drop invalidated Fri replies from the raw cache too, not just from this context.
@@ -363,23 +378,44 @@ class Agent:
             self.summarized = {mid: at for mid, at in self.summarized.items() if at > now-900}
             self.summarized[str(sent.id)] = now
 
-    async def retired(self, rows, guild=None, channel=None):
+    @staticmethod
+    def rechecks(fence):
+        """The turn's Rechecks, kept with the rest of its fence (none without one)."""
+        return None if fence is None else fence.setdefault('rechecks', Rechecks())
+
+    async def retired(self, rows, guild=None, channel=None, turn=None):
         """Of `rows`, the IDs of Fri's replies that drew on a member's summary which Gene no longer holds as said: it
         retires one once that summary goes (gene #112), so the echo may repeat withdrawn words (fri #187). Only those
-        are asked about, in `guild` (else the server of `channel`). A refusal or a controller that doesn't answer
-        counts them all, so none is reused unconfirmed."""
+        are asked about, in `guild` (else the server of `channel`), and for a few seconds at most. A refusal or a
+        controller that doesn't answer counts them all, so none is reused unconfirmed. turn: the turn's Rechecks,
+        shared by its checks (see Rechecks); None, a check on its own."""
         asked = sorted({row['id'] for row in rows if row.get('fri') and row['id'] in self.summarized})
         if not asked:
             return set()
+        turn = Rechecks() if turn is None else turn
+        known = turn.retired.intersection(asked)
+        asked = [mid for mid in asked if mid not in known]
+        wait = min(RECHECK_TIMEOUT, RECHECK_BUDGET-turn.spent)
+        if not asked or turn.failed or wait <= 0:
+            return known | set(asked)
         guild = guild or self.channel_guild(channel)
-        found = {}
+        found, began = {}, time.monotonic()
         try:
-            for start in range(0, len(asked), 10):  # As many as the controller looks up at once.
-                found.update((await self.fri.api('POST', '/chat/messages/sources', {
-                    'guild_id': str(guild), 'message_ids': asked[start:start+10]}))['messages'])
+            async with asyncio.timeout(wait):
+                for start in range(0, len(asked), 10):  # As many as the controller looks up at once.
+                    found.update((await self.fri.api('POST', '/chat/messages/sources', {
+                        'guild_id': str(guild), 'message_ids': asked[start:start+10]}))['messages'])
         except (commands.UserFeedbackCheckFailure, TimeoutError):
-            return set(asked)
-        return {mid for mid in asked if not (found.get(mid) or {}).get('verbatim')}
+            turn.failed = True
+            return known | set(asked)
+        finally:
+            turn.spent += time.monotonic()-began
+        gone = {mid for mid in asked if not (found.get(mid) or {}).get('verbatim')}
+        turn.retired |= gone
+        if gone:  # For good: out of the live view too, so later turns don't ask again.
+            for key, kept in self.recent.items():
+                self.recent[key] = deque((r for r in kept if r['id'] not in gone), maxlen=30)
+        return known | gone
 
     def unsend(self, channel, ids):
         """Messages taken back, by their author or a moderator: they leave Fri's live view and any burst
@@ -531,7 +567,7 @@ class Agent:
             parent = self.fri.get_channel(channel)
             scope = getattr(parent, 'parent_id', None) or channel
             profile = await self.profile(scope, user)
-            data.update(recent=await self.context_messages(channel), summary=profile['summary'],
+            data.update(recent=await self.context_messages(channel, recheck=False), summary=profile['summary'],
                         summary_provenance=profile.get('summary_provenance', []))
             data['historical_topics'] = profile.get('historical_topics', [])
         return data
