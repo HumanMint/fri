@@ -1895,6 +1895,7 @@ class Agent:
             before = str(min(m.id for m in messages)) if messages else before
             done = scanned < claim['limit']
             for message in sorted(messages, key=lambda m: m.id):
+                self.progressed()  # One message's reads at a time: a long batch keeps the tick moving.
                 if message.author.bot or message.webhook_id or not message.content.strip():
                     continue
                 member = await self.member(message.author.id)
@@ -2168,8 +2169,14 @@ class Agent:
         self.heartbeat_progress = time.monotonic()
 
     def progressed(self):
-        """A long stage moved on (attention reached another channel), so the tick isn't stuck in it."""
-        if self.heartbeat_ticking is not None:
+        """A long stage moved on: attention reached another channel, a learning message or meme post is done, or a
+        model call started or ended (see fri_agent_model.progress). Only the tick's own work marks it (see mark)."""
+        from .fri_agent_model import progress
+        progress()
+
+    def mark(self, tick):
+        """The progress mark of tick `tick`, its monotonic start: work it left running can't mark a later tick."""
+        if tick is not None and tick == self.heartbeat_ticking:
             self.heartbeat_progress = time.monotonic()
 
     @tasks.loop(seconds=30)
@@ -2177,6 +2184,9 @@ class Agent:
         self.heartbeat_started, self.heartbeat_ticking = time.time(), time.monotonic()
         self.ensure_memes().expire()  # In memory, so before anything that waits on the controller.
         self.running('state')
+        from .fri_agent_model import PROGRESS
+        # Set in the tick's own context, so a member's message, say, handled meanwhile has no mark to make.
+        marking = PROGRESS.set(lambda tick=self.heartbeat_ticking: self.mark(tick))
         try:
             self.state = await self.fri.api('GET', '/agent/state')
         except Exception as exc:  # A bad tick never ends the loop; the next one retries.
@@ -2210,6 +2220,7 @@ class Agent:
                                         when=lambda: SUMMARIES in getattr(self.fri, 'capabilities', ()))]
             self.heartbeat_status = 'ok' if all(results) else 'deferred'
         finally:
+            PROGRESS.reset(marking)
             self.heartbeat_finished = time.time()
             self.heartbeat_current = self.heartbeat_ticking = self.heartbeat_progress = None
 

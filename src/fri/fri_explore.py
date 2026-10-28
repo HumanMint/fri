@@ -140,6 +140,7 @@ async def explore(agent, claim):
         scanned_ids = [str(row['id']) for row in rows]
         checked = set(await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/checked', {'message_ids': scanned_ids}))
         for row in sorted(rows, key=lambda r: int(r['id'])):
+            agent.progressed()  # One message's reads at a time, as in Agent.learn.
             if row['id'] in checked or row['author'].get('bot') or row.get('webhook_id') or not row.get('content', '').strip():
                 continue
             user = int(row['author']['id'])

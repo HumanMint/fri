@@ -24,7 +24,9 @@ RELAPSE = 1800  # A new outage this soon after the last DM edits that DM instead
 READ = 10  # A watch read that hangs this long counts as an unreachable controller.
 PROBE = 4  # Each live read in the owner's health report.
 DELIVERY = 30  # How long a pass waits on the owner DM's delivery before moving on. It never cancels it.
-STALL = 900  # A heartbeat tick running this long is stuck: past a slow learning backlog or several attention calls.
+# A heartbeat tick that hasn't taken a step (see Agent.progressed) in this long is stuck. Its steps include each
+# model call's start and end, and a call ends by fri_agent_model.DEADLINE, well inside this.
+STALL = 900
 GENE = frozenset({'stale', 'offline', 'stopped'})
 NOT_TAKING = 'gene isn’t taking commands right now, so i didn’t send that.'
 NOT_OFFERED = 'gene isn’t offering that command right now, so i didn’t send it.'
