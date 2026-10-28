@@ -10,6 +10,7 @@ EXPIRED = 'that one expired. ask again.'
 ENDED = (r'fri:(?:request:(?:preview:[a-f0-9]{32}|[a-f0-9]{32}:(?:back|next|submit|cancel))|'
          r'behavior:(?:back|next|submit|cancel)|'
          r'memory:(?:open|choose|remove|replace|share|confirm|keep|summary|clear):[a-f0-9]{32})')
+ANSWERED = 'fri:answered'  # In a click's Interaction.extras: who answers it, Ended or the view it stands in for.
 
 
 async def tell(interaction, text):
@@ -24,6 +25,17 @@ async def tell(interaction, text):
 async def not_yours(interaction):
     """A click on another member's Fri button: told so, instead of Discord's "This interaction failed"."""
     await tell(interaction, NOT_YOURS)
+
+
+def answers(interaction, who):
+    """Whether `who` answers this click: 'ended' for Ended, 'view' for the view it stands in for. discord.py can queue
+    both for one click (ViewStore.dispatch_view), and the view may end before either runs, so the first to ask takes
+    it and the other stays out (fri #175). No await between the check and the claim. Without extras to mark, it
+    answers, as before."""
+    extras = getattr(interaction, 'extras', None)
+    if not isinstance(extras, dict):
+        return True
+    return extras.setdefault(ANSWERED, who) == who
 
 
 def live(interaction):
@@ -41,7 +53,8 @@ def live(interaction):
 
 class Ended(discord.ui.DynamicItem[discord.ui.Item], template=ENDED):
     """One of those buttons, clicked after its view ended: it says so and comes off Fri's message. Nothing is
-    submitted, applied or shown from old state. While its view still runs, the view answers alone."""
+    submitted, applied or shown from old state. While its view still runs, the view answers alone, and a click the
+    view took stays the view's even once it ends (see answers)."""
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
@@ -50,7 +63,8 @@ class Ended(discord.ui.DynamicItem[discord.ui.Item], template=ENDED):
     async def callback(self, interaction):
         fri = interaction.client
         if (live(interaction) or
-                getattr(getattr(interaction.message, 'author', None), 'id', None) != getattr(fri.user, 'id', None)):
+                getattr(getattr(interaction.message, 'author', None), 'id', None) != getattr(fri.user, 'id', None) or
+                not answers(interaction, 'ended')):
             return
         try:
             await interaction.response.edit_message(view=None)

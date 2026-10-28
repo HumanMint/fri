@@ -49,8 +49,10 @@ class DraftView(PagedPreview):
             self.add_item(button)
 
     async def interaction_check(self, interaction):
+        from .fri_buttons import answers, not_yours
+        if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
+            return False
         if interaction.user.id != self.user_id:
-            from .fri_buttons import not_yours
             await not_yours(interaction)
             return False
         if getattr(getattr(interaction.message, 'author', None), 'id', None) != self.cog.user.id:
