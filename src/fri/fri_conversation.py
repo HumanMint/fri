@@ -224,15 +224,17 @@ class Bursts:
 
 
 class Continuation:
-    """An explicit turn in a configured channel, still open to a short undirected line from its author.
+    """An explicit turn in a configured channel, one message on its own, still open to a short undirected line
+    from its author.
 
-    The line has to come within the turn's burst window, from its first message (never renewed), with nobody else
+    The line has to come within the turn's burst window, from its message (never renewed), with nobody else
     speaking in between (see Agent.continuing). Until the turn commits, just before its model request or anything
     it does goes out, the line reopens the turn's burst and the turn gives way: the reopened burst is answered
-    once, from the line, as any burst is. A line taken back before that burst's turn commits voids it, and the
-    turn that gave way answers its own messages alone after all (see Agent.answer_alone). After this turn commits,
-    one line is answered on its own once this reply is done. A line carries no authority of its own: a reopened
-    burst never completes a request (see Actions), and a line is plain words only (see Agent.plain)."""
+    once, from the line, as any burst is, and takes no more lines. If the line or the question is taken back
+    before that burst's turn commits, it's voided, and the question is answered alone or, edited, again (see
+    Agent.unjoin), keeping its place in their queue. After this turn commits, one line is answered on its own
+    once this reply is done. A line carries no authority of its own: a reopened burst never completes a request
+    (see Actions), and a line is plain words only (see Agent.plain)."""
 
     def __init__(self, message, text, rows, since, *, addressed=False, origin=None):
         self.message, self.text, self.rows, self.since = message, text, list(rows), since
@@ -333,33 +335,37 @@ class Continuations:
             return None
         return token
 
-    def withdraw(self, ids, bursts):
-        """Messages edited or deleted. A turn whose own message went takes no line now, and a burst a line reopened
-        from it that's still gathering goes. A line taken back before the turn it reopened committed voids that:
-        the reopened burst goes quietly (its turn gives way too, if it began), and nothing the line said reaches
-        the model. A turn that already gave way to it is returned, to answer its own messages alone after all."""
-        ids, alone = set(ids), []
+    def withdraw(self, ids, bursts, deleted=False):
+        """Messages edited or deleted (`deleted`: known to be). A turn whose own message went takes no line now.
+        Either its message or a line taken back before the burst a line reopened from it committed voids that
+        burst: it goes quietly (its turn gives way too, if it began), and nothing the line said reaches the model.
+        A turn that hadn't given way yet answers, or re-answers, itself (see Agent.reply_once). One that had is
+        returned, to be answered alone after all if a line went, or again as edited if its own message was edited.
+        Returns (to answer alone, to answer again, turns that gave way just now)."""
+        ids, alone, again, voided = set(ids), [], [], []
         for token in list(self.turns.values()):
-            if any(row[1].id in ids for row in token.rows):
+            own = any(row[1].id in ids for row in token.rows)
+            if own:
                 token.closed = True
-                if token.joined is not None and not token.joined.taken:
-                    bursts.discard(token.joined, 'message changed')
-                continue
-            if token.joined is None or token.joined.voided or not token.lines() & ids:
+            if token.joined is None or token.joined.voided or not (own or token.lines() & ids):
                 continue
             after = next((t for t in self.turns.values() if t.origin is token), None)  # The reopened burst's turn.
             if after is not None and after.committed:
-                continue  # Its request went out: the line is withdrawn like any message a turn carries.
+                continue  # Its request went out: the change is withdrawn like any message a turn carries.
             token.joined.voided = True
             bursts.discard(token.joined, 'message changed')
             if after is not None:
                 after.gave_way = True
-            if token.gave_way:
-                self.close(token)
+                voided.append(after)
+            if not token.gave_way:
+                token.joined = None
+                continue
+            self.close(token)
+            if not own:
                 alone.append(token)
-            else:
-                token.joined = None  # It hasn't given way yet: it answers alone when it commits.
-        return alone
+            elif not deleted:
+                again.append(token)
+        return alone, again, voided
 
     def forget(self, user):
         for token in self.turns.values():

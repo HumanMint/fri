@@ -23,7 +23,7 @@ from .fri_addressing import addressed_text, explicit_mention, pinged, visible_co
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SETTINGS_GATE, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_context import addressed_content
-from .fri_conversation import CONTINUATION_TEXT, Burst, Bursts, Continuations, links
+from .fri_conversation import CONTINUATION_TEXT, Bursts, Continuations, links
 from .fri_errors import (
     UNREACHABLE,
     AuthorErased,
@@ -372,7 +372,7 @@ class Agent:
                     del self.active[key]
                 else:
                     self.active[key] = replaced
-        self.unjoin(ids)  # Before the bursts below: a line's turn that gave way answers alone (see Continuation).
+        self.unjoin(ids, deleted=True)  # Before the bursts below: a question that gave way answers alone.
         self.bursts.unsend(channel, ids)
         self.saved_turns.withdraw(ids)  # Their saved exchanges too, so their words don't come back as history.
 
@@ -827,7 +827,8 @@ class Agent:
                         return await self.dropped(message, events, erasure, invitation, since, burst)
                 try:
                     async with asyncio.timeout(until-time.time()):
-                        while not self.turns.ready(user, message.id):
+                        # Or until it gave way (see unjoin): a question answered alone may be queued ahead of it.
+                        while not self.turns.ready(user, message.id) and not self.gave_way(message):
                             await self.turns.changed(user)
                 except TimeoutError:
                     pass  # Told below, unless they erased meanwhile.
@@ -923,52 +924,78 @@ class Agent:
         self.saved_turns.withdraw([message.id])  # And from its author's saved exchange (fri #129).
         self.unjoin([message.id])  # As if a line never joined, before its turn committed (see Continuation).
 
-    def unjoin(self, ids):
-        """Lines taken back before the burst they reopened committed void it (see Continuations.withdraw). A turn
-        that gave way to one answers its own messages alone after all, once its handling has wound down."""
-        for token in self.continuations.withdraw(ids, self.bursts):
+    def unjoin(self, ids, deleted=False):
+        """Messages taken back (`deleted`: known to be) void a burst a line reopened, before it committed (see
+        Continuations.withdraw). A question that gave way to it is answered alone after all if the line went, or
+        again as edited if it was edited (see answer_again), as if it had never given way. Answered alone, it
+        keeps its place in their queue from now, so a newer message waits behind it."""
+        alone, again, voided = self.continuations.withdraw(ids, self.bursts, deleted)
+        for token in alone:
+            user = token.message.author.id
+            self.turns.arrive(user, token.message.id)
             try:
                 task = asyncio.get_running_loop().create_task(self.answer_alone(token))
             except RuntimeError:  # No loop: nothing here can be answered.
+                self.turns.leave(user, token.message.id)
                 LOG.warning('Message %s was not answered alone: no event loop', token.message.id)
                 continue
             self.reruns.add(task)
             task.add_done_callback(self.reruns.discard)
+        if any([self.answer_again(token.message) for token in again]):
+            try:
+                self.answer_edits()  # Now, or once whatever holds it lets go (see handle).
+            except RuntimeError:
+                LOG.warning('Edited messages were not answered again: no event loop')
+        for token in voided:
+            self.turns.wake(token.key[1])  # A turn waiting for theirs, given way, stops waiting.
+
+    def answer_again(self, message):
+        """Answer an edited message again, once, as it reads now, after nothing handles it any more (see rerun).
+        Not after a tool that may change something ran for it, for a privacy control or after a second edit."""
+        if (message.id in self.acted or self.memory_control(message) or
+                self.reanswered.get(message.id, 0) >= MAX_REANSWERS):
+            return False
+        self.reanswered[message.id] = self.reanswered.pop(message.id, 0)+1
+        while len(self.reanswered) > MAX_DELIVERED:
+            del self.reanswered[next(iter(self.reanswered))]
+        self.reanswer[message.id] = message.channel.id
+        return True
 
     async def answer_alone(self, token):
-        """A turn that gave way to a line taken back before anything answered: its messages, as they stand now,
-        get the reply they would have, once. Not before the turns that held them are done with them; then their
-        own checks run again, as for any message that waited (see take_turn). Nothing more joins it, and the
-        exchange spends no second allowance."""
+        """A question that gave way to a line taken back before anything answered: it gets the reply it would have,
+        once, as it stands now. It holds its place in their queue (see unjoin) and goes once the turns that held
+        it are done with it; its own checks then run again, as for any message that waited, so past its deadline
+        it hears the usual "took too long" (see take_turn). Nothing more joins it, and the exchange spends no
+        second allowance."""
         message, user = token.message, token.message.author.id
-        events = [event for _, event, _ in token.rows]
+        until = discord.utils.snowflake_time(message.id).timestamp()+QUEUE_SECONDS
         try:
-            async with asyncio.timeout(QUEUE_SECONDS):
-                while message.id in self.replying or any(self.handling[event.id] for event in events):
-                    try:
-                        await asyncio.wait_for(self.turns.changed(user), 1)
-                    except TimeoutError:
-                        pass  # Checked again: a change can land just before the wait begins.
-        except TimeoutError:
-            return self.missed(events, 'earlier reply still running')
-        burst = Burst(token.since)
-        burst.extend(token.rows)
-        alone = self.continuations.open(message, token.text, token.rows, token.since, addressed=token.addressed,
-                                        origin=token)
-        alone.closed = True
-        self.handling.update(event.id for event in events)
-        self.turns.arrive(user, message.id)
-        try:
-            await self.respond(message, token.text, False, burst=burst if len(burst) > 1 else (), waited=True,
-                               forgotten=token.since[0], revision=token.since[1], addressed=token.addressed)
+            try:
+                async with asyncio.timeout(max(0, until-time.time())):
+                    while message.id in self.replying or self.handling[message.id]:
+                        try:
+                            await asyncio.wait_for(self.turns.changed(user), 1)
+                        except TimeoutError:
+                            pass  # Checked again: a change can land just before the wait begins.
+            except TimeoutError:
+                pass  # Its deadline passed: its turn says so, after the usual checks.
+            if message.id in self.replying:  # The turn that gave way, somehow still going: it answers for it.
+                return self.missed([message], 'earlier reply still running')
+            alone = self.continuations.open(message, token.text, token.rows, token.since, addressed=token.addressed,
+                                            origin=token)
+            alone.closed = True
+            self.handling[message.id] += 1
+            try:
+                await self.respond(message, token.text, False, waited=True, forgotten=token.since[0],
+                                   revision=token.since[1], addressed=token.addressed)
+            finally:
+                self.handling -= Counter([message.id])
+                self.continuations.close(alone)
         except Exception:
             LOG.exception('Answering a message alone after its added line was taken back failed')
         finally:
-            self.handling -= Counter(event.id for event in events)
             self.turns.leave(user, message.id)
-            self.continuations.close(alone)
-            for event in events:
-                self.settle(event)
+            self.settle(message)
             self.answer_edits()
 
     def commit(self, message):
@@ -1456,10 +1483,14 @@ class Agent:
         origin = getattr(burst, 'origin', None)  # The turn whose burst a short line reopened.
         addressed = addressed or bool(origin and origin.addressed)
         token = None
-        if self.continuable(message, burst, directed or text, dm, privacy, invitation, addressed):
+        eligible = self.continuable(message, burst, directed or text, dm, privacy, invitation, addressed)
+        if eligible or origin is not None:
             self.continuations.prune(self.bursts)
             token = self.continuations.open(message, directed or text, burst, (forgotten, observed),
                                             addressed=addressed, origin=origin)
+            # A burst a line reopened takes no more lines, however it ended up, but its turn still owns the
+            # exchange: its allowance, and giving way if that line is taken back (see unjoin).
+            token.closed = not eligible
         if origin or continuing:
             self.riders.add(message.id)  # A line they added: it waits for the turn before it without a notice.
         self.handling.update(event.id for event in earlier)  # Until this reply answers for them too.
@@ -1503,12 +1534,12 @@ class Agent:
         return token
 
     def continuable(self, message, rows, text, dm, privacy, invitation, addressed):
-        """Whether a short line may still join this turn (see Continuation): one spoken to Fri by name in a
-        configured channel, not their DM or Fri's own channel, which already let every line in, and not a ping,
-        which stays one event. Every message of it plain (see plain), as a line it takes must be."""
+        """Whether a short line may still join this turn (see Continuation): one message on its own, spoken to Fri
+        by name in a configured channel, not their DM or Fri's own channel, which already let every line in, and
+        not a ping, which stays one event. Plain (see plain), as a line it takes must be. Not a burst of several,
+        a line's reopened one included: with anything else in play, the member gets the usual behavior."""
         return bool(addressed and not dm and not privacy and not invitation and message.channel.id != self.dedicated and
-                    message.id not in self.rerunning and self.plain(message, text) and
-                    all(self.plain(event, clean(event.content or '', 4000)) for _, event, _ in rows))
+                    message.id not in self.rerunning and len(rows) == 1 and self.plain(message, text))
 
     def line(self, message, text):
         """A short plain line to nobody else, which may join their turn without Fri's name (see Continuation)."""
@@ -1517,13 +1548,14 @@ class Agent:
 
     def plain(self, event, text):
         """Just words (see Continuation): no media, reply, message link or ping, and not a privacy control, a cancel,
-        a usage report or a Gene control, which keep their own paths. A turn taking a line and the line both are."""
+        a usage report, or anything Gene's request grammar reads as asking for a control or a song correction
+        (see Actions.command_requested), which keep their own paths. A turn taking a line and the line both are."""
         from .fri_pending import cancelled
-        from .gene_controls import quick_control, requested
+        from .gene_controls import COMMANDS, CORRECTION, correction_text, quick_control, requested
         return not (media(event) or getattr(event, 'reference', None) or links(event) or
                     explicit_mention(event, self.fri.user.id) or memory_intent(text) or cancelled(text) or
                     usage_requested(text) or quick_control(text, music_context=True) or
-                    any(requested(text, action) for action in ('play', 'volume')))
+                    any(requested(text, action) for action in COMMANDS) or CORRECTION.match(correction_text(text)))
 
     def summoning(self, message, directed, privacy):
         """Just Fri's name or a hello, on its own: what they want usually comes in the next message."""
@@ -1659,13 +1691,8 @@ class Agent:
             """Its one message edited, not deleted, since it came in, and no tool that may change something ran
             for it: nothing goes out, and once this turn is done it's answered again as it reads now (see rerun).
             Not an unprompted reply, a ping (its invitation says why), a burst, a privacy control or a second edit."""
-            if (ambient or invitation or burst or not edited() or message.id in self.acted or
-                    self.memory_control(message) or self.reanswered.get(message.id, 0) >= MAX_REANSWERS):
+            if ambient or invitation or burst or not edited() or not self.answer_again(message):
                 return False
-            self.reanswered[message.id] = self.reanswered.pop(message.id, 0)+1
-            while len(self.reanswered) > MAX_DELIVERED:
-                del self.reanswered[next(iter(self.reanswered))]
-            self.reanswer[message.id] = message.channel.id
             missed('message edited')
             return True
 
@@ -1741,7 +1768,13 @@ class Agent:
             if since:  # Said only if they haven't erased since, checked last.
                 if erased := await self.erasure(message.author.id, *since):
                     return await self.dropped(message, events, erased, invitation, since, burst)
-            await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
+            # A line a member added, then deleted (see Continuation): said on the question it was added to.
+            told = message
+            if getattr(burst, 'origin', None) is not None and message.id in self.unsent:
+                told = next((event for _, event, _ in reversed(burst) if not taken(event)), None)
+                if told is None:
+                    return missed('message deleted')
+            await told.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
             return
