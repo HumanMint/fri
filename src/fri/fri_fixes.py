@@ -3,8 +3,8 @@
 A Gene error Fri files gets a 👀, and its job is watched for three days after the error. Once that fix
 ships, Fri says one dry line under the error, when the room is quiet, and never a second one for it.
 Only deployed counts: a failure, a rejection, a withdrawal or a hand-off to the owner is never
-announced. The owner's DM for a shipped repair that a member reported gets a Tell reporter button,
-which replies to that report once.
+announced, and nothing is while Gene's running release is unknown. The owner's DM for a shipped
+repair that a member reported gets a Tell reporter button, which replies to that report once.
 """
 
 import asyncio
@@ -190,8 +190,11 @@ async def due(agent, job_id, entry):
         return 'drop'
     # The release is read last and every gate after it needs no await, so a rollback, an archive, a
     # config change or proactive posts going off while Discord answered still stops the line.
-    if (await fri.api('GET', '/status')).get('active_sha') != sha:
+    status = await fri.api('GET', '/status')
+    if status.get('active_sha') != sha:
         return 'drop'  # A rollback or a newer release came first, so "fixed" might not hold.
+    if status.get('runtime_unknown'):
+        return 'keep'  # A failed restore never proved healthy: Gene may not be on it (gene #48). Said once known.
     channel = room(agent, entry)
     if not (agent.config['enabled'] and agent.config['proactive']) or channel is None:
         return 'keep'  # Paused, or proactive posts off, while Discord answered.
@@ -308,6 +311,8 @@ async def live(fri, job):
         raise Unreachable('a newer release is live now, so "fixed" might not hold')
     if (status.get('jobs') or {}).get('deploying'):
         raise Unreachable('another release is going out right now. tap again once it lands')
+    if status.get('runtime_unknown'):  # A rollback failed after the claim: what's running isn't known.
+        raise Unreachable("gene can't confirm what's running right now, so \"fixed\" might not hold")
 
 
 async def report(fri, job):

@@ -21,6 +21,17 @@ def bare_greeting_debounce(monkeypatch):
     monkeypatch.setattr('fri.fri_agent.REST_SECONDS', 1.5)
 
 
+@pytest.fixture(autouse=True)
+def inside_maintenance_window(monkeypatch):
+    """A controller from gene #58 on starts deployments only in its production window ([04:00, 05:00)
+    America/Los_Angeles). Tests not about the window run inside it; an older controller has none."""
+    try:
+        import gene.maintenance
+    except ImportError:
+        return
+    monkeypatch.setattr(gene.maintenance, 'clock', lambda: 1793185500.0)  # 2026-10-28T04:05:00-07:00
+
+
 @pytest.fixture
 def store(tmp_path):
     result = Store(tmp_path / 'gene.sqlite3')

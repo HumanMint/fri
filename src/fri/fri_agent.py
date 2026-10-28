@@ -1665,11 +1665,27 @@ class Agent:
                 authors.update((item['user_id'], item['revision']) for item in row['provenance'])
             else:
                 authors.add((row['user_id'], row.get('revision', 0)))
-        # Read together, so one author's answer doesn't age while another's is awaited.
-        users = sorted({user for user, _ in authors})
-        profiles = dict(zip(users, await asyncio.gather(*(self.profile(parent, user) for user in users))))
-        if any(not profiles[user]['enabled'] or profiles[user]['revision'] != revision for user, revision in authors):
-            return False
+        if 'author-fence' in getattr(self.fri, 'capabilities', ()):
+            # One check of every author under the controller's lock (fri #84): no erasure through Gene lands
+            # between two authors' reads. Any refusal names nobody and sends nothing; nor do more authors than
+            # the controller checks at once (200), rather than reading them one by one.
+            if len(authors) > 200:
+                return False
+            if authors:
+                try:
+                    checked = await self.fri.api('POST', '/agent/authors/check', {
+                        'guild_id': str(self.channel_guild(parent)), 'channel_id': str(parent),
+                        'authors': [{'user_id': str(user), 'revision': revision} for user, revision in sorted(authors)]})
+                except ControllerRejected:
+                    return False
+                if not isinstance(checked, dict) or checked.get('ok') is not True:
+                    return False  # Only Gene's explicit yes lets the batch go; anything else stays quiet.
+        else:
+            # Read together, so one author's answer doesn't age while another's is awaited.
+            users = sorted({user for user, _ in authors})
+            profiles = dict(zip(users, await asyncio.gather(*(self.profile(parent, user) for user in users))))
+            if any(not profiles[user]['enabled'] or profiles[user]['revision'] != revision for user, revision in authors):
+                return False
         # Again after those reads: a row withdrawn or forgotten during them must not go out either.
         live = {r['id'] for r in self.recent.get(channel, ())}
         return all(row['id'] in live for row in records)
