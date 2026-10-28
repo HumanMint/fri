@@ -16,6 +16,12 @@ MIMES = {'image/png', 'image/jpeg', 'image/webp'}
 LINK_CARDS = ('rich', 'article', 'link', 'video', 'image')  # Discord's unfurls of a link, besides a GIF link's.
 
 
+def measured(width, height):
+    """A size as Discord measured it: positive integers (never a bool) within an attachment's limit. Checked
+    before multiplying, so malformed embed metadata can't crash a read."""
+    return all(type(side) is int and side > 0 for side in (width, height)) and width * height <= MAX_PIXELS
+
+
 def gif_previews(message):
     """The still preview Discord's own proxy made of each GIF link (Tenor, Giphy) the poster sent."""
     embeds = getattr(message, 'embeds', None)
@@ -40,8 +46,7 @@ def link_previews(message):
             continue  # A card without a picture: its text is all there is.
         url, width, height = (getattr(picture, key, None) for key in ('proxy_url', 'width', 'height'))
         # Its size as Discord measured it, known and within an attachment's limit (see load_image for the bytes').
-        if (not url or not urlsplit(str(url)).path.startswith('/external/') or
-                not all(type(side) is int and side > 0 for side in (width, height)) or width * height > MAX_PIXELS):
+        if not url or not urlsplit(str(url)).path.startswith('/external/') or not measured(width, height):
             return None
         result.append(str(url))
     return result
@@ -65,7 +70,9 @@ def sources(message, most=2, *, gifs=False):
         if gifs and embed.type == 'gifv':
             preview = getattr(embed.thumbnail, 'proxy_url', None)
             width, height = getattr(embed.thumbnail, 'width', None), getattr(embed.thumbnail, 'height', None)
-            if not preview or (width and height and width * height > 20_000_000):  # An attachment's limit.
+            # A side Discord gives must be a real one within an attachment's limit (fri #160). One it leaves out
+            # keeps the fallback, and load_image still holds the bytes to that limit.
+            if not preview or not measured(1 if width is None else width, 1 if height is None else height):
                 return None
             result.append(str(preview))
             continue
