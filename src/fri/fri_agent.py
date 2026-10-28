@@ -1215,8 +1215,13 @@ class Agent:
             return
         dm = message.guild is None
         if dm:
-            if message.author.bot or not self.config['support_dms'] or not await self.member(message.author.id, fresh=True):
-                return  # Fresh: someone who just left mustn't hear server context through a cached lookup.
+            if message.author.bot:
+                return
+            if not self.config['support_dms']:
+                return self.forward_dropped(message, 'dms off')  # Counted, like a forward at any later gate.
+            if not await self.member(message.author.id, fresh=True):
+                # Fresh: someone who just left mustn't hear server context through a cached lookup.
+                return self.forward_dropped(message, 'not a member')
         elif not self.allowed(message.channel):
             self.memory_controls.leave(message.author.id, message.id)  # Outside, it's chat (see Fri.talk).
             # An outside ping is one event, never a new ambient/active channel.
