@@ -675,7 +675,10 @@ class Agent:
             del self.responded[next(iter(self.responded))]
 
     def settle(self, event, reason=None):
-        self.ledger.settle(event.id, reason)
+        if event.id in self.reanswer:  # Answered again as it reads now (see rerun): that handling counts it.
+            self.ledger.park(event.id)
+        else:
+            self.ledger.settle(event.id, reason)
         if event.id in self.misses:  # IDs and a gate or exception name only, never content or names.
             LOG.info('Mention %s/%s not answered: %s', event.channel.id, event.id,
                      self.misses.pop(event.id) or reason or 'no reply')
@@ -995,44 +998,52 @@ class Agent:
             task = asyncio.get_running_loop().create_task(self.rerun(self.reanswer.pop(i), i))
             self.reruns.add(task)
             task.add_done_callback(self.reruns.discard)
-            task.add_done_callback(lambda task, i=i: self.rerun_cancelled(task, i))
+            task.add_done_callback(lambda task, i=i, parked=self.ledger.parked(i): self.rerun_cancelled(task, i, parked))
 
-    def rerun_cancelled(self, task, i):
+    def rerun_cancelled(self, task, i, parked=None):
         """A re-run cancelled before its first step never reaches its own cleanup (rerun's finally), so its marks go
         here (fri #132). Only teardown cancels one; one that ran has already cleaned up, and this finds nothing."""
         if task.cancelled():
             self.rerunning.pop(i, None)
             self.edit_seen.pop(i, None)
+            self.ledger.abandon(i, parked, 'CancelledError')
 
     async def rerun(self, channel_id, message_id):
         """A message edited while Fri answered it, fetched again and handled as if it just came in, so every
         gate runs on what it says now: an edit that drops Fri's name or takes it back gets nothing. The fetch
         counts only if no edit came during it and it shows the newest edit seen (Discord's copy can lag the
         edit event); it's tried a few times, then dropped. It's then taken in as of when that fetch began, so
-        an edit after is withdrawn like any other, and alone, so it never joins a burst sent after it."""
+        an edit after is withdrawn like any other, and alone, so it never joins a burst sent after it. If it ends
+        before handling it again, its count from the first handling settles here, for why (see Ledger.park)."""
+        parked, reason = self.ledger.parked(message_id), 'no reply'
         try:
             for _ in range(3):
                 began = time.time()
                 try:
                     message = await self.fri.get_channel(channel_id).fetch_message(message_id)
                 except (AttributeError, discord.HTTPException):
+                    reason = 'message deleted'
                     return  # Deleted meanwhile, or the channel's gone: nothing left to answer.
                 newest = self.rerunning.get(message_id)
                 if not self.taken_back(message_id, began) and (
                         newest is None or (message.edited_at is not None and message.edited_at >= newest)):
                     break
             else:
+                reason = 'message changed'
                 return  # Still changing, or Discord's copy lags: they can ask again.
             if self.memory_control(message):
+                reason = 'edited into a privacy control'
                 return  # Not a privacy control: it was refused for the edit (see Fri.chat_once), and they send it again.
             self.delivered.pop(message.id, None)
             self.watched.pop(message.id, None)
             await self.handle(message, read=began)
-        except Exception:
+        except Exception as exc:
+            reason = type(exc).__name__
             LOG.exception('Answering an edited message again failed')
         finally:
             self.rerunning.pop(message_id, None)
             self.edit_seen.pop(message_id, None)
+            self.ledger.abandon(message_id, parked, reason)
 
     def saw_edit(self, i, edited):
         """The newest edit seen, by its event or a check's fetch, of a message being handled or answered again:
@@ -1215,10 +1226,11 @@ class Agent:
         # message addressed to Fri, a ping, its name or a DM, is counted once its handling ends (see fri_ledger).
         if message.id in self.watched:
             return  # A copy that outlived the delivered record: its first delivery answered or explained it.
-        kind = None
+        kind = again = None
         if message.id not in self.misses and message.id not in self.replying and message.id not in self.ledger.pending:
-            kind = addressed(self, message)
-        if kind is None:
+            # One answered again as edited still counts as it first came in, even if the edit dropped Fri's name.
+            kind, again = addressed(self, message), self.ledger.parked(message.id)
+        if kind is None and again is None:
             await self.listen(message)
             return
         if kind == 'ping':
@@ -1295,6 +1307,8 @@ class Agent:
             self.forward_dropped(message, 'no text')
             return self.miss(message, 'no text')
         directed = text if dm else await addressed_text(message, self.fri.user.id)
+        if directed is not None:  # A reply that only this fetch of its reference showed is to Fri counts now.
+            self.ledger.confirm(message.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
         control = (owner_addressed and message.author.id == self.fri.owner_id and
                    await self.owner_control(message, directed or text, erasures))
