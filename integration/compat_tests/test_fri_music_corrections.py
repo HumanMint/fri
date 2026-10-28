@@ -45,6 +45,42 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, i meant to say To The Moon', 'To The Moon', False),
     ("wrong song, I Don't Care", "I Don't Care", True),
     ('not that one, play That Funky Music', 'Play That Funky Music', True),
+    # gene #107 (1): after "i meant to", only a word that can't start an infinitive may start a title, whatever
+    # the proposed song.
+    ('i meant to skip To The Moon', 'to skip To The Moon', False),
+    ('not that one, i meant to pause To The Moon', 'to pause To The Moon', False),
+    ('wrong song, i meant to tag alex, To The Moon', 'to tag alex To The Moon', False),
+    ('not that one, i meant To My Love', 'To My Love', True),
+    ('not that one, i meant To Love Somebody', 'To Love Somebody', False),  # Fails closed; these two still count:
+    ('wrong song, To Love Somebody', 'To Love Somebody', True),
+    ("not that one, i meant 'To Love Somebody'", 'To Love Somebody', True),
+    # gene #107 (2): more ways to take the replacement back.
+    ('wrong song, Love Story, not that one either', 'Love Story', False),
+    ("wrong song, Love Story, that's not it either", 'Love Story', False),
+    ('wrong song, Love Story, nope', 'Love Story', False),
+    ('wrong song, Love Story nope', 'Love Story', False),
+    ('not that one, Love Story... nah', 'Love Story', False),
+    ('wrong song, Love Story, no', 'Love Story', False),
+    ('wrong song, "Not That One Either"', 'Not That One Either', True),
+    ('wrong song, Hell No', 'Hell No', True),
+    # gene #107 (3): connectors are skipped only after the title's first word.
+    ('wrong song, From Me to You', 'Me to You', False),
+    ('wrong song, From Me to You', 'From Me to You', True),
+    ('not that one, By The Way', 'The Way', False),
+    ('not that one, By The Way', 'By The Way', True),
+    ('not that one, play From Me to You', 'Me to You', False),
+    # gene #107 (4): single quotes, straight or curly, pair like double quotes; an apostrophe inside a word, or
+    # leading one in "'til" or "'93", never opens or closes one.
+    ('wrong song, \u2018Actually No\u2019', 'Actually No', True),
+    ("wrong song, 'Actually No'", 'Actually No', True),
+    ("wrong song, 'Not That One Either' by someone", 'Not That One Either', True),
+    ("wrong song, 'Don't Stop Believin''", "Don't Stop Believin'", True),
+    ('wrong song, \u2018Don\u2019t Stop Believin\u2019\u2019', "Don't Stop Believin'", True),
+    ("wrong song, it's Love Story, don't play it", 'Love Story', False),
+    ("not that one, 'Til I Collapse, don't play rockin' robin", "'Til I Collapse", False),
+    ("not that one, '93 Til Infinity, don't play rockin' robin", '93 Til Infinity', False),
+    ("wrong song, 'Til I Collapse", "'Til I Collapse", True),
+    ("not that one, alex said 'Never Gonna Give You Up'", 'Never Gonna Give You Up', False),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.

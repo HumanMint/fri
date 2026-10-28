@@ -158,7 +158,11 @@ OPENING = re.compile(
     rf"{FILLER}(?:{MARKER}(?:\s+(?:lol|lmao|bro))?\s*(?:[,:;.!—–-]+\s*(?:{LINK}\s+)?+|\s+{LINK}\s+)|i meant\s+)")
 # The song may follow their own request words ("play X", "i said X"); its first word starts the replacement.
 LEAD = re.compile(r"(?:(?:can|could|would) (?:you|u) )?(?:please |pls )?(?:play|queue|put on|add|i said|i asked for|i wanted)\s+")
-QUOTED = re.compile(r'["“][^"”]*["”]|https://\S+')  # A quoted title or a link keeps every word, whatever it says.
+# A quoted title or a link keeps every word, whatever it says. Single quotes, straight or curly, pair too; an
+# apostrophe inside a word ("don't") never opens or closes one, nor does a leading one ("'til", "'93").
+QUOTED = re.compile(r'["“][^"”]*["”]|https://\S+'
+                    r"|(?<![\w'‘])['‘](?!\d|(?:til|cause|cuz|cos|coz|em|bout|round|n|tis|twas|nuff|fore|kay|sup)\b)(?=\S)"
+                    r"(?:[^'‘]|(?<=\w)'(?=\w))+?(?<!\s)'(?!\w)")
 CLAUSE = r"(?:^|[,;:.!?—–\-\"]\s*|\b(?:and|but|or|so|then|also|plus|like|actually|wait|lol|nah|no|oh|please|pls|just)\s+)"
 # Outside a quoted title, any of these means the message is not asking for that song now.
 REFUSED = re.compile(
@@ -170,13 +174,17 @@ REFUSED = re.compile(
     rf"|{CLAUSE}(?!i\b)(?:[\w']+\s+){{1,3}}?(?:said|says|asked for|suggested|suggests|recommended|recommends"
     r"|requested|requests|mentioned)\b(?=[\s,:]*[\w\"])"
     rf"|{CLAUSE}(?:according to|for example|for instance|e\.g\b|eg\b|such as|something like|stuff like|hypothetically)"
-    # "i meant to say thanks" is chat, not a title; "To The Moon" can be one.
-    r"|\bi meant to\s+(?:say|type|write|ask|tell|send|reply|respond|answer|post|text|put|do|pick|choose|search|look"
-    r"|check|mention|link|ping|go|be|get|make|have|add|play|queue)\b|\bi meant to[\s.!?]*$")
-# After the song, a change of heart withdraws it: "wrong song, Love Story, actually no". Checked after the correction
+    # "i meant to say thanks" is chat, not a title; "To The Moon" can be one. After "i meant to", only a word that
+    # can't start an infinitive may follow ("i meant To Love Somebody" fails closed; quoted, or "wrong song, To ...",
+    # still counts).
+    r"|\bi meant to\b(?!\s+(?:the|a|an|my|your|his|her|our|their|this|that|these|those|me|you|him|us|them|all)\b)")
+# After the song, a change of heart withdraws it: "wrong song, Love Story, actually no", "... not that one either",
+# a bare "nope", or a closing "nah" or "no" after a pause ("Hell No" stays a title). Checked after the correction
 # only, since "actually no, wrong song, X" opens a correction.
 WITHDRAWN = re.compile(r"\b(?:actually,?\s+no(?:pe|t that)?|no,?\s+wait|wait,?\s+no|(?:i\s+)?change[ds]?\s+my\s+mind"
-                       r"|on second thought|never\s+mind|leave it)\b")
+                       r"|on second thought|never\s+mind|leave it|nope"
+                       r"|not\s+(?:(?:that|this|the|it)\s+)?(?:(?:one|song|track)\s+)?either)\b"
+                       r"|\bnah(?:\s+(?:lol|lmao))?[\s.!?]*$|[,;:.!?…—–-]\s*no[\s.!?]*$")
 # Between a title and its artist: "Love Story by Taylor Swift" may be named "Love Story Taylor Swift".
 CONNECTORS = {'by', 'from', 'ft', 'feat', 'featuring'}
 CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
@@ -199,12 +207,12 @@ def song_words(text):
 def grounded_song(said, named):
     """The named song is the start of what they said, word for word: never words picked from a later clause
     ("To The Moon, not To Be With You"). Only a leading article may be left out, and only connectors between a
-    title and its artist skipped."""
+    title and its artist skipped: never the title's first word ("From Me to You" isn't "Me to You")."""
     if said[:1] in (['the'], ['a'], ['an']) and named[:1] != said[:1]:
         said = said[1:]  # "the X" may be named just "X".
     at = 0
     for word in named:
-        while at < len(said) and said[at] != word and said[at] in CONNECTORS:
+        while 0 < at < len(said) and said[at] != word and said[at] in CONNECTORS:
             at += 1
         if at >= len(said) or said[at] != word:
             return False
