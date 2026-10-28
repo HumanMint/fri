@@ -98,6 +98,14 @@ class Receipts:
         for mid in [mid for mid, entry in self.entries.items() if mid in ids or ids & entry['sources'].keys()]:
             del self.entries[mid]
 
+    def changed(self, mid):
+        """A member's post a receipt names changed with no edit time (its card suppressed, swapped or unfurled, a
+        partial update): that receipt goes, as its version holds the post's card pictures (see version). Fri's own
+        answers keep theirs, as their version is only what they say and carry, which an edit time marks."""
+        mid = int(mid) if str(mid).isdigit() else None
+        for key in [key for key, entry in self.entries.items() if entry['sources'].get(mid, ('fri',))[0] != 'fri']:
+            del self.entries[key]
+
     def forget(self, user):
         for mid in [mid for mid, entry in self.entries.items() if str(user) in entry['authors']]:
             del self.entries[mid]

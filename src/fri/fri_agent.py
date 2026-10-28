@@ -404,6 +404,8 @@ class Agent:
                   (sender is None or not getattr(sender, 'bot', True)))  # Not an embed or pin update.
         if getattr(message, 'edited_at', None) is not None:  # Anyone's edit, Fri's too, ends an outside answer's
             self.receipts.withdraw([message.id])  # receipt naming it.
+        else:  # Any other update of a member's post one names too, a card suppressed during a check's last wait say.
+            self.receipts.changed(message.id)
         if edited and message.id in self.looked:
             self.revise(message.id)
         if (self.handling[message.id] or message.id in self.rerunning) and edited:

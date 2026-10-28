@@ -669,3 +669,76 @@ def test_a_nearby_card_picture_the_answer_drew_on_suppressed_during_the_follow_u
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('nearby', [True, False])
+@pytest.mark.parametrize('phase', ['model', 'delivery'])
+@pytest.mark.parametrize('part', ['image', 'thumbnail'])
+def test_a_card_suppressed_during_the_last_privacy_read_ends_the_receipt(monkeypatch, tmp_path, nearby, phase, part):
+    """Stack review round 4: Discord's update for a suppressed card carries no edit time. Processed during a check's
+    final privacy read, after the refetches passed, it still drops the receipt, so the last synchronous check
+    refuses: no request reads Fri's caption, and no reply repeating it goes out."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        w.fri.data = tmp_path
+        loads(monkeypatch)
+        try:
+            post = carded(w, age=600 if nearby else 7*3600)
+            if part == 'thumbnail':
+                post.embeds = [discord.Embed.from_dict({'type': 'article', 'url': 'https://site.test/page',
+                    'title': 'A page', 'thumbnail': {'url': 'https://site.test/card.png', 'proxy_url': PICTURE,
+                                                     'width': 100, 'height': 100}})]
+            ping = reply_to(w.message('<@99> what is in that picture', user=20, age=120), post)
+            first, answer = await handled(w, ping, 'CAPTION', age=110)
+            assert any(read['event'].id == post.id for read in first.get('image_reads', []))
+            for n in range(4):
+                w.message(f'pic {n}', user=50+n, age=60-5*n, attachments=[picture(w.channel.id, f'p{n}.png')])
+            event = follow_up(w, answer)
+            event.reply.return_value = w.fri_post(AGAIN)
+            api, active, reads, done, shown = w.fri.api, [False], [0], [False], []
+
+            async def watched(method, path, payload=None):
+                result = await api(method, path, payload)
+                if active[0] and path == '/chat/mentions/profiles':
+                    reads[0] += 1
+                    if reads[0] == 2:  # The check's final privacy read.
+                        changed = copy.copy(w.rows[post.id])
+                        changed.embeds = []  # Same text, no edit time.
+                        w.rows[post.id] = changed
+                        await w.fri.on_raw_message_edit(SimpleNamespace(channel_id=w.channel.id, message=changed))
+                        done[0] = True
+                return result
+
+            async def model(text, context, *, ready=None):
+                active[0] = phase == 'model'
+                await ready()
+                shown.extend(own(context))
+                active[0] = phase == 'delivery'
+                return ChatResult(status='completed', reply=AGAIN)
+            w.fri.api = watched
+            w.fri.chat_once = Fri.chat_once.__get__(w.fri, Fri)
+            w.fri.chat = SimpleNamespace(respond=model)
+            w.fri.flush_usage = AsyncMock()
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await w.agent.handle(event)
+            assert done[0]
+            if phase == 'model':
+                assert not shown
+            assert AGAIN not in [item.args[0] for item in event.reply.await_args_list]
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_update_to_fris_own_answer_without_an_edit_time_keeps_its_receipt(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            _, _, answer = await opened(w)
+            w.agent.edit(w.channel.id, copy.copy(answer))  # Say, its suppressed embeds settling: no edit time.
+            assert w.agent.receipts.get(answer.id) is not None
+            context, _ = await handled(w, follow_up(w, answer), AGAIN)
+            assert [row['text'] for row in own(context)] == [ANSWER]
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
