@@ -19,7 +19,7 @@ import discord
 from discord.ext import tasks
 
 from . import feedback as commands
-from .fri_addressing import addressed_text, explicit_mention, pinged, visible_content
+from .fri_addressing import addressed_text, explicit_mention, visible_content
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SETTINGS_GATE, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_context import addressed_content
@@ -32,6 +32,7 @@ from .fri_errors import (
     GateClosed,
 )
 from .fri_images import forwarded, media
+from .fri_ledger import COOLDOWN, Ledger, addressed, notice_reason
 from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
@@ -192,6 +193,7 @@ class Agent:
         self.stages = {}
         self.heartbeat_current = None  # The tick's step now, {'stage', 'since'} by the wall clock; None between ticks.
         self.heartbeat_ticking = None  # time.monotonic() as the running tick began, for the watch (see Watch.stalled).
+        self.ledger = Ledger()  # What happened to messages addressed to Fri, for the health file (see fri_ledger).
         self.unreachable_notices = {}  # channel: when Discord took Fri's notice (monotonic), or None in flight.
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
@@ -639,6 +641,7 @@ class Agent:
     def miss(self, event, reason):
         if event.id in self.misses and self.misses[event.id] is None:
             self.misses[event.id] = reason
+        self.ledger.miss(event.id, reason)
 
     def forward_dropped(self, message, reason):
         """A member's forward, which Fri can't read yet, logged as it's dropped so they can be counted: the
@@ -647,7 +650,9 @@ class Agent:
             LOG.info('Forward %s/%s not read: %s', 'dm' if message.guild is None else message.channel.id,
                      message.id, reason)
 
-    def answered(self, events):
+    def answered(self, events, told=None):
+        """Something went out for these: their answer or, `told`, a notice saying why not (see fri_ledger)."""
+        self.ledger.answered([event.id for event in events], told)
         for event in events:
             self.misses.pop(event.id, None)
             self.responded[event.id] = None
@@ -655,11 +660,13 @@ class Agent:
             del self.responded[next(iter(self.responded))]
 
     def settle(self, event, reason=None):
+        self.ledger.settle(event.id, reason)
         if event.id in self.misses:  # IDs and a gate or exception name only, never content or names.
             LOG.info('Mention %s/%s not answered: %s', event.channel.id, event.id,
                      self.misses.pop(event.id) or reason or 'no reply')
 
     def explained(self, events, reason):
+        self.ledger.explained([event.id for event in events], reason)
         for event in events:
             if event.id in self.misses:
                 del self.misses[event.id]
@@ -755,7 +762,7 @@ class Agent:
                 return self.missed(events, f'reply withheld: {gate.refusal}')
         standing = (lambda: self.forgotten.get(message.author.id, 0) == since[0]) if since else None
         if not ambient and await self.unreachable(message, answering=True, standing=standing):
-            self.answered(events)
+            self.answered(events, told='controller unreachable')
         elif standing and not standing():
             self.missed(events, 'author privacy changed')
         else:
@@ -889,7 +896,7 @@ class Agent:
             await message.reply(STALE_CONTROL, mention_author=False, allowed_mentions=NO_MENTIONS)
         except discord.HTTPException:
             return self.missed(events, 'superseded control')
-        self.answered(events)
+        self.answered(events, told='superseded control')
         await self.fri.waiting_notices.clear(message.author.id)
 
     def carried_out(self, user, event, action):
@@ -1068,7 +1075,7 @@ class Agent:
         if not invitation and isinstance(exc, commands.UserFeedbackCheckFailure):
             # Not a ping, so what its reply would have said, e.g. the controller refusing.
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
-            return self.answered(events)
+            return self.answered(events, told='check failed: '+type(exc).__name__)
         return await self.withheld(message, events, 'check failed: '+type(exc).__name__, invitation, fenced=not control,
                                    control=control)
 
@@ -1176,21 +1183,26 @@ class Agent:
             return await self.receive(message)
         except ControllerUnavailable:
             if await self.unreachable(message):
-                self.answered([message])  # Before the ping's miss settles, so it isn't logged as unanswered.
+                # Before the ping's miss settles, so it isn't logged as unanswered.
+                self.answered([message], told='controller unreachable')
             raise  # on_message still logs it.
 
     async def watch(self, message):
-        # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log.
+        # Discord shows a ping as addressed to Fri, so one left unanswered says why, once, in the log. Every
+        # message addressed to Fri, a ping, its name or a DM, is counted once its handling ends (see fri_ledger).
         if message.id in self.watched:
             return  # A copy that outlived the delivered record: its first delivery answered or explained it.
-        if (message.guild is None or message.author.bot or getattr(message, 'webhook_id', None) or
-                message.id in self.misses or message.id in self.replying or
-                not pinged(message, self.fri.user.id)):
+        kind = None
+        if message.id not in self.misses and message.id not in self.replying and message.id not in self.ledger.pending:
+            kind = addressed(self, message)
+        if kind is None:
             await self.listen(message)
             return
-        self.watched[message.id] = self.misses[message.id] = None
-        if len(self.watched) > MAX_DELIVERED:
-            del self.watched[next(iter(self.watched))]
+        if kind == 'ping':
+            self.watched[message.id] = self.misses[message.id] = None
+            if len(self.watched) > MAX_DELIVERED:
+                del self.watched[next(iter(self.watched))]
+        self.ledger.track(message, kind)
         owned = False  # By a burst: its last message answers, or its drop explains, for this one.
         try:
             owned = await self.listen(message) is DEFERRED
@@ -1358,7 +1370,7 @@ class Agent:
         except ValueError as exc:
             self.pending.pop(key, None)
             await message.reply(notice_text(str(exc)), allowed_mentions=NO_MENTIONS, mention_author=False)
-            return self.answered([message])
+            return self.answered([message], told='burst too long')
         self.pending[key] = message.id
         now = time.monotonic()
         self.called = {k: v for k, v in self.called.items() if now-v < 600}  # Bursts end within a minute.
@@ -1598,6 +1610,7 @@ class Agent:
         except ControllerUnavailable:
             return await outage()
         except commands.UserFeedbackCheckFailure as exc:
+            self.ledger.notice([event.id for event in events], notice_reason(exc))  # If its text goes out below.
             if ambient:  # Nobody asked: an unprompted reply that can't go out just stays quiet.
                 return missed('reply withheld: '+type(exc).__name__)
             if again():  # Refused because they edited it: the edit is what gets answered.
@@ -1644,7 +1657,7 @@ class Agent:
                 # Edited, so maybe taken back, and not answered again: say so rather than go quiet.
                 from .fri import WITHDRAWN
                 await message.reply(notice_text(WITHDRAWN), allowed_mentions=NO_MENTIONS, mention_author=False)
-                self.answered(events)
+                self.answered(events, told='message withdrawn')
             else:
                 missed('message deleted')
             await self.fri.waiting_notices.clear(message.author.id)
@@ -1733,7 +1746,7 @@ class Agent:
             if view is not None:
                 view.message = sent  # A draft's or preview's controls come off it when it times out.
             self.saving.add(getattr(sent, 'id', None))  # So a delete while it saves is noticed (see unsend).
-            self.answered(events)
+            self.answered(events, told=COOLDOWN if result.status == 'cooldown' else None)  # Its one notice.
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
             # Deleted while it was sent: the reply stays, but isn't saved or echoed.
             saved = None if taken_back() else await self.fri.record_turn(result, sent)

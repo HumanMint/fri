@@ -342,6 +342,9 @@ class Watch:
         except OSError:
             waiting = '?'
         lines.append(f'- usage receipts waiting: {waiting}')
+        if agent:
+            from .fri_ledger import describe
+            lines.append(describe(agent.ledger.snapshot()))
         scope = {'guild_id': str(fri.guild_id), 'user_id': str(fri.owner_id),
                  'channel_id': str(fri.workshop_id), 'conversation_id': f'public:{fri.workshop_id}'}
         status, health = await asyncio.gather(self.probe('GET', '/status'),
