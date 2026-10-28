@@ -153,10 +153,26 @@ MARKER = r"(?:not (?:that|this|the) (?:one|song|track)|wrong (?:one|song|track)|
 LINK = r"(?:i meant|it'?s|its|it was)"
 # The whole message is one correction: a marker, then a separator or "i meant"/"it's", then the song (or just
 # "i meant <song>"). Nothing before it but a filler word, so a quote, an example, someone else's words or a
-# question never fits, and the song is what follows, whatever words its title uses.
-CORRECTION = re.compile(
-    rf"^{FILLER}(?:{MARKER}(?:\s+(?:lol|lmao|bro))?\s*(?:[,:;.!—–-]+\s*(?:{LINK}\s+)?|\s+{LINK}\s+)|i meant\s+)"
-    r"(?!(?:i meant\s+)?to\b|don'?t\b|do not\b)(?P<song>\S.*?)(?:\s+(?:lol|lmao|pls|please|thx))*[\s.!?]*$")
+# question never fits. The link is consumed once (possessively), never given back to become the song.
+OPENING = re.compile(
+    rf"{FILLER}(?:{MARKER}(?:\s+(?:lol|lmao|bro))?\s*(?:[,:;.!—–-]+\s*(?:{LINK}\s+)?+|\s+{LINK}\s+)|i meant\s+)")
+# The song may follow their own request words ("play X", "i said X"); its first word starts the replacement.
+LEAD = re.compile(r"(?:(?:can|could|would) (?:you|u) )?(?:please |pls )?(?:play|queue|put on|add|i said|i asked for|i wanted)\s+")
+QUOTED = re.compile(r'["“][^"”]*["”]|https://\S+')  # A quoted title or a link keeps every word, whatever it says.
+CLAUSE = r"(?:^|[,;:.!?—–\-\"]\s*|\b(?:and|but|or|so|then|also|plus|like|actually|wait|lol|nah|no|oh|please|pls|just)\s+)"
+# Outside a quoted title, any of these means the message is not asking for that song now.
+REFUSED = re.compile(
+    rf"{CLAUSE}(?:don'?t|do not)\b"  # A clause that opens with "don't": "... do not queue anything yet".
+    r"|\b(?:don'?t|do not|not|never)\s+(?:(?:even|actually|really|just|yet)\s+)?(?:play|queue|add|put|start)\b"
+    r"|\b(?:don'?t|do not)[\s.!?]*$"
+    r"|\b(?:cancel\w*|never ?mind|nvm|forget (?:it|that|about (?:it|that))|scratch that|hold off|not yet|no need|jk|just kidding)\b"
+    # Someone else's words introducing more ("alex said X"; a title like "She Said" ends there), or an example.
+    rf"|{CLAUSE}(?!i\b)(?:[\w']+\s+){{1,3}}?(?:said|says|asked for|suggested|suggests|recommended|recommends"
+    r"|requested|requests|mentioned)\b(?=[\s,:]*[\w\"])"
+    rf"|{CLAUSE}(?:according to|for example|for instance|e\.g\b|eg\b|such as|something like|stuff like|hypothetically)"
+    # "i meant to say thanks" is chat, not a title; "To The Moon" can be one.
+    r"|\bi meant to\s+(?:say|type|write|ask|tell|send|reply|respond|answer|post|text|put|do|pick|choose|search|look"
+    r"|check|mention|link|ping|go|be|get|make|have|add|play|queue)\b|\bi meant to[\s.!?]*$")
 CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
 
 
@@ -169,16 +185,28 @@ def correction_text(text):
     return ' '.join(text.casefold().replace('’', "'").split())
 
 
+def song_words(text):
+    """A title's words in order, without stray apostrophes ("believin'" and "believin" match)."""
+    return [word.strip("'") for word in re.findall(r"[\w']+", text) if word.strip("'")]
+
+
 def correction(text, argument):
     """A member putting right a song Gene just played for them ("not that one, X", "i meant X"): the song is
-    the argument, in their own words after the correction. Whether there was such a play is checked by Gene's
-    control store (Controls.enqueue)."""
-    match = CORRECTION.match(correction_text(text))
-    if not match or not argument:
+    the argument, in their own words, starting the replacement right after the correction. Whether there was
+    such a play is checked by Gene's control store (Controls.enqueue)."""
+    text = correction_text(text)
+    opening = OPENING.match(text)
+    named = song_words(argument.casefold()) if isinstance(argument, str) else []
+    if not opening or not named or REFUSED.search(QUOTED.sub(' " ', text)):
         return False
-    song = match.group('song').strip(' "\'“”')
-    named = set(re.findall(r"[\w']+", argument.casefold()))
-    return bool(named) and (argument.casefold() in song or named <= set(re.findall(r"[\w']+", song)))
+    song = text[opening.end():]
+    lead = LEAD.match(song)
+    for replacement in (song, song[lead.end():] if lead else ''):
+        said = song_words(replacement)
+        first = said[1:2] if said[:1] in (['the'], ['a'], ['an']) else []  # "the X" may be named just "X".
+        if said and named[0] in said[:1]+first and set(named) <= set(said):
+            return True
+    return False
 
 
 def just_played(receipts):
