@@ -1,4 +1,4 @@
-"""Fri keeps an eye on Gene and its controller: one owner DM per outage, plus an owner "fri health"."""
+"""Fri keeps an eye on Gene, its controller and its own heartbeat: one owner DM per outage, plus an owner "fri health"."""
 
 import asyncio
 import datetime as dt
@@ -24,6 +24,7 @@ RELAPSE = 1800  # A new outage this soon after the last DM edits that DM instead
 READ = 10  # A watch read that hangs this long counts as an unreachable controller.
 PROBE = 4  # Each live read in the owner's health report.
 DELIVERY = 30  # How long a pass waits on the owner DM's delivery before moving on. It never cancels it.
+STALL = 900  # A heartbeat tick running this long is stuck: past a slow learning backlog or several attention calls.
 GENE = frozenset({'stale', 'offline', 'stopped'})
 NOT_TAKING = 'gene isn’t taking commands right now, so i didn’t send that.'
 NOT_OFFERED = 'gene isn’t offering that command right now, so i didn’t send it.'
@@ -72,6 +73,9 @@ def down(kind, detail, since):
         return f'gene’s running but has been cut off from discord since {at}. {fix}'
     if kind == 'stopped':
         return f'gene’s command runner has been dead since {at}, so nobody’s touching the music. {fix}'
+    if kind == 'stalled':
+        return (f'my heartbeat’s been stuck in {detail["stage"]} since {at}, so reminders, posts and attention are '
+                'on hold. a restart clears it, and i can’t restart myself.')
     beat = f'last heartbeat {span(detail["age"])} ago' if detail.get('age') is not None else 'no heartbeat on record'
     release = f', release {detail["sha"]}' if detail.get('sha') else ''
     return f'gene’s been dead since {at}. {beat}{release}. {fix}'
@@ -144,6 +148,15 @@ class Watch:
             return 'unreachable', {}
         return assess(health)
 
+    def stalled(self):
+        """Fri's own heartbeat, once Gene and its controller read fine: a tick running STALL or longer, by the
+        monotonic clock, is stuck in the step it's on. Its age dates the start, as Gene's heartbeat does."""
+        agent = self.fri.agent
+        began, current = (agent.heartbeat_ticking, agent.heartbeat_current) if agent else (None, None)
+        if began is None or current is None or (age := time.monotonic()-began) < STALL:
+            return 'ok', {}
+        return 'stalled', {'age': age, 'stage': current['stage']}
+
     async def check(self, observe=True):
         # A watchdog loop that stops on one odd error watches nothing, and a DM that fails waits for the next pass.
         for step in (self.observe, self.deliver) if observe else (self.deliver,):
@@ -157,6 +170,8 @@ class Watch:
         state = self.load()
         start, began = time.time(), time.monotonic()  # Before the read, so its latency can't hide a step.
         kind, detail = await self.read()
+        if kind == 'ok':  # Gene's and the controller's outages come first: they're what the one DM says.
+            kind, detail = self.stalled()
         now = time.time()
         if self.read_at is None:
             # The last read was before a restart, dated only by the wall clock. A clock that moved back,
