@@ -116,3 +116,11 @@ reviews. This repository is public: never commit tokens, session files, real IDs
 - [Integration pair](docs/integration-pair.json): the Gene commit Fri is tested against.
 - [Extraction provenance](docs/extraction.json): Fri was split out of Gene at commit `7bdf6af`.
 - [Gene's README](https://github.com/HumanMint/gene#readme): the controller, Red and Gene's own setup.
+
+## Credits
+
+Fri is maintained by [HumanMint](https://github.com/HumanMint). Early implementation
+was developed with [OpenAI Codex](https://openai.com/codex/), using GPT-6 Astra and
+GPT-6.1 Sol. Development continues with Codex and Claude: Codex contributes code,
+tests and independent reviews; Claude contributes implementation and integration
+work.

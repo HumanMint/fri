@@ -365,11 +365,19 @@ def versions(posts):
     return {str(post.id): hashlib.sha256((post.content or '').encode()).hexdigest() for post in posts}
 
 
+def cards(posts):
+    """Each member target's link cards, by id. Kept beside the rows, so a card that re-unfurls is no edit
+    (unchanged() compares the rows), and joined to them only in what the model reads."""
+    from .fri_images import link_cards
+    return {str(post.id): found for post in posts if (found := link_cards(post))}
+
+
 async def evidence(agent, message, burst, posts=None):
     rows = await live_rows(agent, message, burst) if len(burst) > 1 else []
     posts = [] if posts is None else posts
     target = await reply_target(agent, message, posts)
-    return {'message_burst': rows, 'reply_target': target, 'target_versions': versions(posts)}
+    return {'message_burst': rows, 'reply_target': target, 'target_versions': versions(posts),
+            **({'target_cards': found} if (found := cards(posts)) else {})}
 
 
 async def unchanged(agent, message, context):

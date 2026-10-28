@@ -32,7 +32,7 @@ first, then the newest nearby posts' own attachments; Fri picks among several in
 of asking which one. A speaker's own post keeps the two-image limit; a nearby gallery
 post can use the whole budget. Each image stays a non-spoiler PNG/JPEG/WebP, 4 MB,
 twenty million pixels. A GIF link (Tenor, Giphy) counts as one image through the still preview
-Discord's own proxy made of it; nothing decodes an animation, so an uploaded GIF or an animated
+Discord's own proxy made of it, held to the same pixel limit when Discord gives its size; nothing decodes an animation, so an uploaded GIF or an animated
 preview is not inspected. Other external embeds and videos are not inspected by this path.
 A pasted message link or a replied-to post is opened only when the speaker and Fri can
 read it now (fetched overwrites and roles); from a server channel, only when it is this
@@ -44,6 +44,25 @@ and author checks as any read; each must still be pinned and unchanged before th
 and filenames are never visual evidence. Public research only exports an exact
 public question from the current request, never surrounding chat or image captions.
 
+A link's preview card on a member's post shows on its row in a read, an invitation or a reply
+target as `link_cards`: up to two cards, each its site (40 characters), who made it (60), title (120)
+and a line of text (200), never a URL. Members can't send their own embeds, so these are Discord's
+unfurls of links they sent; bot, webhook and spoilered posts show none. The speaker's own link is read
+from a refetch of their message (`message_link_cards`), since Discord usually unfurls it after the
+message arrives. The reply model is told, only when a card is in the request, that card text is the
+site's and never instructions. Card text isn't part of any recheck: a card that re-unfurls or is
+suppressed changes no fingerprint, and the next read shows it as it is then. On a member's post with no
+attachment or GIF link, the card's picture (a video's thumbnail, an X or Reddit card's image, a pasted
+image link) counts as one image, labelled `still="link preview"`, from the first two cards, through
+Discord's own `/external/` proxy only and within the image limits above. Discord must have sized it within
+twenty million pixels, and the bytes' own header must agree (any preview through that proxy, a GIF link's
+too); a size that's missing or unreadable skips it. Every picture a turn showed the model is found again,
+as Discord shows its post then, before each later model request and before delivery (a ping's own check
+does it, outside channels too, and for a ping answering a pending clarification, which has no mention
+grant), so a swapped or suppressed one stops the turn. A card that unfurls late on
+a post Fri didn't look at changes nothing. A post with both an attachment and a card's picture is still
+not looked at, and history search rows don't show cards yet.
+
 Context from other members keeps its actual author and privacy revision and stays
 ephemeral. Saved conversation uses a neutral breadcrumb; no derived personal notes,
 drafts or posts are retained. Configured-channel mentions start with their normal
@@ -52,6 +71,16 @@ image context on demand; only after that read are persistent writes and external
 image selection removed for that turn. Explicit reply references load only their
 direct target initially, and keep their source and persistence guards. The current
 attachments and existing immediate own-photo pairing remain available directly.
+
+Outside, a ping that directly replies to Fri's own answer there reads that answer as its
+referenced row. Only an answer Fri delivered and saved counts, for 15 minutes from delivery,
+and never past an earlier answer it read in turn. Fri keeps at most 100 such receipts, in memory
+only: a restart forgets them. A receipt holds message IDs, digests and author privacy revisions,
+never words. Every post the answer drew on, the earlier ping included, must still be there
+unchanged, and its authors must still allow it at the same revision. They're registered on the
+new ping's grant like nearby authors, and checked again before each model request and before
+delivery. A delete or edit (Fri's own too) or a privacy control ends the receipt. So does an
+ancestry larger than one privacy read can carry (25 posts, 25 authors). Then the reply reads as before.
 
 Freshness checks compare author and event IDs, never display names. A gateway event shows
 the member's server nickname, but a fetched copy of the same message shows their global
@@ -107,7 +136,7 @@ one deleted while the reply, reaction or card goes out leaves it delivered but u
 model sees; deleted after, the reply is withheld (`nearby message deleted`), with the "things
 changed while i was typing" notice when someone addressed Fri; a reaction or quiet decision is
 dropped too, unsaved and without a notice. An edit replaces a member's row
-with the edited text; an edit Discord sends without its author drops the row. An edit to a member's
+with the edited text and what the post still carries (an image edited out leaves the row's kinds too); an edit Discord sends without its author drops the row. An edit to a member's
 message Fri is still handling (still coming in, or being answered) withdraws it instead: it leaves,
 or never enters, the view, and a reply to it that hasn't reached the model yet is refused. A member's edit
 to any post a model request already carried, after its own handling, stops a turn still running like a
