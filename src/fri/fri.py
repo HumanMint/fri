@@ -966,6 +966,12 @@ class Fri(discord.Client):
         except commands.UserFeedbackCheckFailure:
             found = {}
         unresolved = {mid for mid in own if mid not in found or not found[mid]['verbatim']}
+        if unresolved.difference(found):
+            # Patch notes Fri posted are its own words, drawing on no member. Only an id Gene doesn't know,
+            # in the channel the record names: a reply Gene dropped (an erasure, say) is never stood in for.
+            notes, where = self.posted_notes(), {row['source']['id']: row['source'].get('channel_id')
+                                                 for row in context['reply_target']}
+            unresolved = {mid for mid in unresolved if mid in found or mid not in notes or notes[mid] != where[mid]}
         if unresolved:
             # Fail closed before inference: the model never sees text whose sources erased or were never
             # attributable, and nothing derived is retained. A copy keeps the integrity checks intact.
@@ -973,6 +979,20 @@ class Fri(discord.Client):
             context['reply_target'] = [{**row, 'text': UNAVAILABLE} if row['source']['id'] in unresolved else row
                                        for row in context['reply_target']]
         context['reference_provenance'] = [item for mid in own for item in found.get(mid, {}).get('provenance', [])]
+
+    def posted_notes(self):
+        """Message id -> channel id of every patch-notes part Discord confirmed, in #fri-chat or the owner's DM.
+        A damaged record names none, so those posts stay unavailable."""
+        from .fri_patch_notes import NotesRefused, load
+        posted = {}
+        for name in ('patch-notes-server.json', 'patch-notes.json'):
+            try:
+                state = load(self.data/name)
+            except NotesRefused:
+                continue
+            posted.update((part['message_id'], part['channel_id']) for entry in state['versions'].values()
+                          for part in entry['parts'] if 'message_id' in part)
+        return posted
 
     @staticmethod
     def echo(scope, context, provenance, reply):

@@ -35,12 +35,13 @@ async def answered(agent, fri, event):
     return fri.chat_once.await_args.args[1]
 
 
-def test_reply_to_patch_notes_gets_the_notes_text(monkeypatch, tmp_path):
+@pytest.mark.parametrize('name', ['patch-notes-server.json', 'patch-notes.json'])
+def test_reply_to_patch_notes_gets_the_notes_text(monkeypatch, tmp_path, name):
     async def scenario():
         fri, agent, store, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
         fri.data = tmp_path
         notes = fri_post(message, NOTES, 3600)
-        posted(tmp_path, (notes.id, channel.id))
+        posted(tmp_path, (notes.id, channel.id), name=name)  # #fri-chat's record, or the owner's DM one.
         event = message('fri wait whats meme memory', user=40)
         event.reference = SimpleNamespace(message_id=notes.id, channel_id=channel.id)
         fri.chat_once.return_value = ChatResult(status='completed', reply='i remember memes now. try to keep up')
