@@ -17,6 +17,7 @@ A channel post is one message: a short summary, with the full changelog attached
 (the notes file holds the summary, a `<!-- changelog -->` line, then the changelog). It is then pinned there. The
 record keeps the pinned message's id, so a rerun after a failed pin only pins, never posts again, and
 `pin` pins a version already posted from the record alone. Fri never unpins or removes anything.
+The running Fri only reads both records (Fri.posted_notes), so a reply to a posted part sees its words.
 Exit codes: 0 sent (or already sent) and, in a channel, pinned; 2 refused (fix the notes or the record);
 1 Discord or the network failed (a rerun is safe); 3 posted but not pinned (the post stands; a rerun
 only tries the pin)."""
