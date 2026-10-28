@@ -24,12 +24,20 @@ def bare_greeting_debounce(monkeypatch):
 @pytest.fixture(autouse=True)
 def inside_maintenance_window(monkeypatch):
     """A controller from gene #58 on starts deployments only in its production window ([04:00, 05:00)
-    America/Los_Angeles). Tests not about the window run inside it; an older controller has none."""
+    America/Los_Angeles). Tests not about the window run inside it; an older controller has none.
+
+    Tomorrow's window, not a fixed date: gene #65 allows one deployment per local day, counted from rows the
+    store dates with the real clock. Real rows always fall on an earlier day than the window, so a test's own
+    deployments never use up that day (a fixed date broke every test with two deployments once it arrived)."""
     try:
         import gene.maintenance
     except ImportError:
         return
-    monkeypatch.setattr(gene.maintenance, 'clock', lambda: 1793185500.0)  # 2026-10-28T04:05:00-07:00
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    tomorrow = dt.datetime.now(ZoneInfo('America/Los_Angeles')).date()+dt.timedelta(days=1)
+    window = dt.datetime.combine(tomorrow, dt.time(4, 5), ZoneInfo('America/Los_Angeles')).timestamp()
+    monkeypatch.setattr(gene.maintenance, 'clock', lambda: window)
 
 
 @pytest.fixture
