@@ -192,7 +192,10 @@ class Agent:
         self.heartbeat_status = 'starting'
         self.stages = {}
         self.heartbeat_current = None  # The tick's step now, {'stage', 'since'} by the wall clock; None between ticks.
-        self.heartbeat_ticking = None  # time.monotonic() as the running tick began, for the watch (see Watch.stalled).
+        self.heartbeat_ticking = None  # time.monotonic() as the running tick began; None between ticks.
+        # time.monotonic() at the tick's last step forward (a new stage, another channel's attention): the watch
+        # calls a tick stuck only when this stops moving, not merely when the tick is long (see Watch.stalled).
+        self.heartbeat_progress = None
         self.ledger = Ledger()  # What happened to messages addressed to Fri, for the health file (see fri_ledger).
         self.unreachable_notices = {}  # channel: when Discord took Fri's notice (monotonic), or None in flight.
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
@@ -1973,6 +1976,7 @@ class Agent:
     async def attend(self):
         now = time.time()
         for channel_id in list(self.recent):
+            self.progressed()
             if (running := self.ambient_replies.get(channel_id)) and not running.done():
                 continue  # Its last reply is still waiting on Discord; its fresh messages wait for the next pass.
             records = await self.context_messages(channel_id, raw_errors=True)
@@ -2122,6 +2126,12 @@ class Agent:
     def running(self, name):
         """The tick's step now running, which the health file and the owner's report name while it lasts."""
         self.heartbeat_current = {'stage': name, 'since': time.time()}
+        self.heartbeat_progress = time.monotonic()
+
+    def progressed(self):
+        """A long stage moved on (attention reached another channel), so the tick isn't stuck in it."""
+        if self.heartbeat_ticking is not None:
+            self.heartbeat_progress = time.monotonic()
 
     @tasks.loop(seconds=30)
     async def heartbeat(self):
@@ -2162,7 +2172,7 @@ class Agent:
             self.heartbeat_status = 'ok' if all(results) else 'deferred'
         finally:
             self.heartbeat_finished = time.time()
-            self.heartbeat_current = self.heartbeat_ticking = None
+            self.heartbeat_current = self.heartbeat_ticking = self.heartbeat_progress = None
 
     @heartbeat.before_loop
     async def before_heartbeat(self):

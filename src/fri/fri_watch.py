@@ -149,11 +149,13 @@ class Watch:
         return assess(health)
 
     def stalled(self):
-        """Fri's own heartbeat, once Gene and its controller read fine: a tick running STALL or longer, by the
-        monotonic clock, is stuck in the step it's on. Its age dates the start, as Gene's heartbeat does."""
+        """Fri's own heartbeat, once Gene and its controller read fine: a tick that hasn't moved forward for STALL or
+        longer, by the monotonic clock, is stuck in the step it's on. A long tick that keeps reaching new stages or
+        channels isn't. The time since it last moved dates the start, as Gene's heartbeat does, and a step forward
+        ends the stall, so the DM never names a stage the tick has left."""
         agent = self.fri.agent
-        began, current = (agent.heartbeat_ticking, agent.heartbeat_current) if agent else (None, None)
-        if began is None or current is None or (age := time.monotonic()-began) < STALL:
+        moved, current = (getattr(agent, 'heartbeat_progress', None), agent.heartbeat_current) if agent else (None, None)
+        if moved is None or current is None or (age := time.monotonic()-moved) < STALL:
             return 'ok', {}
         return 'stalled', {'age': age, 'stage': current['stage']}
 

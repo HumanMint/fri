@@ -213,6 +213,7 @@ def stuck_tick(monkeypatch, fri, stage):
     monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
     agent = fri.agent = Agent(fri)
     agent.heartbeat_ticking, agent.heartbeat_current = clock[0], {'stage': stage, 'since': clock[0]}
+    agent.heartbeat_progress = clock[0]
     return agent, clock
 
 
@@ -247,6 +248,39 @@ def test_a_stuck_heartbeat_gets_one_owner_dm_naming_its_stage_and_a_note_once_it
             await checks(1)
             assert len(dm.sends) == 1 and len(dm.edits) == 1 and '-# back at <t:' in dm.edits[0][1]
             assert not fri.watcher.state['alert']['open'] and fri.watcher.state['bad'] == 0
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_long_tick_that_keeps_moving_is_not_stuck_and_a_stage_change_ends_a_stall(
+        monkeypatch, tmp_path, controls_api):  # noqa: F811
+    async def scenario():
+        client, controls = controls_api
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        routed(fri, client)
+        dm = owner_dm(fri)
+        agent, clock = stuck_tick(monkeypatch, fri, 'attention')
+        try:
+            for _ in range(12):  # Twelve channels' attention, 100 s each: 20 minutes, moving the whole time.
+                clock[0] += 100
+                agent.heartbeat_progress = clock[0]
+                beat(controls)
+                await fri.watcher.check()
+            assert not dm.sends and fri.watcher.state['bad'] == 0
+            for _ in range(CHECKS+(STALL//120)):  # Then it stops moving in attention.
+                clock[0] += 120
+                beat(controls)
+                await fri.watcher.check()
+            assert len(dm.sends) == 1 and 'stuck in attention' in dm.sends[0]
+            agent.heartbeat_current = {'stage': 'memes', 'since': clock[0]}  # It moves on to memes.
+            agent.heartbeat_progress = clock[0]
+            clock[0] += 120
+            beat(controls)
+            await fri.watcher.check()
+            assert not fri.watcher.state['alert']['open'] and '-# back at <t:' in dm.edits[-1][1]
+            assert 'memes' not in dm.edits[-1][1]  # The DM never names a stage the tick wasn't stuck in.
         finally:
             await fri.close()
     asyncio.run(scenario())
