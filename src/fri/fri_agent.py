@@ -626,7 +626,9 @@ class Agent:
                     await message.reply('that change is too large for one preview. please change one behavior at a time.', allowed_mentions=NO_MENTIONS)
                 else:
                     view = BehaviorPreview(self, changes, state['version'])
-                    await message.reply(view.content, view=view, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+                    # Its buttons come off that reply when it times out (fri #176).
+                    view.message = await message.reply(view.content, view=view, allowed_mentions=NO_MENTIONS,
+                                                       suppress_embeds=True)
         except (ValueError, KeyError, TypeError):
             if message.guild is None and not self.config['support_dms']:  # It may have raised after they went off.
                 return 'dms off'
