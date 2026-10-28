@@ -1565,12 +1565,23 @@ class Agent:
         a usage report, or anything Gene's request grammar reads as asking for a control or a song correction
         (see Actions.command_requested), which keep their own paths. A turn taking a line and the line both are."""
         from .fri_pending import cancelled
-        from .gene_controls import COMMANDS, OPENING, correction_text, quick_control, requested
+        from .gene_controls import (
+            COMMANDS,
+            FILLER,
+            LINK,
+            MARKER,
+            correction_text,
+            quick_control,
+            requested,
+        )
 
-        def song_correction(text):  # Opens like one and names something: not "i meant to say ..." or "don't ...".
-            text = correction_text(text)
-            opening = OPENING.match(text)
-            return bool(opening) and re.match(r"(?!(?:i meant\s+)?to\b|don'?t\b|do not\b)\S", text[opening.end():])
+        # The whole-line grammar a song correction had before fri #157: "i meant to say ..." is just words,
+        # while "wrong song, it's To The Moon" keeps the correction's own path.
+        def song_correction(text):
+            return re.match(
+                rf"^{FILLER}(?:{MARKER}(?:\s+(?:lol|lmao|bro))?\s*(?:[,:;.!—–-]+\s*(?:{LINK}\s+)?|\s+{LINK}\s+)|i meant\s+)"
+                r"(?!(?:i meant\s+)?to\b|don'?t\b|do not\b)\S.*?(?:\s+(?:lol|lmao|pls|please|thx))*[\s.!?]*$",
+                correction_text(text))
         return not (media(event) or getattr(event, 'reference', None) or links(event) or
                     explicit_mention(event, self.fri.user.id) or memory_intent(text) or cancelled(text) or
                     usage_requested(text) or quick_control(text, music_context=True) or

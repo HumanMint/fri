@@ -160,7 +160,7 @@ def test_a_short_line_after_the_request_went_out_is_answered_on_its_own_once_the
 
 
 @pytest.mark.parametrize('case', ['late', 'another member', 'long', 'ping', 'dm', 'someone spoke between',
-                                  'reply to someone', 'gene control', 'usage report'])
+                                  'reply to someone', 'gene control', 'usage report', 'song correction'])
 def test_other_lines_while_fri_composes_go_as_before(monkeypatch, tmp_path, case):
     async def scenario():
         fri, agent, _, _, channel, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
@@ -188,7 +188,8 @@ def test_other_lines_while_fri_composes_go_as_before(monkeypatch, tmp_path, case
             if case == 'someone spoke between':
                 tasks.append(asyncio.create_task(agent.handle(message('lol create mod', user=30))))
                 await until(lambda: tasks[-1].done())
-            text = {'long': 'for minecraft 1.21 ' + 'and also '*40, 'ping': '<@99> for minecraft 1.21'}.get(case, DETAIL)
+            text = {'long': 'for minecraft 1.21 ' + 'and also '*40, 'ping': '<@99> for minecraft 1.21',
+                    'song correction': "wrong song, it's To The Moon"}.get(case, DETAIL)  # Its own path.
             detail = message(text, user=30 if case == 'another member' else author)
             if case == 'dm':
                 detail.guild = None
