@@ -62,6 +62,45 @@ def test_a_model_call_that_only_keeps_its_stream_alive_ends_at_its_deadline(monk
     assert asyncio.run(scenario()) == ({}, {}, 'interrupted')
 
 
+def test_a_deadline_while_the_stream_closes_after_completing_is_interrupted_not_an_empty_completion(monkeypatch):
+    """A completed answer whose stream then takes past DEADLINE to close must not read as a completed empty result:
+    a member summary saved from that would be emptied."""
+    monkeypatch.setattr('fri.fri_agent_model.DEADLINE', 0.1, raising=False)
+
+    class SlowClose(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield ('data: '+json.dumps(response_event(content=QUIET))+'\n\n').encode()
+
+        async def aclose(self):
+            await asyncio.sleep(0.5)
+
+    def handler(request):
+        return httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=SlowClose())
+    chat = Chat(SimpleNamespace(access_token=lambda: 'plan-auth'), httpx.MockTransport(handler))
+
+    async def scenario():
+        return await asyncio.wait_for(analyze(chat, 'Decide.', {}, 'gpt-6-luna', 'low', ATTENTION), 5)
+    result, _, status = asyncio.run(scenario())
+    assert (result, status) == ({}, 'interrupted')
+
+
+def test_work_attention_stops_waiting_for_never_marks_the_ticks_progress(heartbeat):  # noqa: F811
+    from fri.fri_agent_model import PROGRESS, progress
+    agent, marks = heartbeat.agent, []
+
+    async def scenario():
+        PROGRESS.set(lambda: marks.append('tick'))
+        progress()  # The tick's own step.
+
+        async def work():
+            progress()  # Bounded work, even while attention still waits for it.
+            return 'done'
+        task = await agent.bounded(work())
+        assert task is not None and task.result() == 'done'
+    asyncio.run(scenario())
+    assert marks == ['tick']
+
+
 def test_a_model_call_after_long_reads_starts_its_own_clock_and_outside_calls_never_move_the_tick(
         heartbeat, monkeypatch):  # noqa: F811
     clock, agent, seen = clocks(monkeypatch), heartbeat.agent, []

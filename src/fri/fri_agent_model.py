@@ -95,7 +95,7 @@ async def analyze(chat, instruction, data, model, effort, schema, *, images=(), 
     except (SubscriptionError, httpx.HTTPError, ValueError, KeyError):
         status = 'failed'
     except TimeoutError:
-        pass  # Past DEADLINE: interrupted.
+        status = 'interrupted'  # Past DEADLINE, even if the end of the stream arrived before closing timed out.
     finally:
         progress()
     return {}, counters, status

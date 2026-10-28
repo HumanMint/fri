@@ -242,6 +242,37 @@ def test_an_edit_while_fri_composes_still_settles_its_message_once(monkeypatch, 
     asyncio.run(scenario())
 
 
+def test_a_rerun_cancelled_while_it_fetches_counts_as_cancelled_once(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        trigger = message('fri whats teh best album')
+        edited, fetching = [], asyncio.Event()
+        async def respond(context, ready):
+            await ready()
+            if not edited:
+                edited.append(await edit(fri, rows, trigger, 'fri whats the best album'))
+            return ChatResult(status='completed', reply='that one')
+        model(fri, tmp_path, respond)
+
+        async def hang(*_):  # The rerun's fetch of the edited message never returns.
+            fetching.set()
+            await asyncio.Event().wait()
+        try:
+            await agent.handle(trigger)
+            channel.fetch_message.side_effect = hang
+            await asyncio.wait_for(fetching.wait(), 5)
+            for task in list(agent.reruns):
+                task.cancel()
+            await asyncio.gather(*agent.reruns, return_exceptions=True)
+            outcomes = agent.ledger.snapshot()
+            assert outcomes['in_flight'] == 0
+            assert settled(outcomes) == {'answered': 0, **EMPTY, 'quiet': {'CancelledError': 1}}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_an_edit_answered_again_counts_its_latency_from_the_first_arrival(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)

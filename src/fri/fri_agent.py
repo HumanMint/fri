@@ -1037,6 +1037,9 @@ class Agent:
             self.delivered.pop(message.id, None)
             self.watched.pop(message.id, None)
             await self.handle(message, read=began)
+        except asyncio.CancelledError:
+            reason = 'CancelledError'
+            raise
         except Exception as exc:
             reason = type(exc).__name__
             LOG.exception('Answering an edited message again failed')
@@ -1998,7 +2001,12 @@ class Agent:
         runs in the heartbeat, which a read held up in Discord's global rate-limit wait must not stall, and
         discord.py can't recover from a cancel inside that wait (see fri_fixes.check). The task once it's done,
         or None once attention moved on without it. `channel`: an ambient reply there, still going until done."""
-        task = asyncio.ensure_future(work)
+        from .fri_agent_model import PROGRESS
+
+        async def detached():  # Work attention may stop waiting for never marks the tick's progress (Watch.stalled).
+            PROGRESS.set(None)
+            return await work
+        task = asyncio.ensure_future(detached())
         self.attending.add(task)
         if channel is not None:
             self.ambient_replies[channel] = task
