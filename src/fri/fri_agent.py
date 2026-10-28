@@ -84,17 +84,21 @@ class BehaviorPreview(PagedPreview):
                          'Apply settings', 'fri:behavior:', self.apply)
 
     async def interaction_check(self, interaction):
-        from .fri_buttons import answers, not_yours
+        from .fri_buttons import answers, not_yours, unchecked
         fri = self.agent.fri
         if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
             return False
         if interaction.user.id != fri.owner_id:
             await not_yours(interaction)
             return False
-        return (interaction.message.author.id == fri.user.id and
+        if not (interaction.message.author.id == fri.user.id and
                 (interaction.guild_id is None or (interaction.guild_id == fri.guild_id and
-                                                  self.agent.allowed(interaction.channel))) and
-                bool(await self.agent.member(interaction.user.id, fresh=True)))
+                                                  self.agent.allowed(interaction.channel)))):
+            return False
+        if await self.agent.member(interaction.user.id, fresh=True):
+            return True
+        await unchecked(interaction)
+        return False
 
     async def apply(self, interaction, button=None):
         if not await self.interaction_check(interaction):
@@ -991,6 +995,14 @@ class Agent:
             task = asyncio.get_running_loop().create_task(self.rerun(self.reanswer.pop(i), i))
             self.reruns.add(task)
             task.add_done_callback(self.reruns.discard)
+            task.add_done_callback(lambda task, i=i: self.rerun_cancelled(task, i))
+
+    def rerun_cancelled(self, task, i):
+        """A re-run cancelled before its first step never reaches its own cleanup (rerun's finally), so its marks go
+        here (fri #132). Only teardown cancels one; one that ran has already cleaned up, and this finds nothing."""
+        if task.cancelled():
+            self.rerunning.pop(i, None)
+            self.edit_seen.pop(i, None)
 
     async def rerun(self, channel_id, message_id):
         """A message edited while Fri answered it, fetched again and handled as if it just came in, so every

@@ -49,7 +49,7 @@ class DraftView(PagedPreview):
             self.add_item(button)
 
     async def interaction_check(self, interaction):
-        from .fri_buttons import answers, not_yours
+        from .fri_buttons import answers, not_yours, unchecked
         if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
             return False
         if interaction.user.id != self.user_id:
@@ -58,8 +58,10 @@ class DraftView(PagedPreview):
         if getattr(getattr(interaction.message, 'author', None), 'id', None) != self.cog.user.id:
             return False
         if interaction.guild_id is None:
-            return bool(self.cog.agent and await self.cog.agent.member(self.user_id, fresh=True,
-                                                                       guild_id=self.cog.guild_id))
+            if self.cog.agent and await self.cog.agent.member(self.user_id, fresh=True, guild_id=self.cog.guild_id):
+                return True
+            await unchecked(interaction)
+            return False
         channel = getattr(interaction.channel, 'parent_id', None) or interaction.channel_id
         return bool(interaction.guild_id == self.cog.guild_id and (channel == self.cog.workshop_id or
                     (self.cog.agent and self.cog.agent.allowed(interaction.channel))))
