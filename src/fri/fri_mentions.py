@@ -11,7 +11,7 @@ from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import AuthorErased, ControllerUnavailable
 from .fri_images import details
-from .fri_meme_media import gif_previews, sources
+from .fri_meme_media import gif_previews, sources, unsigned
 from .fri_memes import reacted
 from .privacy import clean
 
@@ -35,15 +35,16 @@ def notice_for(reason):
 
 
 def fingerprint(message):
+    """A post as read, its attachments by upload: Discord renews a CDN link's signature on refetch (see unsigned)."""
     return (source_identity(discord_source(message)), message.content, message.edited_at,
-            tuple((str(a.url), a.content_type, a.size, a.width, a.height, a.is_spoiler())
-                  for a in message.attachments))
+            tuple((url, a.content_type, a.size, a.width, a.height, a.is_spoiler())
+                  for url, a in zip(unsigned([str(a.url) for a in message.attachments]), message.attachments)))
 
 
 def snapshot(message):
     """A nearby post as read: its fingerprint, and the GIF link previews look() may have inspected,
     which live in the embeds (a poster can swap or remove them without an edit time)."""
-    return fingerprint(message), tuple(gif_previews(message))
+    return fingerprint(message), tuple(unsigned(gif_previews(message)))
 
 
 class Invitation:

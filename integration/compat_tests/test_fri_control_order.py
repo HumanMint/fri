@@ -179,3 +179,44 @@ def test_a_queued_dm_reply_needs_its_author_still_there_when_it_goes_out(monkeyp
             fri.busy.discard(20)
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('when', ['fetch', 'reaction'])
+@pytest.mark.parametrize('change', ['stays', 'left', 'dms off'])
+def test_a_dm_reaction_needs_its_author_still_there_after_its_own_reads(monkeypatch, tmp_path, change, when):
+    """fri #55: the reaction's own reads (its message refetched) and the reaction itself come after the reply's
+    DM gate. Closed during the refetch, nothing goes out; during the reaction, it stays but isn't saved."""
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = True
+        present = {'member': SimpleNamespace(id=20)}
+        agent.member = AsyncMock(side_effect=lambda *_, **__: present['member'])
+        event = message('lmao')
+        event.guild = None
+        event.reactions = []
+        def close():
+            if change == 'left':
+                present['member'] = None
+            elif change == 'dms off':
+                agent.config['support_dms'] = False
+        fetch = event.channel.fetch_message.side_effect
+        async def fetching(mid):
+            if when == 'fetch' and agent.reaction_lock.locked():  # The reaction's own refetch.
+                close()
+            return await fetch(mid) if asyncio.iscoroutinefunction(fetch) else fetch(mid)
+        event.channel.fetch_message.side_effect = fetching
+        async def reacting(emoji):
+            if when == 'reaction':
+                close()
+        event.add_reaction = AsyncMock(side_effect=reacting)
+        fri.chat_once.side_effect = AsyncMock(return_value=ChatResult(status='completed', response_kind='react',
+                                                                      reaction='😭'))
+        fri.record_turn = AsyncMock(return_value={'kept': True})
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert event.add_reaction.await_count == (change == 'stays' or when == 'reaction')
+            assert fri.record_turn.await_count == (change == 'stays')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

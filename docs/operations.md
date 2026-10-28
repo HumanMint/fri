@@ -37,7 +37,8 @@ preview is not inspected. Other external embeds and videos are not inspected by 
 A pasted message link or a replied-to post is opened only when the speaker and Fri can
 read it now (fetched overwrites and roles); from a server channel, only when it is this
 channel or one that keeps no role or member out. Every post a read or a link showed is
-found again unchanged before each later model request and before delivery. Asked what's
+found again unchanged before each later model request and before delivery; a linked or replied-to
+post is compared whole, so an edit past the 1,800 characters the model is shown counts too. Asked what's
 pinned, Fri reads up to twenty of a channel's pins, any age, with the same channel, audience
 and author checks as any read; each must still be pinned and unchanged before the next request. Captions
 and filenames are never visual evidence. Public research only exports an exact
@@ -108,7 +109,11 @@ changed while i was typing" notice when someone addressed Fri; a reaction or qui
 dropped too, unsaved and without a notice. An edit replaces a member's row
 with the edited text; an edit Discord sends without its author drops the row. An edit to a member's
 message Fri is still handling (still coming in, or being answered) withdraws it instead: it leaves,
-or never enters, the view, and a reply to it that hasn't reached the model yet is refused. Fri's and Gene's
+or never enters, the view, and a reply to it that hasn't reached the model yet is refused. A member's edit
+to any post a model request already carried, after its own handling, stops a turn still running like a
+delete of it: a request whose quoted, read or looked-at copy predates the edit is refused, and a reply,
+reaction or quiet decision the model made is withheld and unsaved. A turn begun after the edit reads it as
+it is now, from the view or as the post it replies to. Fri's and Gene's
 rows, bursts and the reply fences keep comparing against what arrived. Fri's own reply to a
 message that was later deleted stays in the view as long as it stays in the channel.
 
@@ -159,7 +164,9 @@ advertises it, so the controller must be released first.
   again if they still mean it.
 - **DMs at delivery.** A DM reply, reaction or quiet decision is neither sent nor saved once its author
   has left the server (read fresh from Discord) or DMs were turned off while Fri wrote it, as before
-  the model request. A memory control that already went through still says so.
+  the model request. A memory control that already went through still says so. A reaction checks again
+  after its own refetch of the message, and a DM reaction isn't saved if the gate closed while it went out.
+  The owner's settings preview checks after its own model call too.
 - **Saved only after delivery.** A turn is staged while Fri composes the reply. Just before
   delivery, `/chat/turn/check` runs the save's privacy fence without writing: the speaker's
   revision, plus every referenced member's revision and memory setting. Only after Discord
@@ -523,7 +530,8 @@ Fri can't restart anything. It only notices and says so.
   fetches the message as Discord has it now: it must still exist and never have been edited, since
   discord.py updates its cached copy in place. Before a reply has started, a channel message must
   also still be addressed, and an @mention must pass its channel and access checks with Fri
-  enabled. A posted notice counts as Fri's answer to a ping. A notice that
+  enabled, except a privacy control ("forget me", "show my memory"): it goes on with Fri paused, so
+  its notice does too, before or while replying. A posted notice counts as Fri's answer to a ping. A notice that
   fails to post, for any reason, doesn't use up those 5 minutes, and they count from when Discord
   took the notice, not from when Fri started sending it (a slow send under a rate limit would
   otherwise leave a second notice due moments after the first appeared). Ambient chimes stay quiet, and so

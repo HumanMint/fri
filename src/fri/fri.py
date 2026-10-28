@@ -441,6 +441,19 @@ class Fri(discord.Client):
                         context.get('reply_target', []) + context.get('invited_context', [])) or
                         any(self.agent.taken_back(i, since) for i in own)):
                     raise commands.UserFeedbackCheckFailure(WITHDRAWN)
+            # A post it quotes, looked at or read, edited since the turn began (after its last fetch, say): this
+            # turn's copy may hold what it said before. The live view's rows show an edit as it comes in. The
+            # turn's own messages go by the check above.
+            if self.agent and fence and 'began' in fence:
+                mine = {int(i) for i in own if str(i).isdigit()}
+                def revised(ids):
+                    return any(self.agent.revised.get(mid, 0) >= fence['began'] for mid in ids if mid not in mine)
+                if revised(quoted):
+                    raise commands.UserFeedbackCheckFailure(WITHDRAWN)
+                if revised(looked):
+                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+                if revised(read):
+                    raise commands.UserFeedbackCheckFailure(READ_CHANGED)
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
                 self.get_channel(int(row['conversation_id'].split(':', 1)[1])))]
@@ -507,6 +520,7 @@ class Fri(discord.Client):
         # before an 'action' runs, so the caller shows typing only when words are coming. `last_look(result)`:
         # the caller's own last Discord read, run before the turn's last privacy checks so they cover it.
         typing = typing or noop
+        began = time.time()  # Every copy this turn reads of a post is taken after this (see chat_once).
         if invitation and invitation.outside:
             return await self.invited_talk(invitation, text, typing)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
@@ -726,7 +740,7 @@ class Fri(discord.Client):
                 context['fence'] = {'turn': {**scope, 'revision': context['revision'], 'source': source.model_dump(),
                                              'input': text, 'reply': '', 'model': context['model'],
                                              'effort': context['effort']},
-                                    'actions': actions, 'shown': set()}
+                                    'actions': actions, 'shown': set(), 'began': began}
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
                     async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
                         if closed := await self.agent.dm_closed(user_id):

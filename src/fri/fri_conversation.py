@@ -1,5 +1,6 @@
 """Bounded live conversation evidence. Evidence never supplies general tool authority."""
 
+import hashlib
 import re
 import time
 
@@ -358,10 +359,17 @@ async def target_row(agent, channel, message_id, guild_id, posts, gone=None):
         return []
 
 
+def versions(posts):
+    """Each target's whole text, fingerprinted: its row keeps only the start the model is shown, so an edit
+    past that would otherwise pass unchanged(). Kept beside the rows, never in what the model reads."""
+    return {str(post.id): hashlib.sha256((post.content or '').encode()).hexdigest() for post in posts}
+
+
 async def evidence(agent, message, burst, posts=None):
     rows = await live_rows(agent, message, burst) if len(burst) > 1 else []
+    posts = [] if posts is None else posts
     target = await reply_target(agent, message, posts)
-    return {'message_burst': rows, 'reply_target': target}
+    return {'message_burst': rows, 'reply_target': target, 'target_versions': versions(posts)}
 
 
 async def unchanged(agent, message, context):
@@ -396,10 +404,15 @@ async def unchanged(agent, message, context):
 
     try:
         unchanged, posts, gone = True, [], set()
-        if context.get('reply_target') != await reply_target(agent, message, posts, gone):
-            fetched = {post.id: post for post in posts}
+        rows, kept = await reply_target(agent, message, posts, gone), context.get('target_versions')
+        if context.get('reply_target') != rows or (kept is not None and kept != versions(posts)):
+            fetched, now = {post.id: post for post in posts}, versions(posts)
+            current = {row['source']['id']: row for row in rows}
             for row in context.get('reply_target', []):
                 mid = int(row['source']['id'])
+                if (mid not in gone and current.get(str(mid)) == row and
+                        (kept is None or kept.get(str(mid)) == now.get(str(mid)))):
+                    continue  # As it was read: another target changed. One edited before that stays in view.
                 await withdrawn(row, 1800, None if mid in gone else fetched.get(mid, unread))
             unchanged = False  # The burst still goes on, so each changed message of it is withdrawn too.
         for row in context.get('message_burst', []):  # Every one, so each changed message is withdrawn.

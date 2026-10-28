@@ -6,7 +6,7 @@ import datetime as dt
 import json
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
@@ -1604,6 +1604,37 @@ def test_a_privacy_control_ping_hears_the_outage_notice_when_the_controller_is_d
         try:
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
+            assert [item.args[0] for item in event.reply.await_args_list] == [UNREACHABLE]
+            assert mention_lines(caplog) == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text,path', [('<@99> forget me', '/chat/memory/control'),
+                                       ('<@99> show my memory', '/chat/context'),
+                                       ('<@99> forget me', '/agent/context'),
+                                       ('<@99> show my memory', '/agent/context'),
+                                       ('fri forget me', '/agent/context')])
+def test_a_privacy_control_hears_the_outage_notice_with_fri_paused_meanwhile(monkeypatch, tmp_path, caplog, text, path):
+    """fri #100: a privacy control goes on with Fri paused (fri #64), so its outage notice does too."""
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        event = message(text)
+        api = fri.api
+        async def down(method, called, payload=None):
+            if called == path:
+                agent.config['enabled'] = False  # The owner paused Fri while this read was out.
+                raise ControllerUnavailable('The workshop controller is temporarily unavailable.')
+            return await api(method, called, payload)
+        fri.api = down
+        arriving = path == '/agent/context'  # Its arrival read: on_message still logs the outage.
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()), (
+                    pytest.raises(ControllerUnavailable) if arriving else nullcontext()):
+                await agent.handle(event)
+            assert not agent.config['enabled']
             assert [item.args[0] for item in event.reply.await_args_list] == [UNREACHABLE]
             assert mention_lines(caplog) == []
         finally:

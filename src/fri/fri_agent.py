@@ -157,6 +157,7 @@ class Agent:
         self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
         self.seen = {}
         self.withdrawn = {}  # Message IDs edited or deleted while handled, newest last (see withdraw).
+        self.revised = {}  # Message ID -> when a member edited it after a model request carried it (see edit).
         self.arrived = {}  # Discord message ID -> time.time() as handle() took it (see taken_back).
         self.edits = {}  # Discord message ID -> its edited_at as handle() took it, if edited by then (see rerun).
         self.reanswer = {}  # Message ID -> channel: refused for its own edit, answered again once handled.
@@ -383,10 +384,15 @@ class Agent:
         """A member's edit shows in Fri's live view as they left it. Fri's and Gene's rows keep what they
         said, and in-flight bursts and reply fences keep comparing against what arrived. A member's message
         still being handled is withdrawn instead: what handles it holds what it said before, maybe with no
-        row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once)."""
-        if ((self.handling[message.id] or message.id in self.rerunning) and
-                getattr(message, 'edited_at', None) is not None and
-                not getattr(getattr(message, 'author', None), 'bot', True)):  # Not an embed or pin update.
+        row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once).
+        One a model request carried is also marked revised, for the other turns that carried it: one still
+        running may hold what it said before, so its reply, reaction or save stops (see reply_once), while a
+        later read gets the edit. A turn's own messages go by withdrawn and arrived instead (see taken_back)."""
+        edited = (getattr(message, 'edited_at', None) is not None and
+                  not getattr(getattr(message, 'author', None), 'bot', True))  # Not an embed or pin update.
+        if edited and message.id in self.looked:
+            self.revise(message.id)
+        if (self.handling[message.id] or message.id in self.rerunning) and edited:
             self.saw_edit(message.id, message.edited_at)
             return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
         rows = self.recent.get(channel)
@@ -402,6 +408,14 @@ class Agent:
                     row['text'] = text
                 else:
                     rows.remove(row)
+
+    def revise(self, mid):
+        now = time.time()
+        self.revised.pop(mid, None)
+        self.revised[mid] = now
+        # Kept an hour, as withdrawn is: longer than any turn that could still hold a copy runs.
+        while self.revised and (next(iter(self.revised.values())) < now-3600 or len(self.revised) > 100000):
+            del self.revised[next(iter(self.revised))]
 
     def forget(self, user, erased=False):
         """The member used a privacy control through Fri: their messages still waiting for a reply
@@ -561,7 +575,12 @@ class Agent:
                     'The owner must still click Apply. json_value is a JSON-encoded scalar. Do not claim the change is saved.',
                     {'request': text[:4000], 'current': dict(state['config']), 'ranges': RANGES}, SETTINGS,
                     model='gpt-6.1-sol', effort='high', erased=erased, deliver=False)
-            if status == ERASED or await erased():
+            if status == ERASED:
+                return ERASED
+            # A DM's own gates after that call, as any DM reply's: the owner still a member, and DMs on.
+            if message.guild is None and (closed := await self.dm_closed(user)):
+                return closed
+            if await erased():
                 return ERASED
             changes = {r['key']: json.loads(r['json_value']) for r in result.get('changes', [])}
             if status != 'completed' or set(changes)-set(DEFAULTS):
@@ -686,8 +705,8 @@ class Agent:
                 gates.append(Invitation(self, event))
         if changed:
             return self.missed(events, 'reply withheld: message changed')
-        for gate in gates:
-            if not await gate.current(check_evidence=False):
+        for gate in gates:  # A privacy control's notice goes on with Fri paused, as the control does (fri #64).
+            if not await gate.current(check_evidence=False, control=since is None):
                 return self.missed(events, f'reply withheld: {gate.refusal}')
         standing = (lambda: self.forgotten.get(message.author.id, 0) == since[0]) if since else None
         if not ambient and await self.unreachable(message, answering=True, standing=standing):
@@ -833,11 +852,12 @@ class Agent:
         if event is not None and event.id > self.controlled.get(user, (0, None))[0]:
             self.controlled[user] = (event.id, action)
 
-    def memory_control(self, message):
-        """Whether a message reads as a memory control (see receive), known before anything awaits."""
+    def memory_control(self, message, intents=MEMORY_CONTROLS):
+        """Whether a message reads as a memory control (see receive), known before anything awaits. `intents`:
+        which ones count; None for any privacy control ("show my memory" too)."""
         content = getattr(message, 'content', None)
         return (isinstance(content, str) and not getattr(message.author, 'bot', False) and
-                any(memory_intent(text) in MEMORY_CONTROLS for text in (
+                any(memory_intent(text) and (intents is None or memory_intent(text) in intents) for text in (
                     clean(content, 4000), addressed_content(content, getattr(self.fri.user, 'id', 0)))))
 
     async def dm_closed(self, user):
@@ -1081,13 +1101,14 @@ class Agent:
 
         discord.py updates its cached copy in place on an edit, so only a fresh fetch can show one."""
         if message.guild and not answering:
+            control = self.memory_control(message, None)  # A privacy control goes on with Fri paused (fri #64).
             if explicit_mention(message, self.fri.user.id):
                 # The checks its invitation passed: channel, access, Fri enabled, still a mention.
                 from .fri_mentions import Invitation
                 if (message.guild.id != self.fri.guild_id or
-                        not await Invitation(self, message).current(check_evidence=False)):
+                        not await Invitation(self, message).current(check_evidence=False, control=control)):
                     return False
-            elif not self.config['enabled']:
+            elif not self.config['enabled'] and not control:
                 return False
         try:
             current = await message.channel.fetch_message(message.id)
@@ -1189,6 +1210,8 @@ class Agent:
                    await self.owner_control(message, directed or text, erasures))
         if control == ERASED:
             return self.miss(message, 'author privacy changed')
+        if control in ('not a member', 'dms off'):  # See dm_closed: a settings preview found its DM closed.
+            return self.miss(message, control)
         if control:
             return self.answered([message])
         privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
@@ -1447,10 +1470,12 @@ class Agent:
         events = [message, *(event for _, event, _ in burst if event is not message)]  # This turn answers for all.
         began = time.time()  # A nearby post edited before this was read as it is now (see changed).
         arrival = self.arrival(event.id for event in events)  # Its own messages as they read when they came in.
+        own = {event.id for event in events}
 
         def changed(ids):
             """Those of `ids` deleted, or edited since this turn began: what the model saw of them may be gone."""
             edited = {int(i) for i, at in self.withdrawn.items() if at >= began and i.isdigit()}
+            edited |= {i for i, at in self.revised.items() if at >= began and i not in own}  # Not its own: see taken.
             return (self.unsent.keys() | edited) & set(ids)
 
         def taken(event):  # One this turn answers, deleted or edited (an edit may take it back) while it ran.
@@ -1596,6 +1621,11 @@ class Agent:
                 return
             else:
                 missed('reaction withheld' if result.response_kind == 'react' else 'chose quiet')
+            if (dm and result.response_kind == 'react' and memory_intent(text) not in MEMORY_CONTROLS and
+                    (closed := await self.dm_closed(message.author.id))):
+                missed(closed)  # Left, or DMs went off, while the reaction went out: it stays, but isn't saved.
+                await self.fri.waiting_notices.clear(message.author.id)
+                return
             if not taken_back():  # Deleted while the reaction went out: it stays, but isn't saved.
                 await self.fri.record_turn(result)  # Records the decision, never claimed reaction delivery.
             # Neither outcome renews active attention or the ambient reply timer.
@@ -1694,12 +1724,12 @@ class Agent:
                         permissions.add_reactions and (permissions.send_messages_in_threads
                         if isinstance(channel, discord.Thread) else permissions.send_messages)):
                     return
-            elif not self.config['support_dms'] or not await self.member(user.id, fresh=True):
-                return
             try:
                 current = await channel.fetch_message(message.id)
                 if (current.author.id != user.id or current.author.bot or current.webhook_id or
                         current.content != message.content or any(r.me for r in current.reactions)):
+                    return
+                if not message.guild and await self.dm_closed(user.id):  # A DM's own gates, after that read.
                     return
                 if erased and await erased():
                     return

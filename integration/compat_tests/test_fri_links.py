@@ -89,6 +89,48 @@ def test_a_pasted_link_opens_that_message_with_its_author(monkeypatch, tmp_path,
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('how', ['linked', 'replied'])
+def test_an_edit_past_the_kept_text_of_a_long_post_is_noticed(monkeypatch, tmp_path, how):
+    """fri #59: the model sees a long post's first 1,800 characters; an edit to its ending still counts."""
+    async def scenario():
+        fri, agent, _, _, post, said = world(monkeypatch, tmp_path)
+        target = post(1, 'a' * 1800 + ' and the ending')
+        message = (said(f'fri thoughts on {link(target)}?') if how == 'linked' else
+                   said('fri thoughts?', reference=SimpleNamespace(message_id=target.id, channel_id=1)))
+        try:
+            context = await evidence(agent, message, [])
+            assert context['reply_target'][0]['text'] == 'a' * 1800
+            assert 'ending' not in str(context['reply_target'])  # Only what the model is shown.
+            assert await unchanged(agent, message, context)
+            target.content, target.edited_at = 'a' * 1800 + ' and a new ending', discord.utils.utcnow()
+            assert not await unchanged(agent, message, context)
+            assert str(target.id) in agent.withdrawn
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_edit_to_one_linked_post_withdraws_only_that_one(monkeypatch, tmp_path):
+    """Review of fri #130 (S1): an unchanged target edited before it was read stays, while the one whose ending
+    changed is withdrawn, so a later fresh request quoting the first isn't refused."""
+    async def scenario():
+        fri, agent, _, _, post, said = world(monkeypatch, tmp_path)
+        stable = post(1, 'safe previously edited post')
+        stable.edited_at = discord.utils.utcnow()
+        changing = post(1, 'a' * 1800 + ' original ending')
+        message = said(f'fri compare {link(stable)} and {link(changing)}')
+        try:
+            context = await evidence(agent, message, [])
+            assert await unchanged(agent, message, context)
+            changing.content, changing.edited_at = 'a' * 1800 + ' changed ending', discord.utils.utcnow()
+            assert not await unchanged(agent, message, context)
+            assert str(changing.id) in agent.withdrawn
+            assert str(stable.id) not in agent.withdrawn
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('where', ['staff_only', 'age_restricted', 'not_read_by_fri', 'other_server', 'in_code',
                                    'opted_out', 'old', 'deleted', 'member_cant_read', 'bot'])
 def test_a_link_fri_may_not_open_here_adds_nothing(monkeypatch, tmp_path, where):

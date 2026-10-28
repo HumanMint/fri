@@ -554,3 +554,51 @@ def test_ping_changed_during_post_model_photo_fetch(monkeypatch, tmp_path, workf
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('whose', ['ping', 'photo'])
+@pytest.mark.parametrize('change', ['renewed', 'replaced'])
+def test_a_renewed_cdn_signature_is_the_same_post_to_a_pings_checks(monkeypatch, tmp_path, whose, change):
+    """fri #113: Discord renews a CDN link's signature on every fetch. The ping's checks compare uploads, so
+    that alone refuses nothing, while another upload in its place still does."""
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        upload = attachment(1).url
+        def signed(item, hm):
+            item.attachments = [SimpleNamespace(**{**vars(item.attachments[0]), 'url': f'{upload}?ex=6720d7a1&is=671f8621&hm={hm}'})]
+            return item
+        photo = signed(message('', age=10, attachments=[attachment(1)]), 'a1') if whose == 'photo' else None
+        event = message('<@99> what does my screenshot say?', attachments=[attachment(1)] if whose == 'ping' else ())
+        if whose == 'ping':
+            signed(event, 'a1')
+        target = photo or event
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='it says hi')
+        monkeypatch.setattr('fri.fri_images.load_image', AsyncMock(return_value='data:image/png;base64,aGVsbG8='))
+        fetches = 0
+        async def fetch(mid):
+            nonlocal fetches
+            if mid not in rows:
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'deleted')
+            if mid != target.id:
+                return rows[mid]
+            fetches += 1  # Discord's copy now: signed afresh each time, or another upload once the model answered.
+            current = signed(copy.copy(target), f'r{fetches}')
+            if change == 'replaced' and model_calls:
+                current.attachments[0].url = current.attachments[0].url.replace('/1/meme.png', '/2/meme.png')
+            return current
+        channel.fetch_message.side_effect = fetch
+        model_calls = []
+        async def respond(_, context):
+            assert context['images'] and context['image_event'].id == target.id
+            model_calls.append(context)
+            return ChatResult(status='completed', reply='it says hi')
+        fri.chat_once.side_effect = respond
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            replies = [call.args[0] for call in event.reply.await_args_list]
+            assert fetches > 1 and len(model_calls) == 1
+            assert ('it says hi' in replies) == (change == 'renewed')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
