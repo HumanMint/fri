@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Continue with ChatGPT: authorize Fri to use the owner's subscription on Hostinger."""
+"""Continue with ChatGPT: authorize Fri to use the owner's ChatGPT plan on the machine that runs Fri."""
 
 import base64
 import hashlib
@@ -68,7 +68,7 @@ def main():
             params['agent_name_hint'] = 'Fri'
         # Omit ID-token/login hints so authorization URLs never contain stored credentials.
         url = ISSUER + '/api/accounts/authorize?' + urlencode(params)
-        print('Continue with ChatGPT to authorize Fri on your personal Hostinger VM.')
+        print('Continue with ChatGPT to authorize Fri on the machine that runs them.')
         print('This uses your subscription, not an API key. Fri sets no token budget.')
         print('Opening the sign-in page. If it does not open, visit:\n' + url)
         webbrowser.open(url)
