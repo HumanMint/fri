@@ -14,6 +14,8 @@ MAX_IMAGES = 4  # In one model call, the speaker's own included.
 MAX_LOADS = 2 * MAX_IMAGES  # Downloads one look may try, so a few dead links don't use up the budget.
 MAX_CHARS = 12_000_000  # Their data URLs together, about 9 MB of image.
 KEYS = ('image_sources', 'image_event', 'image_invitation', 'image_reads')
+MAX_CARDS = 2  # Link cards on one row.
+CARD_TYPES = ('rich', 'article', 'link', 'video', 'image', 'gifv')  # Discord's unfurls, not its system embeds.
 
 
 def media(message):
@@ -39,13 +41,15 @@ def media(message):
 
 
 def details(message):
-    """What a reader sees around a post's text: what it carries, its reactions, the post it answers,
-    whether it's pinned.
+    """What a reader sees around a post's text: what it carries, its link cards, its reactions, the post it
+    answers, whether it's pinned.
 
     Reaction counts only, never who reacted; Fri's own reaction is marked so it can own it."""
     extra = {}
     if media(message):
         extra['attachments'] = media(message)
+    if cards := link_cards(message):
+        extra['link_cards'] = cards
     reactions = getattr(message, 'reactions', None)
     if isinstance(reactions, (list, tuple)) and reactions:
         extra['reactions'] = [{'emoji': label(r.emoji), 'count': r.count, **({'fri': True} if r.me is True else {})}
@@ -59,6 +63,32 @@ def details(message):
     if getattr(message, 'pinned', None) is True:
         extra['pinned'] = True
     return extra
+
+
+def link_cards(message):
+    """The preview cards Discord unfurled from links in a member's post, the first two that say anything: the
+    site, who made it, its title and a line of its text, cut short. Text only, never a URL. Members can't send
+    their own embeds, so each one is Discord's preview of a link they sent; a bot's or webhook's never count,
+    and a spoilered post shows none. Untrusted page text: the reply model is told it's never instructions."""
+    from .privacy import clean
+    embeds, author = getattr(message, 'embeds', None), getattr(message, 'author', None)
+    if (not isinstance(embeds, (list, tuple)) or getattr(author, 'bot', True) is not False or
+            getattr(message, 'webhook_id', None) or '||' in str(getattr(message, 'content', '') or '')):
+        return []
+    cards = []
+    for embed in embeds:
+        if getattr(embed, 'type', None) not in CARD_TYPES:
+            continue
+        fields = (('site', getattr(getattr(embed, 'provider', None), 'name', None), 40),
+                  ('by', getattr(getattr(embed, 'author', None), 'name', None), 60),
+                  ('title', getattr(embed, 'title', None), 120), ('text', getattr(embed, 'description', None), 200))
+        card = {key: clean(' '.join(value.split()), most) for key, value, most in fields if isinstance(value, str)}
+        card = {key: value for key, value in card.items() if value}
+        if card.get('title') or card.get('text'):
+            cards.append(card)
+            if len(cards) == MAX_CARDS:
+                break
+    return cards
 
 
 def label(emoji):
@@ -75,9 +105,11 @@ def image_context(context):
 async def look(context, posts, *, invitation=None):
     """Look at still images that a read turned up, newest first, within this call's image budget.
 
-    Other people's posts count only through their own attachments, or the still preview Discord's
-    proxy made of a GIF link they sent, never other embeds or pasted links, which could point anywhere. A post that won't load is just not inspected and the next older one
-    gets its slot; the model is told which posts it saw and how many it didn't."""
+    Other people's posts count only through their own attachments, the still preview Discord's proxy made
+    of a GIF link they sent, or on a member's post with neither, the picture on a link's preview card, as
+    Discord's proxy serves it to everyone (see stills). Never a page a link points at. A post that won't load
+    is just not inspected and the next older one gets its slot; the model is told which posts it saw and how
+    many it didn't."""
     from .fri_context import discord_source
     images = list(context.get('images', []))
     reads = list(context.get('image_reads', []))
@@ -90,8 +122,8 @@ async def look(context, posts, *, invitation=None):
         if post.id in seen:
             continue
         seen.add(post.id)
-        urls = sources(post, MAX_IMAGES, gifs=True)
-        if not urls or urls != [str(a.url) for a in post.attachments]+gif_previews(post) or len(urls) > budget:
+        urls = stills(post)[0]
+        if not urls or len(urls) > budget:
             skipped += 1
             continue
         queue.append((post, urls))
@@ -119,10 +151,12 @@ async def look(context, posts, *, invitation=None):
                 skipped += 1
                 continue
             size += sum(map(len, loaded))
+            still = stills(post)[1]
             inspected.append({'images': list(range(len(images)+1, len(images)+len(loaded)+1)),
-                              'source': discord_source(post).evidence(),
-                              **({'still': 'gif preview'} if gif_previews(post) else {})})
+                              'source': discord_source(post).evidence(), **({'still': still} if still else {})})
             images += loaded
+            if invitation is not None:  # Its own check covers what it looked at (see Invitation.current).
+                invitation.inspected(post, urls)
             reads.append({'event': post, 'sources': urls, 'invitation': invitation})
             budget -= len(urls)
             looked += 1
@@ -232,7 +266,7 @@ async def looked_unchanged(context):
             if (current.id != post.id or current.author.id != post.author.id or
                     current.webhook_id or current.channel.id != post.channel.id or current.content != post.content or
                     current.edited_at != post.edited_at or
-                    unsigned(sources(current, MAX_IMAGES, gifs=True)) != unsigned(read['sources'])):
+                    unsigned(stills(current)[0]) != unsigned(read['sources'])):
                 return False
         return True
     except discord.HTTPException:
@@ -252,3 +286,51 @@ async def still_there(message):
 async def require_current(context, event):
     if not await unchanged(context, event):
         raise commands.UserFeedbackCheckFailure(CHANGED)
+
+
+def stills(post):
+    """What look() can see of a post, and as what: its attachments with any GIF link's still preview, or, on a
+    member's post with neither, the pictures Discord's proxy made of its link cards. (None, None) when there's
+    nothing it can see whole; a post with both kinds keeps today's rule and isn't looked at."""
+    from .fri_meme_media import link_previews
+    urls = sources(post, MAX_IMAGES, gifs=True)
+    if urls and urls == [str(a.url) for a in post.attachments]+gif_previews(post):
+        return urls, 'gif preview' if gif_previews(post) else None
+    author = getattr(post, 'author', None)
+    if (not post.attachments and not gif_previews(post) and getattr(author, 'bot', True) is False and
+            not getattr(post, 'webhook_id', None) and (urls := link_previews(post))):
+        return urls, 'link preview'
+    return None, None
+
+
+def lookable(post):
+    """A post worth handing to look(): attachments, a GIF link's preview, or a link card's picture."""
+    attachments = getattr(post, 'attachments', None)
+    if not isinstance(attachments, (list, tuple)) or not isinstance(getattr(post, 'embeds', None), (list, tuple)):
+        return False
+    return bool(attachments or gif_previews(post) or stills(post)[0])
+
+
+async def own_links(context, event, *, invitation=None):
+    """The speaker's own post as Discord has it now, for the link cards it unfurled after it came in: the
+    event that arrived usually has none yet. Their text goes beside the message (message_link_cards), and a
+    card's picture or a GIF link's preview is looked at like a nearby post's, checked again as Discord has it
+    before each request and before delivery: by a ping's `invitation`, else on its own refetch. Never their
+    attachments: attach() has those. Only a turn that may look."""
+    from .fri_conversation import LINK
+    content = LINK.sub('', str(getattr(event, 'content', '') or ''))  # Discord unfurls no message link.
+    if (not isinstance(event, discord.Message) or has_attachments(event) or
+            not ('https://' in content or 'http://' in content) or
+            not callable(getattr(getattr(event, 'channel', None), 'fetch_message', None))):
+        return
+    try:
+        current = await event.channel.fetch_message(event.id)
+    except discord.HTTPException:
+        return
+    if (current.id != event.id or current.author.id != event.author.id or current.author.bot or
+            current.webhook_id or current.content != event.content or current.edited_at != event.edited_at):
+        return  # Changed since it came in, which the turn's own checks refuse.
+    if cards := link_cards(current):
+        context['message_link_cards'] = cards
+    if lookable(current):
+        await look(context, [current], invitation=invitation)

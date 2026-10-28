@@ -722,11 +722,16 @@ class Fri(discord.Client):
                 from .fri_images import attach as attach_images
                 if inspect_images:
                     await attach_images(context, event, text, source=image_source, invitation=invitation)
+                    from .fri_images import look, lookable, own_links
+                    await own_links(context, event, invitation=invitation)  # Their own link's card, unfurled after it came in.
                     if targets and not context.get('unattributed_reference'):
-                        # The meme they replied to or linked, when it's a still image or a GIF link's preview.
-                        from .fri_images import look
-                        from .fri_meme_media import gif_previews
-                        await look(context, [post for post in targets if post.attachments or gif_previews(post)])
+                        # The meme they replied to or linked: a still image, a GIF link's preview or a link card's picture.
+                        before = len(context.get('image_reads', []))
+                        await look(context, [post for post in targets if lookable(post)])
+                        for read in context.get('image_reads', [])[before:] if invitation else ():
+                            # Checked on their own refetch before each request; a ping's delivery check is its
+                            # invitation's, so that finds them again too (see Actions.valid).
+                            invitation.inspected(read['event'], read['sources'])
                 if actions:
                     from .fri_images import image_context
                     actions.image_context = image_context(context)
@@ -1029,7 +1034,7 @@ class Fri(discord.Client):
     async def invited_talk(self, invitation, text, typing=None):
         """Outside the ambient scope, one ping has only conversation and public research."""
         from .fri_context import addressed_content
-        from .fri_images import attach, image_context
+        from .fri_images import attach, image_context, own_links
         from .fri_mentions import force_text
         event, user = invitation.event, invitation.event.author.id
         expected = addressed_content(event.content, self.user.id) or 'hey'
@@ -1061,6 +1066,7 @@ class Fri(discord.Client):
                 actions.private_evidence = True
                 context['actions'] = await actions.available()
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
+                await own_links(context, event, invitation=invitation)  # The ping's own card, before the nearby posts' pictures.
                 await invitation.look(context)  # Up front: an outside ping has no read to decide on.
                 actions.image_context = image_context(context)
                 # See chat_once. What a Fri answer it reads drew on counts as shown: a delete of it withholds the reply.
