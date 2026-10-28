@@ -105,7 +105,10 @@ def release_link(version):
     {version}, points it elsewhere, for a fork). The post goes out with embeds suppressed, so it shows no preview."""
     url = (os.getenv('FRI_RELEASE_NOTES_URL') or RELEASE_PAGE).replace('{version}', version)
     parsed = urlsplit(url) if re.fullmatch(r'[^\s()<>]+', url) else None
-    host = parsed.hostname if parsed else None
+    try:  # .port raises ValueError on a port that isn't a number from 0 to 65535; 0 is no port either.
+        host = parsed.hostname if parsed and parsed.port != 0 else None
+    except ValueError:
+        host = None
     if not (parsed and parsed.scheme == 'https' and host and re.fullmatch(r'[a-z0-9-]+(\.[a-z0-9-]+)+', host)):
         raise NotesRefused('FRI_RELEASE_NOTES_URL must be an https URL with a host name, and no spaces or brackets')
     return f'for more detailed patch notes: [click here]({url})'

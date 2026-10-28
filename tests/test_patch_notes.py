@@ -1010,8 +1010,12 @@ def test_the_release_link_can_point_at_a_fork_and_must_be_plain_https(dm, tmp_pa
     monkeypatch.setenv('FRI_RELEASE_NOTES_URL', 'https://example.org/forks/fri/releases/v{version}')
     post('fri 0.7.0', tmp_path)
     assert chat.sends[0]['content'].endswith('[click here](https://example.org/forks/fri/releases/v0.7.0)')
+    monkeypatch.setenv('FRI_RELEASE_NOTES_URL', 'https://example.org:8443/fri/v{version}')  # A real port is fine.
+    assert notes.release_link('0.7.2').endswith('(https://example.org:8443/fri/v0.7.2)')
     for bad in ('http://example.org/v{version}', 'https://example.org/a b', 'https://example.org/(x)',
-                'https:///releases/v{version}', 'https://localhost/v{version}', 'https://exa_mple.org/v{version}'):
+                'https:///releases/v{version}', 'https://localhost/v{version}', 'https://exa_mple.org/v{version}',
+                'https://example.org:bad/v{version}', 'https://example.org:99999/v{version}',
+                'https://example.org:0/v{version}'):
         monkeypatch.setenv('FRI_RELEASE_NOTES_URL', bad)
         with pytest.raises(notes.NotesRefused, match='must be an https URL with a host name'):
             post('fri 0.7.1', tmp_path, version='0.7.1')
