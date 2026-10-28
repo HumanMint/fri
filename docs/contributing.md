@@ -63,10 +63,11 @@ overrides (`GENE_SHA`, `GENE_REPO`, `FRI_VENV`, `FRI_OFFLINE_CACHE`, `OFFLINE_IS
 
 ## CI
 
-GitHub Actions ([`checks.yml`](../.github/workflows/checks.yml)) runs the unit tests and ruff, then
-builds the runtime image and imports every module in it as UID 10001 with no network, checking that
-neither Gene nor Red is inside. It skips Markdown-only changes. The integration suites run through the
-offline checks above, not in CI.
+GitHub Actions ([`checks.yml`](../.github/workflows/checks.yml)) runs two jobs and skips Markdown-only
+changes. `runtime` runs the unit tests and ruff, then builds the runtime image and imports every module
+in it as UID 10001 with no network, checking that neither Gene nor Red is inside. `integration` runs the
+offline checks above: it fetches the Gene commit pinned in `docs/integration-pair.json` (Gene is public,
+so no credentials are needed), and only setup uses the network.
 
 ## Live model checks
 
