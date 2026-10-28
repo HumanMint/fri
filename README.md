@@ -124,3 +124,7 @@ was developed with [OpenAI Codex](https://openai.com/codex/), using GPT-6 Astra 
 GPT-6.1 Sol. Development continues with Codex and Claude: Codex contributes code,
 tests and independent reviews; Claude contributes implementation and integration
 work.
+
+## License
+
+Fri is licensed under the [MIT License](LICENSE).
