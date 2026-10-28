@@ -404,11 +404,15 @@ async def unchanged(agent, message, context):
 
     try:
         unchanged, posts, gone = True, [], set()
-        if (context.get('reply_target') != await reply_target(agent, message, posts, gone) or
-                context.get('target_versions', versions(posts)) != versions(posts)):
-            fetched = {post.id: post for post in posts}
+        rows, kept = await reply_target(agent, message, posts, gone), context.get('target_versions')
+        if context.get('reply_target') != rows or (kept is not None and kept != versions(posts)):
+            fetched, now = {post.id: post for post in posts}, versions(posts)
+            current = {row['source']['id']: row for row in rows}
             for row in context.get('reply_target', []):
                 mid = int(row['source']['id'])
+                if (mid not in gone and current.get(str(mid)) == row and
+                        (kept is None or kept.get(str(mid)) == now.get(str(mid)))):
+                    continue  # As it was read: another target changed. One edited before that stays in view.
                 await withdrawn(row, 1800, None if mid in gone else fetched.get(mid, unread))
             unchanged = False  # The burst still goes on, so each changed message of it is withdrawn too.
         for row in context.get('message_burst', []):  # Every one, so each changed message is withdrawn.
