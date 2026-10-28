@@ -96,6 +96,21 @@ def test_edits_refresh_a_members_row_as_they_left_it():
     assert 8 not in agent.recent
 
 
+def test_an_edit_refreshes_a_rows_attachment_kinds_too():
+    """fri #91: an image edited out of a captioned post leaves the row's kinds with it."""
+    def image(kind='image/png'):
+        return SimpleNamespace(content_type=kind, is_spoiler=lambda: False)
+    agent = bare_agent()
+    agent.recent[1].extend([row(1, attachments=['image']), row(2, attachments=['image', 'gif']),
+                            row(3, attachments=['image'])])
+    agent.edit(1, edited(1, 'the caption stays'))
+    assert agent.recent[1][0]['text'] == 'the caption stays' and 'attachments' not in agent.recent[1][0]
+    agent.edit(1, edited(2, 'one of two', attachments=[image('image/gif')]))
+    assert agent.recent[1][1]['attachments'] == ['gif']
+    agent.edit(1, edited(3, ''))  # Uncaptioned, and every attachment gone: nothing left to read.
+    assert [r['id'] for r in agent.recent[1]] == ['1', '2']
+
+
 def test_fri_routes_raw_delete_and_edit_events_to_the_agent(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)

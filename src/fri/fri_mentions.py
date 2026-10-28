@@ -2,6 +2,7 @@
 
 import copy
 import datetime as dt
+import hashlib
 import time
 
 import discord
@@ -10,7 +11,7 @@ from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import AuthorErased, ControllerUnavailable
-from .fri_images import details
+from .fri_images import details, lookable, stills
 from .fri_meme_media import gif_previews, sources, unsigned
 from .fri_memes import reacted
 from .privacy import clean
@@ -18,6 +19,11 @@ from .privacy import clean
 NEARBY_SECONDS = 6 * 3600  # "The memes above" in a slow channel can be hours old; MAX_MESSAGES still bounds it.
 REFERENCE_SECONDS = 7 * 86400
 MAX_MESSAGES = 12
+# A direct reply to Fri's answer outside its channels reads that answer this long after it went out (NX1).
+RECEIPT_SECONDS = 15 * 60
+MAX_RECEIPTS = 100
+MAX_EVIDENCE = 25  # Posts one privacy read can name (Gene's Profiles.evidence).
+MAX_AUTHORS = 25  # Their authors, besides whoever pings (Gene fences 26 with them).
 CHANGED = 'That mention or its context changed while I was replying. Ask again for a fresh reply.'
 # Said instead of a reply that can't go out, while the ping itself is still there to answer. Gates
 # that close access (permissions, thread state, a deleted or un-pinged message) stay quiet.
@@ -47,6 +53,64 @@ def snapshot(message):
     return fingerprint(message), tuple(unsigned(gif_previews(message)))
 
 
+def digest(read):
+    """A post as Fri read it, holding none of its words: enough to tell it changed since."""
+    return hashlib.sha256(repr(read).encode()).hexdigest()
+
+
+def version(message, kind):
+    """Fri's own post by its fingerprint (Fri suppresses its embeds). A member's by its snapshot (see current) and
+    the link card pictures look() can see on it (see fri_images.stills): suppressing a card changes no text or
+    edit time, and an answer may have described its picture."""
+    if kind == 'fri':
+        return digest(fingerprint(message))
+    return digest((snapshot(message), tuple(unsigned(stills(message)[0]) or ())))
+
+
+class Receipts:
+    """Fri's delivered answers to outside pings, newest last, so a direct reply to one can read it (NX1).
+
+    In memory only: a restart forgets them, and a reply to one then reads as before. Each names the posts and
+    authors its answer drew on, as Fri read them, never their words. One whose answer, or any post it drew on,
+    is deleted or edited, or that drew on a member who used a privacy control, goes at once."""
+
+    def __init__(self):
+        self.entries = {}  # Fri's message ID -> its receipt (see Invitation.answered).
+
+    def keep(self, mid, receipt):
+        self.entries.pop(mid, None)
+        self.entries[mid] = receipt
+        now = time.monotonic()
+        for old in [old for old, entry in self.entries.items() if entry['until'] <= now]:
+            del self.entries[old]
+        while len(self.entries) > MAX_RECEIPTS:
+            del self.entries[next(iter(self.entries))]
+
+    def get(self, mid):
+        receipt = self.entries.get(mid)
+        if receipt is not None and receipt['until'] <= time.monotonic():
+            del self.entries[mid]
+            return None
+        return receipt
+
+    def withdraw(self, ids):
+        ids = {int(i) for i in ids if str(i).isdigit()}
+        for mid in [mid for mid, entry in self.entries.items() if mid in ids or ids & entry['sources'].keys()]:
+            del self.entries[mid]
+
+    def changed(self, mid):
+        """A member's post a receipt names changed with no edit time (its card suppressed, swapped or unfurled, a
+        partial update): that receipt goes, as its version holds the post's card pictures (see version). Fri's own
+        answers keep theirs, as their version is only what they say and carry, which an edit time marks."""
+        mid = int(mid) if str(mid).isdigit() else None
+        for key in [key for key, entry in self.entries.items() if entry['sources'].get(mid, ('fri',))[0] != 'fri']:
+            del self.entries[key]
+
+    def forget(self, user):
+        for mid in [mid for mid, entry in self.entries.items() if str(user) in entry['authors']]:
+            del self.entries[mid]
+
+
 class Invitation:
     def __init__(self, agent, message):
         self.agent, self.fri, self.event = agent, agent.fri, message
@@ -59,11 +123,19 @@ class Invitation:
         self.rows, self.events, self.profiles, self.snapshots = [], {}, {}, {}
         self.image = None  # The ping's own image post, the one it replies to, or their photo just before (see current).
         self.images = []  # Otherwise, nearby posts with attachments, for look() to choose from.
+        self.pictures = {}  # Every post whose images the turn showed the model: ID -> (post, unsigned images).
         self.refusal = None  # Why the last check failed, for the drop log: a gate name, never content.
         self.forgotten = agent.forgotten.get(message.author.id, 0)  # The author's erasures so far.
         self.revision = None  # The author's privacy revision as Fri first read it for this ping.
         self.fetched = None  # Its channel (a thread's parent) as the last access check read it (see access).
         self.checked = 0  # Full checks passed, so a later check can tell one just ran (see Fri.chat_once).
+        self.latest = message  # The ping as the last check refetched it, its embeds as they are by then.
+        # Outside, Fri's own answer this ping replies to, and every post that drew on, Fri's or a member's:
+        # message ID -> (message, kind, version), checked with the nearby posts but never shown (see answer).
+        self.carried = {}
+        self.inherited = None  # That answer's receipt, so one for this ping's answer keeps its ancestry.
+        self.answer_id = None  # That answer's message ID, while this ping reads it.
+        self.out = None  # When Fri's answer to this ping went out (time.monotonic()), once it did.
 
     @property
     def image(self):
@@ -89,6 +161,25 @@ class Invitation:
             return None
         agent.miss(message, reason)
         return None
+
+    def inspected(self, post, urls):
+        """The turn showed the model these images of a post (see fri_images.look): each check from here on,
+        before every request and before delivery, finds them again as Discord shows the post now."""
+        self.pictures[post.id] = (post, unsigned(urls))
+
+    async def pictures_unchanged(self):
+        """Every image the turn showed the model (see inspected), as Discord shows its post now. A link card's
+        picture isn't in the nearby snapshots (a card unfurling late on a post Fri didn't look at changes
+        nothing it saw), the ping's own isn't a nearby post, and suppressing a card changes no text or edit
+        time. Before the privacy reads, so the last of those still comes after every Discord read."""
+        for mid, (post, urls) in self.pictures.items():
+            try:
+                current = await post.channel.fetch_message(mid)  # A linked post's from its own channel.
+            except discord.NotFound:
+                return False
+            if current.id != mid or unsigned(stills(current)[0]) != urls:
+                return False
+        return True
 
     def refuse(self, reason):
         self.refusal = reason
@@ -146,6 +237,7 @@ class Invitation:
         if not self.unchanged(current):
             self.agent.withdraw(self.event)
             return False
+        self.latest = current
         return True
 
     async def current(self, *, check_evidence=True, control=False):
@@ -165,19 +257,35 @@ class Invitation:
                 return False
             if not await self.ping_unchanged():
                 return self.refuse('message changed')
+            # With or without a grant: a ping answering a pending clarification skips the mention admission.
+            if check_evidence and not await self.pictures_unchanged():
+                return self.refuse('image changed')
             if check_evidence and self.grant:
-                profiles = await self.profile_sources(list(self.events.values()))
+                profiles = await self.profile_sources(self.evidence())
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
-                changed = False  # Every one is checked, so each edited or deleted leaves the live view.
+                changed, fetched = False, {}  # Every one is checked, so each edited or deleted leaves the live view.
                 for mid, event in self.events.items():
                     try:
-                        current = await self.event.channel.fetch_message(mid)
+                        current = fetched[mid] = await self.event.channel.fetch_message(mid)
                     except discord.NotFound:
                         self.agent.withdraw(event)
                         changed = True
                         continue
                     if current.webhook_id or current.author.bot or snapshot(current) != self.snapshots[mid]:
+                        self.agent.withdraw(event)
+                        changed = True
+                for mid, (event, kind, before) in self.carried.items():  # And what Fri's answer drew on, as its
+                    # receipt names it: card pictures too, which the nearby snapshots leave out (see version). A
+                    # nearby one by the read just above.
+                    if mid in self.events:
+                        current = fetched.get(mid)
+                    else:
+                        try:
+                            current = await self.event.channel.fetch_message(mid)
+                        except discord.NotFound:
+                            current = None
+                    if current is None or not self.same(current, mid, kind, before):
                         self.agent.withdraw(event)
                         changed = True
                 if changed:
@@ -186,9 +294,11 @@ class Invitation:
                 if not await self.ping_unchanged():
                     return self.refuse('message changed')
                 # Their privacy once more, a controller read, so an opt-out during the refetches above counts too.
-                profiles = await self.profile_sources(list(self.events.values()))
+                profiles = await self.profile_sources(self.evidence())
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
+            if not self.standing():  # After the last wait: a withdrawal during the reads above counts too.
+                return self.refuse('nearby message changed')
             self.checked += check_evidence
             return True
         except ControllerUnavailable:
@@ -250,6 +360,22 @@ class Invitation:
     def granted_scope(self):
         return {**self.scope, 'mention_grant': self.grant, 'source': self.source}
 
+    def standing(self):
+        """Fri's earlier answer this ping reads, if any, may still be read, as of now: its receipt is the one Fri
+        read, still kept (a delete or edit of the answer or a post it drew on, or a privacy control of an author,
+        drops it at once, see Receipts) and in date, and nothing it carries was marked taken back since. No waits,
+        so it holds up to the model request or the send that runs it last."""
+        if self.inherited is None:
+            return True
+        return (self.agent.receipts.entries.get(self.answer_id) is self.inherited and
+                self.inherited['until'] > time.monotonic() and
+                not any(mid in self.agent.unsent or str(mid) in self.agent.withdrawn for mid in self.carried))
+
+    def evidence(self):
+        """Every member's post this ping reads or its answer draws on, once each, for their authors' privacy."""
+        drawn = {mid: event for mid, (event, kind, _) in self.carried.items() if kind != 'fri'}
+        return list({**drawn, **self.events}.values())
+
     async def profile_sources(self, events):
         result = await self.fri.api('POST', '/chat/mentions/profiles', {**self.granted_scope(),
             'evidence': [discord_source(event).model_dump() for event in events]})
@@ -280,7 +406,14 @@ class Invitation:
                     not 0 < age <= (REFERENCE_SECONDS if mid == reference_id else NEARBY_SECONDS)):
                 continue
             accepted.append(item)
-        profiles = await self.profile_sources(accepted)
+        answer = await self.answer(candidates.get(reference_id), accepted) if self.outside and reference_id else None
+        nearby = {item.id for item in accepted}
+        drawn = [post for mid, (post, kind, _) in (answer[1] if answer else {}).items()
+                 if kind != 'fri' and mid not in nearby]
+        authors = {str(item.author.id) for item in accepted+drawn} | {str(event.author.id)}
+        if len(accepted+drawn) > MAX_EVIDENCE or len(authors) > MAX_AUTHORS+1:
+            answer, drawn = None, []  # More than one privacy read can carry: it's read as before, never cut short.
+        profiles = await self.profile_sources(accepted+drawn)
         notes, stale = self.agent.ensure_memes().notes(), []
         for item in sorted(accepted, key=lambda m: m.id):
             user = str(item.author.id)
@@ -295,6 +428,21 @@ class Invitation:
                               'privacy_revision': profile['revision'], 'referenced': item.id == reference_id,
                               **details(item), **reacted(notes, item, profile, stale)})
         self.agent.ensure_memes().drop(stale)
+        if answer:
+            receipt, carried = answer
+            if all((profile := profiles.get(user)) and profile['enabled'] and profile['revision'] == revision
+                   for user, revision in receipt['authors'].items()):
+                item = carried[reference_id][0]
+                for user in receipt['authors']:
+                    self.profiles[user] = profiles[user]  # Checked again with the nearby authors (see current).
+                self.carried.update(carried)
+                self.inherited, self.answer_id = receipt, reference_id
+                self.agent.saw(list(carried))  # So a delete while Fri replies is noticed (see Agent.unsend).
+                self.rows = [row for row in self.rows if row['source']['id'] != str(item.id)]
+                self.rows.append({'source': discord_source(item).evidence(), 'text': clean(item.content, 1800),
+                                  'referenced': True, 'fri': True, **details(item)})
+            else:  # Someone it drew on changed their privacy since: it never counts again.
+                self.agent.receipts.withdraw([reference_id])
         self.rows.sort(key=lambda row: int(row['source']['id']))
         own = event if event.attachments else None
         referenced = self.events.get(reference_id)
@@ -303,11 +451,87 @@ class Invitation:
         elif referenced and referenced.attachments:
             self.image = referenced
         # Without one image the ping points at, "which of these" needs all of them; look() keeps the newest that fit.
-        self.images = [] if self.image else [m for m in self.events.values() if m.attachments or gif_previews(m)]
-        # Contextual images use attachments, or a GIF link's Discord-made preview. Never other embeds or URLs.
+        self.images = [] if self.image else [m for m in self.events.values() if lookable(m)]
+        # Contextual images use attachments, a GIF link's Discord-made preview or a link card's picture (see
+        # fri_images.stills). Never a page a link points at.
         if self.image and sources(self.image) != [str(a.url) for a in self.image.attachments]:
             self.image = None
         await self.require_current()
+
+    async def answer(self, item, accepted):
+        """Fri's own outside answer this ping replies to, with its receipt (see answered), while that still
+        stands: in this channel, as Fri posted it, and every post it drew on still there as Fri read it. Their
+        authors' privacy is read next, with the nearby posts' (see collect). None on any doubt: it's read as before."""
+        receipts = self.agent.receipts
+        receipt = receipts.get(item.id) if item is not None else None
+        if (receipt is None or receipt['channel'] != self.event.channel.id or not item.guild or
+                item.guild.id != self.event.guild.id or not item.id < self.event.id or
+                not self.same(item, item.id, 'fri', receipt['version'])):
+            return None
+        nearby, carried = {m.id: m for m in accepted}, {item.id: (item, 'fri', receipt['version'])}
+        for mid, (kind, before) in receipt['sources'].items():
+            # Gene reads an author's privacy for a post up to a week old; this ping's checks run for 300s more.
+            if (not 0 < (self.event.id-mid)/(1 << 22)/1000 <= REFERENCE_SECONDS-300 or
+                    str(mid) in self.agent.withdrawn or mid in self.agent.unsent):
+                return None
+            try:
+                current = nearby.get(mid) or await self.event.channel.fetch_message(mid)
+            except discord.NotFound:
+                receipts.withdraw([mid])
+                return None
+            except discord.HTTPException:
+                return None
+            if not self.same(current, mid, kind, before):
+                receipts.withdraw([mid])
+                return None
+            carried[mid] = (current, kind, before)
+        return receipt, carried
+
+    def same(self, current, mid, kind, before):
+        """A post as Discord has it now is the one a receipt names, as Fri read it: Fri's own or a member's."""
+        return (current.id == mid and not current.webhook_id and current.channel.id == self.event.channel.id and
+                (current.author.id == self.fri.user.id if kind == 'fri' else not current.author.bot) and
+                version(current, kind) == before)
+
+    def delivered(self):
+        self.out = time.monotonic()
+
+    def answered(self, sent):
+        """`sent`, Fri's answer to this outside ping, went out and was saved: keep its receipt, so a direct reply
+        to it here reads it (see answer). Its sources are every post this ping read, the ping too, and what an
+        answer it read drew on in turn; its authors, everyone who wrote them, at the privacy revision Fri read.
+        It lasts 15 minutes from when it went out (see delivered), never past the answer it read. Kept only if one
+        later privacy read can carry it all."""
+        try:
+            if not (self.outside and self.grant and self.revision is not None and self.out is not None and
+                    isinstance(sent, discord.Message) and
+                    sent.channel.id == self.event.channel.id and sent.author.id == self.fri.user.id):
+                return
+            if self.image is not None and self.image.id != self.event.id and self.image.id not in self.events:
+                return  # A post it looked at that no receipt would name.
+            if any(mid != self.event.id and mid not in self.events for mid in self.pictures):
+                return  # Nor one whose pictures it showed the model (a linked post, say).
+            inherited = self.inherited or {'sources': {}, 'authors': {}, 'until': float('inf')}
+            sources = {**inherited['sources'], **{mid: (kind, before) for mid, (_, kind, before) in self.carried.items()}}
+            reads = [(self.event.id, ('post', version(self.latest, 'post'))),
+                     *((mid, ('post', version(self.events[mid], 'post'))) for mid in self.events)]
+            for mid, entry in reads:
+                if sources.setdefault(mid, entry) != entry:
+                    return  # Two reads of one post that differ: it changed while Fri read it.
+            authors = dict(inherited['authors'])
+            for user, revision in [(str(self.event.author.id), self.revision),
+                                   *((user, profile['revision']) for user, profile in self.profiles.items())]:
+                if authors.setdefault(user, revision) != revision:
+                    return
+            if (sum(kind != 'fri' for kind, _ in sources.values()) > MAX_EVIDENCE or len(authors) > MAX_AUTHORS or
+                    any(mid in self.agent.unsent or str(mid) in self.agent.withdrawn for mid in [*sources, sent.id]) or
+                    not self.standing()):
+                return
+            self.agent.receipts.keep(sent.id, {
+                'channel': self.event.channel.id, 'version': version(sent, 'fri'), 'sources': sources,
+                'authors': authors, 'until': min(self.out+RECEIPT_SECONDS, inherited['until'])})
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return  # Delivered all the same; a reply to it reads as before.
 
     def context(self):
         return {'invited_context': self.rows, 'force_text_reply': True, 'acknowledgments_enabled': False,

@@ -44,3 +44,7 @@ The companion has no shell, SSH, Docker, GitHub or worker/deployer credentials.
   against current compatible state; never restore stale approvals, erased context or receipts.
 - Use `codex/` branches and small imperative commits. Fri uses they/them and concise,
   lowercase, playful conversation; never claim an action succeeded without evidence.
+- Credit substantive Codex-authored code, tests and documentation with
+  `Co-authored-by: Codex <noreply@openai.com>` in the commit message. Keep the human
+  author and other accurate co-authors. Record review-only assistance in the PR's
+  review record instead; do not rewrite history solely to add attribution.

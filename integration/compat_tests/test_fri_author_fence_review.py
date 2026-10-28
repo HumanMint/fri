@@ -11,11 +11,6 @@ from fri.fri_errors import ControllerUnavailable
 from fri.fri_fixes import tell
 
 
-@pytest.fixture(autouse=True)
-def maintenance(monkeypatch):
-    monkeypatch.setattr('gene.maintenance.clock', lambda: 1793185500.0)
-
-
 class Reply:
     def __init__(self, value, status=200):
         self.value, self.status = value, status

@@ -65,6 +65,17 @@ def test_a_gif_links_preview_counts_only_when_asked_and_an_uploaded_gif_never_do
     assert sources(upload) is None and sources(upload, gifs=True) is None
 
 
+@pytest.mark.parametrize('size,looked', [((5000, 4000), True), ((5000, 4001), False), (None, True)])
+def test_a_gif_links_preview_gets_the_pixel_limit_attachments_get(size, looked):
+    """fri #79: a preview's size, when Discord gives it, is held to the 20-megapixel limit an attachment is."""
+    embed = tenor_embed()
+    if size:
+        embed = discord.Embed.from_dict({**embed.to_dict(), 'thumbnail': {
+            **embed.to_dict()['thumbnail'], 'width': size[0], 'height': size[1]}})
+    link = SimpleNamespace(attachments=[], content='https://tenor.com/view/dance-123', embeds=[embed])
+    assert sources(link, gifs=True) == ([PREVIEW] if looked else None)
+
+
 @pytest.mark.parametrize('fmt,mime', [('GIF', 'image/gif'), ('PNG', 'image/png'), ('WEBP', 'image/webp')])
 def test_an_animated_preview_is_refused_without_decoding(fmt, mime):
     async def scenario():
@@ -79,26 +90,28 @@ def test_an_animated_preview_is_refused_without_decoding(fmt, mime):
 def tenor(post, *, preview=PREVIEW, kind='gifv'):
     item = post('https://tenor.com/view/dance-123')
     item.embeds = [SimpleNamespace(type=kind, video=None if kind != 'gifv' else SimpleNamespace(url='x.mp4'),
-                                   image=SimpleNamespace(proxy_url=preview) if kind == 'article' else None,
+                                   image=SimpleNamespace(proxy_url=preview, width=600, height=315) if kind == 'article' else None,
                                    thumbnail=SimpleNamespace(proxy_url=preview))]
     return item
 
 
-def test_a_read_looks_at_a_tenor_gif_but_not_a_link_preview(monkeypatch, tmp_path):
+def test_a_read_looks_at_a_tenor_gif_and_labels_a_link_cards_picture_apart(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, channel, rows, post = read_harness(monkeypatch, tmp_path)
         dance = tenor(post)
-        tenor(post, preview='https://images-ext-1.discordapp.net/external/abc/news.png', kind='article')
+        news = tenor(post, preview='https://images-ext-1.discordapp.net/external/abc/news.png', kind='article')
         loader = loads(monkeypatch)
         actions = Actions(agent, 20, 999, False)
         actions.turn_context, actions.media_allowed = {}, True
         actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
         try:
             receipt = await actions.execute({'kind': 'read_recent', 'channel_id': '1', 'window': 'recent'})
-            # The gif link's preview is looked at; an article's preview never is.
-            assert receipt['images_inspected'] == 1 and receipt['images_not_inspected'] == 1
-            assert [call.args[0] for call in loader.await_args_list] == [PREVIEW]
-            row = actions.turn_context['inspected_images'][0]
+            # The gif link's preview is looked at, and since N2's 2a, so is an article card's picture, as one.
+            assert receipt['images_inspected'] == 2 and receipt['images_not_inspected'] == 0
+            assert sorted(call.args[0] for call in loader.await_args_list) == sorted(
+                [PREVIEW, 'https://images-ext-1.discordapp.net/external/abc/news.png'])
+            card, row = actions.turn_context['inspected_images']  # Newest first.
+            assert card['source']['id'] == str(news.id) and card['still'] == 'link preview'
             assert row['source']['id'] == str(dance.id) and row['still'] == 'gif preview'
             assert await looked_unchanged(actions.turn_context)
             dance.embeds = [SimpleNamespace(type='gifv', video=SimpleNamespace(url='y.mp4'), image=None,

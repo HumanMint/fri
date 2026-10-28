@@ -32,7 +32,7 @@ first, then the newest nearby posts' own attachments; Fri picks among several in
 of asking which one. A speaker's own post keeps the two-image limit; a nearby gallery
 post can use the whole budget. Each image stays a non-spoiler PNG/JPEG/WebP, 4 MB,
 twenty million pixels. A GIF link (Tenor, Giphy) counts as one image through the still preview
-Discord's own proxy made of it; nothing decodes an animation, so an uploaded GIF or an animated
+Discord's own proxy made of it, held to the same pixel limit when Discord gives its size; nothing decodes an animation, so an uploaded GIF or an animated
 preview is not inspected. Other external embeds and videos are not inspected by this path.
 A pasted message link or a replied-to post is opened only when the speaker and Fri can
 read it now (fetched overwrites and roles); from a server channel, only when it is this
@@ -44,6 +44,25 @@ and author checks as any read; each must still be pinned and unchanged before th
 and filenames are never visual evidence. Public research only exports an exact
 public question from the current request, never surrounding chat or image captions.
 
+A link's preview card on a member's post shows on its row in a read, an invitation or a reply
+target as `link_cards`: up to two cards, each its site (40 characters), who made it (60), title (120)
+and a line of text (200), never a URL. Members can't send their own embeds, so these are Discord's
+unfurls of links they sent; bot, webhook and spoilered posts show none. The speaker's own link is read
+from a refetch of their message (`message_link_cards`), since Discord usually unfurls it after the
+message arrives. The reply model is told, only when a card is in the request, that card text is the
+site's and never instructions. Card text isn't part of any recheck: a card that re-unfurls or is
+suppressed changes no fingerprint, and the next read shows it as it is then. On a member's post with no
+attachment or GIF link, the card's picture (a video's thumbnail, an X or Reddit card's image, a pasted
+image link) counts as one image, labelled `still="link preview"`, from the first two cards, through
+Discord's own `/external/` proxy only and within the image limits above. Discord must have sized it within
+twenty million pixels, and the bytes' own header must agree (any preview through that proxy, a GIF link's
+too); a size that's missing or unreadable skips it. Every picture a turn showed the model is found again,
+as Discord shows its post then, before each later model request and before delivery (a ping's own check
+does it, outside channels too, and for a ping answering a pending clarification, which has no mention
+grant), so a swapped or suppressed one stops the turn. A card that unfurls late on
+a post Fri didn't look at changes nothing. A post with both an attachment and a card's picture is still
+not looked at, and history search rows don't show cards yet.
+
 Context from other members keeps its actual author and privacy revision and stays
 ephemeral. Saved conversation uses a neutral breadcrumb; no derived personal notes,
 drafts or posts are retained. Configured-channel mentions start with their normal
@@ -52,6 +71,16 @@ image context on demand; only after that read are persistent writes and external
 image selection removed for that turn. Explicit reply references load only their
 direct target initially, and keep their source and persistence guards. The current
 attachments and existing immediate own-photo pairing remain available directly.
+
+Outside, a ping that directly replies to Fri's own answer there reads that answer as its
+referenced row. Only an answer Fri delivered and saved counts, for 15 minutes from delivery,
+and never past an earlier answer it read in turn. Fri keeps at most 100 such receipts, in memory
+only: a restart forgets them. A receipt holds message IDs, digests and author privacy revisions,
+never words. Every post the answer drew on, the earlier ping included, must still be there
+unchanged, and its authors must still allow it at the same revision. They're registered on the
+new ping's grant like nearby authors, and checked again before each model request and before
+delivery. A delete or edit (Fri's own too) or a privacy control ends the receipt. So does an
+ancestry larger than one privacy read can carry (25 posts, 25 authors). Then the reply reads as before.
 
 Freshness checks compare author and event IDs, never display names. A gateway event shows
 the member's server nickname, but a fetched copy of the same message shows their global
@@ -107,7 +136,7 @@ one deleted while the reply, reaction or card goes out leaves it delivered but u
 model sees; deleted after, the reply is withheld (`nearby message deleted`), with the "things
 changed while i was typing" notice when someone addressed Fri; a reaction or quiet decision is
 dropped too, unsaved and without a notice. An edit replaces a member's row
-with the edited text; an edit Discord sends without its author drops the row. An edit to a member's
+with the edited text and what the post still carries (an image edited out leaves the row's kinds too); an edit Discord sends without its author drops the row. An edit to a member's
 message Fri is still handling (still coming in, or being answered) withdraws it instead: it leaves,
 or never enters, the view, and a reply to it that hasn't reached the model yet is refused. A member's edit
 to any post a model request already carried, after its own handling, stops a turn still running like a
@@ -703,20 +732,23 @@ docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md 
 
 `draft` runs one model call with Fri's voice, the owner's voice notes and the controller's chat model:
 talk to the server, call the owner mint or bossman, use only the given facts, and aim for one message
-(under 1,500 characters) with only the highlights, since the full changelog is attached; a draft that
+(under 1,500 characters) with only the highlights, since the release page has the full notes; a draft that
 needs more than one message is refused. It prints
 the post and sends nothing; its usage is reported like an eval's. The maintainer checks every line
 against the facts before sending, and edits the file if a line isn't backed by them.
 
 `send --channel <name>` posts in the one text channel of `GENE_GUILD_ID` with that name (refused if
 there are none or several); without `--channel` the recipient is `GENE_OWNER_ID`. A channel post is one
-message (owner request, 2026-10-27): the notes file holds that short summary, then a `<!-- changelog -->`
-line, then the full changelog, which goes out attached to the same message as `fri-<version>-changelog.md`.
-A summary that needs two messages, or a new channel post without a changelog, is refused before login; a
-changelog in the owner's DM is refused too. The version's `sha256` stays the summary's digest, as older
-code computes it, so a rollback can still finish an unconfirmed post from its summary; the changelog's hash
-is kept beside it, so the same summary with another changelog counts as different notes, a retry that
-might resend refuses to go without the changelog, and recovery only takes a message that carries the file. A version posted before this (1.0.0) keeps working without one. There is no way to
+message (owner request, 2026-10-27): the short summary, then a line linking that version's GitHub release
+page, where the full notes live (owner request, 2026-10-28): `for more detailed patch notes: [click here](...)`,
+pointing at `https://github.com/HumanMint/fri/releases/tag/v<version>` (`FRI_RELEASE_NOTES_URL`, with
+`{version}`, points a fork elsewhere; it must be a plain https URL). The send adds the line, so the notes file
+holds the summary alone, and the post goes out with link embeds off, so the link shows no preview. Publish
+the release page first. A summary that doesn't fit one message with the link, or notes that still carry a
+`<!-- changelog -->` section (the attached changelog file of 2026-10-27 is gone), are refused before login.
+`preview <version> --channel <name>` prints the post exactly as it goes out. Versions posted earlier keep
+their records: 1.0.0 (no changelog) and 1.0.1 (changelog attached) both pin from their record with `pin`,
+and a new post never matches an older code's unfinished attached post, so it is refused rather than resent. There is no way to
 name anyone else. It logs in over REST only, so the running Fri's gateway session is untouched, and
 sends with mentions and link embeds off. Notes are split at blank lines into at most four messages of
 2000 characters, counted the way Discord counts them (UTF-16 units, so most emoji count 2).
