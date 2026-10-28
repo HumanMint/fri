@@ -14,6 +14,8 @@ BURST_SECONDS = 5
 MAX_MESSAGES = 5
 MAX_TEXT = 4000
 REPLY_SECONDS = 7 * 86400
+STARTER_SECONDS = 6 * 3600  # How long a thread opened on a post is about that post (see thread_starter).
+MAX_STARTERS = 1000  # Threads whose start is remembered (see opened_on).
 PERSISTENT_MODEL_WRITES = frozenset({'work_save', 'prepare_post', 'preview_voice', 'reminder_prepare', 'plan_prepare'})
 
 
@@ -247,6 +249,7 @@ async def reply_target(agent, message, posts=None, gone=None):
         if not message.guild or await readable(agent, message, channel):
             rows += await target_row(agent, channel, reference.message_id,
                                      str(message.guild.id) if message.guild else None, posts, gone)
+    rows += await thread_starter(agent, message, posts, gone)
     home = message.guild.id if message.guild else agent.fri.guild_id
     for guild_id, channel_id, message_id in links(message):
         if message_id == message.id or any(row['source']['id'] == str(message_id) for row in rows):
@@ -266,6 +269,53 @@ async def reply_target(agent, message, posts=None, gone=None):
             continue
         rows += [{**row, 'linked': True} for row in await target_row(agent, linked, message_id, str(home), posts, gone)]
     return rows
+
+
+async def thread_starter(agent, message, posts=None, gone=None):
+    """In a new public thread opened on a post, that post, as a reply target marked thread_starter: what "thoughts?"
+    in the thread is about. Read and rechecked like any target, from the parent channel, whose audience a public
+    thread shares. Only while the thread is new, judged by when the message came: later turns are about the
+    thread's own talk, and a target keeps a turn's notes, drafts and posts out (see private_evidence)."""
+    import datetime as dt
+
+    import discord
+
+    thread = message.channel
+    if message.guild is None or not isinstance(thread, discord.Thread) or thread.is_private():
+        return []
+    began = thread.created_at if isinstance(thread.created_at, dt.datetime) else discord.utils.snowflake_time(thread.id)
+    if not 0 <= (discord.utils.snowflake_time(message.id)-began).total_seconds() <= STARTER_SECONDS:
+        return []
+    found = await opened_on(agent, thread)
+    if found is None or not await readable(agent, message, found[0]):
+        return []
+    return [{**row, 'thread_starter': True}
+            for row in await target_row(agent, found[0], found[1], str(message.guild.id), posts, gone)]
+
+
+async def opened_on(agent, thread):
+    """The post a thread was opened on, as (parent channel, message ID), or None. The thread's first message is
+    then Discord's starter notice (type 21), naming that post in the thread's own parent. A forum post's first
+    message is the post itself, in the thread, so it has none. Read once per thread: how it began never changes."""
+    import discord
+
+    starters = agent.thread_starters
+    if thread.id not in starters:
+        try:
+            first = [item async for item in thread.history(limit=1, oldest_first=True)]
+        except discord.HTTPException:
+            return None  # Not known yet: read again next time.
+        reference = getattr(first[0], 'reference', None) if first else None
+        starters[thread.id] = (reference.message_id if first and
+            getattr(first[0], 'type', None) == discord.MessageType.thread_starter_message and
+            isinstance(getattr(reference, 'message_id', None), int) and
+            getattr(reference, 'channel_id', None) == thread.parent_id else None)
+        while len(starters) > MAX_STARTERS:
+            del starters[next(iter(starters))]
+    parent = agent.fri.get_channel(thread.parent_id) if starters[thread.id] else None
+    if parent is None or not callable(getattr(parent, 'fetch_message', None)):
+        return None
+    return parent, starters[thread.id]
 
 
 def in_scope(agent, channel):

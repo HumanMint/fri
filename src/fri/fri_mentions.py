@@ -11,7 +11,7 @@ from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import AuthorErased, ControllerUnavailable
-from .fri_images import details, lookable, stills
+from .fri_images import details, lookable, started_a_thread, stills
 from .fri_meme_media import gif_previews, sources, unsigned
 from .fri_memes import reacted
 from .privacy import clean
@@ -401,7 +401,7 @@ class Invitation:
         accepted = []
         for mid, item in candidates.items():
             age = (event.id-item.id)/(1 << 22)/1000
-            if (item.id != mid or item.author.bot or item.webhook_id or
+            if (item.id != mid or item.author.bot or item.webhook_id or started_a_thread(item) or
                     item.channel.id != event.channel.id or not item.guild or item.guild.id != event.guild.id or
                     not 0 < age <= (REFERENCE_SECONDS if mid == reference_id else NEARBY_SECONDS)):
                 continue

@@ -41,6 +41,12 @@ def media(message):
     return kinds[:10]
 
 
+def started_a_thread(message):
+    """Discord's "started a thread" notice in the parent channel. Its text is the thread's name, not something
+    the member who opened it said."""
+    return getattr(message, 'type', None) == discord.MessageType.thread_created
+
+
 def details(message):
     """What a reader sees around a post's text: what it carries, its link cards, its reactions, the post it
     answers, whether it's pinned.
@@ -57,8 +63,10 @@ def details(message):
                               for r in reactions[:6] if isinstance(getattr(r, 'count', None), int)]
     reference = getattr(message, 'reference', None)
     channel = getattr(message, 'channel', None)
+    # A forward's reference names the post it copies, not one it answers.
     if (isinstance(getattr(reference, 'message_id', None), int) and channel is not None and
-            getattr(reference, 'channel_id', None) == channel.id):
+            getattr(reference, 'channel_id', None) == channel.id and
+            getattr(reference, 'type', None) != discord.MessageReferenceType.forward):
         guild = getattr(getattr(message, 'guild', None), 'id', None)
         extra['reply_to'] = f'https://discord.com/channels/{guild or "@me"}/{channel.id}/{reference.message_id}'
     if getattr(message, 'pinned', None) is True:

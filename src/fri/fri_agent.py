@@ -176,6 +176,7 @@ class Agent:
         self.attending = set()  # Attention's Discord work still going after attention moved on (see bounded).
         self.ambient_replies = {}  # channel: its ambient reply still going after attention moved on.
         self.members = {}
+        self.thread_starters = {}  # Thread ID -> the post it was opened on, or None (see fri_conversation.opened_on).
         self.gene_id = int(os.getenv('GENE_BOT_ID', '0'))
         self.dedicated = int(os.getenv('FRI_CHAT_CHANNEL_ID', '0'))
         self.slots = asyncio.Semaphore(1)

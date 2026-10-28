@@ -15,7 +15,7 @@ from .fri_conversation import PERSISTENT_MODEL_WRITES
 from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
-from .fri_images import details, image_context, look, lookable, media
+from .fri_images import details, image_context, look, lookable, media, started_a_thread
 from .fri_memes import carried, reacted
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
@@ -473,7 +473,8 @@ class Actions:
         stale = []  # Notes on posts edited, or by members whose privacy changed, since Fri reacted.
         async for message in (channel.pins(limit=PINS) if pins else channel.history(**options)):
             scanned, newest = scanned+1, max(newest, message.id)
-            if message.author.bot or message.webhook_id or (floor and message.created_at.timestamp() < floor):
+            if (message.author.bot or message.webhook_id or started_a_thread(message) or
+                    (floor and message.created_at.timestamp() < floor)):
                 continue
             user = message.author.id
             if catch_up and user == self.user:
