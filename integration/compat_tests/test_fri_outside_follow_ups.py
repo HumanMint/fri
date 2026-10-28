@@ -12,12 +12,13 @@ from unittest.mock import AsyncMock, patch
 import discord
 import pytest
 
+from compat_tests.test_fri_looking import loads
 from compat_tests.test_fri_mentions import environment
 from fri.fri import UNAVAILABLE, Fri
 from fri.fri_agent import Agent
 from fri.fri_chat import ChatResult
 from fri.fri_errors import ControllerRejected
-from fri.fri_mentions import CONTEXT_CHANGED
+from fri.fri_mentions import CONTEXT_CHANGED, Invitation
 
 OLD = 'the cat one is mine btw'
 ANSWER = 'kev’s, the cat one. the other one is mid'
@@ -536,6 +537,79 @@ def test_an_answers_fifteen_minutes_start_when_it_goes_out(monkeypatch, tmp_path
             w.clock[0] = 15*60-1
             assert w.agent.receipts.get(answer.id) is not None
             w.clock[0] = 15*60+1  # Fifteen minutes from delivery, not from the save.
+            assert w.agent.receipts.get(answer.id) is None
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+# With fri #150 (link cards): a card's picture an answer may have described is part of what its receipt names.
+
+PICTURE = 'https://images-ext-1.discordapp.net/external/abc/https/site.test/card.png'
+
+
+def carded(w, *, age=7*3600):
+    """A member's post whose link card has a picture Fri can look at (see fri_images.stills)."""
+    post = w.message('https://site.test/page', user=30, age=age)
+    post.embeds = [discord.Embed.from_dict({'type': 'article', 'url': 'https://site.test/page', 'title': 'A page',
+        'image': {'url': 'https://site.test/card.png', 'proxy_url': PICTURE, 'width': 100, 'height': 100}})]
+    return post
+
+
+@pytest.mark.parametrize('change', ['suppressed', 'swapped'])
+def test_a_card_picture_the_answer_looked_at_suppressed_since_ends_its_receipt(monkeypatch, tmp_path, change):
+    """fri #150 r3 review (with #155): suppressing a card changes no text or edit time, so the receipt names
+    its picture too; a follow-up then reads as before, never Fri's caption of what's gone."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        loads(monkeypatch)
+        try:
+            post = carded(w)
+            ping = reply_to(w.message('<@99> what is in that picture', user=20, age=120), post)
+            _, answer = await handled(w, ping, 'CAPTION', age=110)
+            assert w.agent.receipts.get(answer.id) is not None
+            assert post.id in w.agent.receipts.get(answer.id)['sources']
+            later = copy.copy(w.rows[post.id])
+            later.embeds = [] if change == 'suppressed' else [discord.Embed.from_dict({
+                'type': 'article', 'url': 'https://site.test/page', 'title': 'A page', 'image': {
+                    'url': 'https://site.test/other.png', 'proxy_url': PICTURE.replace('card', 'other'),
+                    'width': 100, 'height': 100}})]
+            w.rows[post.id] = later
+            context, _ = await handled(w, follow_up(w, answer), AGAIN)
+            assert not own(context) and 'CAPTION' not in json.dumps(context['invited_context'])
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_unchanged_card_keeps_the_follow_up_reading_the_answer(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        loads(monkeypatch)
+        try:
+            post = carded(w)
+            ping = reply_to(w.message('<@99> what is in that picture', user=20, age=120), post)
+            _, answer = await handled(w, ping, 'CAPTION', age=110)
+            context, _ = await handled(w, follow_up(w, answer), AGAIN)
+            assert [row['text'] for row in own(context)] == ['CAPTION']
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_answer_that_saw_a_picture_on_a_post_no_receipt_names_keeps_none(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            old = w.message(OLD, user=30, age=7*3600)
+            ping = reply_to(w.message('<@99> which one is better', user=20, age=120), old)
+            original = Invitation.answered
+
+            def answered(self, sent):  # As if the turn had looked at a linked post's card elsewhere.
+                self.pictures[424242] = (carded(w), [PICTURE])
+                return original(self, sent)
+            monkeypatch.setattr(Invitation, 'answered', answered)
+            _, answer = await handled(w, ping, ANSWER, age=110)
             assert w.agent.receipts.get(answer.id) is None
         finally:
             await w.fri.close()

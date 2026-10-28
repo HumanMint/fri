@@ -59,8 +59,12 @@ def digest(read):
 
 
 def version(message, kind):
-    """Fri's own post by its fingerprint (Fri suppresses its embeds), a member's by its snapshot (see current)."""
-    return digest(fingerprint(message) if kind == 'fri' else snapshot(message))
+    """Fri's own post by its fingerprint (Fri suppresses its embeds). A member's by its snapshot (see current) and
+    the link card pictures look() can see on it (see fri_images.stills): suppressing a card changes no text or
+    edit time, and an answer may have described its picture."""
+    if kind == 'fri':
+        return digest(fingerprint(message))
+    return digest((snapshot(message), tuple(unsigned(stills(message)[0]) or ())))
 
 
 class Receipts:
@@ -494,10 +498,12 @@ class Invitation:
                 return
             if self.image is not None and self.image.id != self.event.id and self.image.id not in self.events:
                 return  # A post it looked at that no receipt would name.
+            if any(mid != self.event.id and mid not in self.events for mid in self.pictures):
+                return  # Nor one whose pictures it showed the model (a linked post, say).
             inherited = self.inherited or {'sources': {}, 'authors': {}, 'until': float('inf')}
             sources = {**inherited['sources'], **{mid: (kind, before) for mid, (_, kind, before) in self.carried.items()}}
             reads = [(self.event.id, ('post', version(self.latest, 'post'))),
-                     *((mid, ('post', digest(self.snapshots[mid]))) for mid in self.events)]
+                     *((mid, ('post', version(self.events[mid], 'post'))) for mid in self.events)]
             for mid, entry in reads:
                 if sources.setdefault(mid, entry) != entry:
                     return  # Two reads of one post that differ: it changed while Fri read it.
