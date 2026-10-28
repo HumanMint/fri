@@ -75,3 +75,10 @@ def test_the_author_fence_is_offered_and_optional():
     # Attention uses it when offered (fri #84); a controller without it still runs Fri, on the old reads.
     assert 'author-fence' in contract()['capabilities'] and 'author-fence' not in CAPABILITIES
     assert compatible({**contract(), 'capabilities': [c for c in contract()['capabilities'] if c != 'author-fence']})
+
+
+def test_turn_withdrawal_is_offered_and_optional():
+    # Fri asks the controller to drop a withdrawn message's saved exchange when offered (fri #129); an older one
+    # still runs Fri, which then asks nothing.
+    assert 'turn-withdrawal' in contract()['capabilities'] and 'turn-withdrawal' not in CAPABILITIES
+    assert compatible({**contract(), 'capabilities': [c for c in contract()['capabilities'] if c != 'turn-withdrawal']})

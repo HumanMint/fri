@@ -17,6 +17,16 @@ from .subscription import private_json
 KINDS = {'work_list', 'work_read', 'work_save', 'channel_capabilities', 'prepare_post'}
 POST_ID = re.compile(r'^fri:post:(?P<post_id>[a-f0-9]{32}):(?P<decision>send|cancel)$')
 NO_MENTIONS = discord.AllowedMentions.none()
+CHANGED = 'Your original request changed. Send a fresh message.'
+
+
+def taken_back(actions):
+    """The turn's own messages, deleted, or edited since they came in, by fri #126's rule. Checked last before
+    a write, after its waits: the request's fetch came before them, and an edit during one may take it back."""
+    agent = actions.agent
+    own = [actions.event.id, *(row['source']['id'] for row in actions.conversation.get('message_burst', []))]
+    since = agent.arrival(own)
+    return any(int(i) in agent.unsent or agent.taken_back(i, since) for i in own)
 
 
 async def capabilities(fri, target_id=''):
@@ -76,7 +86,7 @@ async def execute(actions, action):
         return {'blocked': 'That capability is unavailable in this conversation.'}
     original = await actions.event.channel.fetch_message(actions.event.id)
     if (original.author.id != actions.user or original.webhook_id or original.content != actions.event.content):
-        return {'blocked': 'Your original request changed. Send a fresh message.'}
+        return {'blocked': CHANGED}
     current = await fri.api('POST', '/chat/context', actions.scope)
     if current['revision'] != actions.revision or not current['personal_memory']['enabled']:
         return {'blocked': 'Saved work is unavailable while memory is off or changing.'}
@@ -93,6 +103,8 @@ async def execute(actions, action):
     if kind == 'work_save':
         if not re.search(r'\b(save|keep|hold|draft|store|remember|update|edit|change|mark|cancel|complete|post|send)\b', actions.message, re.I):
             return {'blocked': 'Ask explicitly to save or update this work first.'}
+        if taken_back(actions):
+            return {'blocked': CHANGED}
         return {'kind': kind, **await fri.api('POST', '/workspace/save',
             {**payload, **{k: v for k, v in action.items() if k != 'kind'}, 'request_text': actions.event.content})}
     if not re.search(r'\b(post|send|publish|introduce|share)\b', actions.message, re.I):
@@ -100,6 +112,8 @@ async def execute(actions, action):
     targets = await capabilities(fri, action['channel_id'])
     if not targets.get(action['channel_id'], {}).get('one_off_post'):
         return {'blocked': 'You and Fri both need permission to post in that server channel.'}
+    if taken_back(actions):
+        return {'blocked': CHANGED}
     post = await fri.api('POST', '/workspace/posts/prepare', {**payload, 'work_id': action['work_id'],
         'version': action['version'], 'target_id': action['channel_id']})
     return {'kind': kind, 'post_preview': post}

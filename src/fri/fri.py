@@ -427,9 +427,12 @@ class Fri(discord.Client):
                     context, fence['turn']['user_id'], fence['actions'])})
             # A message its author edited or deleted since the live view was copied: its old words stay out.
             # A row read again after that, as an edited message answered again is, holds what it says now.
+            # So does one the live view no longer holds as copied: pushed out by newer lines while the turn
+            # waited, an edit or delete of it marks nothing, and the copy keeps what it said before (fri #141).
             if self.agent and context.get('recent'):
-                context['recent'] = [row for row in context['recent']
-                                     if not self.agent.taken_back(row.get('id'), row.get('at', 0))]
+                where = ((fence or {}).get('turn') or {}).get('conversation_id', '')
+                live = self.agent.versions(int(where[7:]) if where.startswith('public:') and where[7:].isdigit() else None)
+                context['recent'] = [row for row in context['recent'] if self.agent.current(row, live)]
             # One this turn quotes or replies to refuses it instead: the answer would be about words taken back,
             # which saved turns may still hold. So does one the turn itself answers, its own message or one of
             # its burst, if taken back since it came in (see Agent.rerun).
@@ -995,11 +998,16 @@ class Fri(discord.Client):
         if payload.get('audience') == 'server' and not server_wide(
                 self.get_channel(int(payload['conversation_id'].split(':', 1)[1]))):
             payload = {**payload, 'audience': 'conversation'}  # Closed while Fri replied: it stays where it was said.
+        began = time.time(), time.monotonic()
         try:
             saved = await self.api('POST', '/chat/turn', payload)
         except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError) as exc:
             LOG.warning('Delivered turn was not recorded: %s', type(exc).__name__)  # Includes privacy changes mid-reply.
+            if isinstance(exc, (TimeoutError, ControllerUnavailable)) and self.agent:  # A lost reply, not a refusal:
+                self.agent.saved_turns.kept(payload, None, began)  # it may have landed all the same.
             return None
+        if self.agent:  # So its messages taken back later take it with them (fri #129).
+            self.agent.saved_turns.kept(payload, saved, began)
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
             notice = self.first_memory(saved)
             content = (sent.content or '')+notice
