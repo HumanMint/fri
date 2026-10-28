@@ -52,21 +52,25 @@ Then, in `gene/` (Gene's README has the details):
 ```sh
 cd gene
 uv sync --frozen
-uv run python scripts/dev.py init     # writes gene/.env.local with fresh service tokens
+uv run python scripts/dev.py init     # writes gene/.env.local from Gene's template
 ```
+
+`init` lists Gene's four service tokens. Run `uv run python scripts/dev.py token` once for each and paste
+what it prints after that token's `=` in `gene/.env.local`. Gene's script never writes a token itself.
 
 Put the server, owner and channel IDs from step 1 into `gene/.env.local` as `GENE_GUILD_ID`,
 `GENE_OWNER_ID` and `GENE_WORKSHOP_CHANNEL_ID`, then:
 
 ```sh
 uv run python scripts/dev.py check
-uv run python scripts/dev.py fri-env ../fri/.env.local   # the controller's share of Fri's settings
-uv run python scripts/dev.py controller                  # leave this running
+uv run python scripts/dev.py fri-env      # prints the controller's share of Fri's settings
+uv run python scripts/dev.py controller   # leave this running
 ```
 
-`fri-env` writes the values Fri and the controller must share (the Fri service token, the three IDs
-and the controller's address) into Fri's git-ignored `.env.local`, without printing the token. The
-controller listens on `http://127.0.0.1:8787` and keeps its SQLite database in `gene/.state/`.
+`fri-env` prints the lines Fri and the controller must share (the three IDs and the controller's
+address) for Fri's git-ignored `.env.local`, which `setup` creates in step 3. It never prints the
+token: copy `GENE_FRI_TOKEN` from `gene/.env.local` yourself. The controller listens on
+`http://127.0.0.1:8787` and keeps its SQLite database in `gene/.state/`.
 
 ## 3. Set up Fri
 
@@ -79,8 +83,9 @@ scripts/local.sh setup
 
 `setup` checks for `git` and `uv`, runs `uv sync --frozen`, creates the private `.state/fri-data` and
 `.secrets` directories, then writes `.env.local` from [`.env.example`](../.env.example) with local
-paths (mode `0600`). If `fri-env` already wrote some values, it keeps them and only adds the missing
-settings. It ends with a check that lists what's still missing; it never prints a value:
+paths (mode `0600`). An existing `.env.local` keeps every value it has; only missing settings are
+added, so paste the lines from `fri-env` before or after, as you like. It ends with a check that
+lists what's still missing; it never prints a value:
 
 ```text
 error  DISCORD_TOKEN             missing: Fri's bot token: Discord Developer Portal > your application > Bot > Reset Token
@@ -96,8 +101,8 @@ Open `.env.local` in an editor and fill in the rest:
 | --- | --- |
 | `DISCORD_TOKEN` | Fri's bot token from step 1. |
 | `FRI_APPLICATION_ID` | Optional: the application ID, so `check` prints an invite link. |
-| `GENE_FRI_TOKEN` | Written by `fri-env`. By hand: the controller's `GENE_FRI_TOKEN`, at least 32 characters. |
-| `GENE_GUILD_ID`, `GENE_OWNER_ID`, `GENE_WORKSHOP_CHANNEL_ID` | Written by `fri-env`. They must equal the controller's values. |
+| `GENE_FRI_TOKEN` | Copy the controller's `GENE_FRI_TOKEN` from `gene/.env.local`, at least 32 characters. |
+| `GENE_GUILD_ID`, `GENE_OWNER_ID`, `GENE_WORKSHOP_CHANNEL_ID` | Printed by `fri-env`. They must equal the controller's values. |
 | `GENE_CONTROLLER_URL` | `http://127.0.0.1:8787` for the local controller. |
 | `FRI_PRESENCE` | `invisible` (the default) or `online`. |
 | `FRI_DATA`, `FRI_CHATGPT_AUTH` | Already set to `.state/fri-data` and `.secrets/fri-chatgpt.json`. |
@@ -187,7 +192,7 @@ env). Elsewhere in the server, an @mention gets a single reply in a channel Fri 
 | You see | Do this |
 | --- | --- |
 | `no controller answered at http://127.0.0.1:8787` | Start the controller (step 2) or fix `GENE_CONTROLLER_URL`. |
-| `the controller refused GENE_FRI_TOKEN` | Run `fri-env` again, or copy the controller's `GENE_FRI_TOKEN` exactly. |
+| `the controller refused GENE_FRI_TOKEN` | Copy the controller's `GENE_FRI_TOKEN` from `gene/.env.local` again, exactly. |
 | `discord.errors.LoginFailure: Improper token has been passed.` | `DISCORD_TOKEN` is wrong or was reset; copy a fresh one from **Bot > Reset Token**. |
 | `PrivilegedIntentsRequired` | Turn on **Message Content Intent** for Fri's bot (step 1). |
 | `another fri process already owns this data directory` | A Fri is already running on this `FRI_DATA`; stop it first. |

@@ -6,7 +6,7 @@
 #                                         # --controller also reads the controller's /fri/contract
 #   scripts/local.sh run                  # check, then start Fri with .env.local
 #
-# setup keeps any values already in .env.local, such as the ones Gene's `scripts/dev.py fri-env` writes,
+# setup keeps any values already in .env.local, such as the lines Gene's `scripts/dev.py fri-env` prints,
 # and adds only missing settings. .env.local, .state/ and .secrets/ are git-ignored.
 # Bash 3.2 compatible (macOS /bin/bash).
 set -euo pipefail
@@ -38,8 +38,8 @@ setup() {
   cat <<'NEXT'
 
 Next (docs/quickstart.md has the details):
-  1. Fill in the values marked "missing" in .env.local; Gene's `scripts/dev.py fri-env` writes the
-     controller's share of them.
+  1. Fill in the values marked "missing" in .env.local; Gene's `scripts/dev.py fri-env` prints the
+     controller's share of them, and GENE_FRI_TOKEN comes from Gene's .env.local.
   2. Connect Fri's model access: uv run --no-sync python scripts/connect_chatgpt.py
   3. Start the Gene controller, then: scripts/local.sh check --controller
   4. Start Fri: scripts/local.sh run

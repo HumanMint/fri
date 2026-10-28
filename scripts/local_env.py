@@ -86,7 +86,7 @@ def setting(line):
 
 def init(env_file=ENV_FILE, example=EXAMPLE):
     """Write the local env file from the example, with local paths. An existing file keeps every value it has
-    (Gene's `scripts/dev.py fri-env` may have written the controller's); only missing settings are added."""
+    (pasted from Gene's `scripts/dev.py fri-env`, say); only missing settings are added."""
     template = [f'{key}={LOCAL_DEFAULTS[key]}' if (key := setting(line)) in LOCAL_DEFAULTS else line
                 for line in example.read_text().splitlines()]
     if not env_file.exists():
