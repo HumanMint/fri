@@ -8,7 +8,9 @@ from urllib.parse import urlsplit
 import httpx
 
 MAX_BYTES = 4 * 1024 * 1024
+MAX_PIXELS = 20_000_000  # An attachment's limit, and a link card picture's.
 MIMES = {'image/png', 'image/jpeg', 'image/webp'}
+LINK_CARDS = ('rich', 'article', 'link', 'video', 'image')  # Discord's unfurls of a link, besides a GIF link's.
 
 
 def gif_previews(message):
@@ -16,6 +18,29 @@ def gif_previews(message):
     embeds = getattr(message, 'embeds', None)
     return [str(e.thumbnail.proxy_url) for e in embeds if e.type == 'gifv' and getattr(e.thumbnail, 'proxy_url', None)] \
         if isinstance(embeds, (list, tuple)) else []
+
+
+def link_previews(message):
+    """The still Discord's own proxy made of each link card's picture, from the first two cards: a video's
+    thumbnail, an X or Reddit card's image, a pasted image link. It's what every member sees on the card, never
+    the page or the clip. None when one can't be shown whole: no proxy copy of it (never fetched from the site
+    itself), or bigger than an attachment may be. A GIF link's preview isn't one (see gif_previews), and a
+    spoilered post shows none."""
+    embeds = getattr(message, 'embeds', None)
+    if not isinstance(embeds, (list, tuple)) or '||' in str(getattr(message, 'content', '') or ''):
+        return []
+    result = []
+    for embed in [e for e in embeds if getattr(e, 'type', None) in LINK_CARDS][:2]:
+        picture = next((part for part in (getattr(embed, 'image', None), getattr(embed, 'thumbnail', None))
+                        if getattr(part, 'proxy_url', None) or getattr(part, 'url', None)), None)
+        if picture is None:
+            continue  # A card without a picture: its text is all there is.
+        url, width, height = (getattr(picture, key, None) for key in ('proxy_url', 'width', 'height'))
+        if (not url or not urlsplit(str(url)).path.startswith('/external/') or
+                (isinstance(width, int) and isinstance(height, int) and width * height > MAX_PIXELS)):
+            return None
+        result.append(str(url))
+    return result
 
 
 def sources(message, most=2, *, gifs=False):

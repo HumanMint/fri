@@ -10,7 +10,7 @@ from . import feedback as commands
 from .fri_addressing import explicit_mention
 from .fri_context import discord_source, source_identity
 from .fri_errors import AuthorErased, ControllerUnavailable
-from .fri_images import details
+from .fri_images import details, lookable
 from .fri_meme_media import gif_previews, sources, unsigned
 from .fri_memes import reacted
 from .privacy import clean
@@ -303,8 +303,9 @@ class Invitation:
         elif referenced and referenced.attachments:
             self.image = referenced
         # Without one image the ping points at, "which of these" needs all of them; look() keeps the newest that fit.
-        self.images = [] if self.image else [m for m in self.events.values() if m.attachments or gif_previews(m)]
-        # Contextual images use attachments, or a GIF link's Discord-made preview. Never other embeds or URLs.
+        self.images = [] if self.image else [m for m in self.events.values() if lookable(m)]
+        # Contextual images use attachments, a GIF link's Discord-made preview or a link card's picture (see
+        # fri_images.stills). Never a page a link points at.
         if self.image and sources(self.image) != [str(a.url) for a in self.image.attachments]:
             self.image = None
         await self.require_current()

@@ -15,7 +15,7 @@ from .fri_conversation import PERSISTENT_MODEL_WRITES
 from .fri_errors import ControllerRejected, ControllerUnavailable
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
-from .fri_images import details, image_context, look, media
+from .fri_images import details, image_context, look, lookable, media
 from .fri_memes import carried, reacted
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
@@ -510,7 +510,7 @@ class Actions:
             records.append({'source': message.jump_url, 'user_id': user, 'name': clean(message.author.display_name, 60),
                             'at': message.created_at.isoformat(), 'text': clean(message.content, 500), **details(message),
                             **reacted(notes, message, profile, stale)})
-            if carries:
+            if carries or lookable(message):  # A link card's picture can come without a kind (an article's).
                 posts.append(message)
         if stale:
             self.agent.ensure_memes().drop(stale)

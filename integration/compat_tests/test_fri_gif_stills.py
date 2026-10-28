@@ -84,21 +84,23 @@ def tenor(post, *, preview=PREVIEW, kind='gifv'):
     return item
 
 
-def test_a_read_looks_at_a_tenor_gif_but_not_a_link_preview(monkeypatch, tmp_path):
+def test_a_read_looks_at_a_tenor_gif_and_labels_a_link_cards_picture_apart(monkeypatch, tmp_path):
     async def scenario():
         fri, agent, channel, rows, post = read_harness(monkeypatch, tmp_path)
         dance = tenor(post)
-        tenor(post, preview='https://images-ext-1.discordapp.net/external/abc/news.png', kind='article')
+        news = tenor(post, preview='https://images-ext-1.discordapp.net/external/abc/news.png', kind='article')
         loader = loads(monkeypatch)
         actions = Actions(agent, 20, 999, False)
         actions.turn_context, actions.media_allowed = {}, True
         actions.event = SimpleNamespace(id=1, channel=SimpleNamespace(id=999))
         try:
             receipt = await actions.execute({'kind': 'read_recent', 'channel_id': '1', 'window': 'recent'})
-            # The gif link's preview is looked at; an article's preview never is.
-            assert receipt['images_inspected'] == 1 and receipt['images_not_inspected'] == 1
-            assert [call.args[0] for call in loader.await_args_list] == [PREVIEW]
-            row = actions.turn_context['inspected_images'][0]
+            # The gif link's preview is looked at, and since N2's 2a, so is an article card's picture, as one.
+            assert receipt['images_inspected'] == 2 and receipt['images_not_inspected'] == 0
+            assert sorted(call.args[0] for call in loader.await_args_list) == sorted(
+                [PREVIEW, 'https://images-ext-1.discordapp.net/external/abc/news.png'])
+            card, row = actions.turn_context['inspected_images']  # Newest first.
+            assert card['source']['id'] == str(news.id) and card['still'] == 'link preview'
             assert row['source']['id'] == str(dance.id) and row['still'] == 'gif preview'
             assert await looked_unchanged(actions.turn_context)
             dance.embeds = [SimpleNamespace(type='gifv', video=SimpleNamespace(url='y.mp4'), image=None,
