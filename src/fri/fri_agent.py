@@ -47,6 +47,14 @@ LOG = logging.getLogger('fri.agent')
 NO_MENTIONS = discord.AllowedMentions.none()
 GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
 REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long, and how many, delivered IDs are remembered.
+MAX_REANSWERS = 1  # Times one message is answered again after its edit; a further edit gets the notice.
+
+
+def gene_command(text):
+    """A Red command for Gene: its prefix, then a command name. Red runs those and answers itself."""
+    prefix = os.getenv('GENE_PREFIX') or '!'
+    text = (text or '').lstrip()
+    return text.startswith(prefix) and text[len(prefix):len(prefix)+1].isalpha()
 DEFERRED = object()  # The burst holding this message answers, or explains, for it.
 BUSY = object()  # A panel or ambient reply to the member started first; wait for it.
 QUEUE_SECONDS = 240  # How long after it was sent a message may wait behind an earlier reply.
@@ -150,6 +158,14 @@ class Agent:
         self.seen = {}
         self.withdrawn = {}  # Message IDs edited or deleted while handled, newest last (see withdraw).
         self.revised = {}  # Message ID -> when a member edited it after a model request carried it (see edit).
+        self.arrived = {}  # Discord message ID -> time.time() as handle() took it (see taken_back).
+        self.edits = {}  # Discord message ID -> its edited_at as handle() took it, if edited by then (see rerun).
+        self.reanswer = {}  # Message ID -> channel: refused for its own edit, answered again once handled.
+        self.reanswered = {}  # Message ID -> times it was answered again, oldest first (see reply_once).
+        self.acted = {}  # Discord message ID -> when a turn for it ran a tool that may change something.
+        self.reruns = set()  # Those answers again still going (see answer_edits).
+        self.rerunning = {}  # Message ID -> the newest edited_at seen while it waits to be answered again.
+        self.edit_seen = {}  # Message ID -> the newest edited_at seen while it was handled (see saw_edit).
         self.last_attention = {}
         self.last_spoke = {}
         self.acknowledged = {}
@@ -369,13 +385,15 @@ class Agent:
         said, and in-flight bursts and reply fences keep comparing against what arrived. A member's message
         still being handled is withdrawn instead: what handles it holds what it said before, maybe with no
         row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once).
-        One a model request carried, handled or not, is marked revised: a turn still running may hold what it
-        said before, so its reply, reaction or save stops (see reply_once), while a later read gets the edit."""
+        One a model request carried is also marked revised, for the other turns that carried it: one still
+        running may hold what it said before, so its reply, reaction or save stops (see reply_once), while a
+        later read gets the edit. A turn's own messages go by withdrawn and arrived instead (see taken_back)."""
         edited = (getattr(message, 'edited_at', None) is not None and
                   not getattr(getattr(message, 'author', None), 'bot', True))  # Not an embed or pin update.
         if edited and message.id in self.looked:
             self.revise(message.id)
-        if self.handling[message.id] and edited:
+        if (self.handling[message.id] or message.id in self.rerunning) and edited:
+            self.saw_edit(message.id, message.edited_at)
             return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
         rows = self.recent.get(channel)
         author = getattr(getattr(message, 'author', None), 'id', None)
@@ -681,8 +699,9 @@ class Agent:
             except discord.HTTPException:  # Unconfirmed: the notice waits, the row stays.
                 changed = changed or event is not message
                 continue
-            if (current is None or getattr(current, 'edited_at', None) is not None or
+            if (current is None or getattr(current, 'edited_at', None) != self.edits.get(event.id) or
                     (event is not message and current.content != arrived)):
+                self.saw_edit(event.id, getattr(current, 'edited_at', None))
                 self.withdraw(event)
                 changed = changed or event is not message
                 continue
@@ -866,8 +885,9 @@ class Agent:
             except discord.HTTPException:  # Unconfirmed, so unanswered but not withdrawn.
                 unchanged = False
                 continue
-            if getattr(current, 'edited_at', None) is not None or current.content != event.content:
-                self.withdraw(event)  # Edited since it was sent, maybe to take it back.
+            if getattr(current, 'edited_at', None) != self.edits.get(event.id) or current.content != event.content:
+                self.saw_edit(event.id, getattr(current, 'edited_at', None))
+                self.withdraw(event)  # Edited since Fri got it, maybe to take it back.
                 unchanged = False
         return unchanged
 
@@ -883,6 +903,77 @@ class Agent:
         # Kept an hour, longer than any turn that could still hold a copy runs; the cap only bounds memory.
         while self.withdrawn and (next(iter(self.withdrawn.values())) < now-3600 or len(self.withdrawn) > 100000):
             del self.withdrawn[next(iter(self.withdrawn))]
+
+    def taken_back(self, i, since):
+        """Whether message `i` was edited or deleted at or after `since`, the time.time() its words were read.
+        Its words read again after that are what it says now: a turn answering it again as edited (see rerun)."""
+        at = self.withdrawn.get(str(i))
+        return at is not None and at >= since
+
+    def arrival(self, ids):
+        """When the earliest of these messages was taken in (time.time()); 0 if any wasn't, so every mark counts."""
+        times = [self.arrived.get(int(i)) if str(i).isdigit() else None for i in ids]
+        return 0 if not times or None in times else min(times)
+
+    def act(self, i):
+        """A turn for message `i` ran a tool that may change something, so it isn't answered again after an edit."""
+        now = time.time()
+        self.acted.pop(i, None)
+        self.acted[i] = now
+        while self.acted and next(iter(self.acted.values())) < now-REDELIVERY_SECONDS:
+            del self.acted[next(iter(self.acted))]
+
+    def answer_edits(self):
+        """Answer, once more and as they read now, the messages whose turns their own edit refused, once
+        nothing is handling them any more (see reply_once)."""
+        for i in [i for i in self.reanswer if not self.handling[i]]:
+            self.rerunning[i] = self.edit_seen.get(i)  # From now, an edit to it is marked as if handled (see edit).
+            task = asyncio.get_running_loop().create_task(self.rerun(self.reanswer.pop(i), i))
+            self.reruns.add(task)
+            task.add_done_callback(self.reruns.discard)
+
+    async def rerun(self, channel_id, message_id):
+        """A message edited while Fri answered it, fetched again and handled as if it just came in, so every
+        gate runs on what it says now: an edit that drops Fri's name or takes it back gets nothing. The fetch
+        counts only if no edit came during it and it shows the newest edit seen (Discord's copy can lag the
+        edit event); it's tried a few times, then dropped. It's then taken in as of when that fetch began, so
+        an edit after is withdrawn like any other, and alone, so it never joins a burst sent after it."""
+        try:
+            for _ in range(3):
+                began = time.time()
+                try:
+                    message = await self.fri.get_channel(channel_id).fetch_message(message_id)
+                except (AttributeError, discord.HTTPException):
+                    return  # Deleted meanwhile, or the channel's gone: nothing left to answer.
+                newest = self.rerunning.get(message_id)
+                if not self.taken_back(message_id, began) and (
+                        newest is None or (message.edited_at is not None and message.edited_at >= newest)):
+                    break
+            else:
+                return  # Still changing, or Discord's copy lags: they can ask again.
+            if self.memory_control(message):
+                return  # Not a privacy control: it was refused for the edit (see Fri.chat_once), and they send it again.
+            self.delivered.pop(message.id, None)
+            self.watched.pop(message.id, None)
+            await self.handle(message, read=began)
+        except Exception:
+            LOG.exception('Answering an edited message again failed')
+        finally:
+            self.rerunning.pop(message_id, None)
+            self.edit_seen.pop(message_id, None)
+
+    def saw_edit(self, i, edited):
+        """The newest edit seen, by its event or a check's fetch, of a message being handled or answered again:
+        answering it again waits until Discord's copy shows that edit (see rerun)."""
+        if not isinstance(edited, dt.datetime):
+            return
+        if self.edit_seen.get(i) is None or edited > self.edit_seen[i]:
+            self.edit_seen.pop(i, None)
+            self.edit_seen[i] = edited
+            while len(self.edit_seen) > MAX_DELIVERED:
+                del self.edit_seen[next(iter(self.edit_seen))]
+        if i in self.rerunning and (self.rerunning[i] is None or edited > self.rerunning[i]):
+            self.rerunning[i] = edited
 
     async def excluded(self, message, dm, invitation=None, privacy=None, text=''):
         """Why a message that waited (its turn, or another control) is no longer one Fri answers, by
@@ -943,19 +1034,28 @@ class Agent:
         for event in events:
             self.miss(event, reason)
 
-    async def handle(self, message):
+    async def handle(self, message, read=None):
         # Discord can deliver an event again, e.g. after a resume. Its first delivery answers, or
         # explains, for every copy: while it or the burst holding it is still being handled, and
         # for an hour after, in a bounded record the in-flight checks don't rely on.
         now = time.monotonic()
         while self.delivered and now-next(iter(self.delivered.values())) > REDELIVERY_SECONDS:
-            del self.delivered[next(iter(self.delivered))]
+            self.arrived.pop(oldest := next(iter(self.delivered)), None)
+            self.edits.pop(oldest, None)
+            del self.delivered[oldest]
         if (message.id in self.handling or self.bursts.group(message) is not None or
                 message.id in self.delivered):
             return
         if len(self.delivered) >= MAX_DELIVERED:
-            del self.delivered[next(iter(self.delivered))]
+            self.arrived.pop(oldest := next(iter(self.delivered)), None)
+            self.edits.pop(oldest, None)
+            del self.delivered[oldest]
         self.delivered[message.id] = now
+        self.arrived[message.id] = time.time() if read is None else read  # `read`: when a refetch began.
+        if edited := getattr(message, 'edited_at', None):  # Fetched again after an edit (see rerun).
+            self.edits[message.id] = edited
+        else:
+            self.edits.pop(message.id, None)
         self.handling[message.id] += 1
         self.turns.arrive(message.author.id, message.id)
         if self.memory_control(message):  # Before anything awaits, so a later one can't overtake it.
@@ -966,6 +1066,7 @@ class Agent:
             self.handling -= Counter([message.id])
             self.turns.leave(message.author.id, message.id)
             self.memory_controls.leave(message.author.id, message.id)
+            self.answer_edits()
 
     async def unreachable(self, message, *, answering=False, standing=None):
         """A message Fri would answer, read while the controller is down: say so instead of going silent.
@@ -1021,8 +1122,9 @@ class Agent:
             return False
         except discord.HTTPException:
             return False
-        if getattr(current, 'edited_at', None) is not None or current.content != message.content:
-            self.withdraw(message)  # Edited since it was sent, maybe to take it back.
+        if getattr(current, 'edited_at', None) != self.edits.get(message.id) or current.content != message.content:
+            self.saw_edit(message.id, getattr(current, 'edited_at', None))
+            self.withdraw(message)  # Edited since Fri got it, maybe to take it back.
             return False
         return answering or message.guild is None or await addressed_text(current, self.fri.user.id) is not None
 
@@ -1102,7 +1204,7 @@ class Agent:
                 profile = await self.profile(parent, message.author.id)
                 # Deleted or edited while the profile read waited: like a text post, it stays out.
                 if (profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent and
-                        str(message.id) not in self.withdrawn):
+                        not self.taken_back(message.id, self.arrived.get(message.id, sent))):
                     self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                         'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
                         'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
@@ -1142,7 +1244,7 @@ class Agent:
             observed = profile.get('revision', 0)
             # Not if it was deleted or edited while its profile was read.
             if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
-                    message.id not in self.unsent and str(message.id) not in self.withdrawn):
+                    message.id not in self.unsent and not self.taken_back(message.id, self.arrived.get(message.id, sent))):
                 if directed is not None or channel == self.dedicated:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
@@ -1165,6 +1267,11 @@ class Agent:
                 return await self.unreadable(message, [message], exc, invitation, forgotten)
             if self.forgotten.get(message.author.id, 0) != forgotten:
                 return self.miss(message, 'author privacy changed')
+        if not dm and gene_command(message.content) and not explicit_mention(message, self.fri.user.id):
+            # "!play …", "!stop": Red runs them and answers itself. Not Fri's turn, even in a follow-up window or
+            # Fri's own channel, and not attention's pick either. Its row above still shows what was asked.
+            self.answer_directly(message)
+            return self.miss(message, 'gene command')
         if message.id in self.replying:
             return  # A redelivered event: its reply is already being delivered or recorded.
         recording = self.recording.get((channel, message.author.id))
@@ -1200,7 +1307,8 @@ class Agent:
         key = (channel, message.author.id)
         self.answer_directly(message)
         try:
-            if not self.bursts.add(message, arrived, None if privacy else (forgotten, observed), alone=bool(privacy)):
+            if not self.bursts.add(message, arrived, None if privacy else (forgotten, observed),
+                                   alone=bool(privacy) or message.id in self.rerunning):
                 return DEFERRED  # Dropped, and said why, as from before an erasure.
         except ValueError as exc:
             self.pending.pop(key, None)
@@ -1366,15 +1474,36 @@ class Agent:
         # error or a low battery doesn't go out once they erased after it.
         events = [message, *(event for _, event, _ in burst if event is not message)]  # This turn answers for all.
         began = time.time()  # A nearby post edited before this was read as it is now (see changed).
+        arrival = self.arrival(event.id for event in events)  # Its own messages as they read when they came in.
+        own = {event.id for event in events}
 
         def changed(ids):
             """Those of `ids` deleted, or edited since this turn began: what the model saw of them may be gone."""
             edited = {int(i) for i, at in self.withdrawn.items() if at >= began and i.isdigit()}
-            edited |= {i for i, at in self.revised.items() if at >= began}
+            edited |= {i for i, at in self.revised.items() if at >= began and i not in own}  # Not its own: see taken.
             return (self.unsent.keys() | edited) & set(ids)
 
         def taken(event):  # One this turn answers, deleted or edited (an edit may take it back) while it ran.
-            return event.id in self.unsent or str(event.id) in self.withdrawn
+            return event.id in self.unsent or self.taken_back(event.id, arrival)
+
+        def edited():
+            """Its own messages: one edited since it came in, none deleted."""
+            return (not any(event.id in self.unsent for event in events) and
+                    any(self.taken_back(event.id, arrival) for event in events))
+
+        def again():
+            """Its one message edited, not deleted, since it came in, and no tool that may change something ran
+            for it: nothing goes out, and once this turn is done it's answered again as it reads now (see rerun).
+            Not an unprompted reply, a ping (its invitation says why), a burst, a privacy control or a second edit."""
+            if (ambient or invitation or burst or not edited() or message.id in self.acted or
+                    self.memory_control(message) or self.reanswered.get(message.id, 0) >= MAX_REANSWERS):
+                return False
+            self.reanswered[message.id] = self.reanswered.pop(message.id, 0)+1
+            while len(self.reanswered) > MAX_DELIVERED:
+                del self.reanswered[next(iter(self.reanswered))]
+            self.reanswer[message.id] = message.channel.id
+            missed('message edited')
+            return True
 
         def missed(reason):
             for event in events:
@@ -1426,6 +1555,9 @@ class Agent:
         except commands.UserFeedbackCheckFailure as exc:
             if ambient:  # Nobody asked: an unprompted reply that can't go out just stays quiet.
                 return missed('reply withheld: '+type(exc).__name__)
+            if again():  # Refused because they edited it: the edit is what gets answered.
+                await self.fri.waiting_notices.clear(message.author.id)
+                return
             if invitation and await refused():
                 return
             if isinstance(exc, ControllerRejected) and (pings := self.pings(events, since, invitation)):
@@ -1460,7 +1592,15 @@ class Agent:
             return 'nearby message deleted' if changed(result.shown) else None
 
         if any(taken(event) for event in events):  # Taken back while Fri composed.
-            missed('message deleted')
+            if again():
+                pass
+            elif edited() and not ambient:
+                # Edited, so maybe taken back, and not answered again: say so rather than go quiet.
+                from .fri import WITHDRAWN
+                await message.reply(notice_text(WITHDRAWN), allowed_mentions=NO_MENTIONS, mention_author=False)
+                self.answered(events)
+            else:
+                missed('message deleted')
             await self.fri.waiting_notices.clear(message.author.id)
             return
         if changed(result.shown):
@@ -1684,14 +1824,15 @@ class Agent:
         return receipt
 
     async def unwithdrawn(self, channel, records):
-        """Every row of `records` is still in the live view and each author it draws on still allows it,
+        """Every row of `records` is still in the live view, as the same version (an edited message answered
+        again comes back under its ID with new words), and each author it draws on still allows it,
         at the revision it was collected under (the check context_messages ran, rerun after a wait)."""
-        live = {r['id'] for r in self.recent.get(channel, ())}
+        live = self.versions(channel)
         source = self.fri.get_channel(channel)
         parent = getattr(source, 'parent_id', None) or channel
         authors = set()
         for row in records:
-            if row['id'] not in live:
+            if not self.current(row, live):
                 return False
             if row['gene_error']:
                 continue
@@ -1699,14 +1840,38 @@ class Agent:
                 authors.update((item['user_id'], item['revision']) for item in row['provenance'])
             else:
                 authors.add((row['user_id'], row.get('revision', 0)))
-        # Read together, so one author's answer doesn't age while another's is awaited.
-        users = sorted({user for user, _ in authors})
-        profiles = dict(zip(users, await asyncio.gather(*(self.profile(parent, user) for user in users))))
-        if any(not profiles[user]['enabled'] or profiles[user]['revision'] != revision for user, revision in authors):
-            return False
+        if 'author-fence' in getattr(self.fri, 'capabilities', ()):
+            # One check of every author under the controller's lock (fri #84): no erasure through Gene lands
+            # between two authors' reads. Any refusal names nobody and sends nothing; nor do more authors than
+            # the controller checks at once (200), rather than reading them one by one.
+            if len(authors) > 200:
+                return False
+            if authors:
+                try:
+                    checked = await self.fri.api('POST', '/agent/authors/check', {
+                        'guild_id': str(self.channel_guild(parent)), 'channel_id': str(parent),
+                        'authors': [{'user_id': str(user), 'revision': revision} for user, revision in sorted(authors)]})
+                except ControllerRejected:
+                    return False
+                if not isinstance(checked, dict) or checked.get('ok') is not True:
+                    return False  # Only Gene's explicit yes lets the batch go; anything else stays quiet.
+        else:
+            # Read together, so one author's answer doesn't age while another's is awaited.
+            users = sorted({user for user, _ in authors})
+            profiles = dict(zip(users, await asyncio.gather(*(self.profile(parent, user) for user in users))))
+            if any(not profiles[user]['enabled'] or profiles[user]['revision'] != revision for user, revision in authors):
+                return False
         # Again after those reads: a row withdrawn or forgotten during them must not go out either.
-        live = {r['id'] for r in self.recent.get(channel, ())}
-        return all(row['id'] in live for row in records)
+        live = self.versions(channel)
+        return all(self.current(row, live) for row in records)
+
+    def versions(self, channel):
+        """The live view's rows by ID, as when each was taken in."""
+        return {r['id']: r.get('at') for r in self.recent.get(channel, ())}
+
+    def current(self, row, live):
+        """A copied row is still the live view's version: not replaced under its ID, nor taken back since."""
+        return row['id'] in live and live[row['id']] == row.get('at') and not self.taken_back(row['id'], row.get('at', 0))
 
     def unsee(self, channel, before, newest):
         """An attention call that didn't decide: its batch is offered again (a Gene error still gets its

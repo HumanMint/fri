@@ -426,22 +426,33 @@ class Fri(discord.Client):
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
                     context, fence['turn']['user_id'], fence['actions'])})
             # A message its author edited or deleted since the live view was copied: its old words stay out.
+            # A row read again after that, as an edited message answered again is, holds what it says now.
             if self.agent and context.get('recent'):
-                context['recent'] = [row for row in context['recent'] if row.get('id') not in self.agent.withdrawn]
-            # One this turn quotes or replies to refuses it instead: the answer would be about words taken back.
-            # So does one the turn itself answers: its own message, or one of its burst.
-            if self.agent and any(str(row.get('source', {}).get('id')) in self.agent.withdrawn for row in
-                                  context.get('reply_target', []) + context.get('invited_context', []) +
-                                  context.get('message_burst', []) + ([fence['turn']] if fence and 'turn' in fence else [])):
-                raise commands.UserFeedbackCheckFailure(WITHDRAWN)
-            # A post it quotes, looked at or read, edited since the turn began (after its last fetch, say): this
-            # turn's copy may hold what it said before. The live view's rows show an edit as it comes in.
-            if self.agent and fence and 'began' in fence:
-                if any(self.agent.revised.get(mid, 0) >= fence['began'] for mid in quoted):
+                context['recent'] = [row for row in context['recent']
+                                     if not self.agent.taken_back(row.get('id'), row.get('at', 0))]
+            # One this turn quotes or replies to refuses it instead: the answer would be about words taken back,
+            # which saved turns may still hold. So does one the turn itself answers, its own message or one of
+            # its burst, if taken back since it came in (see Agent.rerun).
+            if self.agent:
+                own = [row.get('source', {}).get('id') for row in context.get('message_burst', []) +
+                       ([fence['turn']] if fence and 'turn' in fence else [])]
+                since = self.agent.arrival(own)
+                if (any(str(row.get('source', {}).get('id')) in self.agent.withdrawn for row in
+                        context.get('reply_target', []) + context.get('invited_context', [])) or
+                        any(self.agent.taken_back(i, since) for i in own)):
                     raise commands.UserFeedbackCheckFailure(WITHDRAWN)
-                if any(self.agent.revised.get(mid, 0) >= fence['began'] for mid in looked):
+            # A post it quotes, looked at or read, edited since the turn began (after its last fetch, say): this
+            # turn's copy may hold what it said before. The live view's rows show an edit as it comes in. The
+            # turn's own messages go by the check above.
+            if self.agent and fence and 'began' in fence:
+                mine = {int(i) for i in own if str(i).isdigit()}
+                def revised(ids):
+                    return any(self.agent.revised.get(mid, 0) >= fence['began'] for mid in ids if mid not in mine)
+                if revised(quoted):
+                    raise commands.UserFeedbackCheckFailure(WITHDRAWN)
+                if revised(looked):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
-                if any(self.agent.revised.get(mid, 0) >= fence['began'] for mid in read):
+                if revised(read):
                     raise commands.UserFeedbackCheckFailure(READ_CHANGED)
             # A channel closed while Fri gathered context: what was said there stays there.
             context['elsewhere'] = [row for row in context.get('elsewhere', []) if server_wide(
@@ -662,7 +673,9 @@ class Fri(discord.Client):
                             current = await event.channel.fetch_message(event.id)
                         except discord.HTTPException:
                             raise GateClosed('message deleted') from None  # Quiet, as for any taken-back message.
-                        if current.edited_at is not None or current.content != event.content:
+                        if current.edited_at != self.agent.edits.get(event.id) or current.content != event.content:
+                            self.agent.saw_edit(event.id, current.edited_at)  # A re-run waits for Discord to show it.
+                            self.agent.withdraw(event)  # Marked, so its edit is what gets answered (see Agent.reply_once).
                             raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
                     await sources_unchanged()
                     from .fri_images import CHANGED as IMAGES_CHANGED

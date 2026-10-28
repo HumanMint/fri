@@ -305,6 +305,8 @@ class Actions:
             'history_channels': [c for c in overview['history_channels'] if c in channels]}
 
     async def execute(self, action):
+        if action.get('kind') not in READ_ONLY_AFTER_HISTORY and self.event is not None:
+            self.agent.act(self.event.id)  # Tried, so not tried twice by answering an edit of it again.
         if self.invitation:
             await self.invitation.require_current()
             if self.invitation.outside:
