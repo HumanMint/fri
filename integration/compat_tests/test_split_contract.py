@@ -38,7 +38,10 @@ class Session:
 def test_runtime_client_handshake_and_wrong_service_actions(client):
     async def scenario():
         runtime=SimpleNamespace(url='http://controller',token='fri-'+'x'*32,session=Session(client))
-        assert await Fri.api(runtime,'GET','/fri/contract')==contract()
+        # Fri's own acceptance check, not equality: a newer Gene may offer optional capabilities Fri doesn't use
+        # (gene #97's summary-generations, say), and Fri still requires every one it does.
+        offered=await Fri.api(runtime,'GET','/fri/contract')
+        assert compatible(offered) and offered['protocol']==contract()['protocol']
         assert runtime.session.calls[0][2]['X-Fri-Contract']==PROTOCOL
         for path in ('/worker/claim','/deploy/claim'):
             with pytest.raises(ControllerRejected):
