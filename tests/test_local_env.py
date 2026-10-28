@@ -173,6 +173,11 @@ def test_the_controller_probe_explains_each_refusal():
         raise httpx.ConnectError('refused', request=request)
     [(level, message)] = local_env.probe('http://127.0.0.1:8787', SERVICE, httpx.MockTransport(down))
     assert level == 'error' and 'no controller answered' in message and SERVICE not in message
+    # A URL carrying a user name and password is valid, but the failure names only where it went.
+    [(level, message)] = local_env.probe('http://fri:synthetic-password@127.0.0.1:8787/x?k=v', SERVICE,
+                                         httpx.MockTransport(down))
+    assert 'at http://127.0.0.1:8787 (' in message
+    assert not any(secret in message for secret in ('synthetic-password', 'fri:', '?k=v', SERVICE))
 
 
 def test_check_exits_non_zero_until_the_file_is_complete(tmp_path, capsys):

@@ -227,6 +227,17 @@ def findings(values, root=ROOT, env_mode=None):
     return found
 
 
+def address(url):
+    """The URL's scheme, host and port, for messages: never a user name, password, path or query."""
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname or '?', parts.port
+    except ValueError:
+        return 'GENE_CONTROLLER_URL'
+    host = f'[{host}]' if ':' in host else host
+    return f'{parts.scheme}://{host}' + (f':{port}' if port else '')
+
+
 def probe(url, token, transport=None):
     """Read the controller's contract as Fri's startup does. Returns (level, message) lines."""
     import httpx
@@ -239,7 +250,7 @@ def probe(url, token, transport=None):
             response = client.get(url + '/fri/contract',
                                   headers={'Authorization': 'Bearer ' + token, 'X-Fri-Contract': PROTOCOL})
     except httpx.HTTPError as exc:
-        return [('error', f'no controller answered at {url} ({type(exc).__name__}). Start it first: {GENE_GUIDE}')]
+        return [('error', f'no controller answered at {address(url)} ({type(exc).__name__}). Start it first: {GENE_GUIDE}')]
     if response.status_code == 401:
         return [('error', 'the controller refused GENE_FRI_TOKEN: it must equal the controller\'s GENE_FRI_TOKEN')]
     if response.status_code != 200:
