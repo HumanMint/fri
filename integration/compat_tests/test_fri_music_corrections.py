@@ -1,5 +1,7 @@
 """Right after Gene played the wrong song for them, "not that one, X" queues X, and Fri says the other's still on."""
+import ast
 import asyncio
+import inspect
 import time
 from unittest.mock import AsyncMock, patch
 
@@ -138,6 +140,46 @@ def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
     assert correction(text, argument) is expected
     assert genes(text, argument) is expected
+
+
+def correction_source(module):
+    """correction() and every module-level name it reads, as written."""
+    source = inspect.getsource(module)
+    defined = {}
+    for node in ast.parse(source).body:
+        names = [node.name] if isinstance(node, ast.FunctionDef) else [
+            target.id for target in getattr(node, 'targets', []) if isinstance(target, ast.Name)]
+        defined.update(dict.fromkeys(names, node))
+    found, reads = {}, ['correction']
+    while reads:
+        name = reads.pop()
+        if name in defined and name not in found:
+            found[name] = ast.get_source_segment(source, defined[name])
+            reads += [node.id for node in ast.walk(defined[name]) if isinstance(node, ast.Name)]
+    return found
+
+
+def test_fri_and_gene_share_the_correction_code_word_for_word():
+    """Fri's copy of correction() and its helpers is Gene's, character for character, so the rule can't drift."""
+    from gene import gene_controls as genes  # The controller this Fri is pinned to.
+
+    from fri import gene_controls as fris
+    ours = correction_source(fris)
+    assert {'correction', 'replacement', 'grounded_song', 'quoted_title', 'REFUSED', 'WITHDRAWN', 'TRAILING'} <= set(ours)
+    assert ours == correction_source(genes)
+
+
+def test_a_long_message_is_read_without_backtracking():
+    """Each check runs in about linear time, so a 4000-character worst case takes milliseconds, not minutes."""
+    shapes = ["'"+"a' "*1330, "'"+"rockin' "*498, "''a "*997, "' "*1994, '"'+'a '*1993, 'love story nah'+' lol'*990+' x',
+              'love story'+', no lol'*497+' x', 'love story'+' ,'*1990+'x', 'love story'+', a b said'*398, 'love '+'by '*1328,
+              'love'+' from x'*568, 'love story'+' i just'*664+' said', "love story "+"don't "*664, 'i meant '+'to '*1328]
+    for shape in shapes:
+        text = ('wrong song, '+shape)[:4000]
+        began = time.perf_counter()
+        for argument in ('love story', 'a', text[12:200]):
+            correction(text, argument)
+        assert time.perf_counter()-began < 0.5, shape[:20]
 
 
 @pytest.mark.parametrize('case', ['corrects', 'no recent play', 'old play', 'not their words', 'plain title',
