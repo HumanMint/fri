@@ -70,6 +70,7 @@ def test_every_sass_case_is_scored_and_a_failed_call_fails(grader):
     ('you_there_in_distress', 'unfortunately.'),
     ('thread_starter_thoughts', 'thoughts on what?'),
     ('forward_not_a_reply', 'yeah jo answered kev, gave him a pass.'),
+    ('link_the_find', 'found it, kev posted it last tuesday.'),
 ])
 def test_phrase_checks_fail_replies_that_miss_the_point(grader, name, reply):
     assert scored({text(name): reply})[name] is False
@@ -130,6 +131,7 @@ def test_a_failed_grader_call_fails_the_case(grader):
     ('you_there_in_distress', 'yeah, i’m here. are you safe right now?'),
     ('thread_starter_thoughts', 'kev opened a whole thread for pineapple pizza. correct take, wrong amount of confidence.'),
     ('forward_not_a_reply', 'jo just forwarded something, and i can’t read forwards yet. no sign of a raid pass.'),
+    ('link_the_find', 'kev’s masterpiece: <https://discord.com/channels/444/556/100000000000000004>'),
 ])
 def test_replies_that_land_pass_both_checks(grader, name, reply):
     results = scored({text(name): reply})

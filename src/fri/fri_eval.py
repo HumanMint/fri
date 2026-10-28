@@ -467,7 +467,20 @@ def sass_cases():
         memes_above(),
         thread_starter(),
         forward_not_a_reply(),
+        link_the_find(),
     ]
+
+
+def link_the_find():
+    """A history search found the clip they mean: the link is the answer, pasted from the results (see fri_links)."""
+    mid = '100000000000000004'
+    url = 'https://discord.com/channels/444/556/'+mid
+    return {'name': 'link_the_find', 'text': 'fri find that clip kev posted last week', 'max_chars': 300,
+            'action_result': {'kind': 'history_search', 'channel_id': '556', 'messages': [
+                {'id': mid, 'user_id': '201', 'author': 'Kev', 'at': '2026-10-14T21:10:00+00:00', 'text': 'lmaooo',
+                 'source': url, 'attachments': ['video']}]},
+            'needs': (url,), 'banned': RESEND,
+            'expect': "Points at Kev's clip with its link from the search results, in a few words. No made-up link."}
 
 
 def thread_starter():
