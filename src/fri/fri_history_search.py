@@ -19,9 +19,11 @@ READ_ONLY_AFTER_HISTORY = {'history_search', 'read_recent', 'learning_overview',
                            'channel_capabilities', 'work_list', 'work_read'}
 
 
-# Where or when it was said, after the verb: a channel (#name or its mention), this chat or thread, or a day.
-PLACE = (r'(?:in|on)\s+(?:#|<#\d)|in\s+(?:(?:this|the|that|our)\s+)?(?:channel|chat|server|thread|gc|vc)\b'
-         r'|on\s+(?:mon|tues|wednes|thurs|fri|satur|sun)day\b|(?:on|over)\s+the\s+weekend\b')
+# Where or when it was said, after the verb: a channel (#name or its whole mention), here, this chat, server or
+# thread, or a day. A place ends there ("in server documentation" names a document, not where it was said).
+PLACE = (r'(?:(?:in|on)\s+(?:#[\w-]+|<#\d+>)|in\s+here\b|(?:in|on)\s+(?:(?:this|the|that|our|a)\s+)?'
+         r'(?:channel|chat|server|thread|gc|vc)|on\s+(?:mon|tues|wednes|thurs|fri|satur|sun)day|(?:on|over)\s+the\s+weekend)'
+         r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|lol|lmao|rn)\b))')
 
 
 def requested(text):
