@@ -190,6 +190,8 @@ class Agent:
         self.heartbeat_started = self.heartbeat_finished = 0
         self.heartbeat_status = 'starting'
         self.stages = {}
+        self.heartbeat_current = None  # The tick's step now, {'stage', 'since'} by the wall clock; None between ticks.
+        self.heartbeat_ticking = None  # time.monotonic() as the running tick began, for the watch (see Watch.stalled).
         self.unreachable_notices = {}  # channel: when Discord took Fri's notice (monotonic), or None in flight.
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
@@ -2094,6 +2096,7 @@ class Agent:
             if not all(self.config.get(key) for key in switches) or (when and not when()):
                 self.stages.pop(name, None)
                 return True
+            self.running(name)
             await step()
         except Exception as exc:  # CancelledError is a BaseException, so stopping the loop still works.
             LOG.warning('Fri heartbeat stage %s deferred: %s', name, type(exc).__name__)
@@ -2103,10 +2106,15 @@ class Agent:
         self.stages[name] = {'at': now, 'last_ok': now, 'error': None}
         return True
 
+    def running(self, name):
+        """The tick's step now running, which the health file and the owner's report name while it lasts."""
+        self.heartbeat_current = {'stage': name, 'since': time.time()}
+
     @tasks.loop(seconds=30)
     async def heartbeat(self):
-        self.heartbeat_started = time.time()
+        self.heartbeat_started, self.heartbeat_ticking = time.time(), time.monotonic()
         self.ensure_memes().expire()  # In memory, so before anything that waits on the controller.
+        self.running('state')
         try:
             self.state = await self.fri.api('GET', '/agent/state')
         except Exception as exc:  # A bad tick never ends the loop; the next one retries.
@@ -2121,6 +2129,7 @@ class Agent:
             from .fri_social import deliver_one as deliver_reminder
             from .fri_workspace import deliver_one as deliver_post
             # An undeliverable owner report or a broken meme check must not silence attention.
+            self.running('meme_notes')
             try:  # Meme notes follow their authors' privacy even while meme checks are off.
                 await self.ensure_memes().verify()
             except Exception as exc:  # Never at the cost of the stages below.
@@ -2140,6 +2149,7 @@ class Agent:
             self.heartbeat_status = 'ok' if all(results) else 'deferred'
         finally:
             self.heartbeat_finished = time.time()
+            self.heartbeat_current = self.heartbeat_ticking = None
 
     @heartbeat.before_loop
     async def before_heartbeat(self):

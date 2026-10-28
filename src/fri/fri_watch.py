@@ -310,6 +310,8 @@ class Watch:
         if agent:
             beat = 'never finished' if not agent.heartbeat_finished else f'{span(now-agent.heartbeat_finished)} ago'
             me += f', heartbeat {agent.heartbeat_status} ({beat})'
+            if current := agent.heartbeat_current:  # A tick that started and hasn't finished: which step it's on.
+                me += f", running {current['stage']} for {span(now-current['since'])}"
         lines.append(me)
         loops = {'heartbeat': agent.heartbeat if agent else None, 'owner dms': fri.owner_reviews,
                  'health file': fri.health}
