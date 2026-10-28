@@ -41,6 +41,14 @@ def media(message):
     return kinds[:10]
 
 
+def forwarded(message):
+    """A Discord forward: the post it copies sits in a snapshot, with no text or files of the forward's own."""
+    snapshots = getattr(message, 'message_snapshots', None)
+    reference = getattr(message, 'reference', None)
+    return bool((isinstance(snapshots, (list, tuple)) and snapshots) or
+                getattr(reference, 'type', None) == discord.MessageReferenceType.forward)
+
+
 def details(message):
     """What a reader sees around a post's text: what it carries, its link cards, its reactions, the post it
     answers, whether it's pinned.

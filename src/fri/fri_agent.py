@@ -31,7 +31,7 @@ from .fri_errors import (
     ControllerUnavailable,
     GateClosed,
 )
-from .fri_images import media
+from .fri_images import forwarded, media
 from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
@@ -627,6 +627,13 @@ class Agent:
         if event.id in self.misses and self.misses[event.id] is None:
             self.misses[event.id] = reason
 
+    def forward_dropped(self, message, reason):
+        """A member's forward, which Fri can't read yet, logged as it's dropped so they can be counted: the
+        channel and message IDs (none for a DM's channel) and the gate, never content or names."""
+        if not message.author.bot and forwarded(message):
+            LOG.info('Forward %s/%s not read: %s', 'dm' if message.guild is None else message.channel.id,
+                     message.id, reason)
+
     def answered(self, events):
         for event in events:
             self.misses.pop(event.id, None)
@@ -1200,6 +1207,8 @@ class Agent:
             self.memory_controls.leave(message.author.id, message.id)  # Outside, it's chat (see Fri.talk).
             # An outside ping is one event, never a new ambient/active channel.
             if message.guild.id != self.fri.guild_id or not explicit_mention(message, self.fri.user.id):
+                if message.guild.id == self.fri.guild_id:
+                    self.forward_dropped(message, 'not a visible user mention')
                 return self.miss(message, 'outside the main server' if message.guild.id != self.fri.guild_id
                                  else 'not a visible user mention')
             from .fri_mentions import Invitation
@@ -1230,6 +1239,7 @@ class Agent:
                     self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                         'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
                         'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
+            self.forward_dropped(message, 'no text')
             return self.miss(message, 'no text')
         directed = text if dm else await addressed_text(message, self.fri.user.id)
         owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
