@@ -35,7 +35,7 @@ async def recheck(actions, context):
     """Before the model hears the turn again. A tool checks before it acts (Actions.execute) and the reply
     before it goes out, so only model calls need this. A ping's own check runs with the request's last checks,
     once Fri signed in (see Fri.chat_once)."""
-    if context.get('image_sources'):  # Starts with a ping's own check (see fri_images.unchanged).
+    if context.get('image_sources') or context.get('image_declined'):  # Starts with a ping's own check (see fri_images.unchanged).
         await require_current_images(context, getattr(actions, 'event', None))
 
 

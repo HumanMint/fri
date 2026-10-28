@@ -1,19 +1,39 @@
 """Still images a turn may look at: the speaker's own, or ones a read turned up. Never ambient collection or tool authority."""
 
 import asyncio
+import re
 
 import discord
 import httpx
 
 from . import feedback as commands
-from .fri_meme_media import gif_previews, load_image, sources, unsigned
+from .fri_meme_media import MAX_BYTES, MIMES, gif_previews, load_image, sources, unsigned
 
 CHANGED = ('The image request changed while I was checking it. Any earlier tool actions keep '
            'their recorded outcomes; check their status before retrying. Ask again with the current attachment.')
 MAX_IMAGES = 4  # In one model call, the speaker's own included.
 MAX_LOADS = 2 * MAX_IMAGES  # Downloads one look may try, so a few dead links don't use up the budget.
 MAX_CHARS = 12_000_000  # Their data URLs together, about 9 MB of image.
-KEYS = ('image_sources', 'image_event', 'image_invitation', 'image_reads')
+KEYS = ('image_sources', 'image_event', 'image_invitation', 'image_reads', 'image_declined')
+# Why the speaker's own media went unseen, as the member hears it when their ask is about the media itself.
+# Short and true, never a list of formats to resend in. Only "did not load" may work another time.
+LIMITS = {'spoiler': 'i don’t open spoilers.', 'video': 'can’t watch videos, only still pics.',
+          'gif': 'can’t watch gifs, only still pics.', 'more than two images': 'i only look at two pics per post.',
+          'image too large': 'that pic’s too big for me to open.',
+          'unsupported': 'can’t open that one, only plain still pics.', 'did not load': 'couldn’t load that just now.'}
+# Words that only react to media or point at it. An ask with at most one other word ("thoughts?", "lmao",
+# "rate this", "is this ai") needs the media itself; anything more is a question its text carries alone.
+ABOUT_MEDIA = frozenset('''
+fri yo hey hi bro bruh dude lol lmao lmfao haha hahaha xd omg wow damn ok okay oh ah uh hm hmm fr ngl tbh
+pls plz please rn so just really actually lowkey kinda now too also
+this that these those it its them here there above one ones attached
+clip clips video videos vid gif gifs pic pics picture pictures photo photos image images meme memes
+screenshot file post thing
+what whats who whos which how hows why is are was does do did can could would will you u ur your yours
+i im me my mine think of about on at in the a an and or to for any
+thoughts thought opinion opinions take rate rating look see watch check out tell say describe explain
+good bad funny real fake mid cursed guess like cute nice cool crazy wild
+'''.split())
 
 
 def media(message):
@@ -161,7 +181,9 @@ async def select_source(event):
 
 
 async def attach(context, event, text, *, source=None, invitation=None):
-    """An already addressed chat turn can use its attachments with any caption."""
+    """An already addressed chat turn can use its attachments with any caption.
+
+    Its own media that sources() declines, or that won't load, is never shown (see decline)."""
     source = source or event
     if not text.strip() or not has_attachments(source):
         return
@@ -177,11 +199,14 @@ async def attach(context, event, text, *, source=None, invitation=None):
     urls = sources(source)
     attachment_urls = [str(a.url) for a in attachments]
     if urls is None or urls != attachment_urls:
-        raise commands.UserFeedbackCheckFailure('Attach up to two non-spoiler PNG, JPEG or WebP still images, up to 4 MB each. Videos and GIFs are not supported.')
+        return decline(context, event, source, declined(source), text, invitation)
     try:
-        context['images'] = [await load_image(url, event.channel.id) for url in urls]
-    except (httpx.HTTPError, TimeoutError, ValueError):
-        raise commands.UserFeedbackCheckFailure('I couldn’t inspect that image. Try a small PNG, JPEG or WebP attachment.') from None
+        images = [await load_image(url, event.channel.id) for url in urls]
+    except (httpx.HTTPError, TimeoutError):
+        return decline(context, event, source, 'did not load', text, invitation)
+    except ValueError:
+        return decline(context, event, source, 'unsupported', text, invitation)
+    context['images'] = images
     context['image_sources'] = urls
     context['image_event'] = source
     if invitation:
@@ -190,10 +215,48 @@ async def attach(context, event, text, *, source=None, invitation=None):
         context['image_invitation'] = invitation
 
 
+def declined(source):
+    """Why sources() turned the speaker's own post down, the first reason that applies."""
+    kinds, attachments = media(source), source.attachments
+    if any(kind.startswith('spoiler') for kind in kinds) or '||' in source.content:
+        return 'spoiler'
+    for reason in ('video', 'gif'):
+        if any(reason in kind for kind in kinds):
+            return reason
+    if len(attachments) > 2:  # sources()' own limit for one post.
+        return 'more than two images'
+    if any(a.content_type in MIMES and (not 0 < a.size <= MAX_BYTES or (a.width or 0)*(a.height or 0) > 20_000_000)
+           for a in attachments):
+        return 'image too large'
+    return 'unsupported'
+
+
+def about_media(text):
+    """An ask that needs the media itself to answer: at most one word beyond reacting to it or pointing at it."""
+    words = re.findall(r"[^\W_]+", re.sub(r"<[^>]*>|['’]", '', text.casefold()))
+    return sum(word not in ABOUT_MEDIA for word in words) <= 1
+
+
+def decline(context, event, source, reason, text, invitation):
+    """Own media Fri didn't see. An ask about the media itself gets a short local line and no model call; a
+    question its text carries alone goes on, the model told what it didn't see (own_media_not_inspected)
+    and never what a caption or file name might suggest. Someone else's post that won't load keeps its notice."""
+    if context.get('image_event') is source and context.get('image_sources'):
+        return  # An earlier call this turn inspected it, and its checks stand (a read tool attaches again).
+    if about_media(text) or source.author.id != event.author.id:
+        raise commands.UserFeedbackCheckFailure(LIMITS[reason])
+    context['own_media_not_inspected'] = {'attachments': media(source), 'reason': reason}
+    # Rechecked as an inspected post is (see unchanged): an answer never outlives the post it skipped.
+    context['image_event'] = source
+    context['image_declined'] = unsigned([str(a.url) for a in source.attachments])
+    if invitation:
+        context['image_invitation'] = invitation
+
+
 async def unchanged(context, event):
     if not await looked_unchanged(context):
         return False
-    if not context.get('image_sources'):
+    if not context.get('image_sources') and not context.get('image_declined'):
         return True
     invitation = context.get('image_invitation')
     if invitation and not await invitation.current():
@@ -208,7 +271,9 @@ async def unchanged(context, event):
         return ((image.author.id == event.author.id or
                  (invitation and image.author.id == source.author.id)) and not getattr(image.author, 'bot', False) and not image.webhook_id and
                 image.channel.id == event.channel.id and image.content == source.content and
-                image.edited_at == source.edited_at and unsigned(sources(image)) == unsigned(context['image_sources']))
+                image.edited_at == source.edited_at and
+                (unsigned(sources(image)) == unsigned(context['image_sources']) if context.get('image_sources') else
+                 unsigned([str(a.url) for a in image.attachments]) == context['image_declined']))
     except discord.HTTPException:
         return False
 
