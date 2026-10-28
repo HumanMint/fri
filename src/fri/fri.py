@@ -532,6 +532,8 @@ class Fri(discord.Client):
             LOG.warning('Usage is saved locally; controller delivery will retry: %s', type(exc).__name__)
         if result.error or result.status != 'completed':
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
+        if agent := getattr(self, 'agent', None):  # What stops it from here was withheld after composing.
+            agent.ledger.composed(context)
         return result
 
     async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, typing=None, last_look=None):
@@ -1296,7 +1298,9 @@ class Fri(discord.Client):
             'meme_attention': self.agent.memes.status() if self.agent and self.agent.memes else None,
             'agent_heartbeat': {'running': self.agent.heartbeat.is_running(), 'failed': self.agent.heartbeat.failed(),
                 'started': self.agent.heartbeat_started, 'finished': self.agent.heartbeat_finished,
-                'status': self.agent.heartbeat_status, 'stages': self.agent.stages} if self.agent else None,
+                'status': self.agent.heartbeat_status, 'stages': self.agent.stages,
+                'current': self.agent.heartbeat_current} if self.agent else None,
+            'outcomes': self.agent.ledger.snapshot() if self.agent else None,
             'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,

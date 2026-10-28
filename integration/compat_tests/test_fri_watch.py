@@ -19,7 +19,7 @@ from compat_tests.test_gene_controls import control_body, controls_api  # noqa: 
 from fri.fri import patiently
 from fri.fri_agent import Agent
 from fri.fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
-from fri.fri_watch import CHECKS, NOT_OFFERED, NOT_TAKING, RELAPSE, Watch, health_requested
+from fri.fri_watch import CHECKS, NOT_OFFERED, NOT_TAKING, RELAPSE, STALL, Watch, health_requested
 
 
 def beat(controls, age=0, **changes):
@@ -202,6 +202,116 @@ def test_a_busy_command_poll_is_not_an_outage(monkeypatch, tmp_path, controls_ap
             for _ in range(CHECKS+1):
                 await fri.watcher.check()
             assert not sends and fri.watcher.state['bad'] == 0
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def stuck_tick(monkeypatch, fri, stage):
+    """Fri's heartbeat tick, started now and running `stage`, on a fake clock the watch reads too."""
+    clock = [time.time()]
+    monkeypatch.setattr('fri.fri_watch.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
+    agent = fri.agent = Agent(fri)
+    agent.heartbeat_ticking, agent.heartbeat_current = clock[0], {'stage': stage, 'since': clock[0]}
+    agent.heartbeat_progress = clock[0]
+    return agent, clock
+
+
+def test_a_stuck_heartbeat_gets_one_owner_dm_naming_its_stage_and_a_note_once_it_moves(
+        monkeypatch, tmp_path, controls_api):  # noqa: F811
+    async def scenario():
+        client, controls = controls_api
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        routed(fri, client)
+        dm = owner_dm(fri)
+        agent, clock = stuck_tick(monkeypatch, fri, 'memes')
+        began = clock[0]
+        async def checks(count):
+            for _ in range(count):
+                clock[0] += 120
+                beat(controls)  # Gene is fine throughout.
+                await fri.watcher.check()
+        try:
+            await checks(CHECKS)  # Six minutes in: a long tick, not a stuck one.
+            assert not dm.sends and fri.watcher.state['bad'] == 0
+            clock[0] = began+STALL-120
+            await checks(CHECKS-1)
+            assert not dm.sends and fri.watcher.state['bad'] == CHECKS-1
+            await checks(1)
+            assert len(dm.sends) == 1 and fri.watcher.state['alert']['kind'] == 'stalled'
+            assert f'stuck in memes since <t:{int(began)}:t>' in dm.sends[0]
+            assert fri.watcher.refusal() == NOT_TAKING  # Gene still takes commands: no "owner already knows".
+            await checks(1)
+            assert len(dm.sends) == 1 and not dm.edits  # One DM per stall.
+            agent.heartbeat_ticking = agent.heartbeat_current = None  # The tick finished.
+            await checks(1)
+            assert len(dm.sends) == 1 and len(dm.edits) == 1 and '-# back at <t:' in dm.edits[0][1]
+            assert not fri.watcher.state['alert']['open'] and fri.watcher.state['bad'] == 0
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_long_tick_that_keeps_moving_is_not_stuck_and_a_stage_change_ends_a_stall(
+        monkeypatch, tmp_path, controls_api):  # noqa: F811
+    async def scenario():
+        client, controls = controls_api
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        routed(fri, client)
+        dm = owner_dm(fri)
+        agent, clock = stuck_tick(monkeypatch, fri, 'attention')
+        try:
+            for _ in range(12):  # Twelve channels' attention, 100 s each: 20 minutes, moving the whole time.
+                clock[0] += 100
+                agent.heartbeat_progress = clock[0]
+                beat(controls)
+                await fri.watcher.check()
+            assert not dm.sends and fri.watcher.state['bad'] == 0
+            for _ in range(CHECKS+(STALL//120)):  # Then it stops moving in attention.
+                clock[0] += 120
+                beat(controls)
+                await fri.watcher.check()
+            assert len(dm.sends) == 1 and 'stuck in attention' in dm.sends[0]
+            agent.heartbeat_current = {'stage': 'memes', 'since': clock[0]}  # It moves on to memes.
+            agent.heartbeat_progress = clock[0]
+            clock[0] += 120
+            beat(controls)
+            await fri.watcher.check()
+            assert not fri.watcher.state['alert']['open'] and '-# back at <t:' in dm.edits[-1][1]
+            assert 'memes' not in dm.edits[-1][1]  # The DM never names a stage the tick wasn't stuck in.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('down', ['gene', 'controller'])
+def test_gene_and_its_controller_come_before_a_stuck_heartbeat(monkeypatch, tmp_path, controls_api, down):  # noqa: F811
+    async def scenario():
+        client, controls = controls_api
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        routed(fri, client)
+        if down == 'controller':
+            fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        dm = owner_dm(fri)
+        agent, clock = stuck_tick(monkeypatch, fri, 'attention')
+        clock[0] += STALL
+        try:
+            beat(controls, age=420)
+            for _ in range(CHECKS):
+                clock[0] += 120
+                await fri.watcher.check()
+            assert len(dm.sends) == 1 and 'stuck in' not in dm.sends[0]
+            assert fri.watcher.state['alert']['kind'] == ('stale' if down == 'gene' else 'unreachable')
+            # Gene back, the tick still stuck: the one DM now says what's still wrong.
+            routed(fri, client)
+            beat(controls)
+            clock[0] += 120
+            await fri.watcher.check()
+            assert len(dm.sends) == 1 and fri.watcher.state['alert']['kind'] == 'stalled'
+            assert 'stuck in attention' in dm.edits[-1][1]
         finally:
             await fri.close()
     asyncio.run(scenario())

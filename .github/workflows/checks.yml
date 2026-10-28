@@ -56,3 +56,36 @@ jobs:
           assert layers[0] != layers[1], 'probe did not rebuild the source layer'
           print('A source-only rebuild shares the dependency layers')
           PY
+  integration:
+    # The pinned integration and replay suites against the real controller, as scripts/offline-checks.sh runs them
+    # locally: Gene is public, so its exact paired commit is fetched without credentials, and only setup uses the network.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install uv==0.11.30
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-integration-${{ runner.os }}-${{ hashFiles('uv.lock', 'docs/integration-pair.json') }}
+          restore-keys: uv-integration-${{ runner.os }}-
+      - name: Fetch the paired Gene commit
+        run: |
+          read -r repository commit < <(python3 -c "import json; pair = json.load(open('docs/integration-pair.json')); print(pair['controller_repository'], pair['verified_controller_commit'])")
+          git init -q "$RUNNER_TEMP/gene"
+          git -C "$RUNNER_TEMP/gene" fetch -q --depth 1 "https://github.com/$repository.git" "$commit"
+      - name: Let the check deny the network with unshare -rn
+        # Ubuntu's AppArmor blocks unprivileged user namespaces by default; the script then refuses to run.
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -rn true
+      - run: scripts/offline-checks.sh setup
+        env:
+          GENE_REPO: ${{ runner.temp }}/gene
+      - run: scripts/offline-checks.sh check

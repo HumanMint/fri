@@ -106,7 +106,8 @@ async def execute(actions, action):
         if taken_back(actions):
             return {'blocked': CHANGED}
         return {'kind': kind, **await fri.api('POST', '/workspace/save',
-            {**payload, **{k: v for k, v in action.items() if k != 'kind'}, 'request_text': actions.event.content})}
+            {**payload, **{k: v for k, v in action.items() if k != 'kind'}, 'request_text': actions.event.content,
+             **actions.summary_generation()})}
     if not re.search(r'\b(post|send|publish|introduce|share)\b', actions.message, re.I):
         return {'blocked': 'Ask to prepare a post first; saving a draft does not request delivery.'}
     targets = await capabilities(fri, action['channel_id'])

@@ -102,6 +102,32 @@ class Actions:
         # so valid() still notices the change before anything is delivered.
         self.revisions.setdefault((scope, user), revision)
 
+    def summarized(self):
+        """The generation of Fri's summary of the member that the turn's model request had, or None (see
+        Fri.summary_generation): only with a controller offering summary generations, and only once it reached the model."""
+        fence = (self.turn_context or {}).get('fence') or {}
+        generation = fence.get('summary_generation')
+        return generation if type(generation) is int and 'turn' in fence else None
+
+    async def summary_unchanged(self):
+        """Before every step: the summary the model chose it with is still the controller's (fri #171). Typing usually
+        started before the model ran, so the check before a tool (see Fri.talk) can't be relied on for this."""
+        generation = self.summarized()
+        if generation is None:
+            return
+        from .fri import turn_provenance
+        fence = self.turn_context['fence']
+        await self.fri.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
+            self.turn_context, self.user, self), 'summary_generation': generation})
+
+    def summary_generation(self):
+        """For a write of the model's words: that generation, which the controller refuses inside the write once it has
+        moved (fri #171). Only to a controller that takes it on writes; an older one rejects the field."""
+        from .fri_memory import GENERATION_WRITES
+        generation = self.summarized()
+        return {} if generation is None or GENERATION_WRITES not in self.fri.capabilities else {
+            'summary_generation': generation}
+
     def derived(self):
         """Other members' words are in this turn's context, so they could reach a write."""
         from .fri import turn_provenance
@@ -340,6 +366,7 @@ class Actions:
         channels = await self.channels(fresh=True, around=kind == 'read_recent')
         if not channels:
             return {'blocked': 'No approved channels are currently readable.'}
+        await self.summary_unchanged()  # After those waits; a write sends the generation too, for its own wait.
         if self.history.pages and kind not in READ_ONLY_AFTER_HISTORY:
             return {'blocked': 'Archive evidence cannot authorize another action. Ask for that action in a fresh message.'}
         if kind == 'history_search':
