@@ -67,6 +67,7 @@ class Actions:
         self.search_count = 0
         self.image_context = {}
         self.music_receipts = []  # This member's Gene receipts here, as the controller has them.
+        self.music_correctable = None  # The controller: a play of theirs a correction could put right now.
         self.media_allowed = False
         self.invitation = None
         self.turn_context = None
@@ -93,8 +94,8 @@ class Actions:
 
     def correcting(self, action):
         """Putting right the song Gene just played for them: "not that one, X" with X in their own words."""
-        return (action.get('action') == 'play' and correction(self.message, action.get('argument') or '') and
-                just_played(self.music_receipts))
+        recent = self.music_correctable if self.music_correctable is not None else just_played(self.music_receipts)
+        return action.get('action') == 'play' and correction(self.message, action.get('argument') or '') and recent
 
     def observe(self, scope, user, revision):
         # Keep the first revision read this turn: a later read must not relabel earlier evidence,

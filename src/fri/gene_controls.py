@@ -148,21 +148,29 @@ def quick_control(text, *, music_context=False):
 
 
 
-CORRECTION = re.compile(r"\b(?:not (?:that|this|the) (?:one|song|track)|wrong (?:one|song|track)|i meant|"
+CORRECTION = re.compile(r"\b(?:not (?:that|this|the) (?:one|song|track)|wrong (?:one|song|track)|i meant(?! to\b)|"
                         r"that'?s not (?:it|the one|the song|the track))\b")
+# Words of the correction itself, never the song on their own ("not the one i wanted" names none).
+CORRECTION_WORDS = {'the', 'one', 'song', 'track', 'that', 'this', 'it', 'its', "it's", 'a', 'i', 'meant',
+                    'not', 'wrong', 'was', 'is', 'lol'}
 CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
 
 
 def correction(text, argument):
     """A member putting right a song Gene just played for them ("not that one, X", "i meant X"), with the
-    right one in their own words. Gene's control store holds the same rule and checks there was such a play."""
+    right one after it in their own lines: not a blockquote or code, though a title they put in quotes counts.
+    Gene's control store holds the same rule and checks there was such a play."""
     visible = request_text(text).replace('\u2019', "'")
     if not argument or not CORRECTION.search(visible):
         return False
-    if re.search(r"\b(for example|hypothetically|if i|used to|dont|don't|do not)\b", visible):
-        return False
-    said = text.casefold()
-    return argument.casefold() in said or set(re.findall(r"[\w']+", argument.casefold())) <= set(re.findall(r"[\w']+", said))
+    if re.search(r"\b(?:for example|hypothetically|if i|used to|dont|don't|do not|said|says|saying|told|asked|"
+                 r"(?:can|could|would|should) (?:i|you|we))\b", visible):
+        return False  # An example, someone else's words, or a question about it: not a request.
+    own = re.sub(r'```[\s\S]*?```|`[^`]*`|(?m:^>[^\n]*)', '', text).casefold().replace('\u2019', "'")
+    marker = CORRECTION.search(own)
+    after = own[marker.end():] if marker else ''
+    named = set(re.findall(r"[\w']+", argument.casefold()))
+    return bool(named - CORRECTION_WORDS) and (argument.casefold() in after or named <= set(re.findall(r"[\w']+", after)))
 
 
 def just_played(receipts):
