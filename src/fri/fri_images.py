@@ -14,25 +14,7 @@ CHANGED = ('The image request changed while I was checking it. Any earlier tool 
 MAX_IMAGES = 4  # In one model call, the speaker's own included.
 MAX_LOADS = 2 * MAX_IMAGES  # Downloads one look may try, so a few dead links don't use up the budget.
 MAX_CHARS = 12_000_000  # Their data URLs together, about 9 MB of image.
-KEYS = ('image_sources', 'image_event', 'image_invitation', 'image_reads', 'image_declined')
-# Why the speaker's own media went unseen, as the member hears it when their ask is about the media itself.
-# Short and true, never a list of formats to resend in. Only "did not load" may work another time.
-LIMITS = {'spoiler': 'i don’t open spoilers.', 'video': 'can’t watch videos, only still pics.',
-          'gif': 'can’t watch gifs, only still pics.', 'more than two images': 'i only look at two pics per post.',
-          'image too large': 'that pic’s too big for me to open.',
-          'unsupported': 'can’t open that one, only plain still pics.', 'did not load': 'couldn’t load that just now.'}
-# What an ask about the media itself is made of: reactions and pointers at it ("thoughts?", "lmao", "is it
-# good"), or a pointer and one word of its own ("what song is this"). Any other question or request, however
-# short ("what is recursion?", "tell me a joke"), is the text's own and goes to the model (see about_media).
-REACTIONS = frozenset('''lol lmao lmfao haha hahaha xd omg wow damn bruh bro dude fr ngl tbh thoughts thought
-opinion opinions take rate rating think look see watch check good bad funny real fake true mid cursed cute nice
-cool crazy wild like guess'''.split())
-POINTERS = frozenset('''this that these those above attached clip clips video videos vid gif gifs pic pics
-picture pictures photo photos image images meme memes screenshot file post'''.split())
-VAGUE = frozenset('it its them here there one ones thing'.split())  # Pointers only with no word of the ask's own.
-FILLER = frozenset('''fri yo hey hi ok okay oh ah uh um hm hmm so just really actually lowkey kinda now too also
-pls plz please rn what whats who whos which how hows why is are was does do did can could would will you u ur
-your yours i im me my mine of about on at in out the a an and or to for any tell say describe explain'''.split())
+KEYS = ('image_sources', 'image_event', 'image_invitation', 'image_reads')
 
 
 def media(message):
@@ -87,8 +69,8 @@ def label(emoji):
 
 
 def image_context(context):
-    """What later checks need to notice an inspected image changing, from a turn's context."""
-    return {key: context[key] for key in KEYS if key in context}
+    """What later checks need to notice an inspected image changing, or a declined one, from a turn's context."""
+    return {key: context[key] for key in (*KEYS, 'image_declined') if key in context}
 
 
 async def look(context, posts, *, invitation=None):
@@ -214,6 +196,26 @@ async def attach(context, event, text, *, source=None, invitation=None):
         from .fri_context import discord_source
         context['image_provenance'] = discord_source(source).evidence()
         context['image_invitation'] = invitation
+
+
+# Why the speaker's own media went unseen, as the member hears it when their ask is about the media itself.
+# Short and true, never a list of formats to resend in. Only "did not load" may work another time.
+LIMITS = {'spoiler': 'i don’t open spoilers.', 'video': 'can’t watch videos, only still pics.',
+          'gif': 'can’t watch gifs, only still pics.', 'more than two images': 'i only look at two pics per post.',
+          'image too large': 'that pic’s too big for me to open.',
+          'unsupported': 'can’t open that one, only plain still pics.', 'did not load': 'couldn’t load that just now.'}
+# What an ask about the media itself is made of: reactions and pointers at it ("thoughts?", "lmao", "is it
+# good"), or a pointer and one word of its own ("what song is this"). Any other question or request, however
+# short ("what is recursion?", "tell me a joke"), is the text's own and goes to the model (see about_media).
+REACTIONS = frozenset('''lol lmao lmfao haha hahaha xd omg wow damn bruh bro dude fr ngl tbh thoughts thought
+opinion opinions take rate rating think look see watch check good bad funny real fake true mid cursed cute nice
+cool crazy wild like guess'''.split())
+POINTERS = frozenset('''this that these those above attached clip clips video videos vid gif gifs pic pics
+picture pictures photo photos image images meme memes screenshot file post'''.split())
+VAGUE = frozenset('it its them here there one ones thing'.split())  # Pointers only with no word of the ask's own.
+FILLER = frozenset('''fri yo hey hi ok okay oh ah uh um hm hmm so just really actually lowkey kinda now too also
+pls plz please rn what whats who whos which how hows why is are was does do did can could would will you u ur
+your yours i im me my mine of about on at in out the a an and or to for any tell say describe explain'''.split())
 
 
 def declined(source):
