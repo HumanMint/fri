@@ -388,6 +388,8 @@ async def unchanged(agent, message, context):
             except (discord.HTTPException, ValueError):
                 return False  # Unconfirmed: refused, but not withdrawn.
         if current is None or getattr(current, 'edited_at', None) is not None or clean(current.content, limit) != row['text']:
+            if current is not None and hasattr(agent, 'saw_edit'):
+                agent.saw_edit(int(row['source']['id']), getattr(current, 'edited_at', None))
             agent.withdraw(SimpleNamespace(id=int(row['source']['id']), channel=channel))
             return True
         return False
