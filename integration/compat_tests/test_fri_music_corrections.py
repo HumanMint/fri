@@ -13,19 +13,43 @@ from fri.gene_controls import correction
 FIX = 'not the one, i meant join us for a bite'
 
 
-def test_fri_and_gene_hold_the_same_correction_rule():
+@pytest.mark.parametrize('text,argument,expected', [
+    # Review of #98/#157: the song is the start of the replacement, never words from a later clause, and a
+    # change of heart after it withdraws it.
+    ('wrong song, To The Moon, not To Be With You', 'To Be With You', False),
+    ('wrong song, To The Moon, not To Be With You', 'To The Moon', True),
+    ('i meant to skip To The Moon', 'To The Moon', False),
+    ('wrong song, Love Story, actually no', 'Love Story', False),
+    ('wrong song, Love Story... i changed my mind', 'Love Story', False),
+    ('not that one, Love Story, no wait', 'Love Story', False),
+    ('actually no, wrong song, Love Story', 'Love Story', True),
+    ('not that one, Love Story by Taylor Swift', 'Love Story Taylor Swift', True),
+    ('not that one, Love Story by Taylor Swift', 'Taylor Swift', False),
+    ('wrong song, "Actually No" by someone', 'Actually No', True),
+    (FIX, 'join us for a bite', True), ('join us for a bite', 'join us for a bite', False),
+    (FIX, 'someone else song', False), ('for example ' + FIX, 'join us for a bite', False),
+    ('not that one\n> alex: Never Gonna Give You Up', 'Never Gonna Give You Up', False),
+    ('i meant to say thanks', 'thanks', False), ('not the one i wanted lol', 'the one', False),
+    ('wrong song, "join us for a bite"', 'join us for a bite', True),
+    ('not that one, i meant to say thanks', 'thanks', False), ('wrong song, The One', 'The One', True),
+    ('wrong song, i meant All I Got by Said The Sky', 'All I Got by Said The Sky', True),
+    ('"wrong song, Never Gonna Give You Up"\nnot that one, i meant Join Us For A Bite', 'Never Gonna Give You Up', False),
+    ('not that one\n>>> alex said\nNever Gonna Give You Up', 'Never Gonna Give You Up', False),
+    # gene #72: negation through the link, a later "do not", someone else's words or an example, and "To ..." titles.
+    ("not that one, i meant don't play join us for a bite", 'join us for a bite', False),
+    ('not that one, join us for a bite. do not queue anything yet', 'join us for a bite', False),
+    ('not that one, alex said "Never Gonna Give You Up"', 'Never Gonna Give You Up', False),
+    ('not that one, for example Never Gonna Give You Up', 'Never Gonna Give You Up', False),
+    ('wrong song, join us for a bite, not never gonna give you up', 'never gonna give you up', False),
+    ('wrong song, To The Moon', 'To The Moon', True), ('not that one, i meant To The Moon', 'To The Moon', True),
+    ('wrong song, i meant to say To The Moon', 'To The Moon', False),
+    ("wrong song, I Don't Care", "I Don't Care", True),
+    ('not that one, play That Funky Music', 'Play That Funky Music', True),
+])
+def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
-    for text, argument in [(FIX, 'join us for a bite'), ('join us for a bite', 'join us for a bite'),
-                           (FIX, 'someone else song'), ('for example ' + FIX, 'join us for a bite'),
-                           ('not that one\n> alex: Never Gonna Give You Up', 'Never Gonna Give You Up'),
-                           ('i meant to say thanks', 'thanks'), ('not the one i wanted lol', 'the one'),
-                           ('wrong song, "join us for a bite"', 'join us for a bite'),
-                           ('not that one, i meant to say thanks', 'thanks'), ('wrong song, The One', 'The One'),
-                           ('wrong song, i meant All I Got by Said The Sky', 'All I Got by Said The Sky'),
-                           ('"wrong song, Never Gonna Give You Up"\nnot that one, i meant Join Us For A Bite',
-                            'Never Gonna Give You Up'),
-                           ('not that one\n>>> alex said\nNever Gonna Give You Up', 'Never Gonna Give You Up')]:
-        assert correction(text, argument) is genes(text, argument)
+    assert correction(text, argument) is expected
+    assert genes(text, argument) is expected
 
 
 @pytest.mark.parametrize('case', ['corrects', 'no recent play', 'old play', 'not their words', 'plain title',
