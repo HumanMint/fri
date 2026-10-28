@@ -25,6 +25,8 @@ from fri.fri_workspace import send_once
 
 DM = {'guild_id': '123', 'user_id': '10', 'channel_id': '456', 'conversation_id': 'private:999'}
 PUBLIC = {**DM, 'conversation_id': 'public:456'}
+# The agent's record of the turn's own message: never edited or deleted (see fri_workspace.taken_back).
+UNTOUCHED = {'arrival': lambda ids: 0, 'taken_back': lambda i, since: False, 'unsent': {}}
 
 
 def source(offset=0, *, interaction=False, public=False, user='10', channel=None):
@@ -268,10 +270,11 @@ def test_tools_prepare_preview_then_explicit_bound_button_schedules_without_mode
             author=SimpleNamespace(id=10, display_name='Member'), guild=None, webhook_id=None)
         message.channel = Mock(spec=discord.DMChannel, id=999, fetch_message=AsyncMock(return_value=message))
         message.reply = AsyncMock(return_value=SimpleNamespace(id=888))
-        agent = SimpleNamespace(config={'enabled': True, 'support_dms': True}, member=AsyncMock(return_value=SimpleNamespace(id=10)))
+        agent = SimpleNamespace(config={'enabled': True, 'support_dms': True}, member=AsyncMock(return_value=SimpleNamespace(id=10)),
+            **UNTOUCHED)
         fri = SimpleNamespace(api=call, data=tmp_path, agent=agent, guild_id=123, workshop_id=456, user=SimpleNamespace(id=50))
         actions = SimpleNamespace(event=message, public=False, guild=123, user=10, agent=agent, fri=fri,
-            scope=DM, revision=0, private_evidence=False, message=message.content)
+            scope=DM, revision=0, private_evidence=False, message=message.content, conversation={})
         action = {'kind': 'reminder_prepare', 'body': 'update the mods', 'local_time': future(), 'timezone': 'UTC'}
         result = await execute(actions, action)
         await show_preview(fri, message, result['social_preview'])
@@ -376,10 +379,10 @@ def test_game_night_tool_publish_availability_and_rsvp_buttons_use_real_controll
         channel.fetch_message = AsyncMock(return_value=message)
         message.reply = AsyncMock(return_value=SimpleNamespace(id=777))
         agent = SimpleNamespace(config={'enabled': True, 'support_dms': True}, allowed=lambda _: True,
-            member=AsyncMock(return_value=SimpleNamespace(id=10)))
+            member=AsyncMock(return_value=SimpleNamespace(id=10)), **UNTOUCHED)
         fri = SimpleNamespace(api=call, data=tmp_path, guild_id=123, workshop_id=456, agent=agent, user=SimpleNamespace(id=50))
         actions = SimpleNamespace(event=message, public=True, guild=123, user=10, agent=agent, fri=fri,
-            scope=PUBLIC, revision=0, private_evidence=False, message=message.content)
+            scope=PUBLIC, revision=0, private_evidence=False, message=message.content, conversation={})
         result = await execute(actions, {'kind': 'plan_prepare', 'title': 'Helldivers',
             'local_times': future()+'\n'+future(2), 'timezone': 'UTC'})
         await show_preview(fri, message, result['social_preview'])

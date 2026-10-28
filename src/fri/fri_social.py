@@ -13,7 +13,7 @@ import httpx
 from . import feedback as commands
 from .fri_context import ChatSource, addressed_content, discord_source
 from .fri_errors import ControllerRejected
-from .fri_workspace import send_once
+from .fri_workspace import CHANGED, send_once, taken_back
 from .privacy import clean
 from .subscription import private_json
 
@@ -142,7 +142,7 @@ async def execute(actions, action):
         return {'blocked': 'Personal reminders are available in your verified member DM; game-night cards are available in allowed server channels.'}
     original = await actions.event.channel.fetch_message(actions.event.id)
     if original.author.id != actions.user or original.webhook_id or original.content != actions.event.content:
-        return {'blocked': 'Your original request changed. Send a fresh message.'}
+        return {'blocked': CHANGED}
     current = await actions.fri.api('POST', '/chat/context', actions.scope)
     if current['revision'] != actions.revision:
         return {'blocked': 'Privacy settings changed. Ask again for a fresh preview.'}
@@ -154,6 +154,8 @@ async def execute(actions, action):
         item = action.get('reminder_id', '')
         if not re.fullmatch(r'[a-f0-9]{32}', item):
             return {'blocked': 'Ask explicitly to cancel an existing reminder; list your reminders to identify it.'}
+        if taken_back(actions):
+            return {'blocked': CHANGED}
         row = await actions.fri.api('POST', '/social/reminders/'+item+'/decide', {**payload, 'decision': 'cancel'})
         return {'kind': kind, 'id': row['id'], 'state': row['state'],
                 'detail': 'Delivery has already started; cancellation cannot undo it.' if row['state'] == 'sending' else ''}
@@ -163,6 +165,8 @@ async def execute(actions, action):
     route = '/social/reminders/prepare' if kind == 'reminder_prepare' else '/social/plans/prepare'
     if kind == 'plan_prepare':
         payload['request_text'] = request_text
+    if taken_back(actions):
+        return {'blocked': CHANGED}
     row = await actions.fri.api('POST', route, {**payload, **{key: value for key, value in action.items() if key != 'kind'}})
     return {'social_preview': {'kind': 'reminder' if kind == 'reminder_prepare' else 'plan', 'item': row}}
 
