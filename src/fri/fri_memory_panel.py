@@ -67,7 +67,7 @@ async def allowed(cog, interaction, scope, *, message=True, tell=False):
 
 async def show(cog, interaction, scope=None, *, state=None, selected=None, notice='', confirm=False):
     scope = profiled(cog, scope or scope_for(cog, interaction))
-    if not await allowed(cog, interaction, scope, message=False):
+    if not await allowed(cog, interaction, scope, message=False, tell=True):
         return
     state = state or await cog.api('POST', '/chat/memory/notes', scope)
     profiles = getattr(cog, 'profiles', False)

@@ -485,6 +485,22 @@ def test_a_memory_edit_says_why_when_its_members_fresh_lookup_comes_back_empty(m
     asyncio.run(scenario())
 
 
+def test_the_memory_panel_says_why_when_its_own_recheck_finds_no_member():
+    """fri #183: the panel rechecks before it shows (after a click's own check passed, or from the /fri panel), and
+    an empty lookup there says so too, rather than leave the click unanswered."""
+    from fri.fri_memory_panel import show
+    async def scenario():
+        cog, channel = drafts()
+        cog.agent.member = AsyncMock(return_value=None)
+        cog.api = AsyncMock()
+        interaction = click(cog, channel, guild_id=None, custom_id='fri:memory:remove:'+'d'*32)
+        await show(cog, interaction, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                      'conversation_id': 'private:1'})
+        assert said(interaction) == [UNCHECKED]
+        cog.api.assert_not_awaited()
+    asyncio.run(scenario())
+
+
 def test_a_live_views_lookup_notice_leaves_other_refusals_quiet():
     """Only the member lookup says this: a click from the wrong conversation still gets nothing extra."""
     async def scenario():
