@@ -414,3 +414,86 @@ def test_every_view_the_fallback_covers_stays_out_of_a_click_it_answered(monkeyp
             if closing:
                 await closing.close()
     asyncio.run(scenario())
+
+
+UNCHECKED = 'couldn’t check you’re still here. try again.'
+
+
+@pytest.mark.parametrize('kind', ['draft', 'preview', 'settings', 'memory'])
+def test_a_live_view_says_why_when_its_members_fresh_lookup_comes_back_empty(monkeypatch, tmp_path, kind):
+    """fri #183: the view's own member clicks it while it's live, and Discord can't confirm they're still in the
+    server (a failed fetch, or they left). The view says so, privately and once, instead of leaving Discord's "This
+    interaction failed"; the fallback stays out of it, and nothing the button does runs."""
+    from fri.fri_agent import BehaviorPreview
+    from fri.fri_memory_panel import MemoryView
+    async def scenario():
+        state, views = store()
+        fri = SimpleNamespace(user=state.user, _connection=SimpleNamespace(_view_store=views))
+        cog, _ = drafts()
+        cog.agent.member = AsyncMock(return_value=None)
+        cog.api = AsyncMock()
+        closing = None
+        if kind == 'settings':
+            closing, agent, _, _ = harness(monkeypatch, tmp_path)
+            closing._connection.user = SimpleNamespace(id=FRI)
+            closing.owner_id = 20
+            closing.api = cog.api
+            agent.member = cog.agent.member
+            view, prefix = BehaviorPreview(agent, {'voice_notes': 'brief'}, 1), 'fri:behavior:submit'
+        elif kind == 'memory':
+            entry = {'id': 7, 'category': 'likes', 'evidence': 'I like chess', 'expires_at': 0}
+            view = MemoryView(cog, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                    'conversation_id': 'private:1'}, {'entries': [entry], 'revision': 0}, selected=7)
+            prefix = 'fri:memory:remove:'
+        else:
+            view = DraftView(cog, 20, 'Add a queue command', reviewed=kind == 'preview')
+            prefix = f'fri:request:{view.source_id}:submit' if kind == 'preview' else 'fri:request:preview:'
+        [custom_id] = [item.custom_id for item in view.children if item.custom_id.startswith(prefix)]
+        views.add_view(view, 500)
+        try:
+            interaction = raced(fri, state, custom_id, guild_id=None)  # In their DM, where the lookup is the check.
+            await dispatched(views, interaction)
+            assert said(interaction) == [UNCHECKED]
+            assert [kind for kind, *_ in interaction.response.calls] == ['send']
+            interaction.followup.send.assert_not_awaited()
+            cog.agent.member.assert_awaited_once()
+            cog.api.assert_not_awaited()
+        finally:
+            view.stop()
+            if closing:
+                await closing.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('modal', ['EditMemory', 'EditSummary'])
+def test_a_memory_edit_says_why_when_its_members_fresh_lookup_comes_back_empty(modal):
+    """fri #183, the memory panel's edit forms: submitted while the lookup comes back empty, they say so too."""
+    from fri import fri_memory_panel
+    async def scenario():
+        cog, channel = drafts()
+        cog.agent.member = AsyncMock(return_value=None)
+        entry = {'id': 7, 'category': 'likes', 'evidence': 'I like chess', 'expires_at': 0}
+        view = fri_memory_panel.MemoryView(cog, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                                 'conversation_id': 'private:1'},
+                                           {'entries': [entry], 'revision': 0, 'summary': {'text': 'chess talk'}},
+                                           selected=7)
+        form = getattr(fri_memory_panel, modal)(view)
+        interaction = click(cog, channel, guild_id=None, custom_id=form.custom_id)
+        assert not await form.interaction_check(interaction)
+        assert said(interaction) == [UNCHECKED]
+        view.stop()
+    asyncio.run(scenario())
+
+
+def test_a_live_views_lookup_notice_leaves_other_refusals_quiet():
+    """Only the member lookup says this: a click from the wrong conversation still gets nothing extra."""
+    async def scenario():
+        cog, channel = drafts()
+        view = DraftView(cog, 20, 'Add a queue command')
+        elsewhere = click(cog, SimpleNamespace(id=2, parent_id=None), custom_id='fri:request:preview:'+view.source_id)
+        cog.agent.allowed = lambda c: False
+        assert not await view.interaction_check(elsewhere) and said(elsewhere) == []
+        dm = click(cog, channel, guild_id=None, custom_id='fri:request:preview:'+view.source_id)
+        assert await view.interaction_check(dm) and said(dm) == []  # The lookup found them: nothing said.
+        view.stop()
+    asyncio.run(scenario())

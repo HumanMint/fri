@@ -4,6 +4,7 @@ import discord
 
 NOT_YOURS = 'not your button.'
 EXPIRED = 'that one expired. ask again.'
+UNCHECKED = 'couldn’t check you’re still here. try again.'
 # Request drafts, owner settings previews, the memory panel and the old per-reply memory buttons: views kept in
 # memory only, so a restart ends them. Persistent buttons (fri:memory:open:<member>, reviews, posts, plans) and
 # modals aren't matched: those keep working on their own.
@@ -25,6 +26,13 @@ async def tell(interaction, text):
 async def not_yours(interaction):
     """A click on another member's Fri button: told so, instead of Discord's "This interaction failed"."""
     await tell(interaction, NOT_YOURS)
+
+
+async def unchecked(interaction):
+    """A member's own click on a live Fri view, or a memory form they sent, when the fresh check that they're still
+    in the server comes back empty (a failed fetch, or they left): told so, instead of Discord's "This interaction
+    failed" (fri #183)."""
+    await tell(interaction, UNCHECKED)
 
 
 def answers(interaction, who):

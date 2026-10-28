@@ -40,7 +40,9 @@ def launched(cog, interaction):
             'conversation_id': 'public:'+str(interaction.channel_id)}
 
 
-async def allowed(cog, interaction, scope, *, message=True):
+async def allowed(cog, interaction, scope, *, message=True, tell=False):
+    """Whether this click or form is the member's own, here, still. `tell`: a failed member lookup says so (see
+    fri_buttons.unchecked); every other refusal stays quiet."""
     if (str(interaction.user.id) != scope['user_id'] or
             str(interaction.channel_id) != scope['conversation_id'].split(':', 1)[1]):
         return False
@@ -53,6 +55,9 @@ async def allowed(cog, interaction, scope, *, message=True):
         return False
     member = await cog.agent.member(interaction.user.id, fresh=True, guild_id=int(scope['guild_id']))
     if not member:
+        if tell:
+            from .fri_buttons import unchecked
+            await unchecked(interaction)
         return False
     if interaction.guild_id:
         permissions = interaction.channel.permissions_for(member)
@@ -194,7 +199,7 @@ class MemoryView(discord.ui.View):
         from .fri_buttons import answers
         if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
             return False
-        return await allowed(self.cog, interaction, self.scope)
+        return await allowed(self.cog, interaction, self.scope, tell=True)
 
     async def remove(self, interaction):
         if not await self.interaction_check(interaction):
@@ -267,7 +272,7 @@ class EditSummary(discord.ui.Modal):
         self.add_item(self.summary)
 
     async def interaction_check(self, interaction):
-        return await allowed(self.view.cog, interaction, self.view.scope, message=False)
+        return await allowed(self.view.cog, interaction, self.view.scope, message=False, tell=True)
 
     async def on_submit(self, interaction):
         if await self.interaction_check(interaction):
@@ -284,7 +289,7 @@ class EditMemory(discord.ui.Modal):
         self.add_item(self.preference)
 
     async def interaction_check(self, interaction):
-        return await allowed(self.view.cog, interaction, self.view.scope, message=False)
+        return await allowed(self.view.cog, interaction, self.view.scope, message=False, tell=True)
 
     async def on_submit(self, interaction):
         if not await self.interaction_check(interaction):

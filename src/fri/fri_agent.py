@@ -83,17 +83,21 @@ class BehaviorPreview(PagedPreview):
                          'Apply settings', 'fri:behavior:', self.apply)
 
     async def interaction_check(self, interaction):
-        from .fri_buttons import answers, not_yours
+        from .fri_buttons import answers, not_yours, unchecked
         fri = self.agent.fri
         if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
             return False
         if interaction.user.id != fri.owner_id:
             await not_yours(interaction)
             return False
-        return (interaction.message.author.id == fri.user.id and
+        if not (interaction.message.author.id == fri.user.id and
                 (interaction.guild_id is None or (interaction.guild_id == fri.guild_id and
-                                                  self.agent.allowed(interaction.channel))) and
-                bool(await self.agent.member(interaction.user.id, fresh=True)))
+                                                  self.agent.allowed(interaction.channel)))):
+            return False
+        if await self.agent.member(interaction.user.id, fresh=True):
+            return True
+        await unchecked(interaction)
+        return False
 
     async def apply(self, interaction, button=None):
         if not await self.interaction_check(interaction):
