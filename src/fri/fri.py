@@ -660,6 +660,7 @@ class Fri(discord.Client):
                         except discord.HTTPException:
                             raise GateClosed('message deleted') from None  # Quiet, as for any taken-back message.
                         if current.edited_at != self.agent.edits.get(event.id) or current.content != event.content:
+                            self.agent.saw_edit(event.id, current.edited_at)  # A re-run waits for Discord to show it.
                             self.agent.withdraw(event)  # Marked, so its edit is what gets answered (see Agent.reply_once).
                             raise commands.UserFeedbackCheckFailure('the conversation changed while i was typing. ask again and i’ll catch up.')
                     await sources_unchanged()

@@ -164,6 +164,7 @@ class Agent:
         self.acted = {}  # Discord message ID -> when a turn for it ran a tool that may change something.
         self.reruns = set()  # Those answers again still going (see answer_edits).
         self.rerunning = {}  # Message ID -> the newest edited_at seen while it waits to be answered again.
+        self.edit_seen = {}  # Message ID -> the newest edited_at seen while it was handled (see saw_edit).
         self.last_attention = {}
         self.last_spoke = {}
         self.acknowledged = {}
@@ -386,8 +387,7 @@ class Agent:
         if ((self.handling[message.id] or message.id in self.rerunning) and
                 getattr(message, 'edited_at', None) is not None and
                 not getattr(getattr(message, 'author', None), 'bot', True)):  # Not an embed or pin update.
-            if message.id in self.rerunning:  # Its refetch must show this edit, or a later one (see rerun).
-                self.rerunning[message.id] = max(filter(None, (self.rerunning[message.id], message.edited_at)))
+            self.saw_edit(message.id, message.edited_at)
             return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
         rows = self.recent.get(channel)
         author = getattr(getattr(message, 'author', None), 'id', None)
@@ -677,6 +677,7 @@ class Agent:
                 continue
             if (current is None or getattr(current, 'edited_at', None) != self.edits.get(event.id) or
                     (event is not message and current.content != arrived)):
+                self.saw_edit(event.id, getattr(current, 'edited_at', None))
                 self.withdraw(event)
                 changed = changed or event is not message
                 continue
@@ -860,6 +861,7 @@ class Agent:
                 unchanged = False
                 continue
             if getattr(current, 'edited_at', None) != self.edits.get(event.id) or current.content != event.content:
+                self.saw_edit(event.id, getattr(current, 'edited_at', None))
                 self.withdraw(event)  # Edited since Fri got it, maybe to take it back.
                 unchanged = False
         return unchanged
@@ -900,7 +902,7 @@ class Agent:
         """Answer, once more and as they read now, the messages whose turns their own edit refused, once
         nothing is handling them any more (see reply_once)."""
         for i in [i for i in self.reanswer if not self.handling[i]]:
-            self.rerunning[i] = None  # From now, an edit to it is marked as if it were handled (see edit).
+            self.rerunning[i] = self.edit_seen.get(i)  # From now, an edit to it is marked as if handled (see edit).
             task = asyncio.get_running_loop().create_task(self.rerun(self.reanswer.pop(i), i))
             self.reruns.add(task)
             task.add_done_callback(self.reruns.discard)
@@ -933,6 +935,20 @@ class Agent:
             LOG.exception('Answering an edited message again failed')
         finally:
             self.rerunning.pop(message_id, None)
+            self.edit_seen.pop(message_id, None)
+
+    def saw_edit(self, i, edited):
+        """The newest edit seen, by its event or a check's fetch, of a message being handled or answered again:
+        answering it again waits until Discord's copy shows that edit (see rerun)."""
+        if not isinstance(edited, dt.datetime):
+            return
+        if self.edit_seen.get(i) is None or edited > self.edit_seen[i]:
+            self.edit_seen.pop(i, None)
+            self.edit_seen[i] = edited
+            while len(self.edit_seen) > MAX_DELIVERED:
+                del self.edit_seen[next(iter(self.edit_seen))]
+        if i in self.rerunning and (self.rerunning[i] is None or edited > self.rerunning[i]):
+            self.rerunning[i] = edited
 
     async def excluded(self, message, dm, invitation=None, privacy=None, text=''):
         """Why a message that waited (its turn, or another control) is no longer one Fri answers, by
@@ -1081,6 +1097,7 @@ class Agent:
         except discord.HTTPException:
             return False
         if getattr(current, 'edited_at', None) != self.edits.get(message.id) or current.content != message.content:
+            self.saw_edit(message.id, getattr(current, 'edited_at', None))
             self.withdraw(message)  # Edited since Fri got it, maybe to take it back.
             return False
         return answering or message.guild is None or await addressed_text(current, self.fri.user.id) is not None
