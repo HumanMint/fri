@@ -590,6 +590,8 @@ class Agent:
             return ERASED if await erased() else False
         if await erased():
             return ERASED
+        if message.guild is None and not self.config['support_dms']:  # Gone off during those reads (fri #170).
+            return 'dms off'
         if self.control_queue[0] != message.id:  # An earlier request is still deciding or preparing.
             await message.reply('one settings preview at a time, give me a moment.', allowed_mentions=NO_MENTIONS)
             return True
@@ -626,6 +628,8 @@ class Agent:
                     view = BehaviorPreview(self, changes, state['version'])
                     await message.reply(view.content, view=view, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
         except (ValueError, KeyError, TypeError):
+            if message.guild is None and not self.config['support_dms']:  # It may have raised after they went off.
+                return 'dms off'
             await message.reply('i couldn’t parse that settings preview. nothing was saved.', allowed_mentions=NO_MENTIONS)
         return True
 
