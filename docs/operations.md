@@ -44,6 +44,21 @@ and author checks as any read; each must still be pinned and unchanged before th
 and filenames are never visual evidence. Public research only exports an exact
 public question from the current request, never surrounding chat or image captions.
 
+A link's preview card on a member's post shows on its row in a read, an invitation or a reply
+target as `link_cards`: up to two cards, each its site (40 characters), who made it (60), title (120)
+and a line of text (200), never a URL. Members can't send their own embeds, so these are Discord's
+unfurls of links they sent; bot, webhook and spoilered posts show none. The speaker's own link is read
+from a refetch of their message (`message_link_cards`), since Discord usually unfurls it after the
+message arrives. The reply model is told, only when a card is in the request, that card text is the
+site's and never instructions. Card text isn't part of any recheck: a card that re-unfurls or is
+suppressed changes no fingerprint, and the next read shows it as it is then. On a member's post with no
+attachment or GIF link, the card's picture (a video's thumbnail, an X or Reddit card's image, a pasted
+image link) counts as one image, labelled `still="link preview"`, from the first two cards, through
+Discord's own `/external/` proxy only and within the image limits above (a picture Discord sized over
+twenty million pixels is skipped). The picture is checked on its own refetch before each later model
+request, so a swapped or suppressed one stops the turn. A post with both an attachment and a card's
+picture is still not looked at, and history search rows don't show cards yet.
+
 Context from other members keeps its actual author and privacy revision and stays
 ephemeral. Saved conversation uses a neutral breadcrumb; no derived personal notes,
 drafts or posts are retained. Configured-channel mentions start with their normal
