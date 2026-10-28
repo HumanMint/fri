@@ -252,6 +252,8 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
             'source': source(name=name)}
         if case.get('invited_context'):
             context['invited_context'] = case['invited_context']
+        if case.get('reply_target'):
+            context['reply_target'] = case['reply_target']
         context['acknowledgments_enabled'] = suite == 'endings'
         context['images'] = case.get('images', [])
         context['inspected_images'] = case.get('inspected_images', [])
@@ -312,8 +314,9 @@ GRADE = obj({'verdict': {'type': 'string', 'enum': ['pass', 'fail']}, 'reason': 
 async def grade(chat, model, effort, case, result):
     """Model-graded verdict for a sass or model-text case: phrase checks can't judge consent, distress,
     truth, boundaries or help."""
-    situation = {key: case[key] for key in ('turns', 'recent', 'action_result', 'web_research', 'display_name',
-                                            'inspected_images', 'image_notes') if key in case}
+    situation = {key: case[key] for key in ('turns', 'recent', 'reply_target', 'invited_context', 'action_result',
+                                            'web_research', 'display_name', 'inspected_images', 'image_notes')
+                 if key in case}
     verdict, counters, status = await analyze(chat, GRADER, {
         'situation': {**situation, 'available_actions': case.get('actions', {}), 'message': case['text']},
         'expectation': case['expect'], 'fri_reply': result.reply, 'fri_action': result.action,
@@ -462,7 +465,47 @@ def sass_cases():
          'expect': 'Help mode: one concrete design call and a next step '
          '(a request draft is fine). Attitude turned down, no header or sign-off.'},
         memes_above(),
+        thread_starter(),
+        forward_not_a_reply(),
     ]
+
+
+def thread_starter():
+    """"thoughts?" in a thread opened on a post: the post, from the channel above, is what it's about."""
+    mid = '100000000000000001'  # In the channel above the thread.
+    post = {**source('201', 'Kev'), 'id': mid, 'channel_id': '554', 'url': 'https://discord.com/channels/444/554/'+mid}
+    return {'name': 'thread_starter_thoughts', 'text': 'thoughts?', 'max_chars': 200,
+            'reply_target': [{'source': post, 'text': 'hot take: pineapple on pizza is elite', 'privacy_revision': 0,
+                              'thread_starter': True}],
+            'banned': ('on what', 'what post', 'what take', 'which post', 'about what', 'what are we'),
+            'needs': ('pineapple', 'pizza'),
+            'expect': "A take on Kev's pineapple pizza post, the one this thread was opened on. No asking what "
+                      'they mean.'}
+
+
+def forward_not_a_reply():
+    """Jo forwarded a post here, which Fri can't read yet. A forward's reference names the post it copies, so its
+    row must not say it answers Kev's (see fri_images.details)."""
+    from types import SimpleNamespace
+
+    import discord
+
+    from .fri_images import details
+    def posted(user, name, mid):
+        return {**source(user, name), 'id': mid, 'url': 'https://discord.com/channels/444/555/'+mid}
+    here, kev = SimpleNamespace(id=555), '100000000000000002'
+    forward = SimpleNamespace(channel=here, guild=SimpleNamespace(id=444), attachments=[], embeds=[], reactions=[],
+                              pinned=False, author=SimpleNamespace(bot=False), webhook_id=None, content='',
+                              reference=discord.MessageReference(message_id=int(kev), channel_id=here.id, guild_id=444,
+                                                                 type=discord.MessageReferenceType.forward))
+    return {'name': 'forward_not_a_reply', 'text': 'did jo answer kev?', 'max_chars': 200,
+            'invited_context': [
+                {'source': posted('201', 'Kev', kev), 'text': 'anyone got a spare raid pass', 'privacy_revision': 0},
+                {'source': posted('202', 'Jo', '100000000000000003'), 'text': '', 'privacy_revision': 0,
+                 **details(forward)}],
+            'banned': ('jo answered', 'jo replied', 'replied to kev', 'answered kev', 'answered him', 'yeah jo', 'yes jo'),
+            'expect': "Doesn't claim Jo answered or replied to Kev: Jo's post shows nothing Fri can read. A brief, "
+                      'honest answer, not a made-up exchange.'}
 
 
 def memes_above():

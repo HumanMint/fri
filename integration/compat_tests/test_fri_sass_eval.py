@@ -68,6 +68,8 @@ def test_every_sass_case_is_scored_and_a_failed_call_fails(grader):
     ('test_ping', 'yeah, your message came through and i can reply.'),
     ('test_ping_after_failure', 'lol try it and see'),
     ('you_there_in_distress', 'unfortunately.'),
+    ('thread_starter_thoughts', 'thoughts on what?'),
+    ('forward_not_a_reply', 'yeah jo answered kev, gave him a pass.'),
 ])
 def test_phrase_checks_fail_replies_that_miss_the_point(grader, name, reply):
     assert scored({text(name): reply})[name] is False
@@ -126,10 +128,34 @@ def test_a_failed_grader_call_fails_the_case(grader):
     ('test_ping', 'unfortunately.'),
     ('test_ping_after_failure', 'can’t tell yet, gene still isn’t answering. try play again in a sec.'),
     ('you_there_in_distress', 'yeah, i’m here. are you safe right now?'),
+    ('thread_starter_thoughts', 'kev opened a whole thread for pineapple pizza. correct take, wrong amount of confidence.'),
+    ('forward_not_a_reply', 'jo just forwarded something, and i can’t read forwards yet. no sign of a raid pass.'),
 ])
 def test_replies_that_land_pass_both_checks(grader, name, reply):
     results = scored({text(name): reply})
     assert results[name] is True and results[name + ':grade'] is True
+
+
+def test_the_thread_and_forward_cases_carry_what_fri_would_read(grader):
+    """The model reads the thread's starter post as a reply target, and Jo's forward without a reply_to."""
+    seen, _ = grader
+    contexts = {}
+    class Recording(Scripted):
+        async def respond(self, text, context):
+            contexts[text] = context
+            return await super().respond(text, context)
+    async def run():
+        replies = Recording({text('thread_starter_thoughts'): 'kev’s pizza take is fine.',
+                             text('forward_not_a_reply'): 'jo forwarded something i can’t read.'})
+        return [case async for case, _ in evaluate(replies, 'gpt-6.1-sol', 'high', suite='sass')]
+    asyncio.run(run())
+    [starter] = contexts[text('thread_starter_thoughts')]['reply_target']
+    assert starter['thread_starter'] is True and 'pineapple' in starter['text']
+    kev, jo = contexts[text('forward_not_a_reply')]['invited_context']
+    assert jo['text'] == '' and 'reply_to' not in jo
+    situations = {data['situation']['message']: data['situation'] for data in seen}
+    assert situations[text('thread_starter_thoughts')]['reply_target'] == [starter]  # The grader sees it too.
+    assert situations[text('forward_not_a_reply')]['invited_context'][1] == jo
 
 
 def test_every_model_text_case_is_graded_and_the_baseline_escapes_all_input(grader, monkeypatch):
