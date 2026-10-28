@@ -256,10 +256,10 @@ class Invitation:
                 profiles = await self.profile_sources(self.evidence())
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
-                changed = False  # Every one is checked, so each edited or deleted leaves the live view.
+                changed, fetched = False, {}  # Every one is checked, so each edited or deleted leaves the live view.
                 for mid, event in self.events.items():
                     try:
-                        current = await self.event.channel.fetch_message(mid)
+                        current = fetched[mid] = await self.event.channel.fetch_message(mid)
                     except discord.NotFound:
                         self.agent.withdraw(event)
                         changed = True
@@ -267,13 +267,16 @@ class Invitation:
                     if current.webhook_id or current.author.bot or snapshot(current) != self.snapshots[mid]:
                         self.agent.withdraw(event)
                         changed = True
-                for mid, (event, kind, before) in self.carried.items():  # And what Fri's answer drew on.
+                for mid, (event, kind, before) in self.carried.items():  # And what Fri's answer drew on, as its
+                    # receipt names it: card pictures too, which the nearby snapshots leave out (see version). A
+                    # nearby one by the read just above.
                     if mid in self.events:
-                        continue  # Read nearby too, just above, as the same version (see answer).
-                    try:
-                        current = await self.event.channel.fetch_message(mid)
-                    except discord.NotFound:
-                        current = None
+                        current = fetched.get(mid)
+                    else:
+                        try:
+                            current = await self.event.channel.fetch_message(mid)
+                        except discord.NotFound:
+                            current = None
                     if current is None or not self.same(current, mid, kind, before):
                         self.agent.withdraw(event)
                         changed = True

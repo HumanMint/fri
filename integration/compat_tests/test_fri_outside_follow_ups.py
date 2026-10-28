@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 import discord
 import pytest
 
-from compat_tests.test_fri_looking import loads
+from compat_tests.test_fri_looking import loads, picture
 from compat_tests.test_fri_mentions import environment
 from fri.fri import UNAVAILABLE, Fri
 from fri.fri_agent import Agent
@@ -611,6 +611,61 @@ def test_an_answer_that_saw_a_picture_on_a_post_no_receipt_names_keeps_none(monk
             monkeypatch.setattr(Invitation, 'answered', answered)
             _, answer = await handled(w, ping, ANSWER, age=110)
             assert w.agent.receipts.get(answer.id) is None
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('part', ['image', 'thumbnail'])
+@pytest.mark.parametrize('when', ['never', 'sign-in', 'inference'])
+def test_a_nearby_card_picture_the_answer_drew_on_suppressed_during_the_follow_up_stops_it(monkeypatch, tmp_path,
+                                                                                         when, part):
+    """Stack review round 3: the post is nearby for the follow-up too, so its check refetches it once, and compares
+    it with the receipt's version, card picture included, even when four newer pictures fill the follow-up's own
+    image budget so it never looks at that card again."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        w.fri.data = tmp_path
+        loads(monkeypatch)
+        try:
+            post = carded(w, age=600)
+            if part == 'thumbnail':
+                post.embeds = [discord.Embed.from_dict({'type': 'article', 'url': 'https://site.test/page',
+                    'title': 'A page', 'thumbnail': {'url': 'https://site.test/card.png', 'proxy_url': PICTURE,
+                                                     'width': 100, 'height': 100}})]
+            ping = reply_to(w.message('<@99> what is in that picture', user=20, age=120), post)
+            _, answer = await handled(w, ping, 'CAPTION', age=110)
+            assert w.agent.receipts.get(answer.id) is not None
+            for n in range(4):
+                w.message(f'pic {n}', user=50+n, age=60-5*n, attachments=[picture(w.channel.id, f'p{n}.png')])
+            event = follow_up(w, answer)
+            event.reply.return_value = w.fri_post(AGAIN)
+            shown = []
+
+            def suppress():
+                changed = copy.copy(w.rows[post.id])
+                changed.embeds = []  # Same text, same edit time.
+                w.rows[post.id] = changed
+
+            async def model(text, context, *, ready=None):
+                if when == 'sign-in':
+                    suppress()
+                await ready()
+                shown.extend(own(context))
+                if when == 'inference':
+                    suppress()
+                return ChatResult(status='completed', reply=AGAIN)
+            w.fri.chat_once = Fri.chat_once.__get__(w.fri, Fri)
+            w.fri.chat = SimpleNamespace(respond=model)
+            w.fri.flush_usage = AsyncMock()
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await w.agent.handle(event)
+            replies = [item.args[0] for item in event.reply.await_args_list]
+            if when == 'never':
+                assert [row['text'] for row in shown] == ['CAPTION'] and replies == [AGAIN]
+                return
+            assert not shown if when == 'sign-in' else [row['text'] for row in shown] == ['CAPTION']
+            assert AGAIN not in replies
         finally:
             await w.fri.close()
     asyncio.run(scenario())
