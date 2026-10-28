@@ -197,6 +197,8 @@ class Agent:
         self.windows = {}
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
         self.saved_turns = SavedTurns(self)  # Members' messages Fri saved exchanges with, dropped if taken back.
+        from .fri_mentions import Receipts
+        self.receipts = Receipts()  # Fri's answers to outside pings a direct reply may read (see Invitation.answer).
 
     @property
     def config(self):
@@ -371,6 +373,7 @@ class Agent:
                     self.active[key] = replaced
         self.bursts.unsend(channel, ids)
         self.saved_turns.withdraw(ids)  # Their saved exchanges too, so their words don't come back as history.
+        self.receipts.withdraw(ids)  # And Fri's outside answers that drew on them, or were them.
 
     def saw(self, ids):
         """Messages a turn's model request carries, wherever they came from (the live view, a reply target, a
@@ -399,6 +402,8 @@ class Agent:
                                       for r in self.recent.get(channel, ()))
         edited = (getattr(message, 'edited_at', None) is not None and not ours and
                   (sender is None or not getattr(sender, 'bot', True)))  # Not an embed or pin update.
+        if getattr(message, 'edited_at', None) is not None:  # Anyone's edit, Fri's too, ends an outside answer's
+            self.receipts.withdraw([message.id])  # receipt naming it.
         if edited and message.id in self.looked:
             self.revise(message.id)
         if (self.handling[message.id] or message.id in self.rerunning) and edited:
@@ -452,6 +457,7 @@ class Agent:
         for key in list(self.active):
             if key[1] == user:
                 del self.active[key]
+        self.receipts.forget(user)  # Fri's outside answers drawing on them too.
 
     async def extra_context(self, channel, user, public):
         data = {'voice_notes': self.config['voice_notes']}
@@ -911,6 +917,7 @@ class Agent:
         while self.withdrawn and (next(iter(self.withdrawn.values())) < now-3600 or len(self.withdrawn) > 100000):
             del self.withdrawn[next(iter(self.withdrawn))]
         self.saved_turns.withdraw([message.id])  # And from its author's saved exchange (fri #129).
+        self.receipts.withdraw([message.id])
 
     def taken_back(self, i, since):
         """Whether message `i` was edited or deleted at or after `since`, the time.time() its words were read.
@@ -1703,6 +1710,10 @@ class Agent:
                 self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
                     'name': 'Fri', 'text': clean(text, 500), 'at': time.time(), 'gene_error': False,
                     'fri': True, 'provenance': echo['provenance']})
+            if (invitation and invitation.outside and saved is not None and saved.get('kept', True) and
+                    not taken_back() and getattr(sent, 'id', None) not in self.unsent):
+                # Delivered and saved, and nothing it drew on taken back: a direct reply to it may read it.
+                invitation.answered(sent)
             if result.status == 'completed' and not (invitation and invitation.outside):
                 self.active[key] = time.time()+(300 if result.clarification else 120)
         finally:

@@ -147,6 +147,7 @@ def test_an_opt_out_by_an_author_the_answer_drew_on_stops_the_follow_up(monkeypa
                 if when == 'model':
                     w.store.personal_control('30', 'disable')
                 return ChatResult(status='completed', reply='the cat, obviously')
+            w.fri.chat_once.reset_mock()
             w.fri.chat_once.side_effect = respond
             event.reply.return_value = w.fri_post('the cat, obviously')
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
@@ -208,6 +209,24 @@ def test_answers_past_the_cap_are_read_as_before(monkeypatch, tmp_path):
             _, second = await handled(w, other, 'nah', age=90)
             context, _ = await handled(w, follow_up(w, first), AGAIN)
             assert not own(context)  # Pushed out by the newer answer.
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('bound', ['MAX_EVIDENCE', 'MAX_AUTHORS'])
+def test_an_answer_past_one_privacy_reads_bounds_is_read_as_before(monkeypatch, tmp_path, bound):
+    """The answer's two posts and two authors fit, but not with a newer post by someone else: never cut short."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        monkeypatch.setattr('fri.fri_mentions.'+bound, 2, raising=False)
+        try:
+            _, _, answer = await opened(w)
+            w.message('lmao the cat', user=31, age=60)
+            event = follow_up(w, answer)
+            context, _ = await handled(w, event, AGAIN)
+            assert not own(context) and '30' not in tracked(w, event)  # Nothing of the answer was read.
+            assert [row['text'] for row in context['invited_context']] == ['<@99> which one is better', 'lmao the cat']
         finally:
             await w.fri.close()
     asyncio.run(scenario())

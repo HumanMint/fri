@@ -1063,7 +1063,8 @@ class Fri(discord.Client):
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
                 await invitation.look(context)  # Up front: an outside ping has no read to decide on.
                 actions.image_context = image_context(context)
-                context['fence'] = {'invitation': invitation, 'shown': set()}  # See chat_once.
+                # See chat_once. What a Fri answer it reads drew on counts as shown: a delete of it withholds the reply.
+                context['fence'] = {'invitation': invitation, 'shown': set(), 'messages': set(invitation.carried)}
                 result = await self.chat_once(text, context)
                 research = None
                 if result.action:

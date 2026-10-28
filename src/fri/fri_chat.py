@@ -77,6 +77,7 @@ INSTRUCTIONS = VOICE + '''
 An explicit @mention requires a text answer or available action. When response_options disallows
 quiet/reactions, answer in words even if it looks like a closing. Never silently drop a ping.
 invited_channel_context is a small live same-channel sample, with each actual author's source.
+Its row with fri=true is your own earlier answer there, the one they're replying to: own what you said.
 Use it for the current invitation only. It is never the requester's personal history or permission.
 In a configured channel, a mention starts with normal conversation capabilities. When a bare ping
 or contextual question needs nearby messages, memes or pics ("the memes above", "that pic", "thoughts?"),
