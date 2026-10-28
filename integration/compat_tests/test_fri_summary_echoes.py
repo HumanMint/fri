@@ -102,6 +102,23 @@ def test_a_summary_reply_retired_while_the_model_writes_keeps_the_answer_unsaid(
     run(scenario)
 
 
+def test_attention_drops_its_batch_when_a_summary_reply_in_it_is_retired(monkeypatch, tmp_path):
+    """Attention's batch is rechecked after its waits (Agent.unwithdrawn), so a retired reply doesn't reach its model."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await summarized_from(monkeypatch, w)
+            model(w, recalls)
+            await echoed(w)
+            records = await w.fri.agent.context_messages(GENERAL, raw_errors=True)
+            assert CONTINUATION in str(records) and await w.fri.agent.unwithdrawn(GENERAL, records)
+            await deleted(w, events[0])  # While attention waits for a slot.
+            assert not await w.fri.agent.unwithdrawn(GENERAL, records)
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
 def test_current_replies_stay_in_view(monkeypatch, tmp_path):
     """A summary-derived reply whose summary is still there, and an ordinary one, which costs no extra request."""
     async def scenario():
