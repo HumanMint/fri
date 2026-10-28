@@ -35,9 +35,11 @@ def inside_maintenance_window(monkeypatch):
         return
     import datetime as dt
     from zoneinfo import ZoneInfo
-    tomorrow = dt.datetime.now(ZoneInfo('America/Los_Angeles')).date()+dt.timedelta(days=1)
-    window = dt.datetime.combine(tomorrow, dt.time(4, 5), ZoneInfo('America/Los_Angeles')).timestamp()
-    monkeypatch.setattr(gene.maintenance, 'clock', lambda: window)
+
+    def window():  # Worked out on every call, so a test running across midnight stays a day ahead.
+        zone = ZoneInfo('America/Los_Angeles')
+        return dt.datetime.combine(dt.datetime.now(zone).date()+dt.timedelta(days=1), dt.time(4, 5), zone).timestamp()
+    monkeypatch.setattr(gene.maintenance, 'clock', window)
 
 
 @pytest.fixture
