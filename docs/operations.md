@@ -32,7 +32,7 @@ first, then the newest nearby posts' own attachments; Fri picks among several in
 of asking which one. A speaker's own post keeps the two-image limit; a nearby gallery
 post can use the whole budget. Each image stays a non-spoiler PNG/JPEG/WebP, 4 MB,
 twenty million pixels. A GIF link (Tenor, Giphy) counts as one image through the still preview
-Discord's own proxy made of it; nothing decodes an animation, so an uploaded GIF or an animated
+Discord's own proxy made of it, held to the same pixel limit when Discord gives its size; nothing decodes an animation, so an uploaded GIF or an animated
 preview is not inspected. Other external embeds and videos are not inspected by this path.
 A pasted message link or a replied-to post is opened only when the speaker and Fri can
 read it now (fetched overwrites and roles); from a server channel, only when it is this
@@ -136,7 +136,7 @@ one deleted while the reply, reaction or card goes out leaves it delivered but u
 model sees; deleted after, the reply is withheld (`nearby message deleted`), with the "things
 changed while i was typing" notice when someone addressed Fri; a reaction or quiet decision is
 dropped too, unsaved and without a notice. An edit replaces a member's row
-with the edited text; an edit Discord sends without its author drops the row. An edit to a member's
+with the edited text and what the post still carries (an image edited out leaves the row's kinds too); an edit Discord sends without its author drops the row. An edit to a member's
 message Fri is still handling (still coming in, or being answered) withdraws it instead: it leaves,
 or never enters, the view, and a reply to it that hasn't reached the model yet is refused. A member's edit
 to any post a model request already carried, after its own handling, stops a turn still running like a

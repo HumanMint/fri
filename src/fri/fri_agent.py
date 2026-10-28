@@ -422,8 +422,13 @@ class Agent:
                 rows.remove(row)
             elif row['user_id'] == str(author):
                 text = clean(getattr(message, 'content', '') or '', 4000)[:500]  # As receive() stores it.
-                if text or (row.get('attachments') and getattr(message, 'attachments', None)):
+                kinds = media(message)
+                if text or (row.get('attachments') and kinds):
                     row['text'] = text
+                    if kinds:
+                        row['attachments'] = kinds
+                    else:  # The image edited out, the caption kept.
+                        row.pop('attachments', None)
                 else:
                     rows.remove(row)
 

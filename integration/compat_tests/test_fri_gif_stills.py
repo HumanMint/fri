@@ -65,6 +65,17 @@ def test_a_gif_links_preview_counts_only_when_asked_and_an_uploaded_gif_never_do
     assert sources(upload) is None and sources(upload, gifs=True) is None
 
 
+@pytest.mark.parametrize('size,looked', [((5000, 4000), True), ((5000, 4001), False), (None, True)])
+def test_a_gif_links_preview_gets_the_pixel_limit_attachments_get(size, looked):
+    """fri #79: a preview's size, when Discord gives it, is held to the 20-megapixel limit an attachment is."""
+    embed = tenor_embed()
+    if size:
+        embed = discord.Embed.from_dict({**embed.to_dict(), 'thumbnail': {
+            **embed.to_dict()['thumbnail'], 'width': size[0], 'height': size[1]}})
+    link = SimpleNamespace(attachments=[], content='https://tenor.com/view/dance-123', embeds=[embed])
+    assert sources(link, gifs=True) == ([PREVIEW] if looked else None)
+
+
 @pytest.mark.parametrize('fmt,mime', [('GIF', 'image/gif'), ('PNG', 'image/png'), ('WEBP', 'image/webp')])
 def test_an_animated_preview_is_refused_without_decoding(fmt, mime):
     async def scenario():

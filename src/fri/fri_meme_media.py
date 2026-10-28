@@ -64,7 +64,8 @@ def sources(message, most=2, *, gifs=False):
     for embed in message.embeds:
         if gifs and embed.type == 'gifv':
             preview = getattr(embed.thumbnail, 'proxy_url', None)
-            if not preview:
+            width, height = getattr(embed.thumbnail, 'width', None), getattr(embed.thumbnail, 'height', None)
+            if not preview or (width and height and width * height > 20_000_000):  # An attachment's limit.
                 return None
             result.append(str(preview))
             continue
