@@ -182,3 +182,30 @@ def test_fris_or_genes_own_row_pushed_out_then_partially_updated_leaves_an_ordin
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_partial_update_to_fris_own_reply_target_leaves_an_ordinary_answer_alone(monkeypatch, tmp_path):
+    """fri #149: a member replies to an older Fri message, out of the live view. Fri's own words are no member's
+    edit, so an update with no author for it, while the model writes, doesn't refuse the answer."""
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        mine = message('an older fri line', user=99)
+        mine.author.bot = True
+        trigger = message('fri what did you mean')
+        trigger.reference = SimpleNamespace(message_id=mine.id, channel_id=1)
+        trigger.reply.return_value = SimpleNamespace(id=trigger.id+100, content='safe answer', edit=AsyncMock())
+        async def respond(context, ready):
+            assert context.get('reply_target')
+            await ready()
+            assert mine.id in agent.looked
+            await partially_edited(fri, rows, channel, mine, 'an older fri line')
+            assert mine.id not in agent.revised
+            return ChatResult(status='completed', reply='safe answer')
+        model(fri, tmp_path, respond)
+        try:
+            await agent.handle(trigger)
+            assert trigger.reply.await_args.args[0].startswith('safe answer')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
