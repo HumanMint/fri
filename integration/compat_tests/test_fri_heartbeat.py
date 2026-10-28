@@ -11,12 +11,13 @@ import discord
 import pytest
 
 from compat_tests.test_api import actor, headers
+from compat_tests.test_fri_runtime import configured
 from compat_tests.test_split_contract import Session
 from fri import feedback as commands
 from fri.fri import SIGN_IN_NOTICE, Fri
 from fri.fri_agent import Agent
 from fri.fri_agent_settings import DEFAULTS
-from fri.fri_errors import ControllerRejected
+from fri.fri_errors import UNREACHABLE, ControllerRejected, ControllerUnavailable
 from fri.fri_presence import Presence
 from fri.subscription import PLAN_SCOPE, Subscription, SubscriptionError, private_json
 
@@ -141,7 +142,58 @@ def test_heartbeat_cancellation_still_stops_a_stage():
         agent.check_presence = AsyncMock(side_effect=asyncio.CancelledError())
         with pytest.raises(asyncio.CancelledError):
             await agent.heartbeat.coro(agent)
-        assert agent.heartbeat_finished
+        assert agent.heartbeat_finished and agent.heartbeat_current is None and agent.heartbeat_ticking is None
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('stage', ['state', 'memes'])
+def test_a_stuck_stage_is_named_in_the_health_file_and_fri_health_until_its_tick_ends(heartbeat, monkeypatch, tmp_path,
+                                                                                     stage):
+    async def scenario():
+        agent = heartbeat.agent
+        fri = configured(monkeypatch)  # The health writer and report; the tick runs on the fixture's.
+        fri.data, fri.agent = tmp_path, agent
+        heartbeat.fri.data = tmp_path  # For the meme status the health file carries.
+        fri.api = AsyncMock(side_effect=ControllerUnavailable(UNREACHABLE))
+        fri.get_guild = lambda _: None
+        entered, release = asyncio.Event(), asyncio.Event()
+        if stage == 'state':
+            api = heartbeat.fri.api.side_effect
+            async def held(method, path, payload=None):
+                if path == '/agent/state':
+                    entered.set()
+                    await release.wait()
+                return await api(method, path, payload)
+            heartbeat.fri.api.side_effect = held
+        else:
+            async def stuck():
+                entered.set()
+                await release.wait()
+            agent.check_memes = stuck
+
+        async def written():
+            await fri.health.coro(fri)
+            return json.loads((tmp_path/'fri-health.json').read_text())['agent_heartbeat']
+
+        def me(report):
+            return next(line for line in report.splitlines() if line.startswith('- me:'))
+        try:
+            assert (await written())['current'] is None
+            tick = asyncio.create_task(agent.heartbeat.coro(agent))
+            await asyncio.wait_for(entered.wait(), 5)
+            agent.heartbeat_current['since'] -= 14*60  # As if it had hung that long.
+            beat = await written()
+            assert beat['current']['stage'] == stage and 14*60 <= time.time()-beat['current']['since'] < 14*60+5
+            assert {'running', 'failed', 'started', 'finished', 'status', 'stages'} <= set(beat)  # Gene's readers.
+            assert me(await fri.watcher.report()).endswith(f'running {stage} for 14 min')
+            release.set()
+            await asyncio.wait_for(tick, 5)
+            assert agent.heartbeat_current is None and agent.heartbeat_ticking is None
+            assert (await written())['current'] is None
+            assert 'running' not in me(await fri.watcher.report())
+        finally:
+            release.set()
+            await fri.close()
     asyncio.run(scenario())
 
 

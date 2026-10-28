@@ -1,8 +1,8 @@
 """Release patch notes, drafted by Fri and sent from the maintainer side after a release.
 
     docker exec -i fri-runtime-1 python -m fri.fri_patch_notes draft 0.7.0 < facts.md > notes.md
-    python -m fri.fri_patch_notes preview 0.7.0 < notes.md
-    docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 --channel fri-chat < notes.md   # + changelog
+    python -m fri.fri_patch_notes preview 0.7.0 --channel fri-chat < notes.md   # the post exactly as it goes out
+    docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 --channel fri-chat < notes.md
     docker exec -i fri-runtime-1 python -m fri.fri_patch_notes pin 0.7.0 --channel fri-chat   # the pin alone
     docker exec -i fri-runtime-1 python -m fri.fri_patch_notes send 0.7.0 < note.md   # the owner's DM
 
@@ -13,10 +13,12 @@ Each version reaches each place once: every part has a fixed nonce, FRI_DATA/pat
 or patch-notes-server.json (the channel) lists the parts Discord confirmed, and a part whose send was
 attempted but never confirmed is looked for there, after the newest message from before that attempt
 (kept under `anchors`), before it is sent again.
-A channel post is one message: a short summary, with the full changelog attached as fri-<version>-changelog.md
-(the notes file holds the summary, a `<!-- changelog -->` line, then the changelog). It is then pinned there. The
-record keeps the pinned message's id, so a rerun after a failed pin only pins, never posts again, and
-`pin` pins a version already posted from the record alone. Fri never unpins or removes anything.
+A channel post is one message: the short summary, then a line linking the version's GitHub release page,
+where the full notes live ("for more detailed patch notes: [click here](...)", with no link preview). It is
+then pinned there. The record keeps the pinned message's id, so a rerun after a failed pin only pins, never
+posts again, and `pin` pins a version already posted from the record alone. Fri never unpins or removes
+anything. (Posts before 2026-10-28 attached a changelog file instead; their records still pin.)
+The running Fri only reads both records (Fri.posted_notes), so a reply to a posted part sees its words.
 Exit codes: 0 sent (or already sent) and, in a channel, pinned; 2 refused (fix the notes or the record);
 1 Discord or the network failed (a rerun is safe); 3 posted but not pinned (the post stands; a rerun
 only tries the pin)."""
@@ -26,7 +28,6 @@ import asyncio
 import datetime as dt
 import fcntl
 import hashlib
-import io
 import json
 import os
 import re
@@ -34,6 +35,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import discord
 
@@ -42,8 +44,8 @@ from .private_files import private_json
 
 LIMIT = 2000  # Discord's message length, in UTF-16 units.
 MAX_PARTS = 4
-CHANGELOG_MARK = '<!-- changelog -->'  # A line of its own: the summary above it, the attached changelog below.
-CHANGELOG_LIMIT = 512 * 1024  # bytes; far under Discord's attachment limit
+CHANGELOG_MARK = '<!-- changelog -->'  # Older notes files attached a changelog after this line; now refused.
+RELEASE_PAGE = 'https://github.com/HumanMint/fri/releases/tag/v{version}'  # A channel post's full notes.
 EARLIEST = 1767225600  # 2026-01-01 UTC. No real attempt is older; an older attempt time is damage.
 VERSION = re.compile(r'(0|[1-9]\d{0,3})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,5})')
 ID = re.compile(r'[1-9]\d{0,19}')  # A Discord snowflake.
@@ -90,24 +92,35 @@ def parts(text):
     return chunks
 
 
-def split_changelog(text):
-    """The post's text and the full changelog attached to it, split at a `<!-- changelog -->` line (None without one)."""
-    lines = text.replace('\r\n', '\n').split('\n')
-    marks = [i for i, line in enumerate(lines) if line.strip() == CHANGELOG_MARK]
-    if not marks:
-        return text, None
-    if len(marks) > 1:
-        raise NotesRefused(f'the notes have {len(marks)} {CHANGELOG_MARK} lines; need one')
-    changelog = '\n'.join(lines[marks[0]+1:]).strip()
-    if not changelog:
-        raise NotesRefused('the changelog after the mark is empty')
-    if len(changelog.encode()) > CHANGELOG_LIMIT:
-        raise NotesRefused(f'the changelog is over {CHANGELOG_LIMIT // 1024} KiB')
-    return '\n'.join(lines[:marks[0]]), changelog + '\n'
+def summary_only(text):
+    """The post's text. A changelog after a `<!-- changelog -->` line is refused: the release page has the full notes."""
+    if any(line.strip() == CHANGELOG_MARK for line in text.splitlines()):
+        raise NotesRefused(f'patch notes no longer attach a changelog: the GitHub release page has the full notes. '
+                           f'Remove the {CHANGELOG_MARK} line and everything after it')
+    return text
 
 
-def changelog_name(version):
-    return f'fri-{version}-changelog.md'
+def release_link(version):
+    """The line a channel post ends with: a clickable link to the version's release page (FRI_RELEASE_NOTES_URL, with
+    {version}, points it elsewhere, for a fork). The post goes out with embeds suppressed, so it shows no preview."""
+    url = (os.getenv('FRI_RELEASE_NOTES_URL') or RELEASE_PAGE).replace('{version}', version)
+    parsed = urlsplit(url) if re.fullmatch(r'[^\s()<>]+', url) else None
+    try:  # .port raises ValueError on a port that isn't a number from 0 to 65535; 0 is no port either.
+        host = parsed.hostname if parsed and parsed.port != 0 else None
+    except ValueError:
+        host = None
+    if not (parsed and parsed.scheme == 'https' and host and re.fullmatch(r'[a-z0-9-]+(\.[a-z0-9-]+)+', host)):
+        raise NotesRefused('FRI_RELEASE_NOTES_URL must be an https URL with a host name, and no spaces or brackets')
+    return f'for more detailed patch notes: [click here]({url})'
+
+
+def channel_post(version, text):
+    """What a channel post says: the summary, then the release page link on its own line. Empty notes are refused
+    rather than posted (and pinned) as a link alone."""
+    summary = summary_only(text).strip()
+    if not summary:
+        raise NotesRefused('the notes are empty')
+    return f'{summary}\n\n{release_link(version)}'
 
 
 def nonce(version, digest, index, place=''):
@@ -243,14 +256,13 @@ def set_anchor(state, version, index, mark):
         del state['anchors'][version]
 
 
-async def landed(dm, me, chunk, after, taken, attachment=None):
+async def landed(dm, me, chunk, after, taken):
     """The message from an earlier attempt, if Discord took it before that attempt failed or stopped.
     Every message after `after` is read (the whole DM if it was empty). Only Fri's own messages with
     exactly this text count (Discord trims the ends it stores), and never one the record already gives a
     part: Discord keeps no nonce in history, so that is what tells identical parts and releases apart."""
     async for message in dm.history(limit=None, after=after, oldest_first=True):
-        if message.author.id == me and message.content.strip() == chunk.strip() and str(message.id) not in taken and (
-                attachment is None or any(getattr(a, 'filename', None) == attachment for a in getattr(message, 'attachments', []))):
+        if message.author.id == me and message.content.strip() == chunk.strip() and str(message.id) not in taken:
             return message
     return None
 
@@ -318,34 +330,23 @@ async def pin_posted(version, *, token, data, guild_id, channel, out=print):
 
 
 async def send(version, text, *, token, owner_id, data, out=print, guild_id=None, channel=None):
-    text, changelog = split_changelog(text)
+    text = summary_only(text) if channel is None else channel_post(version, text)
     chunks = parts(text)
-    if changelog is not None and channel is None:
-        raise NotesRefused('a changelog goes with a channel post; the owner\'s DM gets the note alone')
-    if changelog is not None and len(chunks) != 1:
+    if channel is not None and len(chunks) != 1:
         raise NotesRefused(f'a channel post is one message, and this summary needs {len(chunks)}; shorten it '
-                           f'(the full changelog is attached)')
-    # The split, not just the text: the digest older code computes too, so a rollback can still retry this
-    # version. The attached changelog is compared on its own, under `changelog`.
+                           f'(the release page has the full notes)')
+    # The split, not just the text: the digest older code computes too, so a rollback can still retry this version.
     digest = hashlib.sha256(json.dumps(chunks).encode()).hexdigest()
     hashes = [text_hash(chunk) for chunk in chunks]
-    attachment = None if changelog is None else changelog_name(version)
     path = data / ('patch-notes.json' if channel is None else 'patch-notes-server.json')
     with locked(data):
         state = load(path)
         entry = state['versions'].get(version)
-        if entry and (entry['sha256'] != digest or len(entry['parts']) != len(chunks) or
-                      (changelog is not None and entry.get('changelog') != text_hash(changelog))):
+        # A version older code posted with a changelog file can't match: a channel post now ends with the link.
+        if entry and (entry['sha256'] != digest or len(entry['parts']) != len(chunks)):
             raise NotesRefused(f'{version} was already sent with different notes; use a new version')
-        if (entry and changelog is None and 'changelog' in entry and
-                not all(part.get('message_id') for part in entry['parts'])):
-            raise NotesRefused(f'{version} goes out with its changelog attached; send the notes with it')
-        if entry is None and channel is not None and changelog is None:
-            raise NotesRefused(f'a channel post attaches its full changelog: add a {CHANGELOG_MARK} line, then the changelog')
         if entry is None:
             entry = state['versions'][version] = {'sha256': digest, 'parts': [{} for _ in chunks]}
-            if changelog is not None:
-                entry['changelog'] = text_hash(changelog)
         if any(part.get('sha256', h) != h for part, h in zip(entry['parts'], hashes)):
             raise NotesRefused(f'{path.name} is not a patch-notes record')
         posted = all(part.get('message_id') for part in entry['parts'])
@@ -389,7 +390,7 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
                     continue
                 taken = set(sent_ids(state))
                 start = 'attempted_at' in part and search_from(state, version, index, part)
-                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, start, taken, attachment)
+                message = 'attempted_at' in part and await landed(dm, client.user.id, chunk, start, taken)
                 if not message:
                     attempted_at = time.time()
                     mark = await anchor(dm, attempted_at)
@@ -398,10 +399,8 @@ async def send(version, text, *, token, owner_id, data, out=print, guild_id=None
                     set_anchor(state, version, index, mark)
                     part.update(attempted_at=attempted_at, sha256=hashes[index - 1])
                     private_json(path, state)
-                    extra = {} if changelog is None else {
-                        'file': discord.File(io.BytesIO(changelog.encode()), filename=attachment)}
                     message = await dm.send(chunk, nonce=nonce(version, digest, index, '' if channel is None else f'#{dm.id}'),
-                                            allowed_mentions=NO_MENTIONS, suppress_embeds=True, **extra)
+                                            allowed_mentions=NO_MENTIONS, suppress_embeds=True)
                     if str(message.id) in taken:
                         raise NotesRefused(f'Discord answered part {index} with message {message.id}, which '
                                            f'{path.name} already gives another part')
@@ -426,8 +425,8 @@ everyone there. Talk to the server, not to one person. The owner is mint, or bos
 the third person if at all ("mint finally shipped it"). Use only the facts given: never invent a
 feature, fix, number, date or name, and leave out anything members wouldn't notice. Plain words a
 member gets: no PR numbers, file names, or words like controller, heartbeat, pin or release script.
-It goes out as one Discord message, with the full changelog attached as a file below it, so this is the
-short version: one version line, then the few **added** and **fixed** things members would notice most
+It goes out as one Discord message, and a link to the release's full notes on GitHub is added below it
+automatically (don't add links yourself), so this is the short version: one version line, then the few **added** and **fixed** things members would notice most
 as short "- " lists (group small fixes into one line), then one **next** line. Under 1500 characters. Same voice as always: lowercase, deadpan, a jab or two,
 no exclamation marks, no hype, never cheerful or salesy, no em dashes, few emojis.
 Return the whole post as Discord text in `notes`.'''
@@ -490,8 +489,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not VERSION.fullmatch(args.version):
         parser.error('version must look like 0.4.0')
-    if args.channel is not None and (args.command not in ('send', 'pin') or not re.fullmatch(r'[a-z0-9_-]{1,100}', args.channel)):
-        parser.error('--channel takes a channel name like fri-chat, with send or pin')
+    if args.channel is not None and (args.command not in ('send', 'pin', 'preview') or
+                                     not re.fullmatch(r'[a-z0-9_-]{1,100}', args.channel)):
+        parser.error('--channel takes a channel name like fri-chat, with send, pin or preview')
     if args.command == 'pin' and args.channel is None:
         parser.error('pin takes --channel: only channel posts are pinned')
     try:
@@ -506,13 +506,13 @@ def main(argv=None):
             text = sys.stdin.buffer.read().decode('utf-8')
         except UnicodeDecodeError:
             raise NotesRefused('the notes are not UTF-8') from None
-        if args.command == 'preview':
-            summary, changelog = split_changelog(text)
-            for index, chunk in enumerate(parts(summary), 1):
+        if args.command == 'preview':  # With --channel, the post exactly as it goes out: one message, link included.
+            post = summary_only(text) if args.channel is None else channel_post(args.version, text)
+            chunks = parts(post)
+            if args.channel is not None and len(chunks) != 1:
+                raise NotesRefused(f'a channel post is one message, and this summary needs {len(chunks)}; shorten it')
+            for index, chunk in enumerate(chunks, 1):
                 print(f'--- part {index} ({length(chunk)} chars)\n{chunk}')
-            if changelog is not None:
-                print(f'--- attached {changelog_name(args.version)} ({len(changelog.encode())} bytes, '
-                      f'{changelog.count(chr(10))} lines)\n{changelog}', end='')
             return 0
         if args.command == 'draft':
             if not text.strip():

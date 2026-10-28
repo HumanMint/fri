@@ -28,6 +28,7 @@ from .fri_errors import (
 from .fri_images import CHANGED as IMAGES_CHANGED
 from .fri_images import unchanged as images_unchanged
 from .fri_memory import (
+    GENERATIONS,
     PROFILES,
     SUMMARIES,
     describe_memory,
@@ -195,6 +196,17 @@ async def patiently(fri, read):
             await asyncio.sleep(CONTRACT_RETRY)
 
 
+def persistent_buttons():
+    """Buttons found again by their custom ID after a timeout or restart, plus the fallback that says a
+    draft's, preview's or memory panel's view ended (fri_buttons.Ended)."""
+    from .fri_buttons import Ended
+    from .fri_fixes import TellReporter
+    from .fri_memory_panel import MemoryOpen
+    from .fri_social import SocialButton
+    from .fri_workspace import PostButton
+    return ReviewButton, ReportButton, PostButton, SocialButton, TellReporter, MemoryOpen, Ended
+
+
 class Fri(discord.Client):
     def __init__(self):
         intents = discord.Intents.none()
@@ -264,10 +276,7 @@ class Fri(discord.Client):
         self.agent = Agent(self)
         await patiently(self, self.agent.start)
         self.add_view(HomeView(self))
-        from .fri_fixes import TellReporter
-        from .fri_social import SocialButton
-        from .fri_workspace import PostButton
-        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton, TellReporter)
+        self.add_dynamic_items(*persistent_buttons())
 
         @self.tree.command(name='fri', description='Chat, request a feature or fix, and follow development.',
                            guild=discord.Object(id=self.guild_id))
@@ -386,8 +395,15 @@ class Fri(discord.Client):
             read = [mid for entry in getattr((fence or {}).get('actions'), 'reads', ()) for mid in entry['shown']]
             carried = [*looked, *quoted, *read, *(int(row['id']) for row in context.get('recent', [])
                                                   if not row.get('gene_error') and str(row.get('id', '')).isdigit())]
+            # Fri's own among them, its cached replies and a reply target it wrote: an update with no author for one
+            # is no member's edit, even once it's out of the live view (see Agent.edit).
+            me = str(getattr(self.user, 'id', ''))
+            ours = [int(row['id']) for row in context.get('recent', [])
+                    if row.get('fri') and str(row.get('id', '')).isdigit()]
+            ours += [int(row['source']['id']) for row in context.get('reply_target', []) + context.get('invited_context', [])
+                     if me and row.get('source', {}).get('user_id') == me and str(row['source'].get('id', '')).isdigit()]
             if self.agent:  # Before the checks below refetch them: a delete after that is marked (see unsend).
-                self.agent.saw(carried)
+                self.agent.saw(carried, ours)
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
@@ -424,7 +440,7 @@ class Fri(discord.Client):
                 if fence.get('gate'):
                     await fence['gate']()
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
-                    context, fence['turn']['user_id'], fence['actions'])})
+                    context, fence['turn']['user_id'], fence['actions']), **self.summary_generation(context)})
             # A message its author edited or deleted since the live view was copied: its old words stay out.
             # A row read again after that, as an edited message answered again is, holds what it says now.
             # So does one the live view no longer holds as copied: pushed out by newer lines while the turn
@@ -477,6 +493,8 @@ class Fri(discord.Client):
                     origins = context['member_summary'].get('origins', [])
                     fence['shown'].update([*origins, *([here] if here.startswith('public:') else [])])
                     fence.setdefault('summarized', set()).update(origins)  # What the reply drew on (see stage_turn).
+                    if GENERATIONS in self.capabilities:  # The one this request carries (see summary_generation).
+                        fence.setdefault('summary_generation', context['member_summary'].get('generation'))
             if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
                 source = context.get('source') or {}
                 asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),
@@ -514,6 +532,8 @@ class Fri(discord.Client):
             LOG.warning('Usage is saved locally; controller delivery will retry: %s', type(exc).__name__)
         if result.error or result.status != 'completed':
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
+        if agent := getattr(self, 'agent', None):  # What stops it from here was withheld after composing.
+            agent.ledger.composed(context)
         return result
 
     async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, typing=None, last_look=None):
@@ -722,11 +742,16 @@ class Fri(discord.Client):
                 from .fri_images import attach as attach_images
                 if inspect_images:
                     await attach_images(context, event, text, source=image_source, invitation=invitation)
+                    from .fri_images import look, lookable, own_links
+                    await own_links(context, event, invitation=invitation)  # Their own link's card, unfurled after it came in.
                     if targets and not context.get('unattributed_reference'):
-                        # The meme they replied to or linked, when it's a still image or a GIF link's preview.
-                        from .fri_images import look
-                        from .fri_meme_media import gif_previews
-                        await look(context, [post for post in targets if post.attachments or gif_previews(post)])
+                        # The meme they replied to or linked: a still image, a GIF link's preview or a link card's picture.
+                        before = len(context.get('image_reads', []))
+                        await look(context, [post for post in targets if lookable(post)])
+                        for read in context.get('image_reads', [])[before:] if invitation else ():
+                            # Checked on their own refetch before each request; a ping's delivery check is its
+                            # invitation's, so that finds them again too (see Actions.valid).
+                            invitation.inspected(read['event'], read['sources'])
                 if actions:
                     from .fri_images import image_context
                     actions.image_context = image_context(context)
@@ -784,7 +809,7 @@ class Fri(discord.Client):
                     if await typing('action'):  # Checked before typing started: again, before the tool sees anything.
                         await as_read()
                         await self.api('POST', '/chat/turn/check', {**context['fence']['turn'], 'provenance': turn_provenance(
-                            context, user_id, actions)})
+                            context, user_id, actions), **self.summary_generation(context)})
                     from .fri_runner import run
                     result, receipts, research = await run(self, actions, text, context, result)
                     result.shown = context['fence'].get('messages', set())  # A summary of the steps may still draw on them.
@@ -846,7 +871,7 @@ class Fri(discord.Client):
                         'burst': context.get('message_burst', []),
                         'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
                                                                          result.post_preview or result.clarification),
-                        'provenance': provenance, 'verbatim': stored == result.reply,
+                        'provenance': provenance, 'verbatim': stored == result.reply, **self.summary_generation(context),
                         **({'audience': audience(context)} if context.get('audience') else {})}
                     if len(result.turn['provenance']) > MAX_PROVENANCE:
                         return ChatResult(reply=unrecorded(receipts, reason='too many people were in that context to '
@@ -904,6 +929,7 @@ class Fri(discord.Client):
             'notes': result.notes, 'input_tokens': 0 if model else result.counters.get('input_tokens'),
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
+            **(self.summary_generation(context) if derived else {}),
             **({'audience': audience(context)} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
             result.echo = self.echo(scope, context, provenance, reply)
@@ -934,10 +960,25 @@ class Fri(discord.Client):
         return kept
 
     def member_summary(self, summary, guild_id, shown):
-        """Fri's own summary of the member where it may show, while every channel it came from is still readable."""
+        """Fri's own summary of the member where it may show, while every channel it came from is still readable.
+        From a controller offering summary generations, only with one a turn can carry (see summary_generation)."""
         if not summary or not shown or not all(self.readable(origin, guild_id) for origin in summary.get('origins', [])):
             return None
+        if GENERATIONS in self.capabilities and not (type(summary.get('generation')) is int and summary['generation'] >= 0):
+            return None
         return summary
+
+    def summary_generation(self, context):
+        """What a turn's checks and save carry for Fri's summary of the member its model request had (gene #91): that
+        summary's generation, from the same /chat/context response. A withdrawal dropping the summary since moves it,
+        so the controller refuses the turn and its reply is withheld. The first one a request carried (see chat_once),
+        else the summary the next request is about to carry, for the check right before it. Nothing when no summary
+        reached the model, or from a controller without summary generations."""
+        if GENERATIONS not in self.capabilities:
+            return {}
+        fence = context.get('fence') or {}
+        generation = fence.get('summary_generation', (context.get('member_summary') or {}).get('generation'))
+        return {'summary_generation': generation} if type(generation) is int else {}
 
     async def memory_overview(self, scope, profile, private, summary=None):
         """Everything for the member's own eyes in private; in public, only what that channel can see."""
@@ -969,6 +1010,12 @@ class Fri(discord.Client):
         except commands.UserFeedbackCheckFailure:
             found = {}
         unresolved = {mid for mid in own if mid not in found or not found[mid]['verbatim']}
+        if unresolved.difference(found):
+            # Patch notes Fri posted are its own words, drawing on no member. Only an id Gene doesn't know,
+            # in the channel the record names: a reply Gene dropped (an erasure, say) is never stood in for.
+            notes, where = self.posted_notes(), {row['source']['id']: row['source'].get('channel_id')
+                                                 for row in context['reply_target']}
+            unresolved = {mid for mid in unresolved if mid in found or mid not in notes or notes[mid] != where[mid]}
         if unresolved:
             # Fail closed before inference: the model never sees text whose sources erased or were never
             # attributable, and nothing derived is retained. A copy keeps the integrity checks intact.
@@ -976,6 +1023,20 @@ class Fri(discord.Client):
             context['reply_target'] = [{**row, 'text': UNAVAILABLE} if row['source']['id'] in unresolved else row
                                        for row in context['reply_target']]
         context['reference_provenance'] = [item for mid in own for item in found.get(mid, {}).get('provenance', [])]
+
+    def posted_notes(self):
+        """Message id -> channel id of every patch-notes part Discord confirmed, in #fri-chat or the owner's DM.
+        A damaged record names none, so those posts stay unavailable."""
+        from .fri_patch_notes import NotesRefused, load
+        posted = {}
+        for name in ('patch-notes-server.json', 'patch-notes.json'):
+            try:
+                state = load(self.data/name)
+            except NotesRefused:
+                continue
+            posted.update((part['message_id'], part['channel_id']) for entry in state['versions'].values()
+                          for part in entry['parts'] if 'message_id' in part)
+        return posted
 
     @staticmethod
     def echo(scope, context, provenance, reply):
@@ -1029,7 +1090,7 @@ class Fri(discord.Client):
     async def invited_talk(self, invitation, text, typing=None):
         """Outside the ambient scope, one ping has only conversation and public research."""
         from .fri_context import addressed_content
-        from .fri_images import attach, image_context
+        from .fri_images import attach, image_context, own_links
         from .fri_mentions import force_text
         event, user = invitation.event, invitation.event.author.id
         expected = addressed_content(event.content, self.user.id) or 'hey'
@@ -1061,9 +1122,11 @@ class Fri(discord.Client):
                 actions.private_evidence = True
                 context['actions'] = await actions.available()
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
+                await own_links(context, event, invitation=invitation)  # The ping's own card, before the nearby posts' pictures.
                 await invitation.look(context)  # Up front: an outside ping has no read to decide on.
                 actions.image_context = image_context(context)
-                context['fence'] = {'invitation': invitation, 'shown': set()}  # See chat_once.
+                # See chat_once. What a Fri answer it reads drew on counts as shown: a delete of it withholds the reply.
+                context['fence'] = {'invitation': invitation, 'shown': set(), 'messages': set(invitation.carried)}
                 result = await self.chat_once(text, context)
                 research = None
                 if result.action:
@@ -1235,7 +1298,9 @@ class Fri(discord.Client):
             'meme_attention': self.agent.memes.status() if self.agent and self.agent.memes else None,
             'agent_heartbeat': {'running': self.agent.heartbeat.is_running(), 'failed': self.agent.heartbeat.failed(),
                 'started': self.agent.heartbeat_started, 'finished': self.agent.heartbeat_finished,
-                'status': self.agent.heartbeat_status, 'stages': self.agent.stages} if self.agent else None,
+                'status': self.agent.heartbeat_status, 'stages': self.agent.stages,
+                'current': self.agent.heartbeat_current} if self.agent else None,
+            'outcomes': self.agent.ledger.snapshot() if self.agent else None,
             'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,

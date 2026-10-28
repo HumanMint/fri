@@ -574,3 +574,111 @@ def test_a_dm_settings_preview_needs_the_owner_still_there_when_it_posts(monkeyp
             assert handled == ('not a member' if change == 'left' else 'dms off')
         await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_dm_settings_preview_rechecks_dms_after_its_last_erasure_read(monkeypatch, tmp_path):
+    """fri #136: the DM gate after the Sol call is followed by an awaited erasure read. DMs went off during that
+    read: nothing posts, and the request ends as the DM gate's would."""
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True, 'support_dms': True},
+                                          'version': 3})
+        reads = []
+        async def profile(scope, user):
+            if agent.run.await_count:  # The erasure read after the DM gate.
+                reads.append(scope)
+                await asyncio.sleep(0)
+                agent.state['config']['support_dms'] = False
+            return {'enabled': True, 'revision': 0, 'summary': ''}
+        agent.profile = AsyncMock(side_effect=profile)
+        gate(monkeypatch)
+        agent.record = AsyncMock()
+        agent.member = AsyncMock(return_value=SimpleNamespace(id=10))
+        agent.run = AsyncMock(return_value=(
+            {'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'))
+        message = owner_message()
+        handled = await agent.owner_control(message, 'set heartbeat to 10 minutes')
+        assert agent.run.await_count == 1 and reads
+        message.reply.assert_not_awaited()
+        assert handled == 'dms off'
+        await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['stays', 'dms off'])
+def test_a_busy_dm_settings_request_rechecks_dms_before_saying_so(monkeypatch, tmp_path, change):
+    """fri #170: an earlier request holds the preview slot. DMs went off during the last erasure read before the
+    busy notice: it doesn't post, and the request ends as the DM gate's would."""
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True, 'support_dms': True},
+                                          'version': 3})
+        reads = []
+        async def profile(scope, user):
+            reads.append(scope)
+            if len(reads) > 1 and change == 'dms off':  # The erasure reads, after the first revision read.
+                await asyncio.sleep(0)
+                agent.state['config']['support_dms'] = False
+            return {'enabled': True, 'revision': 0, 'summary': ''}
+        agent.profile = AsyncMock(side_effect=profile)
+        gate(monkeypatch)
+        agent.record = AsyncMock()
+        agent.run = AsyncMock()
+        agent.control_queue.append(1)  # An earlier preview is being prepared.
+        message = owner_message()
+        handled = await agent.owner_control(message, 'set heartbeat to 10 minutes')
+        agent.run.assert_not_awaited()
+        if change == 'stays':
+            assert handled is True and 'one settings preview at a time' in message.reply.await_args.args[0]
+        else:
+            message.reply.assert_not_awaited()
+            assert handled == 'dms off'
+        assert agent.control_queue == [1]
+        await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['stays', 'dms off'])
+def test_a_dm_settings_preview_that_failed_to_parse_rechecks_dms_before_saying_so(monkeypatch, tmp_path, change):
+    """fri #170: the Sol settings call raised after DMs went off: no parse-error notice posts either."""
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True, 'support_dms': True},
+                                          'version': 3})
+        gate(monkeypatch)
+        agent.record = AsyncMock()
+        async def preparing(*args, **kwargs):  # While Sol prepares the preview.
+            if change == 'dms off':
+                agent.state['config']['support_dms'] = False
+            raise ValueError('not a settings preview')
+        agent.run = AsyncMock(side_effect=preparing)
+        message = owner_message()
+        handled = await agent.owner_control(message, 'set heartbeat to 10 minutes')
+        assert agent.run.await_count == 1
+        if change == 'stays':
+            assert handled is True and 'couldn’t parse that settings preview' in message.reply.await_args.args[0]
+        else:
+            message.reply.assert_not_awaited()
+            assert handled == 'dms off'
+        await fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_owners_settings_preview_takes_its_buttons_off_when_it_times_out(monkeypatch, tmp_path):
+    """fri #176: the preview's view knows the reply it went out on, so a timeout can take its buttons off."""
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={**agent.state, 'config': {**DEFAULTS, 'enabled': True}, 'version': 3})
+        gate(monkeypatch)
+        agent.record = AsyncMock()
+        agent.run = AsyncMock(return_value=(
+            {'explanation': '', 'changes': [{'key': 'heartbeat_seconds', 'json_value': '600'}]}, {}, 'completed'))
+        message = owner_message()
+        sent = message.reply.return_value = SimpleNamespace(id=message.id+1, edit=AsyncMock())
+        assert await agent.owner_control(message, 'set heartbeat to 10 minutes') is True
+        view = message.reply.await_args.kwargs['view']
+        assert isinstance(view, BehaviorPreview) and view.message is sent
+        await view.on_timeout()
+        sent.edit.assert_awaited_once_with(view=None)
+        await fri.close()
+    asyncio.run(scenario())

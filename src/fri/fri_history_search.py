@@ -19,32 +19,67 @@ READ_ONLY_AFTER_HISTORY = {'history_search', 'read_recent', 'learning_overview',
                            'channel_capabilities', 'work_list', 'work_read'}
 
 
+# Where or when it was said, after the verb: a channel (#name or its whole mention), here, this chat, server or
+# thread, or a day. A place ends there ("in server documentation" names a document, not where it was said).
+PLACE = (r'(?:(?:in|on)\s+(?:#[\w-]+|<#\d+>)|in\s+here\b|(?:in|on)\s+(?:(?:this|the|that|our|a)\s+)?'
+         r'(?:channel|chat|server|thread|gc|vc)|on\s+(?:mon|tues|wednes|thurs|fri|satur|sun)day|(?:on|over)\s+the\s+weekend)'
+         r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|lol|lmao|rn)\b))')
+
+
+def cues(*patterns):
+    return tuple(re.compile(pattern, re.I | re.S) for pattern in patterns)
+
+
+ARCHIVE = r'\b(?:history|archive|chat|messages?|logs?)\b'
+SOUGHT = r'\b(?:what|which|who|when|where|find|search|look up)\b'
+SAID = r'\b(?:said|recommended|mentioned|posted|talked|discussed|linked)\b'
+# Archive vocabulary, a recall construction, or an explicit past cue: each run of cues in this order, anywhere.
+RECALL = (
+    cues(r'\b(?:search|find|look\s+(?:up|through|back)|check)\b', ARCHIVE),
+    cues(r'\b(?:what|which|who|when|where)\b', r'\bdid\b', r'\b(?:say|recommend|mention|post|discuss|talk|link)\b'),
+    cues(SOUGHT, SAID, r'\b(?:earlier|before|yesterday|last week|last month|last year|ago|history|chat|messages?|logs?)\b'),
+    cues(SOUGHT, r'\b(?:earlier|yesterday|last week|last month|last year|history|chat|messages?|logs?)\b', SAID),
+    cues(r'\b(?:search|find)\b', r'\b(?:before|last month|last week|last year|ago)\b'),
+    # "find the meme kev posted": a post someone made, asked for by what it carries.
+    cues(r'\b(?:find|search|look\s+up|dig\s+up|pull\s+up)\b',
+         r'\b(?:memes?|pics?|pictures?|images?|photos?|screenshots?|gifs?|videos?|clips?|links?|files?)\b',
+         # The verb ends the clause, as in recall; "a shared drive" uses it as an adjective.
+         r'\b(?:posted|sent|shared|dropped|uploaded|linked)\b'
+         r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn)\b|'+PLACE+r'))'),
+)
+# Recall within a few words.
+NAMED = re.compile(
+    r'(?is)\bwho\s+(said|recommended|mentioned|posted|talked|discussed|linked)\b'
+    # "what was that song kev mentioned": a thing someone said, named before the verb. The word
+    # before the verb is who said it, so "the most commonly recommended laptop" or "the difference
+    # between shared and dedicated" stay general questions.
+    r"|\b(?:what(?:'s|’s|s)?|which)\s+(?:(?:was|were|is)\s+)?(?:that|the|those)\s+\w+(?:\s+\w+){0,3}?\s+"
+    r'(?!(?:\w+ly|most|more|least|between|and|or|of|for|with|in|on|to|by|than|as|being|been)\b)\w+\s+'
+    # The verb ends the clause, as in recall; "doctor recommended dose" uses it as an adjective.
+    # Only a place in the server or a day may follow: "the file size shared on discord" is passive.
+    r'(said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
+    r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn)\b'
+    r'|'+PLACE+r'))')
+
+
+def in_order(text, run):
+    """Whether the cues occur in this order, each after the one before it ends. It's the same as joining them with
+    `.*`, but in one pass: those joins backtracked for seconds on a long repetitive message (fri #134)."""
+    at = 0
+    for cue in run:
+        found = cue.search(text, at)
+        if not found:
+            return False
+        at = found.end()
+    return True
+
+
 def requested(text):
     visible = re.sub(r'```[\s\S]*?```|`[^`]*`|(?m:^>.*$)', '', text)
     if re.search(r"(?i)\b(?:don't|do not|stop)\s+(?:search|look|read)", visible):
         return False
     # A participle alone ("recommended settings") is not past attribution.
-    # Require archive vocabulary, a recall construction, or an explicit past cue.
-    return bool(re.search(
-        r'(?is)\b(search|find|look\s+(?:up|through|back)|check)\b.*\b(history|archive|chat|messages?|logs?)\b'
-        r'|\bwho\s+(said|recommended|mentioned|posted|talked|discussed|linked)\b'
-        r'|\b(what|which|who|when|where)\b.*\bdid\b.+\b(say|recommend|mention|post|discuss|talk|link)\b'
-        r'|\b(what|which|who|when|where|find|search|look up)\b.*\b(said|recommended|mentioned|posted|talked|discussed|linked)\b.*\b(earlier|before|yesterday|last week|last month|last year|ago|history|chat|messages?|logs?)\b'
-        r'|\b(what|which|who|when|where|find|search|look up)\b.*\b(earlier|yesterday|last week|last month|last year|history|chat|messages?|logs?)\b.*\b(said|recommended|mentioned|posted|talked|discussed|linked)\b'
-        r'|\b(search|find)\b.*\b(before|last month|last week|last year|ago)\b'
-        # "find the meme kev posted": a post someone made, asked for by what it carries.
-        r'|\b(find|search|look\s+up|dig\s+up|pull\s+up)\b.*\b(memes?|pics?|pictures?|images?|photos?|screenshots?|gifs?|'
-        r'videos?|clips?|links?|files?)\b.*\b(posted|sent|shared|dropped|uploaded|linked)\b'
-        # The verb ends the clause, as in recall; "a shared drive" uses it as an adjective.
-        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn|in\s+[#<])))'
-        # "what was that song kev mentioned": a thing someone said, named before the verb. The word
-        # before the verb is who said it, so "the most commonly recommended laptop" or "the difference
-        # between shared and dedicated" stay general questions.
-        r"|\b(?:what(?:'s|’s|s)?|which)\s+(?:(?:was|were|is)\s+)?(?:that|the|those)\s+\w+(?:\s+\w+){0,3}?\s+"
-        r'(?!(?:\w+ly|most|more|least|between|and|or|of|for|with|in|on|to|by|than|as|being|been)\b)\w+\s+'
-        # The verb ends the clause, as in recall; "doctor recommended dose" uses it as an adjective.
-        r'(said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
-        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|in|on|here|there|again|lol|lmao|rn)\b))', visible))
+    return any(in_order(visible, run) for run in RECALL) or bool(NAMED.search(visible))
 
 
 def valid_action(action):

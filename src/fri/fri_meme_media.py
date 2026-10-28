@@ -2,13 +2,24 @@
 
 import asyncio
 import base64
+import io
 import re
+import warnings
 from urllib.parse import urlsplit
 
 import httpx
+from PIL import Image
 
 MAX_BYTES = 4 * 1024 * 1024
+MAX_PIXELS = 20_000_000  # An attachment's limit, and a link card picture's.
 MIMES = {'image/png', 'image/jpeg', 'image/webp'}
+LINK_CARDS = ('rich', 'article', 'link', 'video', 'image')  # Discord's unfurls of a link, besides a GIF link's.
+
+
+def measured(width, height):
+    """A size as Discord measured it: positive integers (never a bool) within an attachment's limit. Checked
+    before multiplying, so malformed embed metadata can't crash a read."""
+    return all(type(side) is int and side > 0 for side in (width, height)) and width * height <= MAX_PIXELS
 
 
 def gif_previews(message):
@@ -16,6 +27,29 @@ def gif_previews(message):
     embeds = getattr(message, 'embeds', None)
     return [str(e.thumbnail.proxy_url) for e in embeds if e.type == 'gifv' and getattr(e.thumbnail, 'proxy_url', None)] \
         if isinstance(embeds, (list, tuple)) else []
+
+
+def link_previews(message):
+    """The still Discord's own proxy made of each link card's picture, from the first two cards: a video's
+    thumbnail, an X or Reddit card's image, a pasted image link. It's what every member sees on the card, never
+    the page or the clip. None when one can't be shown whole: no proxy copy of it (never fetched from the site
+    itself), or no size Discord measured within an attachment's limit. A GIF link's preview isn't one (see
+    gif_previews), and a spoilered post shows none."""
+    embeds = getattr(message, 'embeds', None)
+    if not isinstance(embeds, (list, tuple)) or '||' in str(getattr(message, 'content', '') or ''):
+        return []
+    result = []
+    for embed in [e for e in embeds if getattr(e, 'type', None) in LINK_CARDS][:2]:
+        picture = next((part for part in (getattr(embed, 'image', None), getattr(embed, 'thumbnail', None))
+                        if getattr(part, 'proxy_url', None) or getattr(part, 'url', None)), None)
+        if picture is None:
+            continue  # A card without a picture: its text is all there is.
+        url, width, height = (getattr(picture, key, None) for key in ('proxy_url', 'width', 'height'))
+        # Its size as Discord measured it, known and within an attachment's limit (see load_image for the bytes').
+        if not url or not urlsplit(str(url)).path.startswith('/external/') or not measured(width, height):
+            return None
+        result.append(str(url))
+    return result
 
 
 def sources(message, most=2, *, gifs=False):
@@ -35,7 +69,10 @@ def sources(message, most=2, *, gifs=False):
     for embed in message.embeds:
         if gifs and embed.type == 'gifv':
             preview = getattr(embed.thumbnail, 'proxy_url', None)
-            if not preview:
+            width, height = getattr(embed.thumbnail, 'width', None), getattr(embed.thumbnail, 'height', None)
+            # A side Discord gives must be a real one within an attachment's limit (fri #160). One it leaves out
+            # keeps the fallback, and load_image still holds the bytes to that limit.
+            if not preview or not measured(1 if width is None else width, 1 if height is None else height):
                 return None
             result.append(str(preview))
             continue
@@ -97,4 +134,19 @@ async def load_image(url, channel, *, transport=None, previews=False):
              (mime == 'image/webp' and body.startswith(b'RIFF') and body[8:12] == b'WEBP' and b'ANIM' not in body))
     if not valid:
         raise ValueError('Not a supported still image')
+    if previews and urlsplit(url).path.startswith('/external/') and not 0 < pixels(body) <= MAX_PIXELS:
+        # A site can serve Discord's proxy something other than what Discord sized for the card.
+        raise ValueError('Preview size unknown or over the pixel limit')
     return 'data:'+mime+';base64,'+base64.b64encode(body).decode()
+
+
+def pixels(body):
+    """A still image's width times height from its own header, read without decoding it; 0 if unreadable."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(body)) as image:
+                width, height = image.size
+    except Exception:  # Pillow's header parsers raise many kinds; any of them means the size is unknown.
+        return 0
+    return width * height if width > 0 and height > 0 else 0

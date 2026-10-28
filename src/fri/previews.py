@@ -21,9 +21,19 @@ def pages(text):
     return result or ['(empty)']
 
 
+async def strip(message):
+    """Take an ended view's controls off Fri's message, so nothing is left there to fail."""
+    if message is not None:
+        try:
+            await message.edit(view=None)
+        except discord.HTTPException:
+            pass  # Deleted, say: a click on what's left says it expired (see fri_buttons.Ended).
+
+
 class PagedPreview(discord.ui.View):
     def __init__(self, title, body, note, label, prefix, confirm):
         super().__init__(timeout=600)
+        self.message = None  # The message it went out on, when its sender knows it (see Agent.reply_once).
         self.title, self.pages, self.note = title, pages(body), note
         self.page, self.seen, self.finished = 0, {0}, False
         self.lock = asyncio.Lock()
@@ -57,6 +67,9 @@ class PagedPreview(discord.ui.View):
 
     async def recheck(self):
         """Subclasses refuse to render another page here, e.g. once its sources changed."""
+
+    async def on_timeout(self):
+        await strip(self.message)
 
     async def move(self, interaction, offset):
         if not await self.interaction_check(interaction):

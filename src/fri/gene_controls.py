@@ -153,10 +153,57 @@ MARKER = r"(?:not (?:that|this|the) (?:one|song|track)|wrong (?:one|song|track)|
 LINK = r"(?:i meant|it'?s|its|it was)"
 # The whole message is one correction: a marker, then a separator or "i meant"/"it's", then the song (or just
 # "i meant <song>"). Nothing before it but a filler word, so a quote, an example, someone else's words or a
-# question never fits, and the song is what follows, whatever words its title uses.
-CORRECTION = re.compile(
-    rf"^{FILLER}(?:{MARKER}(?:\s+(?:lol|lmao|bro))?\s*(?:[,:;.!—–-]+\s*(?:{LINK}\s+)?|\s+{LINK}\s+)|i meant\s+)"
-    r"(?!(?:i meant\s+)?to\b|don'?t\b|do not\b)(?P<song>\S.*?)(?:\s+(?:lol|lmao|pls|please|thx))*[\s.!?]*$")
+# question never fits. The link is consumed once (possessively), never given back to become the song.
+OPENING = re.compile(
+    rf"{FILLER}(?:{MARKER}(?:\s+(?:lol|lmao|bro))?\s*(?:[,:;.!—–-]+\s*(?:{LINK}\s+)?+|\s+{LINK}\s+)|i meant\s+)")
+# The song may follow their own request words ("play X", "i said X"); its first word starts the replacement.
+LEAD = re.compile(r"(?:(?:can|could|would) (?:you|u) )?(?:please |pls )?(?:play|queue|put on|add|i said|i asked for|i wanted)\s+")
+# A title they quoted, or a link, keeps every word, whatever it says. A single quote, straight or curly, opens one only
+# before a word: an apostrophe inside a word ("don't") never opens or closes one, nor does a leading one ("'til").
+OPENER = r"(?<![\w'‘])['‘](?!\d|(?:til|cause|cuz|cos|coz|em|bout|round|n|tis|twas|nuff|fore|kay|sup)\b)(?=[^\s'])"
+TITLE_QUOTE = re.compile(rf'(?P<double>["“])|(?P<link>https://\S+)|{OPENER}')
+# The first mark after a word closes it, though not a dropped letter with more words after it ("Rockin' Robin");
+# another opening, or a loose mark, before the close leaves it ambiguous.
+CLOSER = re.compile(rf"(?P<loose>{OPENER}|(?<!\S)['‘](?!\w))|(?P<dropped>(?:(?<=in)|(?<=\bol)|(?<=\blil)|(?<=\bn)|(?<=\bo)|(?<=\ban))'"
+                    r"(?=\s+\w))|(?<=\S)'(?!\w)")
+WORD = re.compile(r"[\w']+")
+CLAUSE = r"(?:^|[,;:.!?—–\-\"'‘“”]\s*|\b(?:and|but|or|so|then|also|plus|like|actually|wait|lol|nah|no|oh|please|pls|just)\s+)"
+# Outside a quoted title, any of these means the message is not asking for that song now.
+REFUSED = re.compile(
+    rf"{CLAUSE}(?:don'?t|do not)\b"  # A clause that opens with "don't": "... do not queue anything yet".
+    r"|\b(?:don'?t|do not|not|never)\s+(?:(?:even|actually|really|just|yet)\s+)?(?:play|queue|add|put|start)\b"
+    r"|\b(?:don'?t|do not)[\s.!?'\"”]*$"
+    r"|\b(?:cancel\w*|never ?mind|nvm|forget (?:it|that|about (?:it|that))|scratch that|hold off|not yet|no need|jk|just kidding)\b"
+    # Someone else's words introducing more ("alex said X"; a title like "She Said" ends there), or an example.
+    rf"|{CLAUSE}(?!i\b)(?:[\w']+\s+){{1,3}}?(?:said|says|asked for|suggested|suggests|recommended|recommends"
+    r"|requested|requests|mentioned)\b(?=[\s,:]*[\w\"'‘“])"
+    rf"|{CLAUSE}(?:according to|for example|for instance|e\.g\b|eg\b|such as|something like|stuff like|hypothetically)"
+    # "i meant to say thanks" is chat, not a title; "To The Moon" can be one. After "i meant to", only a word that
+    # can't start an infinitive may follow ("i meant To Love Somebody" fails closed; quoted, or "wrong song, To ...",
+    # still counts).
+    r"|\bi meant to\b(?!\s+(?:the|a|an|my|your|his|her|our|their|this|that|these|those|me|you|him|us|them|all)\b)")
+# After the song, a change of heart withdraws it: "wrong song, Love Story, actually no", "... not that one either",
+# a bare "nope" or "no thanks", or a closing "nah" or "no" after a pause, whatever punctuation or filler follows
+# ("nah, lol"; "Hell No" stays a title). Checked after the correction only, since "actually no, wrong song, X"
+# opens one.
+CLOSING = (r"(?:[\s,;:.!?…—–\-'\"”]|\b(?:lol|lmao|lmfao|haha|bro|bruh|dude|man|fri|thanks|thank you|thx|ty|tho|though"
+           r"|sorry)\b)*+$")
+WITHDRAWN = re.compile(r"\b(?:actually,?\s+(?:no(?:pe|t that)?|nah)|no,?\s+wait|wait,?\s+no|(?:i\s+)?change[ds]?\s+my\s+mind"
+                       r"|on second thought|never\s+mind|leave it|nope|n(?:o|ah)[\s,]+(?:thanks|thank you|thx|ty)"
+                       r"|not\s+(?:(?:that|this|the|it)\s+)?(?:(?:one|song|track)\s+)?either)\b"
+                       rf"|\bnah\b{CLOSING}|[,;:.!?…—–\-'\"]\s*no\b{CLOSING}")
+# After the song, a clause handing it to someone else or calling it an example takes it back too: "'Love Story' was
+# an example", "... is what i heard alex say", "..., alex said". Their own "i said" or "i asked for it" doesn't.
+TRAILING = re.compile(r"\b(?:examples?|for instance|e\.?g|hypothetical(?:ly)?|such as|according to)\b|\bhear[sd]?\b(?!\s+me\b)"
+                      r"|(?P<own>\bi(?:'ve|'d)?\s+(?:(?:just|already|literally|clearly|even|actually|originally)\s+){0,2})?"
+                      r"\b(?:said|says?|told|tells|asked|asks|suggested|suggests|recommended|recommends|requested|requests"
+                      r"|mentioned|mentions|wants?|wanted|picked|meant)\b")
+# Between a title and its artist: "Love Story by Taylor Swift" may be named "Love Story Taylor Swift", though
+# "Stand By Me" can't be "Stand Me". The word right after one names the artist, never a withdrawal ("by Nope").
+CONNECTORS = {'by', 'from', 'ft', 'feat', 'featuring'}
+NOT_ARTISTS = {'me', 'you', 'u', 'him', 'her', 'us', 'them', 'it', 'my', 'your', 'his', 'its', 'our', 'their', 'this',
+               'that'}
+ARTIST = re.compile(r"\b((?:by|from|featuring|ft\.?|feat\.?)\s+)([\w']+)")
 CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
 
 
@@ -169,16 +216,80 @@ def correction_text(text):
     return ' '.join(text.casefold().replace('’', "'").split())
 
 
+def song_words(text):
+    """A title's words in order, without stray apostrophes ("believin'" and "believin" match)."""
+    return [word.strip("'") for word in WORD.findall(text) if word.strip("'")]
+
+
+def quoted_title(text, start):
+    """Where a title quoted (or linked) right at `start` ends, just past its closing mark: None if it isn't quoted
+    or might not close (so nothing in it is protected), or -1 if it's ambiguous."""
+    opening = TITLE_QUOTE.match(text, start)
+    if not opening:
+        return None
+    if opening['link']:
+        return opening.end()
+    if opening['double']:
+        close = re.compile(r'["”]').search(text, start+1)
+        return close.end() if close else None
+    for mark in CLOSER.finditer(text, start+1):
+        if mark['loose']:
+            return -1
+        if not mark['dropped']:
+            return mark.end()
+    return None
+
+
+def grounded_song(said, named, quoted=0):
+    """How many of the words they said the named song covers from the start, word for word, or 0: never words
+    picked from a later clause ("To The Moon, not To Be With You"). A title they quoted (its first `quoted` words)
+    keeps every word. Otherwise only a leading article may be left out, and only connectors between a title and its
+    artist skipped: never the title's first word ("From Me to You" isn't "Me to You") or one before a pronoun."""
+    article = 0
+    if not quoted and said[:1] in (['the'], ['a'], ['an']) and named[:1] != said[:1]:
+        said, article = said[1:], 1  # "the X" may be named just "X".
+    at = 0
+    for word in named:
+        while (max(quoted, 1) <= at < len(said)-1 and said[at] != word and said[at] in CONNECTORS
+               and said[at+1] not in NOT_ARTISTS):
+            at += 1
+        if at >= len(said) or said[at] != word:
+            return 0
+        at += 1
+    return article+at if at >= quoted else 0
+
+
+def replacement(text, song, start, named):
+    """The named song is the replacement at `start`, and nothing outside a title they quoted refuses it, takes it
+    back after the song starts at `song`, or hands it to someone else after the song itself."""
+    end = quoted_title(text, start)
+    if end == -1:
+        return False
+    said = [(m[0].strip("'"), m.start(), m.end()) for m in WORD.finditer(text, start) if m[0].strip("'")]
+    quoted = sum(at < end for _, at, _ in said) if end else 0
+    covered = grounded_song([word for word, _, _ in said], named, quoted)
+    if not covered:
+        return False
+    if quoted:  # Only this title is protected, never another quote in the message.
+        text = text[:start]+'"'+' '*(end-start-2)+'"'+text[end:]
+    title = said[0][2]  # An artist follows the title's first word, never starts it.
+    plain = text[:title]+ARTIST.sub(lambda m: m[1]+'_'*len(m[2]), text[title:])
+    return not (REFUSED.search(text) or WITHDRAWN.search(plain[song:])
+                or any(not m['own'] for m in TRAILING.finditer(plain[said[covered-1][2]:])))
+
+
 def correction(text, argument):
     """A member putting right a song Gene just played for them ("not that one, X", "i meant X"): the song is
-    the argument, in their own words after the correction. Whether there was such a play is checked by Gene's
-    control store (Controls.enqueue)."""
-    match = CORRECTION.match(correction_text(text))
-    if not match or not argument:
+    the argument, in their own words, starting the replacement right after the correction. Whether there was
+    such a play is checked by Gene's control store (Controls.enqueue)."""
+    text = correction_text(text)
+    opening = OPENING.match(text)
+    named = song_words(argument.casefold()) if isinstance(argument, str) else []
+    if not opening or not named:
         return False
-    song = match.group('song').strip(' "\'“”')
-    named = set(re.findall(r"[\w']+", argument.casefold()))
-    return bool(named) and (argument.casefold() in song or named <= set(re.findall(r"[\w']+", song)))
+    lead = LEAD.match(text, opening.end())
+    return any(replacement(text, opening.end(), start, named)
+               for start in (opening.end(), *([lead.end()] if lead else [])))
 
 
 def just_played(receipts):
