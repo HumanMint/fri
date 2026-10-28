@@ -130,6 +130,33 @@ def test_withdrawn_while_its_save_was_on_the_way(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
+def test_withdrawn_after_a_save_whose_reply_was_lost(monkeypatch, tmp_path):
+    """Sol r1 of fri #143: the save landed, but Fri lost the reply (the API reports the controller unreachable)."""
+    async def scenario():
+        from fri.fri_errors import ControllerUnavailable
+        w = await world(monkeypatch, tmp_path)
+        api = w.fri.api
+        earlier = w.said('fri explain '+MARKER)
+        async def saving(method, path, payload=None):
+            result = await api(method, path, payload)
+            if path == '/chat/turn':  # Landed, then the connection dropped before the reply.
+                raise ControllerUnavailable('controller unreachable')
+            return result
+        w.fri.api = saving
+        try:
+            await w.agent.handle(earlier)
+            w.fri.api = api
+            w.agent.withdraw(earlier)
+            await asyncio.sleep(0)
+            for _ in range(5):  # The withdrawal call runs in the background.
+                await asyncio.sleep(0.01)
+            assert MARKER not in await later_unrelated_request(w)
+            assert MARKER not in saved(w)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
 def test_an_older_controller_runs_as_before(monkeypatch, tmp_path):
     async def scenario():
         w = await world(monkeypatch, tmp_path, capable=False)
