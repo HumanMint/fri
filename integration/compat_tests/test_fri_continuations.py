@@ -97,7 +97,9 @@ async def finish(fri, tasks):
     await fri.close()
 
 
-def test_a_short_line_sent_while_fri_composes_is_answered_with_the_question_once(monkeypatch, tmp_path):
+# A clarification that opens like a song correction but names no song ("i meant to say ...") is just words.
+@pytest.mark.parametrize('line', [DETAIL, 'i meant to say minecraft 1.21', 'i meant to ask about minecraft 1.21'])
+def test_a_short_line_sent_while_fri_composes_is_answered_with_the_question_once(monkeypatch, tmp_path, line):
     async def scenario():
         fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
         message = members(message)
@@ -107,14 +109,14 @@ def test_a_short_line_sent_while_fri_composes_is_answered_with_the_question_once
         tasks = [asyncio.create_task(agent.handle(question))]
         try:
             await asyncio.wait_for(model.reached[1].wait(), 5)  # Composing, its request not built yet.
-            detail = message(DETAIL)  # No "fri" in it.
+            detail = message(line)  # No "fri" in it.
             tasks.append(asyncio.create_task(agent.handle(detail)))
             await until(lambda: tasks[1].done() or detail.id in agent.replying)
             model.hold[1].set()
             await asyncio.wait_for(asyncio.gather(*tasks), 5)
             assert len(model.requests) == 1  # One model request...
             text, context = model.requests[0]
-            assert text == DETAIL and burst_of(context) == [QUESTION, DETAIL]  # ...that reads both lines...
+            assert text == line and burst_of(context) == [QUESTION, line]  # ...that reads both lines...
             detail.reply.assert_awaited_once()  # ...and one reply, to the newest line, as for any burst.
             assert detail.reply.await_args.args[0] == ANSWER
             question.reply.assert_not_awaited()

@@ -1566,10 +1566,15 @@ class Agent:
         (see Actions.command_requested), which keep their own paths. A turn taking a line and the line both are."""
         from .fri_pending import cancelled
         from .gene_controls import COMMANDS, OPENING, correction_text, quick_control, requested
+
+        def song_correction(text):  # Opens like one and names something: not "i meant to say ..." or "don't ...".
+            text = correction_text(text)
+            opening = OPENING.match(text)
+            return bool(opening) and re.match(r"(?!(?:i meant\s+)?to\b|don'?t\b|do not\b)\S", text[opening.end():])
         return not (media(event) or getattr(event, 'reference', None) or links(event) or
                     explicit_mention(event, self.fri.user.id) or memory_intent(text) or cancelled(text) or
                     usage_requested(text) or quick_control(text, music_context=True) or
-                    any(requested(text, action) for action in COMMANDS) or OPENING.match(correction_text(text)))
+                    any(requested(text, action) for action in COMMANDS) or song_correction(text))
 
     def summoning(self, message, directed, privacy):
         """Just Fri's name or a hello, on its own: what they want usually comes in the next message."""
