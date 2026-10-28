@@ -58,7 +58,8 @@ Discord's own `/external/` proxy only and within the image limits above. Discord
 twenty million pixels, and the bytes' own header must agree (any preview through that proxy, a GIF link's
 too); a size that's missing or unreadable skips it. Every picture a turn showed the model is found again,
 as Discord shows its post then, before each later model request and before delivery (a ping's own check
-does it, outside channels too), so a swapped or suppressed one stops the turn. A card that unfurls late on
+does it, outside channels too, and for a ping answering a pending clarification, which has no mention
+grant), so a swapped or suppressed one stops the turn. A card that unfurls late on
 a post Fri didn't look at changes nothing. A post with both an attachment and a card's picture is still
 not looked at, and history search rows don't show cards yet.
 

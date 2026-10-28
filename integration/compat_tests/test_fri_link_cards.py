@@ -592,3 +592,73 @@ def test_a_configured_pings_target_card_picture_is_found_again_before_delivery(m
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('part', ['image', 'thumbnail'])
+@pytest.mark.parametrize('where', ['own', 'reply', 'link'])
+@pytest.mark.parametrize('when', ['never', 'sign-in', 'inference'])
+def test_a_continuations_card_picture_is_checked_without_a_mention_grant(monkeypatch, tmp_path, where, when, part):
+    """fri #150 review round 2 B1: a ping that answers a pending clarification skips the mention admission, so
+    its invitation has no grant. The pictures it showed the model, its own card or the one it replies to, are
+    still found again before every request and before delivery."""
+    from compat_tests.test_fri_continuity import arm, origin
+
+    async def scenario():
+        fri, agent, store, _, _, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        question = 'what is the current Python release?'
+        original = message(question, age=120)
+        body = origin(goal='web', text=question)
+        body['source'].update(id=str(original.id), display_name=original.author.display_name)
+        arm(store, body, topic=question)
+        if where == 'own':
+            event = message('<@99> the stable one, and what is in this picture https://site.test/page')
+            source = copy.copy(event)  # Discord's copy has the card; the event that arrived doesn't.
+            rows[event.id] = source
+        elif where == 'reply':
+            source = message('https://site.test/page', user=30, age=60)
+            event = message('<@99> the stable one, and what is in that picture?')
+            event.reference = SimpleNamespace(message_id=source.id, channel_id=1)
+        else:
+            source = message('https://site.test/page', user=30, age=60)
+            event = message(f'<@99> the stable one, and what is in https://discord.com/channels/123/1/{source.id}')
+        source.embeds = [private_card(part, width=100, height=100)]
+        loads(monkeypatch)
+        sent = []
+
+        def suppress():
+            changed = copy.copy(rows[source.id])
+            changed.embeds = []  # Same text, same edit time.
+            rows[source.id] = changed
+
+        def access_token():
+            if when == 'sign-in':
+                suppress()
+            return 'synthetic'
+
+        def handler(request):
+            content = json.loads(request.content)['input'][-1]['content']
+            seen = isinstance(content, list) and any(item['type'] == 'input_image' for item in content)
+            sent.append(seen)
+            if when == 'inference':
+                suppress()
+            answer = {'response_kind': 'reply', 'reaction': None, 'reply': 'CAPTION' if seen else 'no picture',
+                      'request_draft': None, 'action': None, 'notes': [], 'allow_closing': False}
+            return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(answer)))+'\n\n')
+        fri.chat = Chat(SimpleNamespace(access_token=access_token), httpx.MockTransport(handler))
+        del fri.chat_once
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            # A continuation: the operations admission, never the mention one, so no grant.
+            paths = [path for path, _ in calls]
+            assert '/chat/operations/admit' in paths and '/chat/mentions/admit' not in paths
+            replies = [call.args[0] for call in event.reply.await_args_list]
+            if when == 'never':
+                assert sent == [True] and replies == ['CAPTION']
+                return
+            assert 'CAPTION' not in replies
+            assert sent == ([] if when == 'sign-in' else [True])
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

@@ -96,6 +96,20 @@ class Invitation:
         before every request and before delivery, finds them again as Discord shows the post now."""
         self.pictures[post.id] = (post, unsigned(urls))
 
+    async def pictures_unchanged(self):
+        """Every image the turn showed the model (see inspected), as Discord shows its post now. A link card's
+        picture isn't in the nearby snapshots (a card unfurling late on a post Fri didn't look at changes
+        nothing it saw), the ping's own isn't a nearby post, and suppressing a card changes no text or edit
+        time. Before the privacy reads, so the last of those still comes after every Discord read."""
+        for mid, (post, urls) in self.pictures.items():
+            try:
+                current = await post.channel.fetch_message(mid)  # A linked post's from its own channel.
+            except discord.NotFound:
+                return False
+            if current.id != mid or unsigned(stills(current)[0]) != urls:
+                return False
+        return True
+
     def refuse(self, reason):
         self.refusal = reason
         return False
@@ -171,14 +185,17 @@ class Invitation:
                 return False
             if not await self.ping_unchanged():
                 return self.refuse('message changed')
+            # With or without a grant: a ping answering a pending clarification skips the mention admission.
+            if check_evidence and not await self.pictures_unchanged():
+                return self.refuse('image changed')
             if check_evidence and self.grant:
                 profiles = await self.profile_sources(list(self.events.values()))
                 if any(profiles.get(user) != before for user, before in self.profiles.items()):
                     return self.refuse('nearby privacy changed')
-                changed, fetched = False, {}  # Every one is checked, so each edited or deleted leaves the live view.
+                changed = False  # Every one is checked, so each edited or deleted leaves the live view.
                 for mid, event in self.events.items():
                     try:
-                        current = fetched[mid] = await self.event.channel.fetch_message(mid)
+                        current = await self.event.channel.fetch_message(mid)
                     except discord.NotFound:
                         self.agent.withdraw(event)
                         changed = True
@@ -188,16 +205,6 @@ class Invitation:
                         changed = True
                 if changed:
                     return self.refuse('nearby message changed')
-                # Every image Fri looked at, as Discord shows it now: a link card's picture isn't in the
-                # snapshots above (a card unfurling late on a post Fri didn't look at changes nothing it saw),
-                # and the ping's own isn't a nearby post. Suppressing a card changes no text or edit time.
-                for mid, (post, urls) in self.pictures.items():
-                    try:
-                        current = fetched.get(mid) or await post.channel.fetch_message(mid)  # A link's, from its channel.
-                    except discord.NotFound:
-                        return self.refuse('image changed')
-                    if current.id != mid or unsigned(stills(current)[0]) != urls:
-                        return self.refuse('image changed')
                 # The ping again, as an edit during the privacy read would otherwise go unseen.
                 if not await self.ping_unchanged():
                     return self.refuse('message changed')
