@@ -37,7 +37,7 @@ subscription connection is preserved; no API key is introduced by this migration
 
 ## Setup
 
-Use Python 3.11 and `uv`. Access to both private repositories is required for the
+Use Python 3.11 and `uv`. Access to both repositories is required for the
 current controller integration.
 
 ```sh
@@ -87,3 +87,11 @@ each subsequent controller call carries the required version.
 Gene remains the only release authority. Existing Gene job approvals still target
 Gene, and its automatic-repair policy cannot modify this repository. Fri releases
 are maintainer operations with independent images and current-state-preserving rollback.
+
+## Credits
+
+Fri is maintained by [HumanMint](https://github.com/HumanMint). Early implementation
+was developed with [OpenAI Codex](https://openai.com/codex/), using GPT-6 Astra and
+GPT-6.1 Sol. Development continues with Codex and Claude: Codex contributes code,
+tests and independent reviews; Claude contributes implementation and integration
+work.
