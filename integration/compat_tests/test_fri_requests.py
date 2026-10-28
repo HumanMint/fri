@@ -69,6 +69,8 @@ def test_dm_and_public_drafts_cannot_be_approved_by_other_people_or_scope(denial
         cog.api.assert_not_awaited()
         if denial == 'other_user':  # Someone else's draft says so, instead of failing.
             assert event.response.send_message.await_args.kwargs['content'] == 'not your button.'
+        elif denial == 'nonmember':  # Their own, when the member lookup comes back empty: said too (fri #183).
+            assert event.response.send_message.await_args.kwargs['content'] == 'couldn’t check you’re still here. try again.'
         else:
             event.response.send_message.assert_not_awaited()
     asyncio.run(scenario())
