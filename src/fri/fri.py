@@ -196,6 +196,17 @@ async def patiently(fri, read):
             await asyncio.sleep(CONTRACT_RETRY)
 
 
+def persistent_buttons():
+    """Buttons found again by their custom ID after a timeout or restart, plus the fallback that says a
+    draft's, preview's or memory panel's view ended (fri_buttons.Ended)."""
+    from .fri_buttons import Ended
+    from .fri_fixes import TellReporter
+    from .fri_memory_panel import MemoryOpen
+    from .fri_social import SocialButton
+    from .fri_workspace import PostButton
+    return ReviewButton, ReportButton, PostButton, SocialButton, TellReporter, MemoryOpen, Ended
+
+
 class Fri(discord.Client):
     def __init__(self):
         intents = discord.Intents.none()
@@ -265,10 +276,7 @@ class Fri(discord.Client):
         self.agent = Agent(self)
         await patiently(self, self.agent.start)
         self.add_view(HomeView(self))
-        from .fri_fixes import TellReporter
-        from .fri_social import SocialButton
-        from .fri_workspace import PostButton
-        self.add_dynamic_items(ReviewButton, ReportButton, PostButton, SocialButton, TellReporter)
+        self.add_dynamic_items(*persistent_buttons())
 
         @self.tree.command(name='fri', description='Chat, request a feature or fix, and follow development.',
                            guild=discord.Object(id=self.guild_id))
