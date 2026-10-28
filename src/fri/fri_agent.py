@@ -344,7 +344,7 @@ class Agent:
             else:
                 self.uncache(int(user))
         # And one that drew on a member's summary only while Gene still holds it as said (fri #187).
-        if retired := await self.retired(self.channel_guild(parent), accepted):
+        if retired := await self.retired(accepted, channel=parent):
             stale |= retired
             accepted = [row for row in accepted if row['id'] not in retired]
         if stale:  # Drop invalidated Fri replies from the raw cache too, not just from this context.
@@ -363,11 +363,15 @@ class Agent:
             self.summarized = {mid: at for mid, at in self.summarized.items() if at > now-900}
             self.summarized[str(sent.id)] = now
 
-    async def retired(self, guild, rows):
+    async def retired(self, rows, guild=None, channel=None):
         """Of `rows`, the IDs of Fri's replies that drew on a member's summary which Gene no longer holds as said: it
         retires one once that summary goes (gene #112), so the echo may repeat withdrawn words (fri #187). Only those
-        are asked about. A refusal or a controller that doesn't answer counts them all, so none is reused unconfirmed."""
+        are asked about, in `guild` (else the server of `channel`). A refusal or a controller that doesn't answer
+        counts them all, so none is reused unconfirmed."""
         asked = sorted({row['id'] for row in rows if row.get('fri') and row['id'] in self.summarized})
+        if not asked:
+            return set()
+        guild = guild or self.channel_guild(channel)
         found = {}
         try:
             for start in range(0, len(asked), 10):  # As many as the controller looks up at once.
@@ -1963,7 +1967,7 @@ class Agent:
                 authors.update((item['user_id'], item['revision']) for item in row['provenance'])
             else:
                 authors.add((row['user_id'], row.get('revision', 0)))
-        if await self.retired(self.channel_guild(parent), records):  # A reply of Fri's whose summary went (fri #187).
+        if await self.retired(records, channel=parent):  # A reply of Fri's whose summary went (fri #187).
             return False
         if 'author-fence' in getattr(self.fri, 'capabilities', ()):
             # One check of every author under the controller's lock (fri #84): no erasure through Gene lands
