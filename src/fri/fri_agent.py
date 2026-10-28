@@ -83,9 +83,11 @@ class BehaviorPreview(PagedPreview):
                          'Apply settings', 'fri:behavior:', self.apply)
 
     async def interaction_check(self, interaction):
+        from .fri_buttons import answers, not_yours
         fri = self.agent.fri
+        if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
+            return False
         if interaction.user.id != fri.owner_id:
-            from .fri_buttons import not_yours
             await not_yours(interaction)
             return False
         return (interaction.message.author.id == fri.user.id and
@@ -595,6 +597,8 @@ class Agent:
             return ERASED if await erased() else False
         if await erased():
             return ERASED
+        if message.guild is None and not self.config['support_dms']:  # Gone off during those reads (fri #170).
+            return 'dms off'
         if self.control_queue[0] != message.id:  # An earlier request is still deciding or preparing.
             await message.reply('one settings preview at a time, give me a moment.', allowed_mentions=NO_MENTIONS)
             return True
@@ -629,8 +633,12 @@ class Agent:
                     await message.reply('that change is too large for one preview. please change one behavior at a time.', allowed_mentions=NO_MENTIONS)
                 else:
                     view = BehaviorPreview(self, changes, state['version'])
-                    await message.reply(view.content, view=view, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+                    # Its buttons come off that reply when it times out (fri #176).
+                    view.message = await message.reply(view.content, view=view, allowed_mentions=NO_MENTIONS,
+                                                       suppress_embeds=True)
         except (ValueError, KeyError, TypeError):
+            if message.guild is None and not self.config['support_dms']:  # It may have raised after they went off.
+                return 'dms off'
             await message.reply('i couldn’t parse that settings preview. nothing was saved.', allowed_mentions=NO_MENTIONS)
         return True
 
@@ -1212,8 +1220,13 @@ class Agent:
             return
         dm = message.guild is None
         if dm:
-            if message.author.bot or not self.config['support_dms'] or not await self.member(message.author.id, fresh=True):
-                return  # Fresh: someone who just left mustn't hear server context through a cached lookup.
+            if message.author.bot:
+                return
+            if not self.config['support_dms']:
+                return self.forward_dropped(message, 'dms off')  # Counted, like a forward at any later gate.
+            if not await self.member(message.author.id, fresh=True):
+                # Fresh: someone who just left mustn't hear server context through a cached lookup.
+                return self.forward_dropped(message, 'not a member')
         elif not self.allowed(message.channel):
             self.memory_controls.leave(message.author.id, message.id)  # Outside, it's chat (see Fri.talk).
             # An outside ping is one event, never a new ambient/active channel.

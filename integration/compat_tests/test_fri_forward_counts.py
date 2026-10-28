@@ -92,3 +92,28 @@ def test_a_reply_an_uncaptioned_meme_or_a_bots_forward_is_not_counted(monkeypatc
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('gate', ['dms off', 'not a member'])
+def test_a_forward_refused_at_a_dm_gate_is_counted_too(monkeypatch, tmp_path, caplog, gate):
+    """fri #177: a DM refused before its text is read (DMs off, or its author left the server) still counts, by its
+    message ID and that gate only."""
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path)
+        agent.config['support_dms'] = gate != 'dms off'
+        agent.member = AsyncMock(return_value=None if gate == 'not a member' else SimpleNamespace(id=20))
+        event = forward(message('', user=20))
+        event.guild = None
+        plain = message('just saying hi', user=20)  # Not a forward: refused the same way, and not counted.
+        plain.guild = None
+        try:
+            await agent.handle(event)
+            await agent.handle(plain)
+            assert forward_lines(caplog) == [f'Forward dm/{event.id} not read: {gate}']
+            fri.chat_once.assert_not_awaited()
+            log = '\n'.join(caplog.messages)
+            assert TEXT not in log and 'just saying hi' not in log
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
