@@ -72,6 +72,16 @@ image selection removed for that turn. Explicit reply references load only their
 direct target initially, and keep their source and persistence guards. The current
 attachments and existing immediate own-photo pairing remain available directly.
 
+Outside, a ping that directly replies to Fri's own answer there reads that answer as its
+referenced row. Only an answer Fri delivered and saved counts, for 15 minutes from delivery,
+and never past an earlier answer it read in turn. Fri keeps at most 100 such receipts, in memory
+only: a restart forgets them. A receipt holds message IDs, digests and author privacy revisions,
+never words. Every post the answer drew on, the earlier ping included, must still be there
+unchanged, and its authors must still allow it at the same revision. They're registered on the
+new ping's grant like nearby authors, and checked again before each model request and before
+delivery. A delete or edit (Fri's own too) or a privacy control ends the receipt. So does an
+ancestry larger than one privacy read can carry (25 posts, 25 authors). Then the reply reads as before.
+
 Freshness checks compare author and event IDs, never display names. A gateway event shows
 the member's server nickname, but a fetched copy of the same message shows their global
 name, because Fri has no members intent or member cache.
