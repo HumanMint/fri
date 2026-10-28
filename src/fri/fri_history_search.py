@@ -19,6 +19,13 @@ READ_ONLY_AFTER_HISTORY = {'history_search', 'read_recent', 'learning_overview',
                            'channel_capabilities', 'work_list', 'work_read'}
 
 
+# Where or when it was said, after the verb: a channel (#name or its whole mention), here, this chat, server or
+# thread, or a day. A place ends there ("in server documentation" names a document, not where it was said).
+PLACE = (r'(?:(?:in|on)\s+(?:#[\w-]+|<#\d+>)|in\s+here\b|(?:in|on)\s+(?:(?:this|the|that|our|a)\s+)?'
+         r'(?:channel|chat|server|thread|gc|vc)|on\s+(?:mon|tues|wednes|thurs|fri|satur|sun)day|(?:on|over)\s+the\s+weekend)'
+         r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|lol|lmao|rn)\b))')
+
+
 def requested(text):
     visible = re.sub(r'```[\s\S]*?```|`[^`]*`|(?m:^>.*$)', '', text)
     if re.search(r"(?i)\b(?:don't|do not|stop)\s+(?:search|look|read)", visible):
@@ -36,15 +43,17 @@ def requested(text):
         r'|\b(find|search|look\s+up|dig\s+up|pull\s+up)\b.*\b(memes?|pics?|pictures?|images?|photos?|screenshots?|gifs?|'
         r'videos?|clips?|links?|files?)\b.*\b(posted|sent|shared|dropped|uploaded|linked)\b'
         # The verb ends the clause, as in recall; "a shared drive" uses it as an adjective.
-        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn|in\s+[#<])))'
+        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn)\b|'+PLACE+r'))'
         # "what was that song kev mentioned": a thing someone said, named before the verb. The word
         # before the verb is who said it, so "the most commonly recommended laptop" or "the difference
         # between shared and dedicated" stay general questions.
         r"|\b(?:what(?:'s|’s|s)?|which)\s+(?:(?:was|were|is)\s+)?(?:that|the|those)\s+\w+(?:\s+\w+){0,3}?\s+"
         r'(?!(?:\w+ly|most|more|least|between|and|or|of|for|with|in|on|to|by|than|as|being|been)\b)\w+\s+'
         # The verb ends the clause, as in recall; "doctor recommended dose" uses it as an adjective.
+        # Only a place in the server or a day may follow: "the file size shared on discord" is passive.
         r'(said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
-        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|in|on|here|there|again|lol|lmao|rn)\b))', visible))
+        r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn)\b'
+        r'|'+PLACE+r'))', visible))
 
 
 def valid_action(action):
