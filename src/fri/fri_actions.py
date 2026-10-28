@@ -19,7 +19,16 @@ from .fri_images import details, image_context, look, media
 from .fri_memes import carried, reacted
 from .fri_pending import Clarification, completion, research_query
 from .fri_web import lookup
-from .gene_controls import COMMANDS, arguments, grounded, music_control_intent, own_words, requested
+from .gene_controls import (
+    COMMANDS,
+    arguments,
+    correction,
+    grounded,
+    just_played,
+    music_control_intent,
+    own_words,
+    requested,
+)
 from .privacy import clean
 from .web_policy import public_query
 
@@ -57,6 +66,8 @@ class Actions:
         self.research = None
         self.search_count = 0
         self.image_context = {}
+        self.music_receipts = []  # This member's Gene receipts here, as the controller has them.
+        self.music_correctable = None  # The controller: a play of theirs a correction could put right now.
         self.media_allowed = False
         self.invitation = None
         self.turn_context = None
@@ -72,7 +83,7 @@ class Actions:
         continuation_only = getattr(self, 'continuation_only', None)
         if continuation_only and action.get('action') != continuation_only:
             return False
-        if not continuation_only and requested(self.message, action.get('action')):
+        if not continuation_only and (requested(self.message, action.get('action')) or self.correcting(action)):
             return True
         if self.burst_permission(action):
             return True
@@ -80,6 +91,11 @@ class Actions:
             action.get('argument'), discord_source(self.event).model_dump(),
             str(self.guild), self.scope.get('conversation_id', ''), str(self.user), self.revision,
             str(getattr(getattr(self.fri, 'user', None), 'id', ''))))
+
+    def correcting(self, action):
+        """Putting right the song Gene just played for them: "not that one, X" with X in their own words."""
+        recent = self.music_correctable if self.music_correctable is not None else just_played(self.music_receipts)
+        return action.get('action') == 'play' and correction(self.message, action.get('argument') or '') and recent
 
     def observe(self, scope, user, revision):
         # Keep the first revision read this turn: a later read must not relabel earlier evidence,
@@ -561,7 +577,8 @@ class Actions:
             return {'blocked': str(exc)}
         if not self.command_requested(action):
             return {'blocked': 'That music request expired or needs a fresh instruction. Ask me to play it with the song included.'}
-        continued = not requested(self.message, verb)
+        correcting = not requested(self.message, verb) and self.correcting(action)
+        continued = not requested(self.message, verb) and not correcting  # Gene checks a correction itself.
         burst = self.burst_permission(action) if continued else None
         if continued and not burst and not await self.pending_unchanged():
             return {'blocked': 'The earlier music request changed. Ask again with the song included.'}
@@ -607,6 +624,9 @@ class Actions:
         if result.get('uncertain') and not getattr(self, 'operational', False):
             # The command-wait deadline must not cancel diagnosis and cause a second model run.
             result['diagnostic'] = await self.diagnose(channels)
+        if correcting and result.get('done') and not result.get('blocked') and not result.get('uncertain'):
+            result['note'] = ('This put right the earlier song, which is still queued or playing; Gene runs one '
+                              'command per message. Saying "skip" drops it.')
         return {'kind': 'gene_command', 'action': verb, **result}
 
     async def diagnose(self, channels):
