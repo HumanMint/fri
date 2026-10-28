@@ -1,12 +1,12 @@
 name: checks
 # Private repos get a monthly allowance of Actions minutes: test each change once (a pull request, then its
-# merge to main), skip docs-only changes, and let a newer push to the same pull request cancel the older run.
+# merge to main), skip Markdown-only changes (docs/integration-pair.json picks the controller the tests run against), and let a newer push to the same pull request cancel the older run.
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md', 'docs/**']
+    paths-ignore: ['**.md']
   pull_request:
-    paths-ignore: ['**.md', 'docs/**']
+    paths-ignore: ['**.md']
 concurrency:
   group: checks-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
