@@ -21,6 +21,7 @@ from .fri_context import discord_source
 from .fri_errors import (
     UNREACHABLE,
     AuthorErased,
+    Continued,
     ControllerRejected,
     ControllerUnavailable,
     GateClosed,
@@ -500,6 +501,10 @@ class Fri(discord.Client):
             # wait on Discord and Gene, and the owner can turn DMs off meanwhile.
             if fence and fence.get('dms') and not fence['dms']():
                 raise GateClosed('dms off')
+            # Last, with nothing to wait on before the request: a short line from the member that joined the turn
+            # by now is answered with it instead, and one after this is answered on its own (see Continuation).
+            if fence and fence.get('commit') and not fence['commit']():
+                raise Continued()
         # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
         seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
         result = await self.chat.respond(text, context, ready=ready)
@@ -626,6 +631,8 @@ class Fri(discord.Client):
                                              model='local-usage-report', derived=False)
                     await self.api('POST', '/chat/turn/check', result.turn)  # An erasure mid-turn stops it.
                     return result
+                if self.agent and self.agent.gave_way(event):
+                    raise Continued()  # A short line joined it first: nothing here is reserved, run or answered.
                 from .fri_operational import admit as admit_operation
                 operation = await admit_operation(self, event, source, scope, text, context)
                 if operation.result:
@@ -646,10 +653,13 @@ class Fri(discord.Client):
                 if self.agent and self.agent.config['enabled'] and not operation.continuation:
                     # Existing local/operational work keeps its own admission and
                     # allowance. A mention charges social budget only for new chat.
-                    admission = (await invitation.admit() if invitation else
+                    # A burst a short line reopened was already admitted, as the turn it joined: one exchange.
+                    admission = (await invitation.admit() if invitation else self.agent.readmitted(event) or
                         await self.api('POST', '/agent/admit', {**self.agent.identity(user_id, guild_id),
                             'channel_id': str(source_channel),
                             'space': 'dm' if visibility == 'private' else 'public'}))
+                    if admission['allowed']:
+                        self.agent.admitted(event)
                     if not admission['allowed']:
                         minutes = max(1, int((admission['until']-time.time()+59)//60))
                         notice = (f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
@@ -705,6 +715,7 @@ class Fri(discord.Client):
                     actions.pending = context.get('pending')
                     actions.continuation_only = actions.pending['goal'] if operation.continuation else None
                     actions.conversation = conversation
+                    actions.reopened = getattr(burst, 'origin', None) is not None  # See Continuation.
                     actions.private_evidence = bool(conversation.get('reply_target') or context.get('invited_context'))
                     actions.media_allowed = inspect_images
                 context['actions'] = await actions.available() if actions else {}
@@ -744,6 +755,8 @@ class Fri(discord.Client):
                                              'input': text, 'reply': '', 'model': context['model'],
                                              'effort': context['effort']},
                                     'actions': actions, 'shown': set(), 'began': began}
+                if self.agent and source.kind == 'discord_message':
+                    context['fence']['commit'] = lambda: self.agent.commit(event)
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
                     async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
                         if closed := await self.agent.dm_closed(user_id):

@@ -3,6 +3,7 @@
 import hashlib
 import re
 import time
+from collections import deque
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,6 +15,8 @@ BURST_SECONDS = 5
 MAX_MESSAGES = 5
 MAX_TEXT = 4000
 REPLY_SECONDS = 7 * 86400
+CONTINUATION_TEXT = 300  # A line let in without Fri's name adds to the question; a longer one is its own message.
+MOST_CHANNELS = 1000  # Channels whose latest speakers are kept (see Continuations): far more than talk at once.
 PERSISTENT_MODEL_WRITES = frozenset({'work_save', 'prepare_post', 'preview_voice', 'reminder_prepare', 'plan_prepare'})
 
 
@@ -76,11 +79,16 @@ def burst_continuation(origin, source, text, action, argument, revision, bot_id=
 
 
 class Burst(list):
-    """One burst's rows, and its author's erasure baseline (see Agent.erasure) as they came in."""
+    """One burst's rows, and its author's erasure baseline (see Agent.erasure) as they came in.
 
-    def __init__(self, since=None, alone=False):
+    `anchors`: for a burst a short line reopened (see Continuation), the messages of the turn it joined. Its words
+    were let in only for those, so it's dropped whole if one is taken back."""
+
+    def __init__(self, since=None, alone=False, anchors=()):
         super().__init__()
-        self.since, self.alone = since, alone
+        self.since, self.alone, self.anchors = since, alone, frozenset(anchors)
+        self.taken = False  # Taken to be answered (see Agent.receive), not just dropped.
+        self.origin = None  # The turn a short line reopened this burst from (see Continuation).
 
 
 class Bursts:
@@ -131,6 +139,21 @@ class Bursts:
             raise ValueError('Send at most five messages and 4000 characters together, then give me a moment.')
         return True
 
+    def reopen(self, rows, message, arrived, since):
+        """A short line joining a turn that hasn't committed (see Continuation): that turn's burst again, gathering,
+        with the line newest, so its newest message answers for all of it as usual."""
+        key = (message.channel.id, message.author.id)
+        group = Burst(since, anchors=(row[1].id for row in rows))
+        group.extend(rows)
+        group.append((arrived, message, message.content))
+        self.rows.setdefault(key, []).append(group)
+        return group
+
+    def held(self, group):
+        """Whether a burst is still gathering, or was taken to be answered: not dropped."""
+        key = (group[-1][1].channel.id, group[-1][1].author.id)
+        return group.taken or any(rows is group for rows in self.rows.get(key, []))
+
     def group(self, message):
         return next((rows for rows in self.rows.get((message.channel.id, message.author.id), [])
                      if any(row[1].id == message.id for row in rows)), None)
@@ -165,12 +188,13 @@ class Bursts:
     def unsend(self, channel, ids):
         """Deleted messages leave their burst, and its newest message answers for the rest. A burst
         whose newest message went is dropped whole: the rest were waiting on what was taken back.
-        So is a privacy control's: deleting it may be taking it back, and an erasure can't be undone."""
+        So is a privacy control's: deleting it may be taking it back, and an erasure can't be undone.
+        So is a reopened one whose anchor went: its line was let in only for that."""
         for key in [key for key in self.rows if key[0] == channel]:
             groups = []
             for rows in self.rows[key]:
                 gone = [row[1] for row in rows if row[1].id in ids]
-                if gone and rows[-1][1].id in ids:
+                if gone and (rows[-1][1].id in ids or getattr(rows, 'anchors', frozenset()) & set(ids)):
                     self.dropped([row[1] for row in rows], 'message deleted')
                     continue
                 if gone:
@@ -181,6 +205,120 @@ class Bursts:
                 self.rows[key] = groups
             else:
                 del self.rows[key]
+
+
+class Continuation:
+    """An explicit turn in a configured channel, still open to a short undirected line from its author.
+
+    The line has to come within the turn's burst window, from its first message (never renewed), with nobody else
+    speaking in between (see Agent.continuing). Until the turn commits, just before its model request or anything
+    it does goes out, the line reopens the turn's burst and the turn gives way: the reopened burst is answered
+    once, from the line, as any burst is. After that, one line is answered on its own once this reply is done.
+    A line carries no authority of its own: a reopened burst never completes a request (see Actions)."""
+
+    def __init__(self, message, rows, since, *, addressed=False, admitted=False):
+        self.message, self.rows, self.since = message, list(rows), since
+        self.key = (message.channel.id, message.author.id)
+        self.addressed = addressed  # Someone spoke to Fri, so the burst it reopens was spoken to Fri too.
+        self.admitted = admitted  # The member's allowance was spent on this exchange (see Fri.talk).
+        self.joined = None  # The burst a line reopened before this turn committed.
+        self.committed = self.gave_way = self.followed = self.closed = False
+
+    def window(self, message, arrived):
+        """Whether `message` came close enough after the turn's first message, as it arrived and by Discord's clock."""
+        first = self.rows[0]
+        return arrived-first[0] <= BURST_SECONDS and (message.id-first[1].id)/(1 << 22)/1000 <= BURST_SECONDS
+
+    def yields(self, bursts):
+        """Whether a line reopened this turn's burst, and that still stands: the reopened burst answers instead."""
+        if self.gave_way or (not self.committed and self.joined is not None and bursts.held(self.joined)):
+            self.gave_way = True
+        return self.gave_way
+
+    def commit(self, bursts):
+        """Whether this turn goes on to answer. Once it does, a line is no longer let into it (see admit)."""
+        if self.yields(bursts):
+            return False
+        self.joined, self.committed = None, True  # A reopened burst dropped since, e.g. the line deleted.
+        return True
+
+    def admit(self, bursts, message, arrived):
+        """Let the line in, with nothing awaited since find(): 'reopen' this turn's burst with it, before the turn
+        commits; 'add' it as usual, to a burst another line reopened that's still gathering, or on its own once
+        this turn is done (once); None if it's too late for either."""
+        if self.closed or self.gave_way:
+            return None
+        if self.committed:
+            if self.followed:
+                return None
+            self.followed = True
+            return 'add'
+        if self.joined is not None and bursts.held(self.joined):
+            return None if self.joined.taken else 'add'
+        self.joined = bursts.reopen(self.rows, message, arrived, self.since)
+        self.joined.origin = self
+        return 'reopen'
+
+
+class Continuations:
+    """The explicit turns still open to a short line (see Continuation), and who spoke where lately."""
+
+    def __init__(self):
+        self.turns = {}  # The message a turn answers: its Continuation.
+        self.said = {}  # Configured channel or thread: its members' latest (message ID, author), newest last.
+
+    def heard(self, message):
+        said = self.said.pop(message.channel.id, None) or deque(maxlen=20)
+        said.append((message.id, message.author.id))
+        self.said[message.channel.id] = said  # Last spoken in, last: the quietest go first past the bound.
+        while len(self.said) > MOST_CHANNELS:
+            del self.said[next(iter(self.said))]
+
+    def open(self, message, rows, since, **options):
+        token = self.turns[message.id] = Continuation(message, rows, since, **options)
+        return token
+
+    def close(self, token):
+        if self.turns.get(token.message.id) is token:
+            del self.turns[token.message.id]
+
+    def get(self, message):
+        return self.turns.get(getattr(message, 'id', None))
+
+    def find(self, message, arrived, since, bursts):
+        """The turn of theirs a short line can still join: their newest here, still open, the line sent after its
+        message and inside its window, with the same erasure baseline, and nobody else spoke here since it began."""
+        key = (message.channel.id, message.author.id)
+        token = max((t for t in self.turns.values() if t.key == key), key=lambda t: t.message.id, default=None)
+        if (token is None or token.closed or token.gave_way or token.since != since or
+                message.id <= token.message.id or not token.window(message, arrived) or
+                any(token.rows[0][1].id < i < message.id and author != message.author.id
+                    for i, author in self.said.get(message.channel.id, ()))):
+            return None
+        if token.committed:
+            return None if token.followed else token
+        if ((token.joined is not None and bursts.held(token.joined)) or len(token.rows) >= MAX_MESSAGES or
+                sum(len(row[2]) for row in token.rows)+len(message.content) > MAX_TEXT):
+            return None
+        return token
+
+    def withdraw(self, ids):
+        """Messages edited or deleted. A turn whose own message went takes no line now. The bursts a line reopened
+        that hold one and are still gathering, for the caller to drop (Bursts.unsend drops deleted ones itself):
+        until its turn commits, a line taken back is as if it never joined, and the turn answers alone."""
+        ids, reopened = set(ids), []
+        for token in self.turns.values():
+            if any(row[1].id in ids for row in token.rows):
+                token.closed = True
+            if (token.joined is not None and not token.joined.taken and
+                    any(row[1].id in ids for row in token.joined)):
+                reopened.append(token.joined)
+        return reopened
+
+    def forget(self, user):
+        for token in self.turns.values():
+            if token.key[1] == user:
+                token.closed = True
 
 
 async def live_rows(agent, message, burst):

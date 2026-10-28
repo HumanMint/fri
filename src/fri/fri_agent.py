@@ -23,10 +23,11 @@ from .fri_addressing import addressed_text, explicit_mention, pinged, visible_co
 from .fri_agent_model import ATTENTION, DIAGNOSIS, SETTINGS, SETTINGS_GATE, SUMMARY, analyze
 from .fri_agent_settings import DEFAULTS, RANGES
 from .fri_context import addressed_content
-from .fri_conversation import Bursts
+from .fri_conversation import CONTINUATION_TEXT, Bursts, Continuations, links
 from .fri_errors import (
     UNREACHABLE,
     AuthorErased,
+    Continued,
     ControllerRejected,
     ControllerUnavailable,
     GateClosed,
@@ -156,6 +157,8 @@ class Agent:
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
         self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
         self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
+        self.continuations = Continuations()  # Explicit turns a short line from their author may still join.
+        self.riders = set()  # Message IDs a turn answers for a line let in that way: they wait without a notice.
         self.seen = {}
         self.withdrawn = {}  # Message IDs edited or deleted while handled, newest last (see withdraw).
         self.revised = {}  # Message ID -> when a member edited it after a model request carried it (see edit).
@@ -369,6 +372,7 @@ class Agent:
                     del self.active[key]
                 else:
                     self.active[key] = replaced
+        self.continuations.withdraw(ids)  # Its reopened bursts go below, with the rest of what was taken back.
         self.bursts.unsend(channel, ids)
         self.saved_turns.withdraw(ids)  # Their saved exchanges too, so their words don't come back as history.
 
@@ -436,6 +440,7 @@ class Agent:
         if erased:
             self.erased[user] = self.erased.get(user, 0)+1
         self.bursts.forget(user)
+        self.continuations.forget(user)
         for key in list(self.pending):
             if key[1] == user:
                 del self.pending[key]
@@ -797,7 +802,8 @@ class Agent:
             recheck = True
         while True:
             if not self.turns.ready(user, message.id):
-                if not noticed and user in self.fri.busy:
+                # Not for a line they added without Fri's name (see Continuation): the turn before it is theirs.
+                if not noticed and user in self.fri.busy and message.id not in self.riders:
                     noticed, refusal, erasure, exclusion = True, None, None, None  # Why not, if the checks before the notice fail.
                     async def eligible():  # Run just before the notice posts.
                         nonlocal refusal, erasure, exclusion
@@ -911,6 +917,29 @@ class Agent:
         while self.withdrawn and (next(iter(self.withdrawn.values())) < now-3600 or len(self.withdrawn) > 100000):
             del self.withdrawn[next(iter(self.withdrawn))]
         self.saved_turns.withdraw([message.id])  # And from its author's saved exchange (fri #129).
+        for reopened in self.continuations.withdraw([message.id]):  # As if the line never joined (see Continuation).
+            self.bursts.drop(reopened[-1][1], 'message changed')
+
+    def commit(self, message):
+        """Whether the turn answering `message` goes on: False once a short line from its author joined it first,
+        so the burst that reopened answers instead. From now on a line is answered on its own (see Continuation)."""
+        token = self.continuations.get(message)
+        return token is None or token.commit(self.bursts)
+
+    def gave_way(self, message):
+        """Whether a short line already joined the turn answering `message`, without committing it."""
+        token = self.continuations.get(message)
+        return token is not None and token.yields(self.bursts)
+
+    def readmitted(self, message):
+        """The member's allowance, already spent on this exchange by the turn a short line joined (see Fri.talk)."""
+        token = self.continuations.get(message)
+        return {'allowed': True} if token and token.admitted else None
+
+    def admitted(self, message):
+        """The turn answering `message` spent the member's allowance: a burst a short line reopens from it needn't."""
+        if token := self.continuations.get(message):
+            token.admitted = True
 
     def taken_back(self, i, since):
         """Whether message `i` was edited or deleted at or after `since`, the time.time() its words were read.
@@ -1198,6 +1227,8 @@ class Agent:
             return
         channel = message.channel.id
         parent = getattr(message.channel, 'parent_id', None) or channel
+        if not dm and not message.author.bot:
+            self.continuations.heard(message)  # Someone else's line here ends another's continuation window.
         raw = message.content
         if message.author.bot:
             if message.author.id != self.gene_id or message.guild.id != self.fri.guild_id:
@@ -1307,16 +1338,23 @@ class Agent:
             active = False
         if message.reference and directed is None:
             active = False
-        if directed is None and not active and channel != self.dedicated:
+        continuing = None  # The explicit turn of theirs this line adds to, without Fri's name (see continuing).
+        if directed is None and not active and not dm and channel != self.dedicated:
+            continuing = await self.continuing(message, text, privacy, arrived, (forgotten, observed))
+        if directed is None and not active and not continuing and channel != self.dedicated:
             return self.miss(message, 'not a visible user mention')
         if message.id in self.unsent:  # Deleted while it waited, e.g. for a reply to be saved; a privacy
             return self.miss(message, 'message deleted')  # control too, as its recheck before running finds.
+        # With nothing awaited since: the turn it adds to may have committed, or given way, during the reads above.
+        joining = continuing.admit(self.bursts, message, arrived) if continuing else 'add'
+        if joining is None:
+            return self.miss(message, 'not a visible user mention')
         # Short bursts share context and produce one response to the newest message.
         key = (channel, message.author.id)
         self.answer_directly(message)
         try:
-            if not self.bursts.add(message, arrived, None if privacy else (forgotten, observed),
-                                   alone=bool(privacy) or message.id in self.rerunning):
+            if joining == 'add' and not self.bursts.add(message, arrived, None if privacy else (forgotten, observed),
+                                                        alone=bool(privacy) or message.id in self.rerunning):
                 return DEFERRED  # Dropped, and said why, as from before an erasure.
         except ValueError as exc:
             self.pending.pop(key, None)
@@ -1350,8 +1388,18 @@ class Agent:
             self.bursts.drop(message, 'rest came separately')
             return DEFERRED
         burst = self.bursts.take(message)
+        if burst:
+            burst.taken = True
         earlier = [event for _, event, _ in burst if event is not message]
         addressed = any(self.called.pop(event.id, None) is not None for _, event, _ in burst)
+        origin = getattr(burst, 'origin', None)  # The turn whose burst a short line reopened.
+        addressed = addressed or bool(origin and origin.addressed)
+        token = None
+        if self.continuable(message, burst, directed or text, dm, privacy, invitation, addressed):
+            token = self.continuations.open(message, burst, (forgotten, observed), addressed=addressed,
+                                            admitted=bool(origin and origin.admitted))
+        if origin or continuing:
+            self.riders.add(message.id)  # A line they added: it waits for the turn before it without a notice.
         self.handling.update(event.id for event in earlier)  # Until this reply answers for them too.
         try:
             if len(burst) > 1:
@@ -1368,6 +1416,42 @@ class Agent:
             self.handling -= Counter(event.id for event in earlier)
             for event in earlier:
                 self.settle(event)
+            if token:
+                self.continuations.close(token)
+            self.riders.discard(message.id)
+
+    async def continuing(self, message, text, privacy, arrived, since):
+        """The explicit turn of theirs, still being answered, that this undirected line adds to, or None: a short
+        plain line, to nobody else, soon after it, with no one else speaking in between (see Continuation). Not a
+        privacy control, a cancel, or one alongside a photo, which their own turn would pair (see select_source)."""
+        from .fri_images import select_source
+        from .fri_pending import cancelled
+        if (privacy or message.mentions or message.reference or media(message) or len(text) > CONTINUATION_TEXT or
+                message.id in self.rerunning or cancelled(text)):
+            return None
+        token = self.continuations.find(message, arrived, since, self.bursts)
+        if token is None:
+            return None
+        try:  # The turn it joins stays about a photo it paired: a reopened burst would answer from the line.
+            if await select_source(token.message) is not None or await select_source(message) is not None:
+                return None
+        except (discord.HTTPException, aiohttp.ClientError, TimeoutError):
+            return None
+        return token
+
+    def continuable(self, message, rows, text, dm, privacy, invitation, addressed):
+        """Whether a short line may still join this turn (see Continuation): one spoken to Fri by name in a
+        configured channel, not their DM or Fri's own channel, which already let every line in, and not a ping,
+        which stays one event. Plain text only, never a privacy control, a cancel, a usage report or a Gene control:
+        those keep their own paths."""
+        from .fri_pending import cancelled
+        from .gene_controls import quick_control, requested
+        return bool(addressed and not dm and not privacy and not invitation and message.channel.id != self.dedicated and
+                    message.id not in self.rerunning and not cancelled(text) and not usage_requested(text) and
+                    not quick_control(text, music_context=True) and
+                    not any(requested(text, action) for action in ('play', 'volume')) and
+                    all(not media(event) and not getattr(event, 'reference', None) and not links(event) and
+                        not explicit_mention(event, self.fri.user.id) for _, event, _ in rows))
 
     def summoning(self, message, directed, privacy):
         """Just Fri's name or a hello, on its own: what they want usually comes in the next message."""
@@ -1536,6 +1620,11 @@ class Agent:
                                 logged=f'reply withheld: {invitation.refusal}')
             return True
 
+        def continued():
+            """A short line from them joined this turn before it committed: the burst it reopened answers for all of
+            it instead, so nothing goes out here and nothing is missed (see Continuation). Commits it otherwise."""
+            return not ambient and not self.commit(message)
+
         async def room(result):  # An ambient reply's last look, before talk's last privacy checks.
             if result.response_kind not in ('react', 'quiet') and await self.moved_on(message):
                 raise GateClosed('room moved on')  # Nothing posted or saved: as if it had stayed quiet.
@@ -1548,6 +1637,8 @@ class Agent:
                     text, 'private' if dm else 'public', message.author.display_name, event=message,
                     burst=burst, inspect_images=not ambient, typing=typing, **({'invitation': invitation} if invitation else {}),
                     **({'revision': since[1]} if since else {}), **({'last_look': room} if ambient else {}))
+        except Continued:
+            return
         except AuthorErased:
             return missed('author privacy changed')
         except GateClosed as exc:
@@ -1563,6 +1654,8 @@ class Agent:
         except commands.UserFeedbackCheckFailure as exc:
             if ambient:  # Nobody asked: an unprompted reply that can't go out just stays quiet.
                 return missed('reply withheld: '+type(exc).__name__)
+            if continued():  # The reopened burst is answered, or told why, instead.
+                return
             if again():  # Refused because they edited it: the edit is what gets answered.
                 await self.fri.waiting_notices.clear(message.author.id)
                 return
@@ -1579,6 +1672,8 @@ class Agent:
             await message.reply(notice_text(str(exc))[:1800], allowed_mentions=NO_MENTIONS, mention_author=False)
             self.answered(events)
             await self.fri.waiting_notices.clear(message.author.id)
+            return
+        if continued():  # E.g. a closing reaction or a cooldown, which make no model request.
             return
         if invitation:
             if await refused():

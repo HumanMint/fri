@@ -70,6 +70,7 @@ class Actions:
         self.music_correctable = None  # The controller: a play of theirs a correction could put right now.
         self.media_allowed = False
         self.invitation = None
+        self.reopened = False  # Its burst was reopened by a short line (see Continuation): it completes nothing.
         self.turn_context = None
         self.reads = []  # What each read showed, and the history window that finds it again.
         from .fri_image_share import ImageShare
@@ -114,7 +115,7 @@ class Actions:
 
     def burst_permission(self, action):
         rows = self.conversation.get('message_burst', [])
-        if not self.event or len(rows) < 2:
+        if not self.event or len(rows) < 2 or self.reopened:
             return None
         from .fri_conversation import burst_continuation
         return burst_continuation(rows[-2], discord_source(self.event), clean(self.event.content, 4000),

@@ -28,3 +28,8 @@ class AuthorErased(Exception):
 class GateClosed(Exception):
     """A gate the message passed coming in closed before the model saw it, e.g. its DM author left.
     The reason is a gate name for the log, never content."""
+
+
+class Continued(Exception):
+    """A short line from the author joined the turn before it committed: the burst it reopened answers instead
+    (see fri_conversation.Continuation). Nothing went out, and nothing is missed."""
