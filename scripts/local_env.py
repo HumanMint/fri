@@ -163,9 +163,18 @@ def findings(values, root=ROOT, env_mode=None):
             else:
                 add('error', key, 'not a Discord ID (17 to 20 digits): ' + REQUIRED[key])
     if 'GENE_CONTROLLER_URL' not in errors:
-        parts = urlsplit(values['GENE_CONTROLLER_URL'])
-        if parts.scheme not in ('http', 'https') or not parts.hostname:
+        try:
+            parts = urlsplit(values['GENE_CONTROLLER_URL'])
+        except ValueError:  # An unbalanced IPv6 bracket, for example.
+            parts = None
+        try:
+            port = parts and parts.port  # Raises unless the port is a number from 0 to 65535.
+        except ValueError:
+            port = 0
+        if parts is None or parts.scheme not in ('http', 'https') or not parts.hostname:
             add('error', 'GENE_CONTROLLER_URL', 'use a URL like http://127.0.0.1:8787')
+        elif port == 0:
+            add('error', 'GENE_CONTROLLER_URL', 'the port must be a number from 1 to 65535')
         elif parts.hostname == 'controller':
             add('warn', 'GENE_CONTROLLER_URL', '"controller" only resolves inside Docker; '
                 'a controller on this machine is http://127.0.0.1:8787')

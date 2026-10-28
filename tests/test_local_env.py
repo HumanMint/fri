@@ -111,6 +111,24 @@ def test_mistakes_are_named_without_their_values(tmp_path, capsys, changes, key,
     assert DISCORD not in output and SERVICE not in output
 
 
+@pytest.mark.parametrize('url', [
+    'http://[::1', 'http://127.0.0.1:abc', 'http://127.0.0.1:0', 'http://127.0.0.1:65536',
+    'http://fri:hunter2-secret@127.0.0.1:abc', 'http://fri:hunter2-secret@[::1',
+])
+def test_an_unusable_controller_url_is_an_error_not_a_crash(tmp_path, capsys, url):
+    found = local_env.findings(complete(tmp_path, GENE_CONTROLLER_URL=url), root=tmp_path)
+    assert levels(found)['GENE_CONTROLLER_URL'] == 'error'
+    local_env.report(found)
+    output = capsys.readouterr().out
+    assert url not in output and 'hunter2' not in output
+
+
+@pytest.mark.parametrize('url', ['http://127.0.0.1', 'http://127.0.0.1:1', 'http://[::1]:65535'])
+def test_a_local_controller_url_with_or_without_a_port_is_fine(tmp_path, url):
+    assert levels(local_env.findings(complete(tmp_path, GENE_CONTROLLER_URL=url), root=tmp_path))[
+        'GENE_CONTROLLER_URL'] == 'ok'
+
+
 def test_a_missing_sign_in_is_a_warning_and_its_contents_are_never_needed(tmp_path):
     found = local_env.findings(complete(tmp_path), root=tmp_path)
     assert levels(found)['FRI_CHATGPT_AUTH'] == 'warn'
