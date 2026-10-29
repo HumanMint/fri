@@ -526,3 +526,107 @@ def test_memory_views_hold_back_what_a_pending_withdrawal_holds(monkeypatch, tmp
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+# Sol round 2 of fri #224.
+
+def on_disk(tmp_path):
+    path = tmp_path/'withdrawals.json'
+    return path.read_text() if path.exists() else ''
+
+
+def test_a_by_id_withdrawal_whose_author_is_unknown_never_reaches_disk(monkeypatch, tmp_path):
+    """F1: Fri can't name whose it is, so "forget me" couldn't find it there. It's retried in memory only."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        if 'saved-turn-withdrawal' not in w.fri.capabilities:
+            pytest.skip('needs a controller offering saved-turn-withdrawal')
+        try:
+            earlier = await earlier_exchange(w)
+            restarted(w)
+            failing(w, SAVED)
+            await delete(w, earlier, guild=123)
+            assert str(earlier.id) in w.agent.saved_turns.pending  # Still sent again while Fri runs.
+            assert str(earlier.id) not in on_disk(tmp_path)
+            await w.agent.handle(w.said('fri forget me'))
+            assert str(earlier.id) not in on_disk(tmp_path)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_by_id_withdrawal_whose_author_fri_knows_goes_with_their_forget_me(monkeypatch, tmp_path):
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        if 'saved-turn-withdrawal' not in w.fri.capabilities:
+            pytest.skip('needs a controller offering saved-turn-withdrawal')
+        try:
+            nearby = w.said('just chatting')
+            w.agent.recent[1].append({'id': str(nearby.id), 'user_id': '20', 'name': 'member', 'text': nearby.content,
+                                      'at': discord.utils.utcnow().timestamp(), 'revision': 0, 'gene_error': False})
+            failing(w, SAVED)
+            await delete(w, nearby, guild=123)
+            assert str(nearby.id) in on_disk(tmp_path) and '"20"' in on_disk(tmp_path)  # Theirs, so it's kept.
+            await w.agent.handle(w.said('fri forget me'))
+            assert str(nearby.id) not in on_disk(tmp_path) and str(nearby.id) not in w.agent.saved_turns.pending
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_save_answered_after_forget_me_records_nothing_of_them(monkeypatch, tmp_path):
+    """F2: the save commits, its answer is held, they say "forget me", the message is deleted, then the answer comes
+    and the withdrawals fail: nothing names them on disk, and nothing of theirs stays queued."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = w.said('fri explain '+MARKER)
+            api = w.fri.api
+            async def calling(method, path, payload=None):
+                if path.startswith('/chat/turn/withdraw'):
+                    raise TimeoutError()
+                result = await api(method, path, payload)
+                if path == '/chat/turn':  # Committed; its answer held while they erase, then delete it.
+                    w.store.personal_control('20', 'disable')
+                    w.agent.forget(20, erased=True)
+                    await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=1, guild_id=123,
+                                                                      message_id=earlier.id))
+                return result
+            w.fri.api = calling
+            await w.agent.handle(earlier)
+            await settled(w)
+            kept = on_disk(tmp_path)
+            assert str(earlier.id) not in kept and '"20"' not in kept
+            assert not any((entry.get('scope') or {}).get('user_id') == '20' or entry.get('user_id') == '20'
+                           for entry in w.agent.saved_turns.pending.values())
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_private_overview_screens_after_its_own_read(monkeypatch, tmp_path):
+    """F3: a withdrawal that fails while the overview reads My memory still holds its note back."""
+    async def scenario():
+        from compat_tests.test_fri_member_profiles import DM, GENERAL, note
+        from compat_tests.test_fri_member_profiles import world as profiles
+        w = profiles(monkeypatch, tmp_path)
+        if SOURCES not in w.fri.capabilities:
+            pytest.skip('needs a controller offering '+SOURCES)
+        try:
+            said = w.message(GENERAL, 'fri '+LIKE)
+            await w.say(GENERAL, 'fri '+LIKE, 'noted', note(LIKE, 'hobbies'), event=said)
+            api = w.fri.api
+            async def calling(method, path, payload=None):
+                if path.startswith('/chat/turn/withdraw'):
+                    raise TimeoutError()
+                result = await api(method, path, payload)
+                if path == '/chat/memory/notes':  # Taken back while the overview read it; its withdrawal fails.
+                    w.fri.agent.saved_turns.withdraw([said.id], 123)
+                    await asyncio.gather(*w.fri.agent.saved_turns.tasks)
+                return result
+            w.fri.api = calling
+            dm, _, _ = await w.say(DM, 'what do you remember about me')
+            assert LIKE not in dm.reply
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
