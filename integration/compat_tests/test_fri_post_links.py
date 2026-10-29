@@ -191,7 +191,7 @@ def test_a_split_scheme_never_passes_for_the_shown_link_or_hides_another(reply, 
     # a masked link's target is read as a bare one would be, since Discord can refuse the masked link; and a "\\" can
     # escape a masked link's ">" or ")", making what follows its own.
     ('https://discord.com/x/../'+PATH+'/..', '..'), ('[clip](https://discord.com/x/../'+PATH+'/%2e%2e)', 'clip'),
-    ('[clip](<https://discord.com/x/../'+PATH+'/..\\>)', 'clip'), ('[clip](https://discord.com/x/../'+PATH+'/..\\))', 'clip)'),
+    ('[clip](<https://discord.com/x/../'+PATH+'/..\\>)', 'clip'), ('[clip](https://discord.com/x/../'+PATH+'/..\\))', 'clip'),
     # In <…> but maybe a masked link's target, where "\\." is an escape and a ")" can end it: its starts count too. An
     # empty label is a masked link's (fri #220), and one this pattern doesn't take (after a "\ufeff") still counts.
     ('[](<https://discord.com/x/../'+PATH+'/\\..>)', 'can’t link that one.'),
@@ -505,6 +505,9 @@ def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
     '<https://discord.com/'+'x/'*1990, '[a](<https://discord.com/x/../'*130, '<https://discord.com/a/'*180,
     'https://discord.com/x/../'*160, 'https://discord.com/a/'*180, '<h\ttps:'*500, '<https://discord.com\\x/..'*150,
     '(https://discord.com/x/../'*160, '[a\n](<https://discord.com/x/..'*130, '( <\x01https:'*500,
+    # fri #231: escapes in masked targets, read as written and undone, and escaped spaces that don't end one.
+    '[a](https://discord.com/x\\(y/..'*130, '(https://discord.com/a\\ '*160, '[a\n](https\\://discord.com/x\\(/'*120,
+    '[a](<https://discord.com/x\\>/..'*130, '(https\\:'*500,
 ])
 @pytest.mark.parametrize('end', ['', '>'])
 def test_a_4000_character_reply_full_of_links_in_brackets_is_filtered_well_under_100_ms(filler, end):

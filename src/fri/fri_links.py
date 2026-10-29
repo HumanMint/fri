@@ -29,18 +29,26 @@ DROPPED = re.compile(r'[\t\n\r]')
 # A space as Discord's markdown reads one (JavaScript's \s): not a control character Python also calls a space, which a
 # browser keeps in a link (encoded), as it does any of these but the plain space inside <…>.
 SPACE = '\t\n\v\f\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff'
+# Markdown undoes a masked link's escapes before a browser reads its target (fri #231): a "\\" before anything but a
+# letter, digit or space goes, so "x\\(y/.." is "x(y/..", which resolves away, where "\\" read as written splits the
+# path as "/" does. Its scheme's ":" may be escaped too, and in a target an escaped ")", ">" or space (a "\\" and any
+# character but a line break, as Discord's link reads one) doesn't end it.
+ESCAPE = re.compile(r'\\[^0-9A-Za-z'+SPACE+r']')
+ESCAPED = SCHEME[:-1]+r'\\?:'
+SCHEMES = re.compile(ESCAPED, re.I)
+PAIR = r'\\[^\n\r\u2028\u2029]'
 # Where a link can be: masked (an empty label too), in <…>, or bare, whatever its host and path. A masked link's
-# target can hold a "<", as Discord's can. One in <…> runs to a plain space or ">", a "<" too, as Discord's autolink does (fri #220),
-# and a bare one to a space or "<": each run (ANGLED, RUN) is found once for the links that start inside it, and
-# read once for all of them (see ends).
-LINK = re.compile(r'\[(?P<label>[^\]\n]{0,100})\]\(\s*<?(?P<masked>[\x00-\x1f]*'+SCHEME+r'[^'+SPACE+r'>()]*)>?\s*\)|'
-                  r'<(?P<angled>[\x00-\x1f]*'+SCHEME+r')|<?(?P<bare>'+SCHEME+r')', re.I)
+# target can hold a "<", as Discord's can, and escapes (see ESCAPE). One in <…> runs to a plain space or ">", a "<"
+# too, as Discord's autolink does (fri #220), and a bare one to a space or "<": each run (ANGLED, RUN) is found once for
+# the links that start inside it, and read once for all of them (see ends).
+LINK = re.compile(r'\[(?P<label>[^\]\n]{0,100})\]\(\s*<?(?P<masked>[\x00-\x1f]*'+ESCAPED+r'(?:'+PAIR+r'|[^'+SPACE+r'>()\\])*)'
+                  r'>?\s*\)|<(?P<angled>[\x00-\x1f]*'+SCHEME+r')|<?(?P<bare>'+ESCAPED+r')', re.I)
 BARE = re.compile(r'<?(?P<bare>'+SCHEME+r')', re.I)
 ANGLED = re.compile(r'[^ >]*')
 RUN = re.compile(r'[^'+SPACE+r'<]*')
 # Right after a "(", one may be the target of a masked link LINK doesn't take (a label holding a newline, or a "]"
-# Discord allows), which a "<" doesn't end either: it's read to a space instead (see aimed).
-TARGET = re.compile(r'[^'+SPACE+r']*')
+# Discord allows), which a "<" doesn't end either: it's read to a space instead (see aimed), or past an escaped one.
+TARGET = re.compile(r'(?:'+PAIR+r'|[^'+SPACE+r'])*')
 # The rest of a bare one: a trailing slash, query or fragment is part of it. Sentence punctuation or markdown at its
 # end isn't, nor an emoji or other non-URL text right after it, nor a word after closing markdown ("**…**this"):
 # inside it, "_" and "~" are its own (?utm_source=…), but it never ends on them, "*" or "|". Markdown opened before
@@ -90,19 +98,21 @@ def discord(host):
         return False
 
 
-def ends(span):
+def ends(span, plain=True):
     """Where the post link starting at each scheme in `span` ends, through its message's ID, as written or as a
     browser reads it to the end of `span`: {where it starts: (where it ends, where it ends if whole)}, None if it names
-    none. A tab or newline in it counts as nothing (`span` holds one only in a scheme, or is a <…> link's, which can
-    hold one anywhere). `whole`: `span` ends the link (its <…> does), so as a browser reads it, its path's "." and ".."
-    resolve to the end before it names a post or not (fri #209). Otherwise its end is Discord's to find (a bare link
-    never ends on ".", see TAIL), so any start of it that names a post is one.
+    none. A tab or newline in it counts as nothing (`span` holds one only in a scheme or escaped, or is a <…> link's,
+    which can hold one anywhere). `plain`: as written; otherwise as markdown hands a masked link's target to a
+    browser, its escapes undone (see ESCAPE), where an escaped ":" can make a scheme. `whole`: `span` ends the link
+    (its <…> does), so as a browser reads it, its path's "." and ".." resolve to the end before it names a post or not
+    (fri #209). Otherwise its end is Discord's to find (a bare link never ends on ".", see TAIL), so any start of it
+    that names a post is one.
 
     Each link's path is the span's from where its own address ends, so the path is read once for all of them (see
     paths), not once for each (fri #223)."""
-    kept = None
-    if DROPPED.search(span):
-        kept = [at for at, char in enumerate(span) if char not in '\t\n\r']
+    kept, escapes = None, () if plain else {escape.start() for escape in ESCAPE.finditer(span)}
+    if escapes or DROPPED.search(span):
+        kept = [at for at, char in enumerate(span) if char not in '\t\n\r' and at not in escapes]
         span = ''.join(span[at] for at in kept)
     found, starts, mark = {}, [], -1
     for scheme in LINKED.finditer(span):
@@ -236,15 +246,16 @@ def once(text, allowed, found):
     parts, done, at, marks, channels, runs = [], 0, 0, frozenset(), set(), {}
     bare, angled, target = (1, 0), (1, 0), (1, 0)
 
-    def length(scheme, start, stop, whole):
+    def length(scheme, start, stop, whole, plain=True):
         """The length of the post link starting at `start` (its scheme at `scheme`), whose run ends at `stop`; None
-        if it names none. Read once for every link starting in that run (see ends)."""
-        first, ending = runs.get(stop, (None, None))
+        if it names none. Read once for every link starting in that run (see ends), as written or, not `plain`, with
+        its escapes undone."""
+        first, ending = runs.get((stop, plain), (None, None))
         if first is None or scheme-first not in ending:
             span = text[scheme:stop]
-            if span not in found:
-                found[span] = ends(span)
-            first, ending = runs[stop] = scheme, found[span]
+            if (span, plain) not in found:
+                found[span, plain] = ends(span, plain)
+            first, ending = runs[stop, plain] = scheme, found[span, plain]
         end = ending[scheme-first][whole]
         return None if end is None else first+end-start
 
@@ -258,17 +269,21 @@ def once(text, allowed, found):
             else:  # Never closed, so a bare one, as Discord reads it.
                 match, name = BARE.search(text, begin), 'bare'
                 begin = match.start()
-        if name == 'bare' and aimed(text, match.start(name)):  # Maybe a masked link's target: to a space.
+        undone = name == 'masked' or name == 'bare' and aimed(text, match.start(name))  # Its escapes may be undone.
+        if name == 'bare' and undone:  # Maybe a masked link's target: to a space.
             if not target[0] <= match.end() <= target[1]:
                 target = (match.end(), TARGET.match(text, match.end()).end())
             start, stop = match.start(name), target[1]
+        elif name == 'bare' and '\\' in match[name]:  # "https\\:" out of a target: markdown shows it as text, no link.
+            at = begin+1
+            continue
         elif name == 'bare':  # To a space or "<": where an earlier one's run ends, if it starts inside that run.
             if not bare[0] <= match.end() <= bare[1]:
                 bare = (match.end(), RUN.match(text, match.end()).end())
             start, stop = match.start(name), bare[1]
         elif name == 'masked':
             start, stop = match.span(name)
-        url, scheme = text[start:stop], LINKED.search(text, start)
+        url, scheme = text[start:stop], SCHEMES.search(text, start)
         # Only <…> ends a link for certain, so only then is its whole path its own (see ends). Not a masked link's
         # target out of <…>: Discord can refuse the masked link and read it bare. Nor <…> right after a "(": it may be
         # the target of a masked link LINK doesn't take, and end at a ")" in it. Nor one with a "\\" in it, which may
@@ -279,8 +294,11 @@ def once(text, allowed, found):
             name == 'masked' and text[start-1] == '<' and text.startswith('>', stop) and
             not DROPPED.search(scheme[0]) or
             name == 'angled' and not targeted(text, begin) and not escaped(text, begin))
-        scheme = scheme.start()
-        if scheme in channels or (size := length(scheme, start, stop, whole)) is None:
+        plain, scheme = '\\' not in scheme[0], scheme.start()  # As written, "https\\:" is no scheme.
+        size = length(scheme, start, stop, whole) if plain and scheme not in channels else None
+        if size is None and undone and '\\' in url and scheme not in channels:  # As a browser gets it from markdown.
+            size = length(scheme, start, stop, False, False)
+        if size is None:
             if whole:
                 channels.add(scheme)  # Not a post link, so not one read bare from the same start either.
             at = begin+1  # Not a post link: one may still start inside it (…?next=https://discord.com/…).
@@ -303,7 +321,7 @@ def link_posts(reply, context, empty=EMPTY):
     """A post link the model was shown stays, as <link> so it shows no preview. Any other one (made up, mangled,
     another form of a shown one, or copied from someone's words) goes, and a masked one keeps its label. Other
     links are left as they are. `empty`: what to send when only a dropped link was there."""
-    if not LINKED.search(reply):
+    if not SCHEMES.search(reply):
         return reply
     allowed, found = shown(context), {}
     result = reply
