@@ -1923,7 +1923,11 @@ class Agent:
         self.direct[str(message.id)] = now
 
     def ambient_ready(self, channel, user):
+        """Nothing of theirs is being answered: no reply to them running, no burst gathering here, and nothing they
+        said to Fri still being handled or waiting to be answered alone (see unjoin), even before its turn starts
+        (fri #210). And Fri hasn't spoken here for a while."""
         return (user not in self.fri.busy and (channel, user) not in self.pending and
+                not any(str(i) in self.direct for i in self.turns.arrived.get(user, ())) and
                 time.time()-self.last_spoke.get(channel, 0) >= 600)
 
     async def respond(self, message, text, dm=False, **options):
