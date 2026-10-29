@@ -1662,7 +1662,10 @@ class Agent:
                 self.bursts.drop(message, type(exc).__name__)
             raise
         if not self.bursts.latest(message):
-            # A later message answers for this one, or the burst was dropped and said why.
+            # A later message answers for this one, or the burst was dropped and said why. Its mark in pending
+            # goes with it (a voided burst left it, fri #199); a newer message's stays.
+            if self.pending.get(key) == message.id:
+                self.pending.pop(key, None)
             return DEFERRED
         if self.pending.get(key) == message.id:
             self.pending.pop(key, None)
