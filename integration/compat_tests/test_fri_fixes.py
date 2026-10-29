@@ -885,3 +885,104 @@ def test_a_mark_cut_off_by_a_shutdown_is_added_by_the_next_pass(world, monkeypat
     (world.fri.data/'gene-fixes.json').write_text(json.dumps(entries))
     asyncio.run(restarted())
     assert error.add_reaction.await_count == 1
+
+
+def erase_while_the_claim_is_out(world):
+    """The reporter's erasure lands right after the controller grants the claim, before Fri sends (gene #47)."""
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        result = await api(method, path, body)
+        if path.endswith('/requester-notice'):
+            world.store.erase_user(str(MEMBER))
+        return result
+
+    world.fri.api.side_effect = meanwhile
+
+
+def reply_deletions(world, error=None):
+    deleted = []
+
+    def partial(id):
+        async def delete():
+            if error:
+                raise error
+            deleted.append(id)
+        return SimpleNamespace(id=id, delete=AsyncMock(side_effect=delete))
+    world.room.get_partial_message = partial
+    return deleted
+
+
+def recheck_offered(world):
+    from fri.fri_protocol import contract
+    offered = world.client.get('/fri/contract', headers=headers('fri')).json()['capabilities']
+    assert fri_fixes.RECHECK in contract()['capabilities']
+    world.fri.capabilities = frozenset(offered)
+    return fri_fixes.RECHECK in offered
+
+
+def test_a_reply_whose_claim_stopped_holding_while_it_went_out_is_taken_back(world):
+    """A controller that rechecks the claim when the reply is recorded (gene #47) says it no longer held, and Fri
+    deletes its reply. An older controller records it as sent, and Fri answers as before."""
+    report, job_id, _ = reported(world)
+    rechecks = recheck_offered(world)
+    erase_while_the_claim_is_out(world)
+    deleted = reply_deletions(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert len(world.sent) == 1 and sent is not rechecks
+    with world.store.connection() as db:
+        state = db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0]
+    if rechecks:
+        assert state == 'invalidated' and text == 'took the reply back: the report is no longer on record.'
+        assert len(deleted) == 1 and str(deleted[0]) != str(report.id)
+    else:
+        assert state == 'sent' and text.startswith('told them: ') and not deleted
+
+
+def answered(world, verdict):
+    """The controller's answer to recording a sent reply, as a rechecking controller (gene #47) gives it."""
+    api = world.fri.api.side_effect
+
+    async def answer(method, path, body=None):
+        result = await api(method, path, body)
+        return {**result, **verdict} if path.endswith('/finish') else result
+
+    world.fri.api.side_effect = answer
+
+
+@pytest.mark.parametrize('offered', [True, False])
+def test_fri_takes_a_reply_back_only_when_the_controller_offers_the_recheck(world, offered):
+    report, job_id, _ = reported(world)
+    if offered:
+        world.fri.capabilities = world.fri.capabilities | {fri_fixes.RECHECK}
+    answered(world, {'state': 'invalidated', 'reason': 'A rollback ran after this repair shipped, so the fix may not be live'})
+    deleted = reply_deletions(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert len(world.sent) == 1
+    if offered:
+        assert not sent and len(deleted) == 1
+        assert text == 'took the reply back: a rollback ran after this repair shipped, so the fix may not be live.'
+    else:  # A Fri-side guess about an answer the controller never promised would be worse than today's line.
+        assert sent and text.startswith('told them: ') and not deleted
+
+
+@pytest.mark.parametrize('error', [
+    discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Access'), TimeoutError()])
+def test_a_reply_discord_wont_let_fri_take_back_is_reported_as_still_up(world, error):
+    report, job_id, _ = reported(world)
+    world.fri.capabilities = world.fri.capabilities | {fri_fixes.RECHECK}
+    answered(world, {'state': 'invalidated', 'reason': 'A newer release is live now, so this repair is not what the reporter is running'})
+    reply_deletions(world, error)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and len(world.sent) == 1
+    assert text == ('it posted, but a newer release is live now, so this repair is not what the reporter is running, '
+                    'and discord wouldn’t let me take it back: '+report.jump_url)
+
+
+def test_a_reply_already_gone_counts_as_taken_back(world):
+    _, job_id, _ = reported(world)
+    world.fri.capabilities = world.fri.capabilities | {fri_fixes.RECHECK}
+    answered(world, {'state': 'invalidated', 'reason': None})
+    reply_deletions(world, gone())
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and text == 'took the reply back: gene’s checks stopped holding while it went out.'

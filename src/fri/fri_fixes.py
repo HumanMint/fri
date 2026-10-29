@@ -4,7 +4,8 @@ A Gene error Fri files gets a 👀, and its job is watched for three days after 
 ships, Fri says one dry line under the error, when the room is quiet, and never a second one for it.
 Only deployed counts: a failure, a rejection, a withdrawal or a hand-off to the owner is never
 announced, and nothing is while Gene's running release is unknown. The owner's DM for a shipped
-repair that a member reported gets a Tell reporter button, which replies to that report once.
+repair that a member reported gets a Tell reporter button, which replies to that report once. If what the
+controller checked stopped holding while the reply went out, Fri takes the reply back.
 """
 
 import asyncio
@@ -33,6 +34,7 @@ RUNNING = weakref.WeakKeyDictionary()  # Each agent's pass, so a slow one is wai
 MARKING = set()  # 👀 still on their way after attention moved on, kept so none is dropped unfinished.
 SETTLED = frozenset({'deployed', 'rejected', 'failed', 'needs_attention'})
 CAPABILITY = 'requester-notices'
+RECHECK = 'requester-notice-recheck'  # The controller says when a sent reply's claim stopped holding (gene #47).
 JOB = re.compile(r'[a-f0-9]{12}')
 TELL_ID = re.compile(r'^fri:tell:(?P<job_id>[a-f0-9]{12})$')
 SOURCE = re.compile(r'https://discord\.com/channels/(?P<guild>[0-9]{1,25}|@me)/(?P<channel>[0-9]{1,25})/(?P<message>[0-9]{1,25})')
@@ -404,12 +406,31 @@ async def tell(fri, job_id, actor):
         state = 'uncertain' if sending else 'failed'
         text = ('discord didn’t confirm the reply, so it might have posted. not sending it twice.' if sending
                 else 'didn’t send it. tap again later.')
+    recorded = None
     try:
-        await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
-                      {**scope, 'lease': lease, 'state': state, 'message_id': message_id})
+        recorded = await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
+                                 {**scope, 'lease': lease, 'state': state, 'message_id': message_id})
     except (commands.UserFeedbackCheckFailure, *TAP_FAILURES):  # An answer Fri can't read is still unconfirmed.
         LOG.warning('Requester notice outcome for %s not recorded; it stays unretried', job_id)
+    if (state == 'sent' and RECHECK in getattr(fri, 'capabilities', ()) and isinstance(recorded, dict) and
+            recorded.get('state') == 'invalidated'):
+        return await take_back(channel, message_id, recorded.get('reason'), message), False
     return text, state == 'sent'
+
+
+async def take_back(channel, message_id, reason, report):
+    """The controller's checks stopped holding while the reply went out (a rollback, a newer release, the
+    reporter's erasure), so it never recorded it as sent. It's Fri's own message: delete it."""
+    why = reason.strip().rstrip('.')[:300] if isinstance(reason, str) and reason.strip() else ''
+    why = why or 'gene’s checks stopped holding while it went out'
+    try:
+        await asyncio.wait_for(channel.get_partial_message(int(message_id)).delete(), 10)
+    except discord.NotFound:
+        pass  # Already gone.
+    except (discord.HTTPException, *TAP_FAILURES):
+        LOG.warning('A reply whose claim stopped holding could not be taken back')
+        return notice_text(f'it posted, but {why}, and discord wouldn’t let me take it back: {report.jump_url}')
+    return notice_text(f'took the reply back: {why}.')
 
 
 class TellReporter(discord.ui.DynamicItem[discord.ui.Button], template=TELL_ID):
