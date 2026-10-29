@@ -1269,9 +1269,9 @@ def test_a_send_cut_off_is_settled_whatever_the_controller_offers_after(world, m
         history(world, monkeypatch, 'before')
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(tell(world.fri, job_id, OWNER))
-    [entry] = pending(world).values()
-    assert str(report.id) not in json.dumps(entry) and str(MEMBER) not in json.dumps(entry)
-    assert 'message_id' not in entry
+    [entry] = pending(world).values()  # The lease, the owner who tapped, where it'd go and when: nothing of theirs.
+    assert set(entry) <= {'lease', 'actor', 'channel_id', 'since', 'at', 'cleared'}
+    assert entry['actor'] == str(OWNER) and str(report.id) not in json.dumps(entry)
     world.store.erase_user(str(MEMBER))
     world.fri.api.side_effect = api
     world.fri.capabilities = world.fri.capabilities-{AUTHORIZE}
