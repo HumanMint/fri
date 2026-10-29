@@ -1108,6 +1108,7 @@ class Agent:
         for token in alone:
             user = token.message.author.id
             self.turns.arrive(user, token.message.id)
+            token.started = False  # Until answer_alone's first step (see alone_cancelled).
             try:
                 task = asyncio.get_running_loop().create_task(self.answer_alone(token))
             except RuntimeError:  # No loop: nothing here can be answered.
@@ -1116,6 +1117,7 @@ class Agent:
                 LOG.warning('Message %s was not answered alone: no event loop', token.message.id)
                 continue
             self.reruns.add(task)
+            task.add_done_callback(lambda task, token=token: self.alone_cancelled(task, token))
             task.add_done_callback(self.reruns.discard)
         answering = [self.answer_again(token.message) for token in again]
         for token in again + gone:  # Kept for its re-run (see settle), or settled: nothing answers it now.
@@ -1146,6 +1148,7 @@ class Agent:
         it are done with it; its own checks then run again, as for any message that waited, so past its deadline
         it hears the usual "took too long" (see take_turn). Nothing more joins it, and the exchange spends no
         second allowance."""
+        token.started = True
         message, user = token.message, token.message.author.id
         until = discord.utils.snowflake_time(message.id).timestamp()+QUEUE_SECONDS
         try:
@@ -1177,6 +1180,14 @@ class Agent:
             self.turns.leave(user, message.id)
             self.settle(message)
             self.answer_edits()
+
+    def alone_cancelled(self, task, token):
+        """A recovery cancelled before its first step never reaches its own cleanup (answer_alone's finally), so its
+        place in their queue and its count in the ledger go here, as when it can't start at all (see unjoin; fri
+        #210). One that started cleans up itself, and this does nothing."""
+        if task.cancelled() and not token.started:
+            self.turns.leave(token.message.author.id, token.message.id)
+            self.settle(token.message, 'CancelledError')
 
     def commit(self, message):
         """Whether the turn answering `message` goes on: False once a short line from its author joined it first,
