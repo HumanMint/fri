@@ -1,7 +1,7 @@
 {
   "controller_repository": "HumanMint/gene",
   "contract": "gene-fri/1",
-  "minimum_controller_commit": "95f7b3d5d2d9282962beb031cf263b26a1a16596",
+  "minimum_controller_commit": "29592532a8245dbb8385de28e7e4eae6e02cfd2e",
   "baseline_fixture_commit": "7bdf6af858a5231c6e6af0e10662aa126aa4eb2a",
-  "verified_controller_commit": "95f7b3d5d2d9282962beb031cf263b26a1a16596"
+  "verified_controller_commit": "29592532a8245dbb8385de28e7e4eae6e02cfd2e"
 }
