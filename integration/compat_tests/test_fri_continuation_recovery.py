@@ -127,3 +127,40 @@ def test_a_line_deleted_after_the_turn_for_both_committed_found_only_by_refetch_
                 hold.set()
             await finish(fri, tasks)
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+def test_a_line_taken_back_while_its_burst_gathers_leaves_nothing_pending(monkeypatch, tmp_path, change):
+    """fri #199: the question gave way to the burst the line reopened, and the line goes while that burst is still
+    gathering. Its recovery answers the question, and nothing stays pending for the member, so ambient attention
+    comes back after the usual cooldown."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        question = message(QUESTION)
+        tasks = [asyncio.create_task(agent.handle(question))]
+        try:
+            await asyncio.wait_for(model.reached[1].wait(), 5)
+            detail = message(DETAIL)
+            tasks.append(asyncio.create_task(agent.handle(detail)))
+            await until(lambda: tasks[1].done() or agent.bursts.group(detail) is not None)  # Admitted, gathering.
+            model.hold[1].set()
+            await asyncio.wait_for(tasks[0], 5)  # The question gave way to the burst the line reopened.
+            assert agent.pending[(channel.id, detail.author.id)] == detail.id and not tasks[1].done()
+            if change == 'deleted':
+                deleted(channel, rows, detail)
+                agent.unsend(1, [detail.id])
+            else:
+                agent.edit(1, edited(rows, detail))
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            await until(lambda: not agent.reruns, 10)
+            question.reply.assert_awaited_once()  # Answered alone after all...
+            assert question.reply.await_args.args[0] == ANSWER
+            assert (channel.id, detail.author.id) not in agent.pending  # ...and nothing names the line now.
+            agent.last_spoke.clear()  # The usual cooldown, over.
+            assert agent.ambient_ready(channel.id, detail.author.id)
+        finally:
+            model.hold[1].set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
