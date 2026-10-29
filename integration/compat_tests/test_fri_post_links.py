@@ -79,6 +79,7 @@ def test_a_read_then_the_answer_links_the_post_it_found_and_drops_a_made_up_one(
 
 
 NOT_SHOWN = MADE_UP.split('://', 1)[1]  # discord.com/channels/…, written below with each variant's scheme and host.
+PATH, ID = NOT_SHOWN.split('/', 1)[1], MADE_UP.rsplit('/', 1)[1]  # channels/123/2/1300…9, and its message's ID.
 
 
 @pytest.mark.parametrize('url', [
@@ -90,6 +91,16 @@ NOT_SHOWN = MADE_UP.split('://', 1)[1]  # discord.com/channels/…, written belo
     f'https://kev@{NOT_SHOWN}', f'https://discordapp.com/{NOT_SHOWN.split("/", 1)[1]}/',
     f'https://discord.com/CHANNELS/{NOT_SHOWN.split("/", 2)[2]}', f'{FOUND}/', f'{FOUND}?ref=1',
     f'https://www.{FOUND.split("://", 1)[1]}', f'http://{FOUND.split("://", 1)[1]}',
+    # fri #200: forms a browser reads as a post link: an encoded or mapped host, dot segments, a backslash, extra
+    # slashes, an @ in a sign-in, an encoded path.
+    *(f'https://{host}/{PATH}' for host in ('%64iscord.com', 'disc%6Frd.com', 'discord%2Ecom', 'DISCORD%2ECOM',
+                                            'ｄｉｓｃｏｒｄ.com', 'discord。com', 'dis\u00adcord.com', 'kev@x@discord.com')),
+    *(f'https://discord.com/{dots}/{PATH}' for dots in ('unused/..', 'unused/%2e%2E', 'a/b/../..', '.', '%2e')),
+    f'https://discord.com/channels/123/x/../2/{ID}', f'https://discord.com/channels/123/2/./{ID}',
+    'https://discord.com\\'+PATH.replace('/', '\\'), f'https:\\\\discord.com/{PATH}', f'https:////discord.com/{PATH}',
+    f'https:discord.com/{PATH}', f'https://discord.com/%63hannels/123/2/{ID}',
+    f'https://discord.com/channels/%31%32%33/2/{ID}', f'https://discord.com/channels/123/2/%31{ID[1:]}',
+    f'https://%64iscord.com/{FOUND.split("/", 3)[3]}', f'https://discord.com/x/../{FOUND.split("/", 3)[3]}',
 ])
 @pytest.mark.parametrize('form, sent', [('this one: {}', 'this one: '), ('this one: <{}>', 'this one: '),
                                         ('[kev’s clip]({})', 'kev’s clip'), ('[kev’s clip](<{}>)', 'kev’s clip'),
@@ -107,6 +118,20 @@ def test_a_post_link_in_any_form_goes_unless_it_is_the_exact_one_shown(url, form
     (f'_{FOUND}_', f'_<{FOUND}>_'), (f'~~{FOUND}~~!', f'~~<{FOUND}>~~!'), (f"'{FOUND}'", f"'<{FOUND}>'"),
     (f'here {FOUND}👀', f'here <{FOUND}>👀'), (f'{FOUND}—that one', f'<{FOUND}>—that one'),
     (f'{MADE_UP}/?utm_source=discord', 'can’t link that one.'), (f'see {MADE_UP}?a_b~c=1 ok', 'see  ok'),
+    # fri #203: markdown opened before a link closes inside its tail, and the word after it stays. Not opened
+    # there, "__" and "~~" are the link's own, as "_" and "~" are.
+    (f'before __{MADE_UP}?x=1__z after', 'before ____z after'), (f'~~{MADE_UP}?x=1~~y', '~~~~y'),
+    (f'__{FOUND}?x=1__z', '____z'), (f'~~{FOUND}?x=1~~y', '~~~~y'),  # Not the exact link shown: it goes too.
+    (f'**{MADE_UP}?x=1**this', '****this'), (f'||{MADE_UP}?x=1||x', '||||x'),
+    (f'__see {MADE_UP}?utm_source=x__z', '__see __z'), (f'~~see {MADE_UP}#a~b~~ok', '~~see ~~ok'),
+    (f'__a__ {MADE_UP}?a__b=1 ok', '__a__  ok'), (f'see {MADE_UP}?a~~b=1 ok', 'see  ok'),
+    (f'__<{MADE_UP}?x=1>__z', '____z'), (f'__[clip]({MADE_UP}?x=1)__z', '__clip__z'),
+    (f'__{FOUND}__z and __{MADE_UP}?x__y', f'__<{FOUND}>__z and ____y'),
+    # fri #200: a browser drops tabs and newlines, which only <…> can hold. And a link it reads as another path isn't
+    # a post link.
+    ('this one: <'+MADE_UP.replace('channels', 'chan\nnels')+'>', 'this one: '),
+    ('this one: <'+MADE_UP.replace('discord', 'disc\tord')+'> ok', 'this one:  ok'),
+    ('https://discord.com/channels/123/../2/1300000000000000009', 'https://discord.com/channels/123/../2/1300000000000000009'),
     # Not a Discord post: a channel, an invite or another site.
     ('https://discord.com/channels/123/2', 'https://discord.com/channels/123/2'),
     ('https://discord.com/invite/abc', 'https://discord.com/invite/abc'),
@@ -121,7 +146,7 @@ def test_sentence_punctuation_and_other_links_are_read_as_discord_reads_them(rep
     assert link_posts(reply, read()) == sent
 
 
-def respond_with(action, context):
+def respond_with(action, context, **fields):
     import json
 
     import httpx
@@ -130,7 +155,7 @@ def respond_with(action, context):
     from fri.fri_chat import Chat
 
     def model_reply(request):
-        output = {'reply': '', 'request_draft': None, 'action': action, 'notes': []}
+        output = {'reply': '', 'request_draft': None, 'action': action, 'notes': [], **fields}
         return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(output)))+'\n\n')
     chat = Chat(type('Auth', (), {'access_token': staticmethod(lambda: 'fictional')}), httpx.MockTransport(model_reply))
     return asyncio.run(chat.respond('which clip, the one in https://discord.com/channels/123/2/1 or the other', context))
@@ -193,3 +218,36 @@ def test_a_clarifying_question_goes_out_and_is_saved_without_a_made_up_link(monk
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('draft, kept', [
+    (f'Please fix the example reported in {MADE_UP}', 'Please fix the example reported in '),
+    (f'Please fix the example reported in [this post]({MADE_UP.upper()})', 'Please fix the example reported in this post'),
+    (f'Please fix the example reported in {FOUND}', f'Please fix the example reported in <{FOUND}>'),
+    (f'Fix the one at {FOUND} not {MADE_UP}/', f'Fix the one at <{FOUND}> not '),
+])
+def test_a_request_draft_keeps_only_post_links_the_model_was_shown(draft, kept):
+    """fri #204: a draft's body is shown in its preview and submitted as Fri's words, so it gets the reply's filter."""
+    context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high', **read()}
+    result = respond_with(None, context, reply='drafted it', request_draft=draft)
+    assert (result.status, result.reply, result.draft) == ('completed', 'drafted it', kept)
+
+
+@pytest.mark.parametrize('length, status', [(3998, 'completed'), (3999, 'invalid_output'), (4000, 'invalid_output')])
+def test_a_request_draft_the_link_rule_lengthens_past_its_limit_fails_safely(length, status):
+    """A kept link gains <…>, so a draft at its 4000-character limit can grow past it: that's an unreadable reply,
+    never a preview that fails later."""
+    head = f'see {FOUND} '
+    draft = head + 'x'*(length-len(head))
+    context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high', **read()}
+    result = respond_with(None, context, reply='drafted it', request_draft=draft)
+    assert result.status == status
+    if status == 'completed':
+        assert result.draft == draft.replace(FOUND, f'<{FOUND}>') and len(result.draft) == 4000
+
+
+@pytest.mark.parametrize('draft', [MADE_UP, f'fix {MADE_UP}', f'<{MADE_UP}>'])
+def test_a_request_draft_left_too_short_by_a_dropped_link_fails_safely(draft):
+    context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high', **read()}
+    result = respond_with(None, context, reply='drafted it', request_draft=draft)
+    assert result.status == 'invalid_output' and result.draft is None

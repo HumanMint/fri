@@ -758,6 +758,13 @@ class Chat:
                             draft, rendered_draft = render_tree(draft, said_at(context))
                             if not (rendered_action and rendered_draft):
                                 reply, draft, action, response_kind = TIME_ASK, None, None, 'reply'
+                            elif draft is not None:
+                                # Its body is shown in the preview and submitted as Fri's words (fri #204). A kept
+                                # link gains <…> and a dropped one shortens it: it must still fit, or the reply is
+                                # unreadable.
+                                draft = link_posts(draft, context, empty='')
+                                if not 5 <= len(draft) <= 4000:
+                                    raise ValueError('Invalid draft once its links are checked')
                             elif isinstance(action, dict) and action.get('kind') == 'clarify':
                                 # Its question goes out and is saved as a reply would; the topic stays an exact excerpt.
                                 question = link_posts(action['question'], context, empty='')
