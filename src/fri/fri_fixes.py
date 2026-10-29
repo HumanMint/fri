@@ -49,6 +49,8 @@ PENDING = 'requester-notices.json'
 GAVE_UP = 60  # Fri gives a send 25 s: noted this long ago with no tap running, it has posted or never will.
 KEEP = 86400  # A noted send still unsettled after this (a channel gone, say) is dropped, and logged.
 TELLING = collections.Counter()  # Taps replying for each job in this process, which a pass leaves alone.
+TAKE_BACK = 10  # How long a take-back waits on Discord's answer. It never cancels the delete (see retract).
+DELETING = {}  # Each delete still on its way after its take-back moved on, by message, so none is doubled.
 SETTLING = weakref.WeakKeyDictionary()  # Each agent's settling pass, waited on like check's.
 JOB = re.compile(r'[a-f0-9]{12}')
 TELL_ID = re.compile(r'^fri:tell:(?P<job_id>[a-f0-9]{12})$')
@@ -479,9 +481,20 @@ async def cleared(fri, job_id, scope, lease):
 
 async def retract(channel, message_id):
     """Fri's own reply down: 'gone' once it is (or already was), 'refused' when Discord won't, 'unconfirmed'
-    when Discord didn't answer, which a later try may settle."""
+    when Discord didn't answer, which a later try may settle.
+
+    Waits up to TAKE_BACK and never cancels the delete: discord.py can't recover from a cancel inside its global
+    rate-limit wait, and every later Discord call would stall (fri #226). One still going is left to finish, and
+    a later try waits on it again instead of starting another."""
     try:
-        await asyncio.wait_for(channel.get_partial_message(int(message_id)).delete(), 10)
+        task = deleting(channel, int(message_id))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return 'refused'
+    done, _ = await asyncio.wait({task}, timeout=TAKE_BACK)
+    if not done:
+        return 'unconfirmed'
+    try:
+        task.result()
     except discord.NotFound:
         return 'gone'
     except discord.HTTPException as exc:
@@ -491,6 +504,24 @@ async def retract(channel, message_id):
     except (ValueError, KeyError, TypeError, AttributeError):
         return 'refused'
     return 'gone'
+
+
+def deleting(channel, message_id):
+    """The delete as its own task, or the one already on its way for that message, like eyes."""
+    task = DELETING.get(message_id)
+    if task is None or task.done():
+        task = DELETING[message_id] = asyncio.create_task(channel.get_partial_message(message_id).delete(),
+                                                          name=f'fri-take-back:{message_id}')
+        task.add_done_callback(lambda done: deleted(message_id, done))
+    return task
+
+
+def deleted(message_id, task):
+    """A delete that ends after its take-back moved on is still retrieved, and the next try starts afresh."""
+    if DELETING.get(message_id) is task:
+        del DELETING[message_id]
+    if not task.cancelled() and task.exception() is not None:
+        LOG.info('Requester notice delete ended: %s', type(task.exception()).__name__)
 
 
 def taken_back(outcome, reason, report, retried=False):
