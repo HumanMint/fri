@@ -1257,3 +1257,90 @@ def test_an_older_controller_gets_no_prepared_claim(world):
     [claim] = [c.args[2] for c in world.fri.api.await_args_list if c.args[1].endswith('/requester-notice')]
     assert 'prepare' not in claim
     assert not [c for c in world.fri.api.await_args_list if c.args[1].endswith('/authorize')]
+
+
+def test_a_tap_on_a_send_never_recorded_touches_nothing_in_discord(world, monkeypatch):
+    """A cleared send whose outcome never came back may have posted, and another reply of Fri's to the same report
+    looks just like it in Discord. The tap is refused before any of that: nothing is read, sent or deleted, even
+    with a rollback landing meanwhile (gene#143 / fri#218 round 1)."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = history(world, monkeypatch)
+    stuck(world, job_id, report)
+    other = SimpleNamespace(id=snowflake(3600-5), author=SimpleNamespace(id=FRI),  # Fri's own, about something else.
+                            reference=SimpleNamespace(message_id=report.id))
+    posted.append(other)
+    read = world.room.history.side_effect
+
+    def rollback_while_reading(*args, **kwargs):
+        rolled_back(world.store)
+        return read(*args, **kwargs)
+
+    world.room.history = Mock(side_effect=rollback_while_reading)
+    deleted = reply_deletions(world)
+    before = tuple(notice_row(world, job_id))
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not deleted and not world.sent and not sent
+    assert not world.room.history.called and 'may already have posted' in text
+    assert tuple(notice_row(world, job_id)) == before and not pending(world)
+
+
+@pytest.mark.parametrize('cut', ['before_cleared', 'after_cleared'])
+def test_a_send_cut_off_is_settled_whatever_the_controller_offers_after(world, monkeypatch, cut):
+    """Fri stopped mid-tap, the reporter erased, and Fri came back to a controller without
+    requester-notice-authorize (a rollback). The note holds nothing of the report's, and the next pass settles it
+    anyway: failed if Fri was never cleared to send, so a later tap may try, and uncertain once it was."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    api = world.fri.api.side_effect
+    if cut == 'before_cleared':
+        async def stopped(method, path, body=None):
+            if path.endswith('/authorize'):
+                raise asyncio.CancelledError  # Fri shut down while the controller answered.
+            return await api(method, path, body)
+        world.fri.api.side_effect = stopped
+    else:
+        history(world, monkeypatch, 'before')
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tell(world.fri, job_id, OWNER))
+    [entry] = pending(world).values()
+    assert str(report.id) not in json.dumps(entry) and str(MEMBER) not in json.dumps(entry)
+    assert 'message_id' not in entry
+    world.store.erase_user(str(MEMBER))
+    world.fri.api.side_effect = api
+    world.fri.capabilities = world.fri.capabilities-{AUTHORIZE}
+    monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
+    deleted = reply_deletions(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not pending(world) and not deleted
+    assert notice_row(world, job_id)[0] == ('failed' if cut == 'before_cleared' else 'uncertain')
+
+
+@pytest.mark.parametrize('status', [404, 409])
+def test_a_finish_an_older_controller_refuses_settles_the_note(world, status):
+    """Rolled back to a controller without the route (404), or one that has no claim of this lease (409)."""
+    _, job_id, _ = reported(world)
+    authorize_offered(world)
+    lost_finish(world)
+    asyncio.run(tell(world.fri, job_id, OWNER))
+    assert pending(world)
+    world.fri.capabilities = world.fri.capabilities-{AUTHORIZE}
+
+    async def refused(method, path, body=None):
+        raise ControllerRejected('Not Found' if status == 404 else 'This reply has already been recorded', status)
+
+    world.fri.api.side_effect = refused
+    deleted = reply_deletions(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not pending(world) and not deleted
+
+
+def test_a_note_a_day_old_is_dropped_whatever_the_controller_offers(world):
+    from fri.private_files import private_json
+    _, job_id, _ = reported(world)
+    old = time.time()-2*86400
+    private_json(world.fri.data/'requester-notices.json',
+                 {job_id: {'lease': 'f'*32, 'actor': str(OWNER), 'channel_id': '456', 'since': old, 'at': old}})
+    world.fri.api.reset_mock()
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not pending(world) and not world.fri.api.await_args_list
