@@ -13,7 +13,8 @@ POST = re.compile(URL, re.I)
 HOST = re.compile(r'(?:(?:www|ptb|canary)\.)?discord(?:app)?\.com\.?')
 # A browser reads one more loosely (fri #200): past the scheme it skips any slashes or backslashes, takes the host
 # after the last "@", percent-decodes and maps it as a domain (%64iscord.com, ｄｉｓｃｏｒｄ.com), splits the path at
-# "/" or "\" and resolves "." and ".." ("%2e" too). Discord's app reads the path's escapes too ("%31" is 1).
+# "/" or "\" and resolves "." and ".." ("%2e" too). The path's escapes count as what they encode ("%31" as 1), as an
+# app's router may read them.
 AUTHORITY = re.compile(r'[/\\]*([^/\\?#]*)')
 SEGMENT = re.compile(r'[/\\]([^/\\?#]*)')
 DIGITS = re.compile(r'(?:[0-9]|%3[0-9]){1,25}')
