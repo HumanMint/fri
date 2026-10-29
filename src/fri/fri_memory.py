@@ -121,14 +121,17 @@ def before_removal(message_id, profile):
 def memory_intent(text):
     """Handle direct privacy requests locally, without asking a model to authorize them."""
     text = text.lower().strip().replace('’', "'")
-    text = re.sub(r'^(?:(?:hey|hi|yo|ok|okay|please)[,\s]+)*fri\b[,\s:]*', '', text)
-    text = re.sub(r'[,\s]+fri[.!?]*$', '', text).strip(' .!?')
-    text = re.sub(r'[,\s]+please$', '', text)
-    text = re.sub(r'^(?:please |can you |could you )', '', text).strip(' .!?')
-    if text in ('what do you remember about me', 'what do you know about me', 'show my memory',
-                'show me my memory', 'show my memories', 'what have you remembered about me'):
+    text = re.sub(r'^(?:(?:hey|hi|yo|ok|okay|please|pls|plz)[,\s]+)*fri\b[,\s:]*', '', text)
+    # Each suffix starts where its separator run does, so a long run isn't retried from every spot inside it.
+    text = re.sub(r'(?<![,\s])[,\s]+fri[.!?]*$', '', text).strip(' .!?')
+    text = re.sub(r'(?<![,\s])[,\s]+(?:please|pls|plz)$', '', text)
+    text = re.sub(r'^(?:please |pls |plz |can you |could you )', '', text).strip(' .!?')
+    # "u" and "abt" only in asking to see it; what erases or turns memory on stays spelled out.
+    if re.sub(r'\babt\b', 'about', re.sub(r'\bu\b', 'you', text)) in (
+            'what do you remember about me', 'what do you know about me', 'show my memory',
+            'show me my memory', 'show my memories', 'what have you remembered about me'):
         return 'show'
-    if text in ('forget me', 'forget everything about me', 'forget what you know about me',
+    if text in ('forget me', 'forget about me', 'forget everything about me', 'forget what you know about me',
                 'forget what you remember about me', 'clear my memory', 'clear my memories',
                 'stop remembering me', "don't remember me", 'turn memory off', 'disable memory'):
         return 'disable'
