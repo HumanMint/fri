@@ -81,3 +81,43 @@ def test_a_forget_me_said_to_fri_still_erases(monkeypatch, tmp_path, text, to_fr
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['forget about me', 'forget me pls', 'forget me'])
+def test_attention_never_carries_out_a_memory_control(monkeypatch, tmp_path, text):
+    """Ambient attention can pick a message that was edited into a memory control while it chose (review of fri #195,
+    round 2): it isn't said to Fri, so it changes nothing."""
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            await remembered(agent, store, message)
+            theirs = message('can anyone help?', user=30)
+            picked = message(text)
+            picked.reference = SimpleNamespace(message_id=theirs.id, channel_id=1, resolved=theirs)
+            agent.ambient_ready = lambda channel, user: True  # Attention picks only a message it's ready to answer.
+            await agent.respond(picked, text, ambient=True)
+            assert memory(store) == (True, True)
+            assert not any(path == '/chat/memory/control' for path, _ in calls)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['forget about me', 'forget me pls'])
+def test_a_forget_me_said_to_someone_else_leaves_local_context_alone(monkeypatch, tmp_path, text):
+    """Dropped before Fri clears anything locally, so a reply of Fri's still on its way to that member isn't
+    cancelled by it (review of fri #195, round 2)."""
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            await remembered(agent, store, message)
+            before = agent.forgotten.get(20, 0)
+            theirs = message('ugh this game', user=30)
+            control = message(text)
+            control.reference = SimpleNamespace(message_id=theirs.id, channel_id=1, resolved=theirs)
+            await agent.handle(control)
+            assert agent.forgotten.get(20, 0) == before
+            assert memory(store) == (True, True)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
