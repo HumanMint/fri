@@ -10,8 +10,10 @@ controller checked stopped holding while the reply went out, Fri takes the reply
 A controller that offers it has Fri ask for the send itself once its last Discord read is done, so the
 reporter's erasure or a release landing meanwhile stops the reply before it posts (fri #214). The send is
 noted first, and a heartbeat pass settles one a lost answer or a shutdown left, whatever the controller
-offers by then: it records what happened and takes back a reply that no longer holds. A send whose outcome
-never came back stays unconfirmed: Discord can't tell the notice from another reply of Fri's to the report.
+offers by then: it records what happened and takes back a reply that no longer holds. A send whose answer
+was lost is known only by Discord's own copy of it, which Fri's gateway delivers with its claim's nonce
+(fri #221): seen, it's recorded as sent and so checked again, and unseen it stays unconfirmed, since nothing
+in Discord tells the notice from another reply of Fri's to the report.
 """
 
 import asyncio
@@ -431,7 +433,7 @@ async def tell_once(fri, job_id, actor):
             note(fri, job_id, entry)  # Raises if it can't be noted, and then nothing is sent.
             postable(fri, channel)  # Again, after the controller's answer: nothing is awaited from here to the send.
         sending = True
-        result = await send_once(fri, {'id': job_id, 'target_id': str(channel.id),
+        result = await send_once(fri, {'id': notice_id(job_id, lease), 'target_id': str(channel.id),
                                        'body': told_line(job['approved_sha'])}, reply_to=message.id)
         message_id, state = str(int(result['id'])), 'sent'
         if entry:
@@ -450,6 +452,11 @@ async def tell_once(fri, job_id, actor):
         state = 'uncertain' if sending else 'failed'
         text = ('discord didn’t confirm the reply, so it might have posted. not sending it twice.' if sending
                 else 'didn’t send it. tap again later.')
+    if state == 'uncertain' and entry:  # Its answer lost, the notice is known only by Discord's copy (see seen).
+        current = noted(fri).get(job_id)
+        if not (isinstance(current, dict) and current.get('lease') == lease and current.get('message_id')):
+            return text, False  # Not seen yet: the next pass records it, as sent once seen (see settle_one).
+        entry, message_id, state, text = current, str(current['message_id']), 'sent', f'told them: {message.jump_url}'
     recorded, answered = None, False
     try:
         recorded = await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
@@ -477,6 +484,30 @@ async def cleared(fri, job_id, scope, lease):
         await fri.api('POST', f'/requests/{job_id}/requester-notice/authorize', {**scope, 'lease': lease})
     except ControllerRejected as exc:
         raise Unreachable(notice_text(str(exc)).strip().rstrip('.')[:300] or 'gene said no') from None
+
+
+def notice_id(job_id, lease):
+    """The notice's post id: its job's, then its claim's, so the nonce send_once gives it is this claim's alone,
+    never the "fixed now" line's (its job's) or another claim's. A lease that isn't hex adds nothing (see seen)."""
+    return job_id+lease[:8] if re.fullmatch(r'[0-9a-f]{8,}', str(lease)) else job_id
+
+
+def seen(fri, message):
+    """Fri's own message as the gateway delivered it: the notice of a cleared send whose answer was lost, if it
+    carries that claim's nonce in that channel (fri #221). Noted as sent, so the tap or the next pass records it,
+    the controller checks it again and Fri takes it back if it no longer holds. Nothing else of Fri's matches:
+    each claim's nonce is its own. Never raises."""
+    nonce = getattr(message, 'nonce', None)
+    if nonce is None or getattr(getattr(message, 'author', None), 'id', None) != getattr(fri.user, 'id', None):
+        return
+    try:
+        for job_id, entry in noted(fri).items():
+            if (isinstance(entry, dict) and entry.get('cleared') and not entry.get('message_id') and
+                    (notice := notice_id(job_id, entry.get('lease'))) != job_id and
+                    str(nonce) == str(int(notice[:20], 16)) and str(message.channel.id) == entry.get('channel_id')):
+                keep(fri, job_id, {**entry, 'message_id': str(int(message.id))})
+    except (*MALFORMED, AttributeError):
+        LOG.info('A requester notice copy could not be matched')
 
 
 async def retract(channel, message_id):
@@ -619,7 +650,8 @@ async def settle_one(fri, job_id, entry):
     """Record what a noted send did, then take it back if it no longer holds. True once nothing's left to do.
 
     A send cut off before Fri heard its outcome is recorded as unconfirmed once it was cleared (it may be up),
-    and as failed before then: Fri never sends without the controller's go."""
+    and as failed before then: Fri never sends without the controller's go. One whose copy Fri saw is recorded
+    as sent (see seen), so the controller checks it again."""
     message_id = str(entry.get('message_id') or '')
     if not message_id and time.time()-float(entry['since']) < GAVE_UP:
         return False  # A send from a tap that just stopped may still land.
