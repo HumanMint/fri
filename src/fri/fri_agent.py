@@ -180,7 +180,7 @@ class Agent:
         self.pending = {}
         self.misses = {}  # Pings to Fri still unanswered: message ID -> the first reason, if any yet.
         self.watched = {}  # Pings already watched, oldest first, kept apart from delivered events.
-        self.bursts = Bursts(dropped=lambda events, reason: [self.settle(e, reason) for e in events])
+        self.bursts = Bursts(dropped=self.unanswered)
         self.continuations = Continuations()  # Explicit turns a short line from their author may still join.
         self.riders = set()  # Message IDs a turn answers for a line let in that way: they wait without a notice.
         self.seen = {}
@@ -760,6 +760,15 @@ class Agent:
             LOG.info('Mention %s/%s not answered: %s', event.channel.id, event.id,
                      self.misses.pop(event.id) or reason or 'no reply')
 
+    def unanswered(self, events, reason):
+        """A dropped burst's messages, which nothing answers now (see Bursts). Not a question a short line reopened
+        a burst from (see Continuation): its own turn, still going, counts it, as does its recovery once that burst
+        is voided (see unjoin). One that gave way to that burst ends with it."""
+        for event in events:
+            token = self.continuations.get(event)
+            if token is None or token.gave_way and not getattr(token.joined, 'voided', False):
+                self.settle(event, reason)
+
     def explained(self, events, reason):
         self.ledger.explained([event.id for event in events], reason)
         for event in events:
@@ -1059,8 +1068,9 @@ class Agent:
         """Messages taken back (`deleted`: known to be) void a burst a line reopened, before it committed (see
         Continuations.withdraw). A question that gave way to it is answered alone after all if the line went, or
         again as edited if it was edited (see answer_again), as if it had never given way. Answered alone, it
-        keeps its place in their queue from now, so a newer message waits behind it."""
-        alone, again, voided = self.continuations.withdraw(ids, self.bursts, deleted)
+        keeps its place in their queue from now, so a newer message waits behind it. Its count in the ledger,
+        which giving way handed to that burst (see receive), comes back with it, to whatever answers it now."""
+        alone, again, gone, voided = self.continuations.withdraw(ids, self.bursts, deleted)
         for token in alone:
             user = token.message.author.id
             self.turns.arrive(user, token.message.id)
@@ -1068,11 +1078,15 @@ class Agent:
                 task = asyncio.get_running_loop().create_task(self.answer_alone(token))
             except RuntimeError:  # No loop: nothing here can be answered.
                 self.turns.leave(user, token.message.id)
+                self.settle(token.message, 'RuntimeError')
                 LOG.warning('Message %s was not answered alone: no event loop', token.message.id)
                 continue
             self.reruns.add(task)
             task.add_done_callback(self.reruns.discard)
-        if any([self.answer_again(token.message) for token in again]):
+        answering = [self.answer_again(token.message) for token in again]
+        for token in again + gone:  # Kept for its re-run (see settle), or settled: nothing answers it now.
+            self.settle(token.message, 'message deleted' if token in gone else 'message changed')
+        if any(answering):
             try:
                 self.answer_edits()  # Now, or once whatever holds it lets go (see handle).
             except RuntimeError:
@@ -1112,6 +1126,7 @@ class Agent:
                 pass  # Its deadline passed: its turn says so, after the usual checks.
             if message.id in self.replying:  # The turn that gave way, somehow still going: it answers for it.
                 return self.missed([message], 'earlier reply still running')
+            self.ledger.restart(message.id)
             alone = self.continuations.open(message, token.text, token.rows, token.since, addressed=token.addressed,
                                             origin=token)
             alone.closed = True
@@ -1673,14 +1688,17 @@ class Agent:
             raise
         finally:
             self.handling -= Counter(event.id for event in earlier)
-            for event in earlier:
-                self.settle(event)
+            for event in earlier:  # Not a voided burst's question: it went back to its own turn (see unjoin).
+                if not (getattr(burst, 'voided', False) and event.id in burst.anchors):
+                    self.settle(event)
             # One that gave way stays until the burst it gave way to is answered or voided (see unjoin).
             if token and not (token.gave_way and token.joined is not None and self.bursts.held(token.joined)):
                 self.continuations.close(token)
             if origin is not None and origin.gave_way:
                 self.continuations.close(origin)  # This turn had its messages; done, however it ended.
             self.riders.discard(message.id)
+        if token and token.gave_way and token.joined is not None:
+            return DEFERRED  # The burst a short line reopened from it counts it, as any burst's earlier message.
 
     async def continuing(self, message, text, arrived, since):
         """The explicit turn of theirs, still being answered, that this undirected line adds to, or None: a short
