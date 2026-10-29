@@ -278,8 +278,8 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, Love Story, No More Drama', 'Love Story', True),
     ('wrong song, If Not Now', 'If Not Now', True),
     ('wrong song, No More', 'No More', True),
-    # A title that is itself a withdrawal, after "i said", fails closed unless quoted, as "i said No" already does.
-    ('not that one, i said Not Today', 'Not Today', False),
+    # A title that is itself a "not now" or "no more" is the title, after "i said" as anywhere (Sol r1 on #151).
+    ('not that one, i said Not Today', 'Not Today', True),
     ("not that one, i said 'Not Today'", 'Not Today', True),
     ('not that one, i meant Not Today', 'Not Today', True),
     # gene #133 (2): their own denial with someone else alongside ("alex and i") is still theirs.
@@ -304,6 +304,22 @@ FIX = 'not the one, i meant join us for a bite'
     # Masking it keeps its words: their own words after a two-word artist stay out of reach, as on main.
     ("wrong song, 'It Wasn't Me' by The Wanted i suggested lol", "It Wasn't Me", True),
     ("wrong song, 'It Wasn't Me' by The Wanted we mentioned lol", "It Wasn't Me", True),
+    # Sol r1 on #151: a closing "not now" or "no more" is read only after the song they named. Inside it, it's the
+    # title, as on main, and so is the song said again; another one after it still takes it back.
+    ('wrong song, No More, No More', 'No More No More', True),
+    ('wrong song, No, Not Now', 'No Not Now', True),
+    ('wrong song, We Said No More', 'We Said No More', True),
+    ('wrong song, No More, No More', 'No More', True),
+    ('wrong song, Not Now, i said not now', 'Not Now', True),
+    ('wrong song, No More, not now', 'No More', False),
+    ('wrong song, Not Now, no more lol', 'Not Now', False),
+    ('wrong song, No, not now', 'No', False),
+    # Their own subject first, with someone after it ("i and alex", "me and the boys"), and "no more tracks".
+    ("wrong song, Love Story isn't what i and alex chose", 'Love Story', False),
+    ("wrong song, Love Story isn't what me and the boys picked", 'Love Story', False),
+    ("wrong song, Love Story is what i and alex didn't ask for", 'Love Story', False),
+    ("wrong song, 'Love Story Isn't What I and Alex Chose'", "Love Story Isn't What I and Alex Chose", True),
+    ('wrong song, Love Story, we said no more tracks', 'Love Story', False),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
@@ -350,7 +366,8 @@ SHAPES = [("'", "a' ", ''), ("'", "rockin' ", ''), ('', "''a ", ''), ('', "' ", 
           ('love story, i said not to', ' ever again', ' x'), ('love story', ', we said no more', ''),
           ('love story, i said not right now', ' lol', ' x'), ('love story', " isn't what alex and", ' i said'),
           ("'all i got'", ' by said the sky', ''), ('love story', ', not now', ' x'), ('love story', ' nah not now', ' x'),
-          ('love story', ', no more of those songs', ''), ('love story', ' is what x, y and', ' i never asked')]
+          ('love story', ', no more of those songs', ''), ('love story', ' is what x, y and', ' i never asked'),
+          ('love story', " isn't what i and", ' x chose'), ('no more', ', no more', ' x')]
 
 
 def message(shape, length=4000):
