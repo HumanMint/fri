@@ -29,6 +29,15 @@ def read(url=FOUND):
     (f'{FOUND}5', 'can’t link that one.'),
     ('kev posted it tuesday, no link needed', 'kev posted it tuesday, no link needed'),
     ('the docs: https://example.com/a', 'the docs: https://example.com/a'),  # Not a post link: left to cite_reply.
+    # A masked link's label follows the same rule, even when its target is another form of a shown link.
+    (f'[{MADE_UP}]({FOUND}/)', 'can’t link that one.'),
+    (f'[{MADE_UP}](<{FOUND}>)', f'<{FOUND}>'),
+    # Markdown right after a shown link isn't part of it, and neither is the word after that.
+    (f'**{FOUND}**this is the clip', f'**<{FOUND}>**this is the clip'),
+    (f'||{FOUND}||spoiler', f'||<{FOUND}>||spoiler'), (f'~~{FOUND}~~gone', f'~~<{FOUND}>~~gone'),
+    (f'__{FOUND}__under', f'__<{FOUND}>__under'),
+    # Dropping one link can't join the text around it into another post link nobody was shown.
+    (f'https://discord.com/channels/123<{MADE_UP}>/2/1300000000000000009', 'can’t link that one.'),
 ])
 def test_a_reply_keeps_only_post_links_the_model_was_shown(reply, sent):
     from fri.fri_links import link_posts
