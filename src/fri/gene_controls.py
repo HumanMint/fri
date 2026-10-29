@@ -174,8 +174,9 @@ REFUSED = re.compile(
     r"|\b(?:don'?t|do not|not|never)\s+(?:(?:even|actually|really|just|yet|to|ever|again)\s+){0,2}(?:play|queue|add|put|start)\b"
     r"|\b(?:don'?t|do not)[\s.!?'\"”]*$"
     r"|\b(?:cancel\w*|never ?mind|nvm|forget (?:it|that|about (?:it|that))|scratch that|hold off|not yet|no need|jk|just kidding)\b"
-    # Someone else's words introducing more ("alex said X"; a title like "She Said" ends there), or an example.
-    rf"|{CLAUSE}(?!i\b)(?:[\w']+\s+){{1,3}}?(?:said|says|asked for|suggested|suggests|recommended|recommends"
+    # Someone else's words introducing more ("alex said X"; a title like "She Said" ends there), or an example. Their
+    # own "i said ..." or "we said ..." aren't someone else's.
+    rf"|{CLAUSE}(?!(?:i|we)\b)(?:[\w']+\s+){{1,3}}?(?:said|says|asked for|suggested|suggests|recommended|recommends"
     r"|requested|requests|mentioned)\b(?=[\s,:]*[\w\"'‘“])"
     rf"|{CLAUSE}(?:according to|for example|for instance|e\.g\b|eg\b|such as|something like|stuff like|hypothetically)"
     # "i meant to say thanks" is chat, not a title; "To The Moon" can be one. After "i meant to", only a word that
@@ -184,29 +185,30 @@ REFUSED = re.compile(
     r"|\bi meant to\b(?!\s+(?:the|a|an|my|your|his|her|our|their|this|that|these|those|me|you|him|us|them|all)\b)")
 # After the song, a change of heart withdraws it: "wrong song, Love Story, actually no", "... not that one either",
 # a bare "nope" or "no thanks", or a closing "nah" or "no" after a pause, whatever punctuation or filler follows
-# ("nah, lol"; "Hell No" stays a title), or a closing "i said no (to that)" or "i told you not to". Checked after the
-# correction only, since "actually no, wrong song, X" opens one.
+# ("nah, lol"; "Hell No" stays a title), or a closing "i said no (to that)", "i told you not to" or "we said no", which
+# may end "this time" or "ever again". Checked after the correction only, since "actually no, wrong song, X" opens one.
 CLOSING = (r"(?:[\s,;:.!?…—–\-'\"”]|\b(?:lol|lmao|lmfao|haha|bro|bruh|dude|man|fri|thanks|thank you|thx|ty|tho|though"
-           r"|sorry|please|pls|plz|again)\b)*+$")
+           r"|sorry|please|pls|plz|again|ever again|this time)\b)*+$")
 WITHDRAWN = re.compile(r"\b(?:actually,?\s+(?:no(?:pe|t that)?|nah)|no,?\s+wait|wait,?\s+no|(?:i\s+)?change[ds]?\s+my\s+mind"
                        r"|on second thought|never\s+mind|leave it|nope|n(?:o|ah)[\s,]+(?:thanks|thank you|thx|ty)"
                        r"|not\s+(?:(?:that|this|the|it)\s+)?(?:(?:one|song|track)\s+)?either)\b"
                        rf"|\bnah\b{CLOSING}|[,;:.!?…—–\-'\"]\s*no\b{CLOSING}"
-                       r"|\bi(?:'ve|'d)?\s+(?:(?:just|already|literally|clearly|even|actually|originally)\s+){0,2}"
+                       r"|\b(?:i|we)(?:'ve|'d)?\s+(?:(?:just|already|literally|clearly|even|actually|originally)\s+){0,2}"
                        r"(?:said|told\s+(?:you|u)|asked(?:\s+(?:you|u))?|meant)\s+(?:(?:not|never)(?:\s+to(?:\s+do\s+(?:that|this|it))?)?"
                        rf"|(?:no(?:pe)?|nah)(?:\s+to\s+(?:that|this|it)(?:\s+(?:one|song|track))?)?)\b{CLOSING}")
 # After the song, a clause handing it to someone else, quoting someone or calling it an example takes it back too:
 # "'Love Story' was an example", "... is what i heard alex say", "..., alex said", "... was a quote from alex". Their
-# own "i said" or "i asked for it" doesn't.
+# own "i said" or "i asked for it" doesn't, nor does an inclusive "we want".
 TRAILING = re.compile(r"\b(?:examples?|for instance|e\.?g|hypothetical(?:ly)?|such as|according to|quot\w*)\b"
                       r"|\bhear[sd]?\b(?!\s+me\b)"
-                      r"|(?P<own>\bi(?:'ve|'d)?\s+(?:(?:just|already|literally|clearly|even|actually|originally)\s+){0,2})?"
+                      r"|(?P<own>\b(?:i|we)(?:'ve|'d)?\s+(?:(?:just|already|literally|clearly|even|actually|originally)\s+){0,2})?"
                       r"\b(?P<verb>said|says?|told|tells|asked|asks|suggested|suggests|recommended|recommends|requested"
                       r"|requests|mentioned|mentions|wants?|wanted|picked|meant)\b")
 # Unless they quoted it, a title ends with the song they named or sooner, at a clause break: punctuation, "is" or
-# "was", a joining word, or an example ("Love Story, alex said" is no title, whatever song is proposed). A verb that
-# opens a clause inside the named song is still the title's ("Say You, Say Me").
-BREAK = re.compile(r"[,;:!?…—–()\[\]\"“”]|\.(?!\w)|\s-+(?=\s|$)|'s\b|\b(?:is|was|were|are|like|as|and|but|or|so|then|also"
+# "was" (or "isn't"), a joining word, or an example ("Love Story, alex said" is no title, whatever song is proposed).
+# A verb that opens a clause inside the named song is still the title's ("Say You, Say Me").
+BREAK = re.compile(r"[,;:!?…—–()\[\]\"“”]|\.(?!\w)|\s-+(?=\s|$)|'s\b|\b(?:is|was|were|are|(?:isn|wasn|aren|weren|ain)'?t"
+                   r"|like|as|and|but|or|so|then|also"
                    r"|plus|actually|wait|lol|lmao|nah|no|oh|please|pls|examples?|for instance|e\.?g|hypothetical(?:ly)?"
                    r"|such as|according to|quot\w*)\b")
 PAUSE = re.compile(r"[,;:.!?…—–()\[\]\"“”]\s?$")
@@ -297,8 +299,8 @@ def masked(text, spans):
 
 def handed_off(text, clause, song_end):
     """From `clause`, the title's end, the words hand the song to someone else or call it an example. Their own "i
-    said" doesn't, unless the "i" was part of the song they named; nor does a verb opening a clause in that song, or
-    a bare "you say" or "we want" in it ("I Like the Way You Say My Name")."""
+    said" or "we want" doesn't, unless the "i" or "we" was part of the song they named; nor does a verb opening a
+    clause in that song, or a bare "you say" or "we want" in it ("I Like the Way You Say My Name")."""
     for m in TRAILING.finditer(text, clause):
         verb = m.start('verb') if m['verb'] else -1
         if m['own'] and not m.start() < song_end <= verb:
