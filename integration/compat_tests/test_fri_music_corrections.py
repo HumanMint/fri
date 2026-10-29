@@ -187,11 +187,26 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, Love Story, i said no', 'Love Story', False),
     ('wrong song, Love Story, i told you not to', 'Love Story', False),
     ('wrong song, Say You, Say Me by The Wanted is not what i meant', 'Say You, Say Me', False),
+    # gene #126 round 1: a hedged denial, or a refusal with its object, still denies it.
+    ('wrong song, Glad You Came by The Wanted is absolutely not what I meant', 'Glad You Came', False),
+    ('wrong song, Love Story is absolutely not what I meant', 'Love Story', False),
+    ('wrong song, Love Story is just not the one i wanted', 'Love Story', False),
+    ("wrong song, Love Story isn't really what i asked for", 'Love Story', False),
+    ('wrong song, Glad You Came by The Wanted, I said no to that', 'Glad You Came', False),
+    ('wrong song, Love Story, I said no to that', 'Love Story', False),
+    ('wrong song, Love Story, i said not to do that', 'Love Story', False),
+    ('wrong song, Love Story, I said not to ever play it', 'Love Story', False),
+    ('wrong song, Love Story is what they want', 'Love Story', False),
     # ...while they still count, and a complaint about the song Gene played isn't a denial.
     ('wrong song, Love Story is what i meant', 'Love Story', True),
     ('wrong song, Love Story, i said it already', 'Love Story', True),
     ('wrong song, Love Story, not Glad You Came like i said', 'Love Story', True),
     ("wrong song, Love Story, that's not what i asked for", 'Love Story', True),
+    # A bare "say" or "want" in the song they named is its wording, not someone else's words.
+    ('wrong song, I Like the Way You Say My Name', 'I Like the Way You Say My Name', True),
+    ('wrong song, This Is What You Want', 'This Is What You Want', True),
+    ('wrong song, Love Story like alex wanted', 'Love Story like alex wanted', False),
+    ('wrong song, Love Story is what they want', 'Love Story is what they want', False),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
@@ -232,7 +247,8 @@ def test_a_long_message_is_read_without_backtracking():
               'love story'+', no lol'*497+' x', 'love story'+' ,'*1990+'x', 'love story'+', a b said'*398, 'love '+'by '*1328,
               'love'+' from x'*568, 'love story'+' i just'*664+' said', "love story "+"don't "*664, 'i meant '+'to '*1328,
               'love story'+' is not what'*331, 'love '+'by the '*664, 'love story'+' i said no'*398, 'love story'+', say'*797,
-              'love story '+'x '*1990+'is not what i meant']
+              'love story '+'x '*1990+'is not what i meant', 'love story'+' is absolutely'*363,
+              'love story'+', i said no to that'*222, 'love story'+' not to ever'*363, 'i like '+'you say '*499]
     for shape in shapes:
         text = ('wrong song, '+shape)[:4000]
         began = time.perf_counter()
