@@ -1374,15 +1374,17 @@ class Agent:
                 del self.unreachable_notices[message.channel.id]
         return posted
 
+    def points_elsewhere(self, message):
+        """A reply to, or a mention of, someone other than Fri, as far as the message itself says."""
+        others = [user for user in (getattr(message, 'mentions', None) or ())
+                  if getattr(user, 'id', None) != self.fri.user.id]
+        return bool(getattr(message, 'reference', None) or others)
+
     async def aimed_elsewhere(self, message):
         """A reply to, or a mention of, someone other than Fri, without Fri's name, mention or a reply to Fri. The
         dedicated channel answers plain chat too, but a memory control there is only one said to Fri: "forget me"
         said to someone else changes nothing. A reply whose target can't be read counts as someone else's."""
-        others = [user for user in (getattr(message, 'mentions', None) or ())
-                  if getattr(user, 'id', None) != self.fri.user.id]
-        if not (getattr(message, 'reference', None) or others):
-            return False
-        return await addressed_text(message, self.fri.user.id) is None
+        return self.points_elsewhere(message) and await addressed_text(message, self.fri.user.id) is None
 
     async def still_addressed(self, message, answering=False):
         """The message as Discord has it now: still there, never edited, and, before a reply, still addressed.
@@ -1521,8 +1523,13 @@ class Agent:
         if control:
             return self.answered([message])
         privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
-        # Said to someone else, it's no control, so it clears nothing here either (take_turn rechecks before one runs).
-        aimed = bool(privacy) and not dm and directed is None and await self.aimed_elsewhere(message)
+        aimed = False
+        if privacy and not dm and directed is None:
+            if (again := await addressed_text(message, self.fri.user.id)) is not None:
+                directed = again  # A second look found its reply target is Fri: the first read can fail for a moment.
+                self.ledger.confirm(message.id)
+            else:  # Said to someone else, it's no control, so it clears nothing (take_turn rechecks before one runs).
+                aimed = self.points_elsewhere(message)
         if aimed or privacy not in MEMORY_CONTROLS:  # Nothing for a later memory control to wait for.
             self.memory_controls.leave(message.author.id, message.id)
         if aimed:
@@ -1537,7 +1544,10 @@ class Agent:
             invitation = await Invitation.create(self, message)
             if invitation is None:
                 return
-        if privacy in ('disable', 'enable'):  # Showing their memory changes nothing, so drops nothing.
+        # Showing their memory changes nothing, so drops nothing. One said to Fri (or in a DM or the dedicated channel)
+        # clears local context now; another, e.g. a follow-up, once it's admitted below; one not said to Fri, never.
+        early = privacy in ('disable', 'enable') and (directed is not None or dm or channel == self.dedicated)
+        if early:
             self.forget(message.author.id, erased=privacy == 'disable')
             forgotten = self.forgotten.get(message.author.id, 0)  # Their own request isn't an erasure since.
         observed = None  # The author's privacy revision as first read for this message.
@@ -1611,6 +1621,9 @@ class Agent:
             continuing = await self.continuing(message, text, arrived, (forgotten, observed))
         if directed is None and not active and not continuing and channel != self.dedicated:
             return self.miss(message, 'not a visible user mention')
+        if privacy in ('disable', 'enable') and not early:  # Admitted only now, e.g. a follow-up in a conversation.
+            self.forget(message.author.id, erased=privacy == 'disable')
+            forgotten = self.forgotten.get(message.author.id, 0)
         if message.id in self.unsent:  # Deleted while it waited, e.g. for a reply to be saved; a privacy
             return self.miss(message, 'message deleted')  # control too, as its recheck before running finds.
         # With nothing awaited since: the turn it adds to may have committed, or given way, during the reads above.
