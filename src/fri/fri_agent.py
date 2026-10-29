@@ -394,9 +394,9 @@ class Agent:
             self.summarized[str(sent.id)] = now
 
     def withdrawn_from(self, ids):
-        """Messages taken back: Fri's replies in the channel's view whose turn carried one leave it, and so do those
-        that carried one of those, since each may repeat the words (gene #141). Returns their IDs, which count as taken
-        back too, for a turn that already holds a copy (see SavedTurns.withdraw)."""
+        """Messages deleted: Fri's replies in the channel's view whose turn carried one leave it, and so do those that
+        carried one of those, since each may repeat the words (gene #141). An edit leaves them (gene #150). Returns
+        their IDs, which count as taken back too, for a turn that already holds a copy (see SavedTurns.withdraw)."""
         gone, found = {str(i) for i in ids}, set()
         while more := {mid for mid, (_, carried) in self.drawn.items() if mid not in found and carried & (gone | found)}:
             found |= more
@@ -504,7 +504,8 @@ class Agent:
                     self.active[key] = replaced
         self.unjoin(ids, deleted=True)  # Before the bursts below: a question that gave way answers alone.
         self.bursts.unsend(channel, ids)
-        self.saved_turns.withdraw(ids, saved_in)  # Their saved exchanges too, so their words don't come back as history.
+        # Their saved exchanges too, so their words don't come back as history, and what carried them (gene #141).
+        self.saved_turns.withdraw(ids, saved_in, deleted=True)
         self.receipts.withdraw(ids)  # And Fri's outside answers that drew on them, or were them.
 
     def gone(self, i):
@@ -591,6 +592,7 @@ class Agent:
         self.forgotten[user] = self.forgotten.get(user, 0)+1
         if erased:
             self.erased[user] = self.erased.get(user, 0)+1
+            self.saved_turns.forget(user)  # Their queued withdrawals name nothing kept now (fri #215).
         self.bursts.forget(user)
         self.continuations.forget(user)
         for key in list(self.pending):
@@ -1114,7 +1116,8 @@ class Agent:
         # Kept an hour, longer than any turn that could still hold a copy runs; the cap only bounds memory.
         while self.withdrawn and (next(iter(self.withdrawn.values())) < now-3600 or len(self.withdrawn) > 100000):
             del self.withdrawn[next(iter(self.withdrawn))]
-        self.saved_turns.withdraw([message.id])  # And from its author's saved exchange (fri #129).
+        # And from its author's saved exchange (fri #129); a deletion takes what carried it too (gene #141).
+        self.saved_turns.withdraw([message.id], deleted=message.id in self.unsent)
         self.receipts.withdraw([message.id])
         self.unjoin([message.id])  # As if a line never joined, before its turn committed (see Continuation).
 

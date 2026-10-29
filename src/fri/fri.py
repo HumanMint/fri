@@ -598,8 +598,7 @@ class Fri(discord.Client):
         if intent == 'show' and self.profiles:
             context = place_notes(self.get_channel, await self.api('POST', '/chat/context', profiled(self, scope, True)),
                                   scope['conversation_id'])
-            return ChatResult(reply=await self.memory_overview(scope, context['personal_memory'], visibility == 'private',
-                                                               context.get('member_summary')),
+            return ChatResult(reply=await self.memory_overview(scope, context, visibility == 'private'),
                               status='completed', memory_scope=scope)
         if intent == 'show':
             context = await self.api('POST', '/chat/context', scope)
@@ -1092,14 +1091,22 @@ class Fri(discord.Client):
                                                     'ask again in a bit.')
         return {'drew_on': ids} if ids else {}
 
-    async def memory_overview(self, scope, profile, private, summary=None):
-        """Everything for the member's own eyes in private; in public, only what that channel can see."""
+    async def memory_overview(self, scope, context, private):
+        """Everything for the member's own eyes in private; in public, only what that channel can see. Neither shows
+        what a request couldn't now: a note a withdrawal still on its way holds, or the summary then (fri #215)."""
         escape = discord.utils.escape_markdown
+        turns = self.agent.saved_turns if self.agent else None
+        screening = turns is not None and turns.withholding()
         if private:
-            state = await self.api('POST', '/chat/memory/notes', profiled(self, scope))
+            state = await self.api('POST', '/chat/memory/notes', profiled(self, scope, screening))
+            if screening:
+                state = turns.screen(context, state)
             enabled, rows = state['enabled'], state['entries']
             summary = escape(state['summary']['text']) if state.get('summary') else None
         else:
+            if screening:
+                turns.screen(context)
+            profile, summary = context['personal_memory'], context.get('member_summary')
             enabled, rows = profile['enabled'], profile['notes']
             # Its words stay out of a public channel; that it exists may show where it would itself.
             summary = bool(self.member_summary(summary, scope['guild_id'], self.readable(
