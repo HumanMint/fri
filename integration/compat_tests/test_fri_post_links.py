@@ -127,7 +127,10 @@ def test_a_post_link_in_any_form_goes_unless_it_is_the_exact_one_shown(url, form
     (f'__a__ {MADE_UP}?a__b=1 ok', '__a__  ok'), (f'see {MADE_UP}?a~~b=1 ok', 'see  ok'),
     (f'__<{MADE_UP}?x=1>__z', '____z'), (f'__[clip]({MADE_UP}?x=1)__z', '__clip__z'),
     (f'__{FOUND}__z and __{MADE_UP}?x__y', f'__<{FOUND}>__z and ____y'),
-    # fri #200: a link a browser reads as another path isn't a post link.
+    # fri #200: a browser drops tabs and newlines, which only <…> can hold. And a link it reads as another path isn't
+    # a post link.
+    ('this one: <'+MADE_UP.replace('channels', 'chan\nnels')+'>', 'this one: '),
+    ('this one: <'+MADE_UP.replace('discord', 'disc\tord')+'> ok', 'this one:  ok'),
     ('https://discord.com/channels/123/../2/1300000000000000009', 'https://discord.com/channels/123/../2/1300000000000000009'),
     # Not a Discord post: a channel, an invite or another site.
     ('https://discord.com/channels/123/2', 'https://discord.com/channels/123/2'),
