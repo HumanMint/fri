@@ -135,6 +135,89 @@ FIX = 'not the one, i meant join us for a bite'
     ("wrong song, Love Story, i've literally just said", 'Love Story', True),
     ('wrong song, Love Story by Example', 'Love Story', True),
     ('wrong song, Simon Says', 'Simon Says', True),
+    # gene #119 (1): only an artist right after the title (or in it) is protected, and a quote is someone else's.
+    ("wrong song, 'Love Story' was a quote from Nope", 'Love Story', False),
+    ('wrong song, Love Story was a quote from Nope', 'Love Story', False),
+    ("wrong song, 'Love Story' came from Nope", 'Love Story', False),
+    ("wrong song, 'Love Story', quoting alex", 'Love Story', False),
+    ('wrong song, Love Story is a quote from Taylor Swift', 'Love Story', False),
+    ("wrong song, 'Love Story' by Nope", 'Love Story', True),
+    # gene #119 (2): an artist's name may carry those words ("The Wanted"), though a withdrawal after its first word,
+    # or someone else's words after it, still counts.
+    ('wrong song, Glad You Came by The Wanted', 'Glad You Came', True),
+    ("wrong song, 'Glad You Came' by The Wanted", 'Glad You Came', True),
+    ('wrong song, Glad You Came by The Wanted', 'Glad You Came The Wanted', True),
+    ('wrong song, All I Got by Said The Sky', 'All I Got', True),
+    ('wrong song, Glad You Came by The Wanted nope', 'Glad You Came', False),
+    ('wrong song, Glad You Came by The Wanted, alex said', 'Glad You Came', False),
+    ('wrong song, Glad You Came by The Wanted is what alex said', 'Glad You Came', False),
+    ('wrong song, Love Story by Taylor Swift alex said', 'Love Story', False),
+    ('wrong song, Hell No by The Wanted', 'Hell No', True),
+    ('wrong song, Love Story from the example', 'Love Story', False),
+    # gene #119 (3): a title ends at its closing quote, or unquoted at a clause break, whatever the proposed song
+    # covers...
+    ("wrong song, 'Love Story' was an example", 'Love Story was an example', False),
+    ("wrong song, 'Love Story' is what Alex said", 'Love Story is what Alex said', False),
+    ("wrong song, 'Love Story' alex said", 'Love Story alex said', False),
+    ("wrong song, 'Love Story' was a quote from Nope", 'Love Story was a quote from Nope', False),
+    ('wrong song, Love Story was an example', 'Love Story was an example', False),
+    ('wrong song, Love Story is what alex said', 'Love Story is what alex said', False),
+    ('wrong song, Love Story, alex said', 'Love Story alex said', False),
+    ('wrong song, Love Story like alex said', 'Love Story like alex said', False),
+    ('wrong song, Love Story for example', 'Love Story for example', False),
+    ('wrong song, Love Story by Taylor Swift is what alex wants', 'Love Story Taylor Swift is what alex wants', False),
+    # ...though a title can still carry those words.
+    ('wrong song, Say You, Say Me', 'Say You, Say Me', True),
+    ('wrong song, Say, Say, Say', 'Say Say Say', True),
+    ('wrong song, Everybody Wants to Rule the World', 'Everybody Wants to Rule the World', True),
+    ('wrong song, This Is What You Came For', 'This Is What You Came For', True),
+    ("wrong song, I Don't Want to Miss a Thing", "I Don't Want to Miss a Thing", True),
+    ('wrong song, Please Please Please Let Me Get What I Want', 'Please Please Please Let Me Get What I Want', True),
+    ('wrong song, Stand By Me by Ben E. King', 'Stand By Me Ben E. King', True),
+    ('wrong song, Say You, Say Me by Nope', 'Say You, Say Me', True),
+    ('wrong song, This Is What You Came For by Said The Sky', 'This Is What You Came For', True),
+    # gene #119 (4): their own words don't vouch for a song they deny...
+    ('wrong song, Love Story, I said not to play it', 'Love Story', False),
+    ('wrong song, Love Story is not what I meant', 'Love Story', False),
+    ('wrong song, Love Story is not what I meant', 'Love Story is not what I meant', False),
+    ("wrong song, Love Story isn't what i asked for", 'Love Story', False),
+    ("wrong song, 'Love Story' is not the one i wanted", 'Love Story', False),
+    ('wrong song, Love Story by Taylor Swift is not what i meant', 'Love Story', False),
+    ("wrong song, Love Story is what i didn't ask for", 'Love Story', False),
+    ('wrong song, Love Story, i said no', 'Love Story', False),
+    ('wrong song, Love Story, i told you not to', 'Love Story', False),
+    ('wrong song, Say You, Say Me by The Wanted is not what i meant', 'Say You, Say Me', False),
+    # gene #126 round 1: a hedged denial, or a refusal with its object, still denies it.
+    ('wrong song, Glad You Came by The Wanted is absolutely not what I meant', 'Glad You Came', False),
+    ('wrong song, Love Story is absolutely not what I meant', 'Love Story', False),
+    ('wrong song, Love Story is just not the one i wanted', 'Love Story', False),
+    ("wrong song, Love Story isn't really what i asked for", 'Love Story', False),
+    ('wrong song, Glad You Came by The Wanted, I said no to that', 'Glad You Came', False),
+    ('wrong song, Love Story, I said no to that', 'Love Story', False),
+    ('wrong song, Love Story, i said not to do that', 'Love Story', False),
+    ('wrong song, Love Story, I said not to ever play it', 'Love Story', False),
+    ('wrong song, Love Story is what they want', 'Love Story', False),
+    # ...while they still count, and a complaint about the song Gene played isn't a denial.
+    ('wrong song, Love Story is what i meant', 'Love Story', True),
+    ('wrong song, Love Story, i said it already', 'Love Story', True),
+    ('wrong song, Love Story, not Glad You Came like i said', 'Love Story', True),
+    ("wrong song, Love Story, that's not what i asked for", 'Love Story', True),
+    # A bare "say" or "want" in the song they named is its wording, not someone else's words.
+    ('wrong song, I Like the Way You Say My Name', 'I Like the Way You Say My Name', True),
+    ('wrong song, This Is What You Want', 'This Is What You Want', True),
+    ('wrong song, Love Story like alex wanted', 'Love Story like alex wanted', False),
+    ('wrong song, Love Story is what they want', 'Love Story is what they want', False),
+    # gene #126 round 2: "like you say" and "what we want" are someone else's words or a denial, and a withdrawal
+    # can end with "please" or "again".
+    ('wrong song, Love Story, like you say', 'Love Story like you say', False),
+    ('wrong song, Love Story as you say', 'Love Story as you say', False),
+    ('wrong song, Love Story is not what we want', 'Love Story is not what we want', False),
+    ('wrong song, Love Story is not what we want', 'Love Story', False),
+    ('wrong song, Love Story, i said no to that one please', 'Love Story', False),
+    ('wrong song, Love Story, i said not to do it again', 'Love Story', False),
+    ('wrong song, We Want the Airwaves', 'We Want the Airwaves', True),
+    ('wrong song, Say No to This', 'Say No to This', True),
+    ('wrong song, Love Story again please', 'Love Story', True),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
@@ -173,7 +256,10 @@ def test_a_long_message_is_read_without_backtracking():
     """Each check runs in about linear time, so a 4000-character worst case takes milliseconds, not minutes."""
     shapes = ["'"+"a' "*1330, "'"+"rockin' "*498, "''a "*997, "' "*1994, '"'+'a '*1993, 'love story nah'+' lol'*990+' x',
               'love story'+', no lol'*497+' x', 'love story'+' ,'*1990+'x', 'love story'+', a b said'*398, 'love '+'by '*1328,
-              'love'+' from x'*568, 'love story'+' i just'*664+' said', "love story "+"don't "*664, 'i meant '+'to '*1328]
+              'love'+' from x'*568, 'love story'+' i just'*664+' said', "love story "+"don't "*664, 'i meant '+'to '*1328,
+              'love story'+' is not what'*331, 'love '+'by the '*664, 'love story'+' i said no'*398, 'love story'+', say'*797,
+              'love story '+'x '*1990+'is not what i meant', 'love story'+' is absolutely'*363,
+              'love story'+', i said no to that'*222, 'love story'+' not to ever'*363, 'i like '+'you say '*499]
     for shape in shapes:
         text = ('wrong song, '+shape)[:4000]
         began = time.perf_counter()
