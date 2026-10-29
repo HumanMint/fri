@@ -8,14 +8,14 @@ memory only, so any other message edited or deleted where Fri saves exchanges, y
 saved before a restart, say), is asked about by ID alone from a controller that also offers saved-turn-withdrawal:
 it drops only an exchange that holds it (fri #174).
 
-Each withdrawal waits in one queue until the controller takes it (fri #215): on disk, so a timeout, an outage or a
-restart sends it again later, and sent by one worker, one call at a time, ten IDs a call by ID, each ID once however
+Each withdrawal waits in one queue until the controller takes it (fri #215), so a timeout or an outage sends it again
+later, and sent by one worker, one call at a time, ten IDs a call by ID, each ID once however
 many events name it. Meanwhile, and for an hour after (past any turn still holding a copy), what holds a taken-back
 message stays out of every request and memory view: saved history, a pending question, an exchange elsewhere, a note
 learned from it and the member's summary (see withhold and screen); once deleted, a reply of Fri's in the channel's
-view that carried it too (see Agent.withdrawn_from). A member's "forget me" takes their queued withdrawals with it:
-only one whose author Fri knows, and sent after their last "forget me" it knows of, is kept on disk (see lasting).
-One by ID whose author it can't name is retried in memory only, so a restart loses it, as main never retried it.
+view that carried it too (see Agent.withdrawn_from). A member's "forget me" takes their queued withdrawals with it.
+Only one for an exchange this process saved (under the erasure guard, see kept) is kept on disk, so a restart sends it
+again; one by ID is retried in memory only, so a restart loses it, as before this queue (see lasting).
 """
 
 import asyncio
@@ -53,7 +53,6 @@ class SavedTurns:
         self.timer = None
         self.generation = 0  # Each queued entry's own number: a reply to an older one never settles a newer one.
         self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
-        self.erased_at = {}  # Member (str) -> when they last did, so nothing they sent before is kept on disk again.
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -84,9 +83,6 @@ class SavedTurns:
                         self._pending[str(i)] = self.entry(scope={key: str(entry['scope'].get(key, '')) for key in (
                             'guild_id', 'channel_id', 'conversation_id', 'user_id')}, deleted=deleted,
                             revision=revision if type(revision) is int and revision >= 0 else None)
-                    elif str(entry.get('server', '')).isdigit() and str(entry.get('user_id', '')).isdigit():
-                        self._pending[str(i)] = self.entry(server=str(entry['server']), deleted=deleted,
-                                                           user_id=str(entry['user_id']))
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 LOG.warning('Pending withdrawals could not be read, so none are resent: %s', type(exc).__name__)
             self.prune(time.time())
@@ -99,17 +95,18 @@ class SavedTurns:
         data = getattr(self.agent.fri, 'data', None)
         return None if data is None else data/RECORD
 
-    def lasting(self, i, entry):
-        """Whether a queued withdrawal goes to disk: only one Fri can name the author of, so their "forget me" finds it,
-        and of a message sent after the last one it knows of, as nothing from before it holds anything now."""
-        user = (entry.get('scope') or {}).get('user_id') or entry.get('user_id')
-        return bool(user) and sent_at(int(i)) > self.erased_at.get(str(user), 0)
+    @staticmethod
+    def lasting(entry):
+        """Whether a queued withdrawal goes to disk: only one for an exchange this process saved, which names its member
+        so their "forget me" finds it, and which a save answered after one never records (see kept). Never one by ID:
+        Fri may not know whose it is, and a restart forgets any "forget me" before it (fri #224 round 3)."""
+        return 'scope' in entry
 
     def persist(self):
         if path := self.record():
             try:
                 private_json(path, {'pending': {i: {key: value for key, value in entry.items() if key != 'gen'}
-                                                for i, entry in self.pending.items() if self.lasting(i, entry)}})
+                                                for i, entry in self.pending.items() if self.lasting(entry)}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
                 LOG.warning('Pending withdrawals could not be saved: %s', type(exc).__name__)
 
@@ -198,7 +195,6 @@ class SavedTurns:
         it was saved under, which the erasure moved, so the controller writes nothing for it (gene #141)."""
         user = str(user)
         self.erasures[user] = self.erasures.get(user, 0)+1
-        self.erased_at[user] = time.time()
         for i in [i for i, entry in self.saved.items() if entry[1].get('user_id') == user]:
             del self.saved[i]
         mine = [i for i, entry in self.pending.items()
