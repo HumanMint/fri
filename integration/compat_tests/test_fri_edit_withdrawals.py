@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import discord
+import pytest
 
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_unsend import heard, model, no_debounce
@@ -78,7 +79,8 @@ def test_a_message_edited_while_the_model_answers_it_is_neither_delivered_nor_sa
     asyncio.run(scenario())
 
 
-def test_a_forget_me_edited_during_its_last_fetch_is_not_carried_out(monkeypatch, tmp_path):
+@pytest.mark.parametrize('text', ['fri forget me', 'fri forget about me'])
+def test_a_forget_me_edited_during_its_last_fetch_is_not_carried_out(monkeypatch, tmp_path, text):
     async def scenario():
         fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
         no_debounce(monkeypatch)
@@ -86,7 +88,7 @@ def test_a_forget_me_edited_during_its_last_fetch_is_not_carried_out(monkeypatch
         earlier.reply.return_value = SimpleNamespace(id=earlier.id+100, content='okay', edit=AsyncMock())
         await agent.handle(earlier)
         assert store.chat_context('123', 'public:1', '20')['turns']
-        control = message('fri forget me')
+        control = message(text)
         original = channel.fetch_message.side_effect
         changed = False
         async def fetch(mid):
