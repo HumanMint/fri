@@ -922,6 +922,8 @@ class Agent:
                                                control=True, logged=f'reply withheld: {invitation.refusal}')
                 if privacy and not invitation and not await self.still_addressed(message, answering=True):
                     return self.missed(events, 'message changed')  # E.g. a ping sent while Fri was paused.
+                if privacy and not dm and not invitation and await self.aimed_elsewhere(message):
+                    return self.missed(events, 'said to someone else')  # An erasure can't be undone.
                 if privacy in MEMORY_CONTROLS and (newer := self.controlled.get(user)) and (
                         newer[0] > message.id and newer[1] != privacy):
                     # Sent before one that already went through, e.g. delivered late: it mustn't undo that.
@@ -1371,6 +1373,16 @@ class Agent:
             else:
                 del self.unreachable_notices[message.channel.id]
         return posted
+
+    async def aimed_elsewhere(self, message):
+        """A reply to, or a mention of, someone other than Fri, without Fri's name, mention or a reply to Fri. The
+        dedicated channel answers plain chat too, but a memory control there is only one said to Fri: "forget me"
+        said to someone else changes nothing. A reply whose target can't be read counts as someone else's."""
+        others = [user for user in (getattr(message, 'mentions', None) or ())
+                  if getattr(user, 'id', None) != self.fri.user.id]
+        if not (getattr(message, 'reference', None) or others):
+            return False
+        return await addressed_text(message, self.fri.user.id) is None
 
     async def still_addressed(self, message, answering=False):
         """The message as Discord has it now: still there, never edited, and, before a reply, still addressed.
