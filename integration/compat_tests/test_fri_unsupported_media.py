@@ -28,10 +28,13 @@ from fri.fri_mentions import Invitation
 QUESTION = 'whats 12 times 12'
 # Reactions and pointers at the media: no model call.
 MEDIA_ONLY = ('thoughts?', 'lmao', 'rate this', 'which one', 'is this ai', 'what do you think of this clip', '😭',
-              'what song is this', 'lol what', 'is it good', 'translate this', 'who is this', 'how do i look')
+              'what song is this', 'lol what', 'is it good', 'translate this', 'who is this', 'how do i look',
+              'funny clips', 'rate the gif', 'is this gif cursed', 'what song is in the video')
 # Questions and requests the text carries on its own, however short: the model answers them.
 QUESTIONS = (QUESTION, 'what is recursion?', 'who is gandalf?', 'tell me a joke', 'how are you', 'what time is it',
-             'which one should i wear', 'explain recursion', 'help me pick a laptop')
+             'which one should i wear', 'explain recursion', 'help me pick a laptop',
+             # A format named in general is the question's subject, not a pointer at the post (fri #153).
+             'what is a video codec?', 'how do gifs loop?', 'is a gif better?', 'is mp3 better?')
 FORMAT_WORDS = ('png', 'jpeg', 'webp', 'mb', 'attach', 'resend', 're-upload', 'supported')
 
 

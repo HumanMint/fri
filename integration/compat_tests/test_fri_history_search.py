@@ -70,7 +70,15 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'what’s the link sam dropped in chat?', 'which was the meme you posted on #memes?',
                  'what was the song he mentioned on monday', 'find the clips jo posted in <#123>', 'what was that song kev mentioned in here?',
                  'which was the meme you posted on this server', 'what was that game jo recommended in a thread',
-                 'what was the link sam posted in this channel yesterday?'):
+                 'what was the link sam posted in this channel yesterday?',
+                 # A mention names the speaker (fri #127), and a time may follow a place (fri #138).
+                 'what was that song <@123456789012345678> mentioned?', 'what’s the link <@!123> dropped in #general',
+                 'what was the song he mentioned on monday night?', 'find the clips jo posted in <#123> this morning',
+                 'what was the link sam posted in #general on monday', 'what was that song kev mentioned the other day',
+                 'which was the meme you posted in this chat last night', 'what was the new song posted in #music',
+                 'what was the song posted in #music', 'what was the link <@123> sent the other day again',
+                 'what’s the recipe lulu shared in the cooking thread', 'what was the game sam recommended tonight',
+                 'what was the link ollie dropped like an hour ago'):
         assert requested(text)
     for text in ('hey fri', 'play Sad Machine', 'do not search chat', '> find old messages',
                  'what do you recommend?', 'what should I say to a friend who is upset?',
@@ -87,7 +95,15 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'what is the data rate recommended in the spec?',
                  'what is the data rate recommended in <https://example.com/spec>?',
                  'what is the data rate recommended in server documentation?',
-                 'what is the data rate recommended in <#123oops>?'):
+                 'what is the data rate recommended in <#123oops>?',
+                 # What sits before the verb is part of the thing, not who said it (fri #77), and a place
+                 # alone isn't a speaker (fri #138).
+                 'what is the maximum file size shared in a server?', 'what’s the file size limit shared here?',
+                 'what is the max bitrate sent today?', 'what is the default setting recommended here?',
+                 "what's the best laptop recommended?", 'what is the daily dose recommended?',
+                 'what is the max file size shared in this server?', 'what was the price posted here?',
+                 'what are the side effects mentioned?', 'what is the html tag recommended?',
+                 'what’s the max player count recommended in the minecraft server?'):
         assert not requested(text)
     assert valid_action(query())
     assert not valid_action(query(cursor='invented'))
