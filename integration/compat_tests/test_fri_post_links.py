@@ -67,3 +67,101 @@ def test_a_read_then_the_answer_links_the_post_it_found_and_drops_a_made_up_one(
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+NOT_SHOWN = MADE_UP.split('://', 1)[1]  # discord.com/channels/…, written below with each variant's scheme and host.
+
+
+@pytest.mark.parametrize('url', [
+    # fri #178: every way Discord links a post the model wasn't shown, each compared whole against what it was shown.
+    f'{MADE_UP}/', f'{MADE_UP.replace("discord.com", "ptb.discord.com")}/',
+    f'{MADE_UP.replace("discord.com", "canary.discord.com")}/', f'https://DISCORD.COM/{NOT_SHOWN.split("/", 1)[1]}',
+    f'http://{NOT_SHOWN}', f'HTTPS://{NOT_SHOWN}', f'https://www.{NOT_SHOWN}', f'https://Discord.com/{NOT_SHOWN.split("/", 1)[1]}',
+    f'{MADE_UP}?x=1', f'{MADE_UP}#top', f'{MADE_UP}/extra', f'https://{NOT_SHOWN.replace(".com", ".com:443")}',
+    f'https://kev@{NOT_SHOWN}', f'https://discordapp.com/{NOT_SHOWN.split("/", 1)[1]}/',
+    f'https://discord.com/CHANNELS/{NOT_SHOWN.split("/", 2)[2]}', f'{FOUND}/', f'{FOUND}?ref=1',
+    f'https://www.{FOUND.split("://", 1)[1]}', f'http://{FOUND.split("://", 1)[1]}',
+])
+@pytest.mark.parametrize('form, sent', [('this one: {}', 'this one: '), ('this one: <{}>', 'this one: '),
+                                        ('[kev’s clip]({})', 'kev’s clip'), ('[kev’s clip](<{}>)', 'kev’s clip'),
+                                        ('this one: {}.', 'this one: .'), ('(this one: {})', '(this one: )')])
+def test_a_post_link_in_any_form_goes_unless_it_is_the_exact_one_shown(url, form, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(form.format(url), read()) == sent
+
+
+@pytest.mark.parametrize('reply, sent', [
+    (f'here: {FOUND}.', f'here: <{FOUND}>.'),  # Sentence punctuation isn't part of the link, as Discord reads it.
+    (f'(here: {FOUND})', f'(here: <{FOUND}>)'), (f'here: {FOUND}, ok', f'here: <{FOUND}>, ok'),
+    (f'"{FOUND}"', f'"<{FOUND}>"'), (f'[kev’s clip]( <{FOUND}> )', f'[kev’s clip](<{FOUND}>)'),
+    # Not a Discord post: a channel, an invite or another site.
+    ('https://discord.com/channels/123/2', 'https://discord.com/channels/123/2'),
+    ('https://discord.com/invite/abc', 'https://discord.com/invite/abc'),
+    (f'https://example.com/{NOT_SHOWN}', f'https://example.com/{NOT_SHOWN}'),
+    (f'https://notdiscord.com/{NOT_SHOWN.split("/", 1)[1]}', f'https://notdiscord.com/{NOT_SHOWN.split("/", 1)[1]}'),
+    (f'https://discord.com.example/{NOT_SHOWN.split("/", 1)[1]}', f'https://discord.com.example/{NOT_SHOWN.split("/", 1)[1]}'),
+    (f'https://example.com/?next={MADE_UP}', 'https://example.com/?next='),  # Still shaped like a post link: goes.
+    (f'[{MADE_UP}](https://example.com)', '[](https://example.com)'),  # A post link as the label still goes.
+])
+def test_sentence_punctuation_and_other_links_are_read_as_discord_reads_them(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+def respond_with(action, context):
+    import json
+
+    import httpx
+
+    from compat_tests.test_fri_chat import response_event
+    from fri.fri_chat import Chat
+
+    def model_reply(request):
+        output = {'reply': '', 'request_draft': None, 'action': action, 'notes': []}
+        return httpx.Response(200, text='data: '+json.dumps(response_event(content=json.dumps(output)))+'\n\n')
+    chat = Chat(type('Auth', (), {'access_token': staticmethod(lambda: 'fictional')}), httpx.MockTransport(model_reply))
+    return asyncio.run(chat.respond('which clip, the one in https://discord.com/channels/123/2/1 or the other', context))
+
+
+@pytest.mark.parametrize('question, kept', [
+    (f'this one {MADE_UP} or the tuesday one?', 'this one  or the tuesday one?'),
+    (f'[this one]({MADE_UP.upper()}) or the tuesday one?', 'this one or the tuesday one?'),
+    (f'this one <{FOUND}> or {MADE_UP}/?', f'this one <{FOUND}> or ?'),
+])
+def test_a_clarifying_question_keeps_only_post_links_the_model_was_shown(question, kept):
+    """fri #178: the question is delivered and saved as Fri's words, so it gets the reply's filter. The topic stays
+    the member's exact words, link and all."""
+    topic = 'the one in https://discord.com/channels/123/2/1'
+    context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high',
+               'actions': {'clarify': {'goals': ['web']}}, **read()}
+    result = respond_with({'kind': 'clarify', 'goal': 'web', 'topic': topic, 'question': question}, context)
+    assert result.status == 'completed' and result.action == {'kind': 'clarify', 'goal': 'web', 'topic': topic,
+                                                              'question': kept}
+
+
+@pytest.mark.parametrize('question', [MADE_UP, f'{MADE_UP}?', f'<{MADE_UP}>'])
+def test_a_clarifying_question_that_was_only_a_made_up_link_says_so_instead(question):
+    context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high',
+               'actions': {'clarify': {'goals': ['web']}}, **read()}
+    result = respond_with({'kind': 'clarify', 'goal': 'web', 'topic': 'which clip', 'question': question}, context)
+    assert (result.status, result.response_kind, result.action, result.reply) == (
+        'completed', 'reply', None, 'can’t link that one.')
+
+
+def test_a_clarifying_question_goes_out_and_is_saved_without_a_made_up_link(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        topic = 'what time is the chess final for everyone'
+        event = message(f'fri {topic}, tomorrow or friday?')
+        fake = f'https://DISCORD.com/channels/123/1/{event.id+7}/'
+        model(fri, tmp_path, [{'action': {'kind': 'clarify', 'goal': 'web', 'topic': topic,
+                                          'question': f'the one in {fake} or friday?'}}])
+        texts = delivered(event)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert texts == ['the one in  or friday?']
+            assert saved_replies(calls) and not any('channels' in reply for reply in saved_replies(calls))
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
