@@ -18,10 +18,15 @@ HOST = re.compile(r'(?:(?:www|ptb|canary)\.)?discord(?:app)?\.com\.?')
 AUTHORITY = re.compile(r'[/\\]*([^/\\?#]*)')
 SEGMENT = re.compile(r'[/\\]([^/\\?#]*)')
 DIGITS = re.compile(r'(?:[0-9]|%3[0-9]){1,25}')
+# A browser drops a tab or newline anywhere in a link, its scheme too ("htt\tps:"), and a control character before
+# it (fri #208).
+SCHEME = r'h[\t\n\r]*t[\t\n\r]*t[\t\n\r]*p[\t\n\r]*(?:s[\t\n\r]*)?:'
+LINKED = re.compile(SCHEME, re.I)
+DROPPED = re.compile(r'[\t\n\r]')
 # Where a link can be: masked, in <…> (which can hold the tabs and newlines a browser drops), or bare up to a space
 # or "<", whatever its host and path (see post).
-LINK = re.compile(r'\[(?P<label>[^\]\n]{1,100})\]\(\s*<?(?P<masked>https?:[^\s<>()]*)>?\s*\)|'
-                  r'<(?P<angled>https?:(?:[^\s<>]|[\t\n\r])*)>|<?(?P<bare>https?:[^\s<]*)', re.I)
+LINK = re.compile(r'\[(?P<label>[^\]\n]{1,100})\]\(\s*<?(?P<masked>[\x00-\x1f]*'+SCHEME+r'[^\s<>()]*)>?\s*\)|'
+                  r'<(?P<angled>[\x00-\x1f]*'+SCHEME+r'(?:[^\s<>]|[\t\n\r])*)>|<?(?P<bare>'+SCHEME+r'[^\s<]*)', re.I)
 # The rest of a bare one: a trailing slash, query or fragment is part of it. Sentence punctuation or markdown at its
 # end isn't, nor an emoji or other non-URL text right after it, nor a word after closing markdown ("**…**this"):
 # inside it, "_" and "~" are its own (?utm_source=…), but it never ends on them, "*" or "|". Markdown opened before
@@ -67,8 +72,21 @@ def discord(host):
 
 def post(url):
     """The length of the post link at the start of `url`, through its message's ID, as written or as a browser reads
-    it; None if `url` doesn't start with one. A tab or newline in it (only <…> holds one) counts as nothing."""
-    url = re.sub(r'[\t\n\r]', '', url)
+    it; None if `url` doesn't start with one. A tab or newline in it counts as nothing, and so does a control
+    character or space before it."""
+    kept = None
+    if url[0] <= ' ' or DROPPED.search(url):
+        kept = [at for at, char in enumerate(url) if char not in '\t\n\r']
+        start = next((index for index, at in enumerate(kept) if url[at] > ' '), len(kept))
+        kept = kept[start:]
+        url = ''.join(url[at] for at in kept)
+    if (length := read(url)) is None:
+        return None
+    return kept[length-1]+1 if kept else length  # Where it ends in `url` as written.
+
+
+def read(url):
+    """post, for a `url` with nothing in it a browser drops."""
     if written := POST.match(url):
         return written.end()
     authority = AUTHORITY.match(url, url.index(':')+1)
@@ -125,7 +143,7 @@ def link_posts(reply, context, empty=EMPTY):
     """A post link the model was shown stays, as <link> so it shows no preview. Any other one (made up, mangled,
     another form of a shown one, or copied from someone's words) goes, and a masked one keeps its label. Other
     links are left as they are. `empty`: what to send when only a dropped link was there."""
-    if not re.search(r'https?:', reply, re.I):
+    if not LINKED.search(reply):
         return reply
     allowed = shown(context)
     result = reply
