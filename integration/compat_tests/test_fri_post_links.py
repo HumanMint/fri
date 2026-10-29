@@ -106,6 +106,7 @@ def test_a_post_link_in_any_form_goes_unless_it_is_the_exact_one_shown(url, form
     (f'is it {FOUND}?', f'is it <{FOUND}>?'), (f'**{FOUND}**', f'**<{FOUND}>**'), (f'||{FOUND}||', f'||<{FOUND}>||'),
     (f'_{FOUND}_', f'_<{FOUND}>_'), (f'~~{FOUND}~~!', f'~~<{FOUND}>~~!'), (f"'{FOUND}'", f"'<{FOUND}>'"),
     (f'here {FOUND}👀', f'here <{FOUND}>👀'), (f'{FOUND}—that one', f'<{FOUND}>—that one'),
+    (f'{MADE_UP}/?utm_source=discord', 'can’t link that one.'), (f'see {MADE_UP}?a_b~c=1 ok', 'see  ok'),
     # Not a Discord post: a channel, an invite or another site.
     ('https://discord.com/channels/123/2', 'https://discord.com/channels/123/2'),
     ('https://discord.com/invite/abc', 'https://discord.com/invite/abc'),
@@ -149,6 +150,21 @@ def test_a_clarifying_question_keeps_only_post_links_the_model_was_shown(questio
     result = respond_with({'kind': 'clarify', 'goal': 'web', 'topic': topic, 'question': question}, context)
     assert result.status == 'completed' and result.action == {'kind': 'clarify', 'goal': 'web', 'topic': topic,
                                                               'question': kept}
+
+
+@pytest.mark.parametrize('length, status', [(298, 'completed'), (299, 'invalid_output'), (300, 'invalid_output')])
+def test_a_clarifying_question_the_link_rule_lengthens_past_its_limit_fails_safely(length, status):
+    """A kept link gains <…>, so a question at the 300-character limit can grow past it: that's an unreadable reply,
+    never a turn that crashes later on the oversized action."""
+    head = f'this one {FOUND} or '
+    question = head + 'x'*(length-len(head)-1) + '?'
+    assert len(question) == length
+    context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high',
+               'actions': {'clarify': {'goals': ['web']}}, **read()}
+    result = respond_with({'kind': 'clarify', 'goal': 'web', 'topic': 'which clip', 'question': question}, context)
+    assert result.status == status
+    if status == 'completed':
+        assert result.action['question'] == question.replace(FOUND, f'<{FOUND}>')
 
 
 @pytest.mark.parametrize('question', [MADE_UP, f'{MADE_UP}?', f'<{MADE_UP}>'])
