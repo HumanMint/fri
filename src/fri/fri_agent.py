@@ -470,6 +470,12 @@ class Agent:
         self.saved_turns.withdraw(ids)  # Their saved exchanges too, so their words don't come back as history.
         self.receipts.withdraw(ids)  # And Fri's outside answers that drew on them, or were them.
 
+    def gone(self, i):
+        """Discord says message `i` was deleted (a fetch found it gone), though its delete event hasn't come: marked
+        deleted, as that event would mark it (see unsend), so a notice never goes to it (see reply_once)."""
+        if i not in self.unsent:
+            self.unsent[i] = time.monotonic()
+
     def saw(self, ids, ours=()):
         """Messages a turn's model request carries, wherever they came from (the live view, a reply target, a
         read, a look): a delete is marked for an hour, past any reply still running, even once one leaves the
