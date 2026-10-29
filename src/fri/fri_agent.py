@@ -920,10 +920,11 @@ class Agent:
                 if privacy and invitation and not await invitation.current(check_evidence=False, control=True):
                     return await self.withheld(message, events, invitation.refusal, invitation, fenced=False,
                                                control=True, logged=f'reply withheld: {invitation.refusal}')
-                if privacy and not invitation and not await self.still_addressed(message, answering=True):
-                    return self.missed(events, 'message changed')  # E.g. a ping sent while Fri was paused.
+                # Its reply target first: that lookup awaits, so the message itself is read after it, right before.
                 if privacy and not dm and not invitation and await self.aimed_elsewhere(message):
                     return self.missed(events, 'said to someone else')  # An erasure can't be undone.
+                if privacy and not invitation and not await self.still_addressed(message, answering=True):
+                    return self.missed(events, 'message changed')  # E.g. a ping sent while Fri was paused.
                 if privacy in MEMORY_CONTROLS and (newer := self.controlled.get(user)) and (
                         newer[0] > message.id and newer[1] != privacy):
                     # Sent before one that already went through, e.g. delivered late: it mustn't undo that.
