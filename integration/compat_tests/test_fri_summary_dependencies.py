@@ -265,3 +265,39 @@ def test_a_reply_whose_request_carried_one_depends_on_it_whether_or_not_it_repea
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_dependency_counts_only_once_the_request_carries_it(monkeypatch, tmp_path):
+    """A's echo is deleted while B's turn runs its check, so the request never carries it: B's unrelated answer depends on
+    no summary and stays once A's summary goes (review of fri #213, round 1)."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        agent = w.fri.agent
+        try:
+            events = await summarized_from(monkeypatch, w)
+            model(w, recalls)
+            assert await echoed(w) == [CONTINUATION]
+            echo = next(int(row['id']) for row in agent.recent[GENERAL] if row['text'] == CONTINUATION)
+            api = w.fri.api
+
+            async def checking(method, path, payload=None):
+                if path == CHECK and (payload or {}).get('user_id') == '30':
+                    agent.unsend(GENERAL, [echo])  # Deleted while the turn checks, after its context was read.
+                return await api(method, path, payload)
+            w.fri.api = checking
+
+            async def unrelated(text, context):
+                assert not any(CONTINUATION in row.get('text', '') for row in context.get('recent', []))
+                return ChatResult(status='completed', reply='no idea, ask them')
+            model(w, unrelated)
+            before = len(w.calls)
+            await echoed(w, 'fri what did they say', user=30)
+            saves = sent(w, TURN, since=before)
+            w.fri.api = api
+            assert 'no idea, ask them' in saved_replies(w, 30)
+            await deleted(w, events[0])
+            assert 'no idea, ask them' in saved_replies(w, 30)
+            assert saves and all('summary_dependencies' not in body for body in saves)
+        finally:
+            await w.fri.close()
+    run(scenario)
