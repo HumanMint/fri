@@ -566,7 +566,8 @@ def test_a_by_id_withdrawal_whose_author_fri_knows_goes_with_their_forget_me(mon
                                       'at': discord.utils.utcnow().timestamp(), 'revision': 0, 'gene_error': False})
             failing(w, SAVED)
             await delete(w, nearby, guild=123)
-            assert str(nearby.id) in on_disk(tmp_path) and '"20"' in on_disk(tmp_path)  # Theirs, so it's kept.
+            assert w.agent.saved_turns.pending[str(nearby.id)].get('user_id') == '20'  # Theirs, in memory only.
+            assert str(nearby.id) not in on_disk(tmp_path)
             await w.agent.handle(w.said('fri forget me'))
             assert str(nearby.id) not in on_disk(tmp_path) and str(nearby.id) not in w.agent.saved_turns.pending
         finally:
@@ -627,6 +628,29 @@ def test_the_private_overview_screens_after_its_own_read(monkeypatch, tmp_path):
             w.fri.api = calling
             dm, _, _ = await w.say(DM, 'what do you remember about me')
             assert LIKE not in dm.reply
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+# Sol round 3 of fri #224.
+
+def test_an_edit_after_forget_me_and_a_restart_writes_nothing_of_them_to_disk(monkeypatch, tmp_path):
+    """F1r: by ID, nothing goes to disk at all, so a restart that forgot their "forget me" can't write their message
+    back. It's retried in memory, as before."""
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        if 'saved-turn-withdrawal' not in w.fri.capabilities:
+            pytest.skip('needs a controller offering saved-turn-withdrawal')
+        try:
+            before = w.said('said before they erased')
+            await w.agent.handle(w.said('fri forget me'))
+            w.agent.saved_turns = SavedTurns(w.agent)  # Started again.
+            failing(w, SAVED)
+            await edit(w, edited(before))
+            assert str(before.id) in w.agent.saved_turns.pending  # Sent again while Fri runs.
+            assert str(before.id) not in on_disk(tmp_path) and '"20"' not in on_disk(tmp_path)
         finally:
             await w.fri.close()
     asyncio.run(scenario())
