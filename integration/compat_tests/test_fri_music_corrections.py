@@ -298,12 +298,14 @@ def test_a_long_message_is_read_without_backtracking():
               'love story'+', i said no to that'*222, 'love story'+' not to ever'*363, 'i like '+'you say '*499,
               "love story"+" isn't what"*363, 'love story, i said no'+' this time'*397+' x', 'love story'+' we just'*568+' said',
               'love story'+', we said no to that'*210, 'love story, i said not to'+' ever again'*361+' x']
+    correction('wrong song, '+shapes[0], 'love story')  # Warmed up first: a slow CI runner's first call isn't backtracking.
     for shape in shapes:
         text = ('wrong song, '+shape)[:4000]
         began = time.perf_counter()
         for argument in ('love story', 'a', text[12:200]):
             correction(text, argument)
-        assert time.perf_counter()-began < 0.5, shape[:20]
+        # Milliseconds here; backtracking would take seconds to minutes, so the bound has room for a busy runner.
+        assert time.perf_counter()-began < 2, shape[:20]
 
 
 @pytest.mark.parametrize('case', ['corrects', 'no recent play', 'old play', 'not their words', 'plain title',

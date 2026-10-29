@@ -1263,15 +1263,15 @@ class Fri(discord.Client):
     # With no message cache, Discord's deletes and edits arrive only as raw events.
     async def on_raw_message_delete(self, payload):
         if self.agent:
-            self.agent.unsend(payload.channel_id, [payload.message_id])
+            self.agent.unsend(payload.channel_id, [payload.message_id], self.agent.saved_in(payload))
 
     async def on_raw_bulk_message_delete(self, payload):
         if self.agent:
-            self.agent.unsend(payload.channel_id, payload.message_ids)
+            self.agent.unsend(payload.channel_id, payload.message_ids, self.agent.saved_in(payload))
 
     async def on_raw_message_edit(self, payload):
         if self.agent:
-            self.agent.edit(payload.channel_id, payload.message)
+            self.agent.edit(payload.channel_id, payload.message, self.agent.saved_in(payload))
 
     async def on_message(self, message):
         if self.agent:
