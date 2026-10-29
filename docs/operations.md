@@ -277,7 +277,15 @@ advertises it, so the controller must be released first.
   `summary-generation-writes` also takes the generation on saved work and reminder previews and
   refuses a moved one inside the write. The same controller retires a saved reply that drew on a
   summary since gone: history shows a breadcrumb instead, and a question it left pending goes (fri
-  #172). A turn without the summary, or a controller without summary generations, runs as before.
+  #172). Fri's echo of such a reply in a public channel's live view is marked, in memory only, and
+  rechecked through `/chat/messages/sources` before attention reuses it, before every model request
+  and before delivery: once Gene no longer holds it as said, it leaves the view, and an answer whose
+  request carried it is withheld (fri #187). A refusal or outage counts as retired. A turn reads its
+  context without asking, since its request's own check follows, so an ordinary turn asks twice. Each
+  lookup waits 3 seconds at most and a turn's 6 in all. Within a turn, one Gene retired isn't asked
+  about again, and once a lookup gets no answer none is asked: every marked echo counts as retired,
+  so an outage costs the turn one short wait (fri #193). A turn with no marked echo asks nothing, and
+  one without the summary, or a controller without summary generations, runs as before.
 - **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
   research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
   an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead

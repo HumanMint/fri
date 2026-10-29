@@ -71,6 +71,8 @@ RECHARGING = '🪫'
 ERASED = 'erased'  # owner_control: the author erased their chats while it waited.
 CHECK_SECONDS = 10  # A slower owner settings check gives way to the Sol settings call.
 MEMORY_CONTROLS = ('disable', 'enable')  # "forget me", "remember me again": they change what Fri keeps.
+RECHECK_TIMEOUT = 3  # Seconds one recheck of Fri's summary-derived replies waits on the controller (see Agent.retired).
+RECHECK_BUDGET = 6  # And all of one turn's rechecks together: a full wait before its request and one before delivery.
 STALE_CONTROL = 'skipped that one. a newer memory request of yours already went through. send it again if you still mean it.'
 
 
@@ -147,11 +149,22 @@ class Typing:
         await self.stack.aclose()
 
 
+class Rechecks:
+    """One turn's rechecks of Fri's summary-derived replies (see Agent.retired), kept with its fence. One Gene retired
+    stays retired for the rest of the turn, unasked. Once a recheck gets no answer, or the turn's time for them is
+    spent, none is asked again and every one counts as retired: a controller that doesn't answer costs the turn one
+    short wait, not one at every check (fri #193)."""
+
+    def __init__(self):
+        self.retired, self.spent, self.failed = set(), 0.0, False
+
+
 class Agent:
     def __init__(self, fri):
         self.fri = fri
         self.state = {'config': dict(DEFAULTS), 'version': 0, 'channels': [], 'history_channels': []}
         self.recent = defaultdict(lambda: deque(maxlen=30))
+        self.summarized = {}  # Fri's echoed replies that drew on a member's summary: message ID -> when (see retired).
         self.active = {}
         self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
         self.handling = Counter()  # Discord message IDs being handled now, burst members included.
@@ -316,7 +329,10 @@ class Agent:
         self.recent[channel] = deque((r for r in self.recent[channel] if r['at'] > now-900), maxlen=30)
         return list(self.recent[channel])
 
-    async def context_messages(self, channel, raw_errors=False):
+    async def context_messages(self, channel, raw_errors=False, recheck=True):
+        """The channel's live view, as far as everyone it drew on still allows. recheck=False: the caller rechecks Fri's
+        summary-derived replies itself right before its request (a turn's, see Fri.chat_once), so they aren't asked
+        about twice."""
         rows = self.messages(channel)
         source = self.fri.get_channel(channel)
         parent = getattr(source, 'parent_id', None) or channel
@@ -346,9 +362,64 @@ class Agent:
                 accepted.append(row)
             else:
                 self.uncache(int(user))
+        # And one that drew on a member's summary only while Gene still holds it as said (fri #187).
+        if recheck and (retired := await self.retired(accepted, channel=parent)):
+            stale |= retired
+            accepted = [row for row in accepted if row['id'] not in retired]
         if stale:  # Drop invalidated Fri replies from the raw cache too, not just from this context.
             self.recent[channel] = deque((r for r in self.recent[channel] if r['id'] not in stale), maxlen=30)
         return accepted
+
+    def echoed(self, channel, sent, echo):
+        """Fri's delivered public reply joins the channel's live view, as shown. One that drew on the member's summary
+        is marked, so it's rechecked before each reuse (see retired)."""
+        text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']
+        self.recent[channel].append({'id': str(sent.id), 'user_id': str(self.fri.user.id), 'name': 'Fri',
+                                     'text': clean(text, 500), 'at': time.time(), 'gene_error': False, 'fri': True,
+                                     'provenance': echo['provenance']})
+        if echo.get('summarized'):
+            now = time.time()  # As long as the live view keeps a row (see messages).
+            self.summarized = {mid: at for mid, at in self.summarized.items() if at > now-900}
+            self.summarized[str(sent.id)] = now
+
+    @staticmethod
+    def rechecks(fence):
+        """The turn's Rechecks, kept with the rest of its fence (none without one)."""
+        return None if fence is None else fence.setdefault('rechecks', Rechecks())
+
+    async def retired(self, rows, guild=None, channel=None, turn=None):
+        """Of `rows`, the IDs of Fri's replies that drew on a member's summary which Gene no longer holds as said: it
+        retires one once that summary goes (gene #112), so the echo may repeat withdrawn words (fri #187). Only those
+        are asked about, in `guild` (else the server of `channel`), and for a few seconds at most. A refusal or a
+        controller that doesn't answer counts them all, so none is reused unconfirmed. turn: the turn's Rechecks,
+        shared by its checks (see Rechecks); None, a check on its own."""
+        asked = sorted({row['id'] for row in rows if row.get('fri') and row['id'] in self.summarized})
+        if not asked:
+            return set()
+        turn = Rechecks() if turn is None else turn
+        known = turn.retired.intersection(asked)
+        asked = [mid for mid in asked if mid not in known]
+        wait = min(RECHECK_TIMEOUT, RECHECK_BUDGET-turn.spent)
+        if not asked or turn.failed or wait <= 0:
+            return known | set(asked)
+        guild = guild or self.channel_guild(channel)
+        found, began = {}, time.monotonic()
+        try:
+            async with asyncio.timeout(wait):
+                for start in range(0, len(asked), 10):  # As many as the controller looks up at once.
+                    found.update((await self.fri.api('POST', '/chat/messages/sources', {
+                        'guild_id': str(guild), 'message_ids': asked[start:start+10]}))['messages'])
+        except (commands.UserFeedbackCheckFailure, TimeoutError):
+            turn.failed = True
+            return known | set(asked)
+        finally:
+            turn.spent += time.monotonic()-began
+        gone = {mid for mid in asked if not (found.get(mid) or {}).get('verbatim')}
+        turn.retired |= gone
+        if gone:  # For good: out of the live view too, so later turns don't ask again.
+            for key, kept in self.recent.items():
+                self.recent[key] = deque((r for r in kept if r['id'] not in gone), maxlen=30)
+        return known | gone
 
     def unsend(self, channel, ids):
         """Messages taken back, by their author or a moderator: they leave Fri's live view and any burst
@@ -502,7 +573,7 @@ class Agent:
             parent = self.fri.get_channel(channel)
             scope = getattr(parent, 'parent_id', None) or channel
             profile = await self.profile(scope, user)
-            data.update(recent=await self.context_messages(channel), summary=profile['summary'],
+            data.update(recent=await self.context_messages(channel, recheck=False), summary=profile['summary'],
                         summary_provenance=profile.get('summary_provenance', []))
             data['historical_topics'] = profile.get('historical_topics', [])
         return data
@@ -2016,10 +2087,7 @@ class Agent:
             # or a save that failed, whose reply may carry exactly what the controller would have refused.
             if (echo and saved is not None and saved.get('kept', True) and message.guild and
                     self.allowed(message.channel) and sent.id not in self.unsent):  # Deleted while it saved.
-                text = sent.content if isinstance(getattr(sent, 'content', None), str) else echo['text']  # As shown.
-                self.recent[message.channel.id].append({'id': str(sent.id), 'user_id': str(self.fri.user.id),
-                    'name': 'Fri', 'text': clean(text, 500), 'at': time.time(), 'gene_error': False,
-                    'fri': True, 'provenance': echo['provenance']})
+                self.echoed(message.channel.id, sent, echo)
             if (invitation and invitation.outside and saved is not None and saved.get('kept', True) and
                     not taken_back() and getattr(sent, 'id', None) not in self.unsent):
                 # Delivered and saved, and nothing it drew on taken back: a direct reply to it may read it.
@@ -2171,6 +2239,8 @@ class Agent:
                 authors.update((item['user_id'], item['revision']) for item in row['provenance'])
             else:
                 authors.add((row['user_id'], row.get('revision', 0)))
+        if await self.retired(records, channel=parent):  # A reply of Fri's whose summary went (fri #187).
+            return False
         if 'author-fence' in getattr(self.fri, 'capabilities', ()):
             # One check of every author under the controller's lock (fri #84): no erasure through Gene lands
             # between two authors' reads. Any refusal names nobody and sends nothing; nor do more authors than

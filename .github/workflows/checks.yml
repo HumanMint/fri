@@ -1,6 +1,7 @@
 name: checks
-# Private repos get a monthly allowance of Actions minutes: test each change once (a pull request, then its
-# merge to main), skip Markdown-only changes (docs/integration-pair.json picks the controller the tests run against), and let a newer push to the same pull request cancel the older run.
+# Runs on every pull request and on each push to main, except Markdown-only changes (a change to
+# docs/integration-pair.json, which picks the controller the integration job runs against, still runs). A newer
+# push to the same pull request cancels its older run; runs on main always finish.
 on:
   push:
     branches: [main]

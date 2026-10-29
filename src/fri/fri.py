@@ -405,6 +405,14 @@ class Fri(discord.Client):
                      if me and row.get('source', {}).get('user_id') == me and str(row['source'].get('id', '')).isdigit()]
             if self.agent:  # Before the checks below refetch them: a delete after that is marked (see unsend).
                 self.agent.saw(carried, ours)
+            # Fri's own replies in view that drew on a member's summary, while Gene still holds them as said: it
+            # retires one once that summary goes (fri #187). First, so nothing waits between the checks below and
+            # the request. Reading the context didn't ask (see Agent.extra_context): this does, with the turn's
+            # budget (fri #193).
+            if self.agent and context.get('recent'):
+                retired = await self.agent.retired(context['recent'], ((fence or {}).get('turn') or {}).get('guild_id'),
+                                                   turn=self.agent.rechecks(fence))
+                context['recent'] = [row for row in context['recent'] if row.get('id') not in retired]
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
@@ -892,9 +900,11 @@ class Fri(discord.Client):
                     if context.get('unattributed_reference'):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
                     elif not private and not crossed and not recalled:
-                        result.echo = self.echo(scope, context, result.turn['provenance'], stored)
+                        result.echo = self.echo(scope, context, result.turn['provenance'], stored,
+                                                'summary_generation' in result.turn)
                     await looked(result)
                     try:  # The save's privacy fence, applied before anything is shown.
+                        await self.echoes_standing(context)
                         await self.api('POST', '/chat/turn/check', result.turn)
                         self.still_open(context)
                     except commands.UserFeedbackCheckFailure:
@@ -905,6 +915,7 @@ class Fri(discord.Client):
                 result = self.stage_turn(scope, source, text, context, result, actions=actions)
                 await looked(result)
                 # The save's privacy fence runs before delivery; the save itself waits for delivery.
+                await self.echoes_standing(context)
                 await self.api('POST', '/chat/turn/check', result.turn)
                 self.still_open(context)
                 return result
@@ -945,8 +956,17 @@ class Fri(discord.Client):
             **(self.summary_generation(context) if derived else {}),
             **({'audience': audience(context)} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
-            result.echo = self.echo(scope, context, provenance, reply)
+            result.echo = self.echo(scope, context, provenance, reply, 'summary_generation' in result.turn)
         return result
+
+    async def echoes_standing(self, context):
+        """Before delivery: Fri's own earlier replies the request carried that drew on a member's summary are still
+        held as said. One Gene retired since, as that summary went, may be what the answer repeats (fri #187)."""
+        fence = context.get('fence')
+        guild = ((fence or {}).get('turn') or {}).get('guild_id')
+        if self.agent and context.get('recent') and await self.agent.retired(context['recent'], guild,
+                                                                             turn=self.agent.rechecks(fence)):
+            raise commands.UserFeedbackCheckFailure(CONVERSATION_CHANGED)
 
     def still_open(self, context):
         """Before delivery: every other channel whose words reached the model is still one everyone can read."""
@@ -1052,12 +1072,14 @@ class Fri(discord.Client):
         return posted
 
     @staticmethod
-    def echo(scope, context, provenance, reply):
-        """Fri's delivered public reply for the shared channel view, tagged with whose words shaped it."""
+    def echo(scope, context, provenance, reply, summarized=False):
+        """Fri's delivered public reply for the shared channel view, tagged with whose words shaped it. summarized:
+        its turn carries a summary generation, so Gene retires it if that summary goes (see Agent.retired)."""
         if not scope['conversation_id'].startswith('public:') or not context.get('personal_memory', {}).get('enabled', True):
             return None
         return {'text': reply, 'provenance': provenance + [{'user_id': str(scope['user_id']),
-                                                            'revision': context['revision']}]}
+                                                            'revision': context['revision']}],
+                **({'summarized': True} if summarized else {})}
 
     async def record_turn(self, result, sent=None):
         """Save a staged turn once delivered. Delivery is the evidence Fri actually said it."""
