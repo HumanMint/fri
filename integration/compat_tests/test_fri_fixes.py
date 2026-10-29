@@ -917,7 +917,8 @@ def recheck_offered(world):
     from fri.fri_protocol import contract
     offered = world.client.get('/fri/contract', headers=headers('fri')).json()['capabilities']
     assert fri_fixes.RECHECK in contract()['capabilities']
-    world.fri.capabilities = frozenset(offered)
+    # A controller that rechecks the finish but isn't asked for the send (gene #136): with that, see below.
+    world.fri.capabilities = frozenset(offered)-{'requester-notice-authorize'}
     return fri_fixes.RECHECK in offered
 
 
@@ -986,3 +987,273 @@ def test_a_reply_already_gone_counts_as_taken_back(world):
     reply_deletions(world, gone())
     text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
     assert not sent and text == 'took the reply back: gene’s checks stopped holding while it went out.'
+
+
+AUTHORIZE = 'requester-notice-authorize'
+
+
+def test_fri_asks_for_the_send_when_offered():
+    from fri.fri_protocol import contract
+    assert AUTHORIZE in contract()['capabilities'] and fri_fixes.AUTHORIZE == AUTHORIZE
+
+
+def authorize_offered(world):
+    """Fri's capabilities as the paired controller offers them. One without requester-notice-authorize has
+    nothing for these to check: Fri keeps today's flow there, which the tests above cover."""
+    offered = world.client.get('/fri/contract', headers=headers('fri')).json()['capabilities']
+    if AUTHORIZE not in offered:
+        pytest.skip('the paired controller has no requester-notice-authorize')
+    world.fri.capabilities = frozenset(offered)
+
+
+def history(world, monkeypatch, shutdown=None):
+    """Discord keeps what Fri posts, so a later read finds it. shutdown: 'before' the post goes out, or 'after'
+    it went out and before Fri hears back."""
+    posted = []
+
+    async def send_once(_, post, *, reply_to=None, **__):
+        if shutdown == 'before':
+            raise asyncio.CancelledError
+        reply = SimpleNamespace(id=snowflake(), author=SimpleNamespace(id=FRI),
+                                reference=SimpleNamespace(message_id=reply_to))
+        posted.append(reply)
+        world.sent.append({**post, 'reply_to': reply_to})
+        if shutdown == 'after':
+            raise asyncio.CancelledError
+        return {'id': str(reply.id)}
+
+    def read(limit=100, after=None, before=None, oldest_first=None):
+        async def messages():
+            inside = [m for m in posted if after < discord.utils.snowflake_time(m.id) < before]
+            for item in inside[:limit]:
+                yield item
+        return messages()
+
+    monkeypatch.setattr('fri.fri_workspace.send_once', send_once)
+    world.room.history = Mock(side_effect=read)
+    return posted
+
+
+def pending(world):
+    path = world.fri.data/'requester-notices.json'
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def notice_row(world, job_id):
+    with world.store.connection() as db:
+        return db.execute('SELECT state,message_id FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()
+
+
+@pytest.mark.parametrize('change', ['erased', 'rolled_back', 'released'])
+def test_a_change_while_fri_reads_discord_after_the_claim_sends_nothing(world, monkeypatch, change):
+    """fri #214: the report is in a thread Fri had to fetch, so it reads it once more with the claim held. The
+    reporter's erasure, or a release, landing then reaches the controller's last check, right before the send."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    client, state, guild, payload = report_thread(world, report, job_id)
+    reads = []
+
+    async def thread(id):
+        reads.append(id)
+        if len(reads) == 3:  # The read with the claim held.
+            {'erased': lambda: world.store.erase_user(str(MEMBER)), 'rolled_back': lambda: rolled_back(world.store),
+             'released': lambda: released(world.store)}[change]()
+        return payload
+
+    state.http.get_channel = AsyncMock(side_effect=thread)
+    world.fri.fetch_channel = client.fetch_channel
+
+    async def fetch(*args):
+        return report
+
+    monkeypatch.setattr(discord.Thread, 'fetch_message', fetch)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert len(reads) == 3
+    assert not sent and not world.sent and text.startswith('didn’t send it: ')
+    assert notice_row(world, job_id)[0] == 'failed' and not pending(world)  # Nothing posted, so nothing to settle.
+
+
+def test_an_erasure_while_the_claim_is_out_sends_nothing(world):
+    """fri #214: before, Fri sent and then took the reply back, and a member may have read it meanwhile."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    erase_while_the_claim_is_out(world)
+    deleted = reply_deletions(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and not world.sent and not deleted
+    assert text == 'didn’t send it: only a shipped repair whose report is still on record can reply to its reporter.'
+    assert notice_row(world, job_id)[0] == 'failed'
+
+
+def test_the_owner_tells_the_reporter_once_after_asking_for_the_send(world):
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert sent and text == 'told them: '+report.jump_url and len(world.sent) == 1
+    paths = [c.args[1] for c in world.fri.api.await_args_list]
+    assert paths.index(f'/requests/{job_id}/requester-notice/authorize') == len(paths)-2  # Then the finish.
+    state, message_id = notice_row(world, job_id)
+    assert state == 'sent' and message_id.isdigit()
+    assert not pending(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and 'already told' in text and len(world.sent) == 1
+
+
+def lost_finish(world):
+    """The controller records the outcome, and its answer never reaches Fri."""
+    from fri.fri_errors import UNREACHABLE, ControllerUnavailable
+    api = world.fri.api.side_effect
+
+    async def lost(method, path, body=None):
+        result = await api(method, path, body)
+        if path.endswith('/finish') and not getattr(lost, 'once', False):
+            lost.once = True
+            raise ControllerUnavailable(UNREACHABLE)
+        return result
+
+    world.fri.api.side_effect = lost
+
+
+def erase_while_it_sends(world, monkeypatch):
+    sent = world.sent
+
+    async def send_once(_, post, *, reply_to=None, **__):
+        sent.append({**post, 'reply_to': reply_to})
+        world.store.erase_user(str(MEMBER))
+        return {'id': str(snowflake())}
+
+    monkeypatch.setattr('fri.fri_workspace.send_once', send_once)
+
+
+def test_a_reply_taken_back_after_a_lost_answer_is_taken_back_by_the_next_pass(world, monkeypatch):
+    """fri #214: the reporter erased while the reply went out, and the controller's answer that it no longer held
+    was lost. Fri kept the reply, and the next heartbeat pass hears the answer again and takes it back."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    erase_while_it_sends(world, monkeypatch)
+    lost_finish(world)
+    deleted = reply_deletions(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert len(world.sent) == 1 and not deleted
+    [entry] = pending(world).values()
+    assert entry['message_id'] and 'report_id' not in entry  # Kept to take it back, and nothing more.
+    assert notice_row(world, job_id)[0] == 'invalidated'
+    asyncio.run(fri_fixes.settle_all(world.fri))
+    assert [str(id) for id in deleted] == [entry['message_id']] and not pending(world)
+    asyncio.run(fri_fixes.settle_all(world.fri))
+    assert len(deleted) == 1
+
+
+def test_a_take_back_cut_off_by_a_shutdown_is_finished_by_the_next_pass(world, monkeypatch):
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    erase_while_it_sends(world, monkeypatch)
+    deleted = []
+
+    def partial(id):
+        async def delete():
+            if not getattr(partial, 'restarted', False):
+                raise asyncio.CancelledError  # Fri shut down mid-delete.
+            deleted.append(id)
+        return SimpleNamespace(id=id, delete=delete)
+
+    world.room.get_partial_message = partial
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tell(world.fri, job_id, OWNER))
+    [entry] = pending(world).values()
+    assert entry['take_back'] and not deleted
+    partial.restarted = True
+    asyncio.run(fri_fixes.settle_all(world.fri))
+    assert [str(id) for id in deleted] == [entry['message_id']] and not pending(world)
+
+
+@pytest.mark.parametrize('error', [discord.HTTPException(SimpleNamespace(status=503, reason='Unavailable'), 'down'),
+                                   TimeoutError()])
+def test_a_take_back_discord_did_not_confirm_is_tried_again(world, monkeypatch, error):
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    erase_while_it_sends(world, monkeypatch)
+    reply_deletions(world, error)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and text == ('it posted, but the report is no longer on record, and discord didn’t confirm taking '
+                                 'it back. i’ll keep trying: '+report.jump_url)
+    assert pending(world)
+    deleted = reply_deletions(world)
+    asyncio.run(fri_fixes.settle_all(world.fri))
+    assert len(deleted) == 1 and not pending(world)
+
+
+@pytest.mark.parametrize('shutdown', ['before', 'after'])
+def test_a_send_cut_off_by_a_shutdown_is_settled_by_the_next_pass(world, monkeypatch, shutdown):
+    """Fri stopped once the send was cleared. The next pass looks for the reply in Discord: one it finds is
+    recorded with the usual checks (here the reporter erased since, so it's taken back), and none frees the tap."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = history(world, monkeypatch, shutdown)
+    deleted = reply_deletions(world)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tell(world.fri, job_id, OWNER))
+    [entry] = pending(world).values()
+    assert entry['report_id'] == str(report.id) and 'message_id' not in entry
+    asyncio.run(fri_fixes.settle_all(world.fri))
+    assert pending(world)  # Too soon: a send may still be on its way.
+    monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
+    if shutdown == 'after':
+        world.store.erase_user(str(MEMBER))
+    asyncio.run(fri_fixes.settle_all(world.fri))
+    assert not pending(world)
+    if shutdown == 'after':
+        assert notice_row(world, job_id)[0] == 'invalidated' and [str(id) for id in deleted] == [str(posted[0].id)]
+    else:
+        assert notice_row(world, job_id)[0] == 'failed' and not deleted
+        history(world, monkeypatch)
+        text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+        assert sent and len(world.sent) == 1
+
+
+def stuck(world, job_id, report, posted=None):
+    """A tap that was cleared to send an hour ago and stopped: its outcome was never recorded."""
+    owner = {'guild_id': '123', 'user_id': str(OWNER)}
+    route = f'/requests/{job_id}/requester-notice'
+    lease = world.client.post(route, headers=headers('fri'), json={**owner, 'prepare': True}).json()['lease']
+    assert world.client.post(route+'/authorize', headers=headers('fri'), json={**owner, 'lease': lease}).status_code == 200
+    with world.store.connection() as db:
+        db.execute('UPDATE requester_notices SET at=at-3600 WHERE job_id=?', (job_id,))
+    if posted is not None:
+        reply = SimpleNamespace(id=snowflake(3600-5), author=SimpleNamespace(id=FRI),
+                                reference=SimpleNamespace(message_id=report.id))
+        posted.append(reply)
+        return reply
+
+
+@pytest.mark.parametrize('earlier', ['posted', 'not_posted', 'unreadable'])
+def test_a_tap_after_a_send_that_never_recorded_looks_for_it_first(world, monkeypatch, earlier):
+    """gene #139: a claim stuck on a send Fri never recorded was refused for good. Now the next tap looks for that
+    reply in Discord: one that posted is recorded and never sent twice, and only none found sends."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = history(world, monkeypatch)
+    reply = stuck(world, job_id, report, posted if earlier == 'posted' else None)
+    if earlier == 'unreadable':
+        world.room.history = Mock(side_effect=discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'no'))
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    state, message_id = notice_row(world, job_id)
+    if earlier == 'posted':
+        assert sent and not world.sent and text == 'it already went out, so i didn’t send it twice: '+report.jump_url
+        assert (state, message_id) == ('sent', str(reply.id))
+    elif earlier == 'not_posted':
+        assert sent and len(world.sent) == 1 and state == 'sent'
+    else:
+        assert not sent and not world.sent and state == 'uncertain'
+        assert text == 'couldn’t tell whether the last reply went out, so not sending it twice.'
+    assert not pending(world)
+
+
+def test_an_older_controller_gets_no_prepared_claim(world):
+    """A controller without requester-notice-authorize ignores a field it doesn't know, and would take a
+    prepared claim as cleared to send: Fri asks to prepare only when it's offered."""
+    _, job_id, _ = reported(world)
+    asyncio.run(tell(world.fri, job_id, OWNER))
+    [claim] = [c.args[2] for c in world.fri.api.await_args_list if c.args[1].endswith('/requester-notice')]
+    assert 'prepare' not in claim
+    assert not [c for c in world.fri.api.await_args_list if c.args[1].endswith('/authorize')]
