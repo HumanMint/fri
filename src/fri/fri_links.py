@@ -38,6 +38,9 @@ LINK = re.compile(r'\[(?P<label>[^\]\n]{0,100})\]\(\s*<?(?P<masked>[\x00-\x1f]*'
 BARE = re.compile(r'<?(?P<bare>'+SCHEME+r')', re.I)
 ANGLED = re.compile(r'[^ >]*')
 RUN = re.compile(r'[^'+SPACE+r'<]*')
+# Right after a "(", one may be the target of a masked link LINK doesn't take (a label holding a newline, or a "]"
+# Discord allows), which a "<" doesn't end either: it's read to a space instead (see aimed).
+TARGET = re.compile(r'[^'+SPACE+r']*')
 # The rest of a bare one: a trailing slash, query or fragment is part of it. Sentence punctuation or markdown at its
 # end isn't, nor an emoji or other non-URL text right after it, nor a word after closing markdown ("**…**this"):
 # inside it, "_" and "~" are its own (?utm_source=…), but it never ends on them, "*" or "|". Markdown opened before
@@ -220,10 +223,18 @@ def targeted(text, at):
     return text[at-1:at] == '('
 
 
+def aimed(text, at):
+    """targeted, for the scheme at `at`: control characters and a "<" may come before it too."""
+    while at and text[at-1] <= ' ':
+        at -= 1
+    return targeted(text, at-(text[at-1:at] == '<'))
+
+
 def once(text, allowed, found):
     """`text` with each post link in it kept, as <link>, or dropped (see link_posts), once. `found`: what ends found for
     each run of text read so far."""
-    parts, done, at, marks, channels, bare, angled, runs = [], 0, 0, frozenset(), set(), (1, 0), (1, 0), {}
+    parts, done, at, marks, channels, runs = [], 0, 0, frozenset(), set(), {}
+    bare, angled, target = (1, 0), (1, 0), (1, 0)
 
     def length(scheme, start, stop, whole):
         """The length of the post link starting at `start` (its scheme at `scheme`), whose run ends at `stop`; None
@@ -247,7 +258,11 @@ def once(text, allowed, found):
             else:  # Never closed, so a bare one, as Discord reads it.
                 match, name = BARE.search(text, begin), 'bare'
                 begin = match.start()
-        if name == 'bare':  # To a space or "<": where an earlier one's run ends, if it starts inside that run.
+        if name == 'bare' and aimed(text, match.start(name)):  # Maybe a masked link's target: to a space.
+            if not target[0] <= match.end() <= target[1]:
+                target = (match.end(), TARGET.match(text, match.end()).end())
+            start, stop = match.start(name), target[1]
+        elif name == 'bare':  # To a space or "<": where an earlier one's run ends, if it starts inside that run.
             if not bare[0] <= match.end() <= bare[1]:
                 bare = (match.end(), RUN.match(text, match.end()).end())
             start, stop = match.start(name), bare[1]
@@ -258,11 +273,12 @@ def once(text, allowed, found):
         # target out of <…>: Discord can refuse the masked link and read it bare. Nor <…> right after a "(": it may be
         # the target of a masked link LINK doesn't take, and end at a ")" in it. Nor one with a "\\" in it, which may
         # escape its ">". Nor one whose "<" is escaped ("\\<"): only text, so the link is a bare one. Nor one without a
-        # "/" right after its scheme, which Discord's autolink needs.
-        whole = '\\' not in url and (
-            name == 'masked' and text[start-1] == '<' and text.startswith('>', stop) or
-            name == 'angled' and text.startswith('/', scheme.end()) and not targeted(text, begin) and
-            not escaped(text, begin))
+        # "/" right after its scheme, which Discord's autolink needs, nor a masked one whose scheme a tab or newline
+        # splits, which Discord may not take for a link at all.
+        whole = '\\' not in url and text.startswith('/', scheme.end()) and (
+            name == 'masked' and text[start-1] == '<' and text.startswith('>', stop) and
+            not DROPPED.search(scheme[0]) or
+            name == 'angled' and not targeted(text, begin) and not escaped(text, begin))
         scheme = scheme.start()
         if scheme in channels or (size := length(scheme, start, stop, whole)) is None:
             if whole:
