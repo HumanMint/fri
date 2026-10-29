@@ -1310,3 +1310,50 @@ def test_a_note_a_day_old_is_dropped_whatever_the_controller_offers(world):
     world.fri.api.reset_mock()
     asyncio.run(fri_fixes.settle(world.agent))
     assert not pending(world) and not world.fri.api.await_args_list
+
+
+class Answer:
+    """One of Discord's HTTP answers, as discord.py's client reads it."""
+
+    def __init__(self, status, body=None):
+        self.status, self.body = status, body
+        self.headers = {'Via': '1.1 google', 'content-type': 'application/json'} if body is not None else {}
+
+    async def text(self, encoding=None):
+        return json.dumps(self.body) if self.body is not None else ''
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def test_a_take_back_held_up_by_a_global_rate_limit_never_stalls_discord(monkeypatch):
+    """fri #226: Discord answers the take-back with a global 429 that lasts longer than the take-back waits. discord.py
+    holds every call at its global gate meanwhile; cancelling the delete inside that wait left the gate shut for good.
+    The wait gives up, the delete is left to finish, and later calls go through once the 429 is over."""
+    monkeypatch.setattr(fri_fixes, 'TAKE_BACK', 0.05)
+    calls = []
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            calls.append(method)
+            if len(calls) == 1:
+                return Answer(429, {'message': 'You are being rate limited.', 'retry_after': 0.3, 'global': True})
+            return Answer(204)
+
+    async def scenario():
+        http = discord.http.HTTPClient(asyncio.get_running_loop())
+        http._HTTPClient__session = Session()
+        http._global_over = asyncio.Event()
+        http._global_over.set()
+        room = SimpleNamespace(id=456, get_partial_message=lambda id: SimpleNamespace(
+            id=id, delete=lambda: http.delete_message(456, id)))
+        reply = str(snowflake(60))
+        assert await fri_fixes.retract(room, reply) == 'unconfirmed'  # Still waiting out the 429.
+        assert await fri_fixes.retract(room, reply) == 'unconfirmed'  # The same delete, waited on again.
+        await asyncio.wait_for(http.request(discord.http.Route('GET', '/gateway')), 2)  # Not stuck at the gate.
+        assert calls == ['DELETE', 'DELETE', 'GET']  # The 429, then the delete itself once: never a second one.
+    asyncio.run(scenario())
+
