@@ -65,8 +65,10 @@ def details(message):
                               for r in reactions[:6] if isinstance(getattr(r, 'count', None), int)]
     reference = getattr(message, 'reference', None)
     channel = getattr(message, 'channel', None)
+    # A forward's reference names the post it copies, not one it answers.
     if (isinstance(getattr(reference, 'message_id', None), int) and channel is not None and
-            getattr(reference, 'channel_id', None) == channel.id):
+            getattr(reference, 'channel_id', None) == channel.id and
+            getattr(reference, 'type', None) != discord.MessageReferenceType.forward):
         guild = getattr(getattr(message, 'guild', None), 'id', None)
         extra['reply_to'] = f'https://discord.com/channels/{guild or "@me"}/{channel.id}/{reference.message_id}'
     if getattr(message, 'pinned', None) is True:
@@ -104,6 +106,12 @@ def label(emoji):
     """A unicode emoji as itself, a server emoji by its name."""
     from .privacy import clean
     return clean(emoji, 16) if isinstance(emoji, str) else ':'+clean(str(getattr(emoji, 'name', None) or 'emoji'), 32)+':'
+
+
+def started_a_thread(message):
+    """Discord's "started a thread" notice in the parent channel. Its text is the thread's name, not something
+    the member who opened it said."""
+    return getattr(message, 'type', None) == discord.MessageType.thread_created
 
 
 def image_context(context):

@@ -232,7 +232,7 @@ class HistorySearch:
         import discord
         from discord.http import Route
 
-        from .fri_images import image_context, look, media
+        from .fri_images import image_context, look, media, started_a_thread
 
         a = self.actions
         permissions = channel.permissions_for(channel.guild.me)
@@ -281,7 +281,8 @@ class HistorySearch:
             except discord.NotFound:
                 continue
             carries = media(message)  # A meme with no caption is still a find.
-            if (message.author.bot or message.webhook_id or str(message.author.id) != str(row['author']['id'])
+            if (message.author.bot or message.webhook_id or started_a_thread(message) or
+                    str(message.author.id) != str(row['author']['id'])
                     or message.content != row['content'] or not (message.content.strip() or carries)):
                 continue
             a.observe(scope, message.author.id, profile['revision'])
