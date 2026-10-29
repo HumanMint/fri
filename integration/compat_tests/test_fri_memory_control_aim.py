@@ -217,3 +217,35 @@ def test_the_no_agent_fallback_leaves_memory_changes_to_the_panel(monkeypatch, t
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['forget me', 'forget about me'])
+def test_a_control_withdrawn_during_its_last_reply_target_lookup_is_not_carried_out(monkeypatch, tmp_path, text):
+    """The message is read again after every reply-target lookup, so an edit that lands during the last one, before
+    its gateway event arrives, still takes the control back (review of fri #195, round 5)."""
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            agent.dedicated = 0
+            await remembered(agent, store, message)
+            agent.active.clear()
+            frisays = message('noted', user=99)
+            control = message(text)
+            control.reference = SimpleNamespace(message_id=frisays.id, channel_id=1, resolved=None)
+            original, lookups = channel.fetch_message.side_effect, []
+            def fetch(mid):
+                if mid == frisays.id:
+                    lookups.append(mid)
+                    if len(lookups) == 2:  # The last lookup, inside the turn: edited meanwhile, its event delayed.
+                        edited = copy.copy(control)
+                        edited.content = 'never mind'
+                        rows[control.id] = edited
+                return original(mid)
+            channel.fetch_message.side_effect = fetch
+            await agent.handle(control)
+            assert len(lookups) >= 2
+            assert memory(store) == (True, True)
+            assert not any(path == '/chat/memory/control' for path, _ in calls)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
