@@ -1521,8 +1521,12 @@ class Agent:
         if control:
             return self.answered([message])
         privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
-        if privacy not in MEMORY_CONTROLS:  # Nothing for a later memory control to wait for.
+        # Said to someone else, it's no control, so it clears nothing here either (take_turn rechecks before one runs).
+        aimed = bool(privacy) and not dm and directed is None and await self.aimed_elsewhere(message)
+        if aimed or privacy not in MEMORY_CONTROLS:  # Nothing for a later memory control to wait for.
             self.memory_controls.leave(message.author.id, message.id)
+        if aimed:
+            return self.miss(message, 'said to someone else')
         owner_report = (owner_addressed and message.author.id == self.fri.owner_id and
                         (dm or message.guild.id == self.fri.guild_id) and usage_requested(directed or text))
         if not self.config['enabled'] and not privacy and not owner_report:
@@ -1849,6 +1853,8 @@ class Agent:
         if message.id in self.replying:
             return  # Including ambient attention picking a message whose direct reply is still saving.
         if options.get('ambient'):
+            if memory_intent(text):  # Attention never carries out a memory control: only one said to Fri does.
+                return
             return await self.reply_once(message, text, dm, **options)
         self.replying.add(message.id)
         try:
