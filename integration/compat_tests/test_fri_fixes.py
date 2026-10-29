@@ -1423,6 +1423,60 @@ def test_an_unconfirmed_notice_seen_later_is_taken_back_by_the_next_pass(world, 
     assert not pending(world)
 
 
+def copy_during_finish(world, posted, arrives):
+    """Fri's gateway delivers the notice's copy while the pass's finish is on its way: before the controller records
+    it, or after it did and before Fri hears back."""
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        if path.endswith('/finish') and arrives == 'before_recorded':
+            fri_fixes.seen(world.fri, own(world.sent[0], posted[0]))
+        result = await api(method, path, body)
+        if path.endswith('/finish') and arrives == 'after_recorded':
+            fri_fixes.seen(world.fri, own(world.sent[0], posted[0]))
+        return result
+
+    world.fri.api.side_effect = meanwhile
+
+
+@pytest.mark.parametrize('arrives', ['before_recorded', 'after_recorded'])
+def test_a_notice_seen_while_the_pass_records_it_unconfirmed_is_taken_back(world, monkeypatch, arrives):
+    """fri #232: Discord posted the notice, its answer was lost and the reporter erased. Its copy came back while the
+    next pass recorded it as unconfirmed, from the note it read before. The controller never checks an unconfirmed
+    reply again, so Fri takes it back instead of forgetting where it went."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = lose_the_answer(world, monkeypatch)
+    deleted = reply_deletions(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and 'might have posted' in text and not deleted
+    copy_during_finish(world, posted, arrives)
+    monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(posted[0])]
+    assert notice_row(world, job_id)[0] == 'uncertain' and not pending(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert len(deleted) == 1 and len(world.sent) == 1
+
+
+def test_a_take_back_of_a_notice_seen_late_is_tried_again_until_discord_confirms(world, monkeypatch):
+    """The take-back of a notice seen while the pass recorded it unconfirmed, which Discord didn't confirm: the note
+    keeps where it went, and the next pass tries again."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = lose_the_answer(world, monkeypatch)
+    reply_deletions(world, TimeoutError())
+    asyncio.run(tell(world.fri, job_id, OWNER))
+    copy_during_finish(world, posted, 'after_recorded')
+    monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    [entry] = pending(world).values()
+    assert entry['take_back'] and entry['message_id'] == str(posted[0])
+    deleted = reply_deletions(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(posted[0])] and not pending(world)
+
+
 @pytest.mark.parametrize('other', ['no_nonce', 'job_nonce', 'another_channel', 'another_author', 'later_claim'])
 def test_only_the_claims_own_notice_is_ever_taken_for_it(world, monkeypatch, other):
     """Fri's other messages, even ones replying to the same report, never stand in for the notice: not one without
