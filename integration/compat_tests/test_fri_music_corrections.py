@@ -326,6 +326,49 @@ FIX = 'not the one, i meant join us for a bite'
     ("wrong song, Love Story is what i and alex didn't ask for", 'Love Story', False),
     ("wrong song, 'Love Story Isn't What I and Alex Chose'", "Love Story Isn't What I and Alex Chose", True),
     ('wrong song, Love Story, we said no more tracks', 'Love Story', False),
+    # gene #152 (1): an artist they named runs to a clause break, another artist, their own "i" or "we", or the end,
+    # so its second word is its name, not someone's words ("by She Wants Revenge"), quoted or not...
+    ("wrong song, 'Tear You Apart' by She Wants Revenge", 'Tear You Apart', True),
+    ('wrong song, Tear You Apart by She Wants Revenge', 'Tear You Apart', True),
+    ('wrong song, "Tear You Apart" by "She Wants Revenge"', 'Tear You Apart', True),
+    ("wrong song, 'Tear You Apart' by 'She Wants Revenge'", 'Tear You Apart', True),
+    ('wrong song, Say You, Say Me by She Wants Revenge', 'Say You, Say Me She Wants Revenge', True),
+    ("wrong song, 'Tear You Apart' by She Wants Revenge, i said it already", 'Tear You Apart', True),
+    ('wrong song, "Love" by "Alex Said Taylor"', 'Love', True),
+    # ...though a withdrawal or someone else's words after it still count, and so does a verb that isn't its second
+    # word, has no name after it, or introduces someone's words ("'Love' by Alex said Taylor").
+    ("wrong song, 'Tear You Apart' by She Wants Revenge nope", 'Tear You Apart', False),
+    ("wrong song, 'Tear You Apart' by She Wants Revenge, alex said", 'Tear You Apart', False),
+    ("wrong song, 'Tear You Apart' by She Wants Revenge is what alex wants", 'Tear You Apart', False),
+    ('wrong song, \'Tear You Apart\' by "She Wants Revenge" alex said', 'Tear You Apart', False),
+    ('wrong song, \'Tear You Apart\' by "She Wants Revenge", not now', 'Tear You Apart', False),
+    ('wrong song, Love Story by Taylor wants', 'Love Story', False),
+    ('wrong song, Love Story by Taylor wants it', 'Love Story', False),
+    ("wrong song, 'Love' by Alex asked for", 'Love', False),
+    ('wrong song, Love Story by Taylor alex wants Despacito', 'Love Story', False),
+    ('wrong song, Love Story by Alex said Taylor', 'Love Story', False),
+    # gene #152 (2): their own closing "i said not now" or "we said no more" takes the song back even when the song
+    # they proposed took it in, unless it's that song said again, and a title they quoted keeps its words.
+    ('wrong song, Love Story, we said no more', 'Love Story we said no more', False),
+    ('wrong song, Love Story, i said not now', 'Love Story i said not now', False),
+    ('wrong song, Love Story, we said not right now lol', 'Love Story, we said not right now lol', False),
+    ('wrong song, Love Story, i said no, not now', 'Love Story i said no not now', False),
+    ('wrong song, Love Story by Taylor Swift, i told you not anymore', 'Love Story Taylor Swift i told you not anymore',
+     False),
+    ('wrong song, Not Now, i said not now', 'Not Now i said not now', True),
+    ('wrong song, Not Now by Blink-182, i said not now', 'Not Now Blink-182 i said not now', True),
+    ('wrong song, "Love Story, we said no more"', 'Love Story we said no more', True),
+    # gene #152 (3): the song said again is the title they quoted without an artist they quoted with it...
+    ('wrong song, "Not Now by Blink-182", i said "Not Now"', 'Not Now by Blink-182', True),
+    ('wrong song, "Not Now from Blink-182", i said "Not Now"', 'Not Now from Blink-182', True),
+    ('wrong song, "Not Now feat. Blink-182", i said "Not Now"', 'Not Now feat. Blink-182', True),
+    ('wrong song, "No More by Blink-182", not now', 'No More by Blink-182', False),
+    ("wrong song, 'Not Now By Me', i said not now", 'Not Now By Me', False),  # "By Me" names no one.
+    # gene #152 (4): ...and may leave out a leading article, as naming the song may.
+    ('wrong song, the Not Now by Blink-182, i said "Not Now"', 'Not Now Blink-182', True),
+    ('wrong song, the Not Now by Blink-182, not now', 'Not Now Blink-182', True),
+    ('wrong song, the Not Now by Blink-182, i said "Not Now"', 'The Not Now Blink-182', True),
+    ('wrong song, the No More by Blink-182, not now', 'No More Blink-182', False),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
