@@ -446,9 +446,16 @@ def test_a_reply_built_from_receipts_keeps_only_post_links_they_showed(kind, val
      f'<{FOUND}> <https://discord.com/x<y/../channels/123/2/1300000000000000005/..>'),
     # A masked link with an empty label is one too, and its target holds a "<" as well.
     ('see [](https://discord.com/x<y/../'+PATH+') ok', 'see  ok'), (f'see []({FOUND}) ok', f'see <{FOUND}> ok'),
-    # Discord's autolink needs a "/" after the scheme, so without one the <…> isn't a link's end for certain.
+    # Discord's autolink needs a "/" after the scheme, so without one the <…> isn't a link's end for certain, nor a
+    # masked link's whose scheme a tab splits.
     ('<https:discord.com/'+PATH[:-3]+'<009/../>', 'can’t link that one.'),
     ('<htt\tps\n:discordapp.com/'+PATH[:-3]+'<009/../>', 'can’t link that one.'),
+    ('[kev](<htt\tps://discord.com/'+PATH+'/..>)', 'kev'),
+    # A masked link this pattern doesn't take (its label holds a newline, or a "]" Discord allows): right after the "(",
+    # its target is read to a space, through a "<" or ">".
+    ('[kev\n](https://discord.com/x<y/../'+PATH+')', '[kev\n]()'), ('[a]b](https://discord.com/x<y/../'+PATH+')', '[a]b]()'),
+    ('[kev\n](<https://discord.com/a>b<c/../'+PATH+'>)', '[kev\n](<)'),
+    (f'[kev\n]({FOUND}<x)', f'[kev\n](<{FOUND}><x)'), (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'),
 ])
 def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
     from fri.fri_links import link_posts
@@ -459,6 +466,7 @@ def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
     '<https:'*660, '<https://discord.com/x/../'*160, '<\x01htt\tps://discord.com/x/..'*140, '<https://a<'*400,
     '<https://discord.com/'+'x/'*1990, '[a](<https://discord.com/x/../'*130, '<https://discord.com/a/'*180,
     'https://discord.com/x/../'*160, 'https://discord.com/a/'*180, '<h\ttps:'*500, '<https://discord.com\\x/..'*150,
+    '(https://discord.com/x/../'*160, '[a\n](<https://discord.com/x/..'*130, '( <\x01https:'*500,
 ])
 @pytest.mark.parametrize('end', ['', '>'])
 def test_a_4000_character_reply_full_of_links_in_brackets_is_filtered_well_under_100_ms(filler, end):
