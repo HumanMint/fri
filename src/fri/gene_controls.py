@@ -171,7 +171,7 @@ CLAUSE = r"(?:^|[,;:.!?—–\-\"'‘“”]\s*|\b(?:and|but|or|so|then|also|plu
 # Outside a quoted title, any of these means the message is not asking for that song now.
 REFUSED = re.compile(
     rf"{CLAUSE}(?:don'?t|do not)\b"  # A clause that opens with "don't": "... do not queue anything yet".
-    r"|\b(?:don'?t|do not|not|never)\s+(?:(?:even|actually|really|just|yet|to)\s+)?(?:play|queue|add|put|start)\b"
+    r"|\b(?:don'?t|do not|not|never)\s+(?:(?:even|actually|really|just|yet|to|ever|again)\s+){0,2}(?:play|queue|add|put|start)\b"
     r"|\b(?:don'?t|do not)[\s.!?'\"”]*$"
     r"|\b(?:cancel\w*|never ?mind|nvm|forget (?:it|that|about (?:it|that))|scratch that|hold off|not yet|no need|jk|just kidding)\b"
     # Someone else's words introducing more ("alex said X"; a title like "She Said" ends there), or an example.
@@ -184,7 +184,7 @@ REFUSED = re.compile(
     r"|\bi meant to\b(?!\s+(?:the|a|an|my|your|his|her|our|their|this|that|these|those|me|you|him|us|them|all)\b)")
 # After the song, a change of heart withdraws it: "wrong song, Love Story, actually no", "... not that one either",
 # a bare "nope" or "no thanks", or a closing "nah" or "no" after a pause, whatever punctuation or filler follows
-# ("nah, lol"; "Hell No" stays a title), or a closing "i said no" or "i told you not to". Checked after the
+# ("nah, lol"; "Hell No" stays a title), or a closing "i said no (to that)" or "i told you not to". Checked after the
 # correction only, since "actually no, wrong song, X" opens one.
 CLOSING = (r"(?:[\s,;:.!?…—–\-'\"”]|\b(?:lol|lmao|lmfao|haha|bro|bruh|dude|man|fri|thanks|thank you|thx|ty|tho|though"
            r"|sorry)\b)*+$")
@@ -193,7 +193,8 @@ WITHDRAWN = re.compile(r"\b(?:actually,?\s+(?:no(?:pe|t that)?|nah)|no,?\s+wait|
                        r"|not\s+(?:(?:that|this|the|it)\s+)?(?:(?:one|song|track)\s+)?either)\b"
                        rf"|\bnah\b{CLOSING}|[,;:.!?…—–\-'\"]\s*no\b{CLOSING}"
                        r"|\bi(?:'ve|'d)?\s+(?:(?:just|already|literally|clearly|even|actually|originally)\s+){0,2}"
-                       rf"(?:said|told\s+(?:you|u)|asked(?:\s+(?:you|u))?|meant)\s+(?:(?:not|never)(?:\s+to)?|no(?:pe)?|nah)\b{CLOSING}")
+                       r"(?:said|told\s+(?:you|u)|asked(?:\s+(?:you|u))?|meant)\s+(?:(?:not|never)(?:\s+to(?:\s+do\s+(?:that|this|it))?)?"
+                       rf"|(?:no(?:pe)?|nah)(?:\s+to\s+(?:that|this|it)(?:\s+(?:one|song|track))?)?)\b{CLOSING}")
 # After the song, a clause handing it to someone else, quoting someone or calling it an example takes it back too:
 # "'Love Story' was an example", "... is what i heard alex say", "..., alex said", "... was a quote from alex". Their
 # own "i said" or "i asked for it" doesn't.
@@ -209,13 +210,15 @@ BREAK = re.compile(r"[,;:!?…—–()\[\]\"“”]|\.(?!\w)|\s-+(?=\s|$)|'s\b|\
                    r"|plus|actually|wait|lol|lmao|nah|no|oh|please|pls|examples?|for instance|e\.?g|hypothetical(?:ly)?"
                    r"|such as|according to|quot\w*)\b")
 PAUSE = re.compile(r"[,;:.!?…—–()\[\]\"“”]\s?$")
-# Right after the song (and its artist), in the same clause, their own words denying it: "... is not what i meant",
+ADDRESSED = re.compile(r"\b(?:you|u|we)\s$")
+# Right after the song (and its artist), in the same clause, their own words denying it: "... is (absolutely) not what i meant",
 # "... isn't the one i asked for", "... is what i didn't ask for". ("..., that's not what i asked for" is about the
 # song Gene played.)
 DENIAL = (r"(?:said|say(?:ing)?|told|tell(?:ing)?|ask(?:ed|ing)?|want(?:ed|ing)?|meant|mean(?:ing)?|pick(?:ed|ing)?"
           r"|request(?:ed|ing)?|cho(?:se|ose|osing)|had\s+in\s+mind)\b")
-DISOWNED = re.compile(r"[^,;:.!?…—–()\[\]\"“”]*?\b(?:(?:(?:is|was|are|were)\s+not|(?:isn|wasn|aren|weren|ain)'?t)\s+"
-                      r"(?:(?:really|quite|exactly|even|at\s+all)\s+)?(?:what|who|the\s+(?:one|song|track))\s+(?:that\s+)?"
+HEDGE = r"(?:really|quite|exactly|even|at\s+all|absolutely|definitely|certainly|totally|clearly|honestly|literally|actually|just|so|simply)"
+DISOWNED = re.compile(rf"[^,;:.!?…—–()\[\]\"“”]*?\b(?:(?:(?:is|was|are|were)\s+(?:{HEDGE}\s+){{0,2}}not|(?:isn|wasn|aren|weren|ain)'?t)\s+"
+                      rf"(?:{HEDGE}\s+){{0,2}}(?:what|who|the\s+(?:one|song|track))\s+(?:that\s+)?"
                       r"i(?:'ve|'d|'m)?\s+(?:(?:just|already|literally|clearly|even|actually|originally|been)\s+){0,2}"
                       r"|(?:is|was|are|were)\s+(?:(?:really|exactly|just)\s+)?(?:what|who|the\s+(?:one|song|track))\s+"
                       r"(?:that\s+)?i\s+(?:didn'?t|did\s+not|don'?t|do\s+not|never)\s+(?:(?:even|really|ever)\s+)?)"+DENIAL)
@@ -294,12 +297,14 @@ def masked(text, spans):
 
 def handed_off(text, clause, song_end):
     """From `clause`, the title's end, the words hand the song to someone else or call it an example. Their own "i
-    said" doesn't, unless the "i" was part of the song they named; nor does a verb opening a clause in that song."""
+    said" doesn't, unless the "i" was part of the song they named; nor does a verb opening a clause in that song, or
+    a bare "you say" or "we want" in it ("I Like the Way You Say My Name")."""
     for m in TRAILING.finditer(text, clause):
         verb = m.start('verb') if m['verb'] else -1
         if m['own'] and not m.start() < song_end <= verb:
             continue
-        if 0 <= verb < song_end and PAUSE.search(text, max(0, verb-2), verb):
+        if 0 <= verb < song_end and (PAUSE.search(text, max(0, verb-2), verb)
+                                     or m['verb'] in ('say', 'want') and ADDRESSED.search(text, max(0, verb-4), verb)):
             continue
         return True
     return False
