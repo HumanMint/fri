@@ -420,7 +420,6 @@ class Fri(discord.Client):
                 retired = await self.agent.retired(context['recent'], ((fence or {}).get('turn') or {}).get('guild_id'),
                                                    turn=self.agent.rechecks(fence))
                 context['recent'] = [row for row in context['recent'] if row.get('id') not in retired]
-            self.depend(context)  # And the summaries those, and a reply of Fri's it answers, drew on (fri #193).
             # The delivery check, run before the request too: the words of anyone in view who erased or
             # changed their privacy since they were read never reach the model. An outside @mention has
             # its invitation's own check instead, as before it replies.
@@ -456,8 +455,11 @@ class Fri(discord.Client):
                 # during them is caught (see talk).
                 if fence.get('gate'):
                     await fence['gate']()
+                # With the summaries Fri's replies in view (and one it answers) drew on, as they stand now: refused
+                # if one went. They count for the save only once the request still carries them (see depend).
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
-                    context, fence['turn']['user_id'], fence['actions']), **self.summary_generation(context)})
+                    context, fence['turn']['user_id'], fence['actions']), **self.summary_generation(
+                        context, also=self.dependencies(context))})
             # A message its author edited or deleted since the live view was copied: its old words stay out.
             # A row read again after that, as an edited message answered again is, holds what it says now.
             # So does one the live view no longer holds as copied: pushed out by newer lines while the turn
@@ -539,6 +541,7 @@ class Fri(discord.Client):
             # by now is answered with it instead, and one after this is answered on its own (see Continuation).
             if fence and fence.get('commit') and not fence['commit']():
                 raise Continued()
+            self.depend(context)  # What the request carries now drew on those summaries (fri #193).
         # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
         seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
         result = await self.chat.respond(text, context, ready=ready)
@@ -1009,7 +1012,7 @@ class Fri(discord.Client):
             return None
         return summary
 
-    def summary_generation(self, context):
+    def summary_generation(self, context, also=()):
         """What a turn's checks and save carry for Fri's summary of the member its model request had (gene #91): that
         summary's generation, from the same /chat/context response. A withdrawal dropping the summary since moves it,
         so the controller refuses the turn and its reply is withheld. The first one a request carried (see chat_once),
@@ -1020,26 +1023,30 @@ class Fri(discord.Client):
         fence = context.get('fence') or {}
         generation = fence.get('summary_generation', (context.get('member_summary') or {}).get('generation'))
         carried = {'summary_generation': generation} if type(generation) is int else {}
-        if DEPENDENCIES in self.capabilities and fence.get('summary_dependencies'):  # See depend.
-            carried['summary_dependencies'] = [{'user_id': user, 'generation': number}
-                                               for user, number in sorted(fence['summary_dependencies'])]
+        depends = set(fence.get('summary_dependencies', ())) | set(also)  # `also`: a check's prospective ones.
+        if DEPENDENCIES in self.capabilities and depends:  # See depend.
+            carried['summary_dependencies'] = [{'user_id': user, 'generation': number} for user, number in sorted(depends)]
         return carried
 
-    def depend(self, context):
-        """Before a request: Fri's earlier replies it carries that drew on a member's summary, an echo in the channel's
-        view (as Gene answered its recheck) or a reply of Fri's the member answered (see resolve_references). The turn
-        depends on those summaries from here to its save, so Gene refuses it once one goes, and retires its saved reply
-        then, and its echo is rechecked like theirs (fri #193). Kept with the fence, which tool steps share: an earlier
-        request's still count. Nothing from a controller without summary dependencies, or for an ordinary turn."""
+    def dependencies(self, context):
+        """The summaries Fri's earlier replies in this context drew on: an echo in the channel's view (as Gene answered
+        its recheck) or a reply of Fri's the member answered (see resolve_references), as (user, generation) pairs.
+        Nothing from a controller without summary dependencies, or for an ordinary turn."""
         fence = context.get('fence')
         if fence is None or DEPENDENCIES not in self.capabilities:
-            return
+            return set()
         known = getattr(fence.get('rechecks'), 'summaries', {})
         carried = [item for row in context.get('recent', []) for item in known.get(row.get('id'), ())]
         carried += context.get('reference_summaries', [])
-        if carried:
-            fence.setdefault('summary_dependencies', set()).update(
-                (str(item['user_id']), int(item['generation'])) for item in carried)
+        return {(str(item['user_id']), int(item['generation'])) for item in carried}
+
+    def depend(self, context):
+        """Last thing before a request, once nothing more leaves its context: the turn depends on the summaries what it
+        carries drew on, from here to its save, so Gene refuses it once one goes, and retires its saved reply then, and
+        its echo is rechecked like theirs (fri #193). One that dropped out before the request (deleted meanwhile, say)
+        doesn't count. Kept with the fence, which tool steps share: an earlier request's still count."""
+        if found := self.dependencies(context):
+            context['fence'].setdefault('summary_dependencies', set()).update(found)
 
     async def memory_overview(self, scope, profile, private, summary=None):
         """Everything for the member's own eyes in private; in public, only what that channel can see."""
