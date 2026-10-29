@@ -1459,6 +1459,26 @@ def test_a_notice_seen_while_the_pass_records_it_unconfirmed_is_taken_back(world
     assert len(deleted) == 1 and len(world.sent) == 1
 
 
+def test_a_notice_seen_after_a_pass_recorded_it_unconfirmed_is_taken_back(world, monkeypatch):
+    """The pass's record of the notice as unconfirmed went through, its answer was lost, and the copy came after.
+    The next pass reports it sent, and the controller answers with its record, which it never checks again: Fri
+    takes it back instead of forgetting where it went."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = lose_the_answer(world, monkeypatch)
+    deleted = reply_deletions(world)
+    asyncio.run(tell(world.fri, job_id, OWNER))
+    lost_finish(world)
+    monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    [entry] = pending(world).values()
+    assert 'message_id' not in entry and notice_row(world, job_id)[0] == 'uncertain' and not deleted
+    fri_fixes.seen(world.fri, own(world.sent[0], posted[0]))
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(posted[0])]
+    assert notice_row(world, job_id)[0] == 'uncertain' and not pending(world)
+
+
 def test_a_take_back_of_a_notice_seen_late_is_tried_again_until_discord_confirms(world, monkeypatch):
     """The take-back of a notice seen while the pass recorded it unconfirmed, which Discord didn't confirm: the note
     keeps where it went, and the next pass tries again."""
