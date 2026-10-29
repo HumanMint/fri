@@ -6,9 +6,16 @@ Only deployed counts: a failure, a rejection, a withdrawal or a hand-off to the 
 announced, and nothing is while Gene's running release is unknown. The owner's DM for a shipped
 repair that a member reported gets a Tell reporter button, which replies to that report once. If what the
 controller checked stopped holding while the reply went out, Fri takes the reply back.
+
+A controller that offers it has Fri ask for the send itself once its last Discord read is done, so the
+reporter's erasure or a release landing meanwhile stops the reply before it posts (fri #214). The send is
+noted first, and a heartbeat pass settles one a lost answer or a shutdown left, whatever the controller
+offers by then: it records what happened and takes back a reply that no longer holds. A send whose outcome
+never came back stays unconfirmed: Discord can't tell the notice from another reply of Fri's to the report.
 """
 
 import asyncio
+import collections
 import json
 import logging
 import re
@@ -35,6 +42,14 @@ MARKING = set()  # 👀 still on their way after attention moved on, kept so non
 SETTLED = frozenset({'deployed', 'rejected', 'failed', 'needs_attention'})
 CAPABILITY = 'requester-notices'
 RECHECK = 'requester-notice-recheck'  # The controller says when a sent reply's claim stopped holding (gene #47).
+AUTHORIZE = 'requester-notice-authorize'  # Fri asks for the send right before it (fri #214).
+# Sends a tap asked for, until what happened is recorded and done: the lease, the owner who tapped, where it went,
+# Fri's own message once it's out, and times. Nothing of the report's.
+PENDING = 'requester-notices.json'
+GAVE_UP = 60  # Fri gives a send 25 s: noted this long ago with no tap running, it has posted or never will.
+KEEP = 86400  # A noted send still unsettled after this (a channel gone, say) is dropped, and logged.
+TELLING = collections.Counter()  # Taps replying for each job in this process, which a pass leaves alone.
+SETTLING = weakref.WeakKeyDictionary()  # Each agent's settling pass, waited on like check's.
 JOB = re.compile(r'[a-f0-9]{12}')
 TELL_ID = re.compile(r'^fri:tell:(?P<job_id>[a-f0-9]{12})$')
 SOURCE = re.compile(r'https://discord\.com/channels/(?P<guild>[0-9]{1,25}|@me)/(?P<channel>[0-9]{1,25})/(?P<message>[0-9]{1,25})')
@@ -359,16 +374,31 @@ async def tell(fri, job_id, actor):
     """Read Discord, then claim the controller's mark, reply once and record what happened.
 
     The claim checks erasure, rollbacks and the live release, so nothing that changed while Discord answered
-    can slip through. With it held, Fri reads the live release and a thread it had to fetch once more, so a
-    release or an archive while the claim was out stops the reply too. What the owner sees, and whether it posted."""
+    can slip through. With it held, Fri reads a thread it had to fetch once more, then asks the controller for
+    the send, which checks all that again (fri #214); an older controller has Fri read the live release itself
+    instead. A release, an erasure or an archive while the claim was out stops the reply too. What the owner
+    sees, and whether the reporter was told."""
+    TELLING[job_id] += 1  # Counted: a second tap that ends first mustn't uncover the first.
+    try:
+        return await tell_once(fri, job_id, actor)
+    finally:
+        TELLING[job_id] -= 1
+        if TELLING[job_id] <= 0:
+            del TELLING[job_id]
+
+
+async def tell_once(fri, job_id, actor):
     from .fri_workspace import send_once
     scope = {'guild_id': str(fri.guild_id), 'user_id': str(actor)}
+    # An older controller ignores a field it doesn't know, and would take a prepared claim as cleared to send.
+    authorizes = AUTHORIZE in getattr(fri, 'capabilities', ())
     try:
         job = await fri.api('GET', '/requests/'+job_id)
         channel, message, fetched = await report(fri, job)
         await live(fri, job)
         postable(fri, channel)
-        claimed = await fri.api('POST', f'/requests/{job_id}/requester-notice', scope)
+        claimed = await fri.api('POST', f'/requests/{job_id}/requester-notice',
+                                {**scope, 'prepare': True} if authorizes else scope)
     except Unreachable as exc:
         return f'didn’t send it: {exc}.', False
     except commands.UserFeedbackCheckFailure as exc:
@@ -379,19 +409,31 @@ async def tell(fri, job_id, actor):
     if not isinstance(lease, str) or not lease:
         LOG.warning('Requester notice claim for %s came back without a lease; nothing sent', job_id)
         return 'didn’t send it. tap again later.', False
-    state, message_id, sending = 'failed', '', False
+    state, message_id, sending, entry = 'failed', '', False, None
     try:
         if not isinstance(claimed.get('job'), dict) or any(
                 str(claimed['job'].get(key)) != str(job.get(key)) for key in ('user_id', 'source_url', 'approved_sha')):
             raise Unreachable('their report changed while i looked. tap again')
-        await live(fri, job)
+        if not authorizes:
+            await live(fri, job)
         if fetched:
             channel = await fri.fetch_channel(channel.id)
         postable(fri, channel)  # Config or the channel may have changed while the claim was out.
+        if authorizes:
+            # Noted before the send is asked for: a shutdown from here on leaves the next pass something to settle.
+            entry = {'lease': lease, 'actor': str(actor), 'channel_id': str(channel.id), 'since': time.time(),
+                     'at': time.time()}
+            note(fri, job_id, entry)
+            await cleared(fri, job_id, scope, lease)
+            entry = {**entry, 'cleared': True}  # From here a shutdown may leave a reply up: unconfirmed, not failed.
+            note(fri, job_id, entry)  # Raises if it can't be noted, and then nothing is sent.
+            postable(fri, channel)  # Again, after the controller's answer: nothing is awaited from here to the send.
         sending = True
         result = await send_once(fri, {'id': job_id, 'target_id': str(channel.id),
                                        'body': told_line(job['approved_sha'])}, reply_to=message.id)
         message_id, state = str(int(result['id'])), 'sent'
+        if entry:
+            entry = keep(fri, job_id, {**entry, 'message_id': message_id})
         text = f'told them: {message.jump_url}'
     except Unreachable as exc:
         text = f'didn’t send it: {exc}.'
@@ -406,31 +448,170 @@ async def tell(fri, job_id, actor):
         state = 'uncertain' if sending else 'failed'
         text = ('discord didn’t confirm the reply, so it might have posted. not sending it twice.' if sending
                 else 'didn’t send it. tap again later.')
-    recorded = None
+    recorded, answered = None, False
     try:
         recorded = await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
                                  {**scope, 'lease': lease, 'state': state, 'message_id': message_id})
-    except (commands.UserFeedbackCheckFailure, *TAP_FAILURES):  # An answer Fri can't read is still unconfirmed.
+        answered = True
+    except (commands.UserFeedbackCheckFailure, *TAP_FAILURES) as exc:  # An answer Fri can't read is still unconfirmed.
+        answered = isinstance(exc, ControllerRejected)  # Refused: the same again would be too.
         LOG.warning('Requester notice outcome for %s not recorded; it stays unretried', job_id)
     if (state == 'sent' and RECHECK in getattr(fri, 'capabilities', ()) and isinstance(recorded, dict) and
             recorded.get('state') == 'invalidated'):
-        return await take_back(channel, message_id, recorded.get('reason'), message), False
+        if entry:
+            entry = keep(fri, job_id, {**entry, 'take_back': True})
+        outcome = await retract(channel, message_id)
+        if entry and outcome != 'unconfirmed':
+            forget(fri, job_id, lease)
+        return taken_back(outcome, recorded.get('reason'), message, retried=entry is not None), False
+    if entry and answered:  # Otherwise the next pass hears the answer again (see settle).
+        forget(fri, job_id, lease)
     return text, state == 'sent'
 
 
-async def take_back(channel, message_id, reason, report):
-    """The controller's checks stopped holding while the reply went out (a rollback, a newer release, the
-    reporter's erasure), so it never recorded it as sent. It's Fri's own message: delete it."""
-    why = reason.strip().rstrip('.')[:300] if isinstance(reason, str) and reason.strip() else ''
-    why = why or 'gene’s checks stopped holding while it went out'
+async def cleared(fri, job_id, scope, lease):
+    """The controller's go for the send, which checks the claim, the reporter's privacy and the release again."""
+    try:
+        await fri.api('POST', f'/requests/{job_id}/requester-notice/authorize', {**scope, 'lease': lease})
+    except ControllerRejected as exc:
+        raise Unreachable(notice_text(str(exc)).strip().rstrip('.')[:300] or 'gene said no') from None
+
+
+async def retract(channel, message_id):
+    """Fri's own reply down: 'gone' once it is (or already was), 'refused' when Discord won't, 'unconfirmed'
+    when Discord didn't answer, which a later try may settle."""
     try:
         await asyncio.wait_for(channel.get_partial_message(int(message_id)).delete(), 10)
     except discord.NotFound:
-        pass  # Already gone.
-    except (discord.HTTPException, *TAP_FAILURES):
+        return 'gone'
+    except discord.HTTPException as exc:
+        return 'unconfirmed' if exc.status >= 500 else 'refused'
+    except (TimeoutError, OSError, discord.DiscordException):
+        return 'unconfirmed'
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return 'refused'
+    return 'gone'
+
+
+def taken_back(outcome, reason, report, retried=False):
+    """The controller's checks stopped holding while the reply went out (a rollback, a newer release, the
+    reporter's erasure), so it never recorded it as sent. retried: a later pass tries again (see settle)."""
+    why = reason.strip().rstrip('.')[:300] if isinstance(reason, str) and reason.strip() else ''
+    why = why or 'gene’s checks stopped holding while it went out'
+    if outcome == 'gone':
+        return notice_text(f'took the reply back: {why}.')
+    LOG.warning('A reply whose claim stopped holding was not taken back yet')
+    if outcome == 'unconfirmed' and retried:
+        return notice_text(f'it posted, but {why}, and discord didn’t confirm taking it back. '
+                           f'i’ll keep trying: {report.jump_url}')
+    return notice_text(f'it posted, but {why}, and discord wouldn’t let me take it back: {report.jump_url}')
+
+
+def noted(fri):
+    try:
+        entries = json.loads((fri.data/PENDING).read_text())
+    except FileNotFoundError:
+        return {}
+    except (ValueError, RecursionError, OSError) as exc:
+        LOG.warning('Requester notice sends unreadable (%s)', type(exc).__name__)
+        return {}
+    return entries if isinstance(entries, dict) else {}
+
+
+def note(fri, job_id, entry):
+    """Read again just before each write, like save. Raises if it can't be written: a send isn't cleared then."""
+    entries = noted(fri)
+    entries[job_id] = entry
+    private_json(fri.data/PENDING, entries)
+
+
+def keep(fri, job_id, entry):
+    """note, once the send is out: a failed write is logged, and the tap still records what happened."""
+    try:
+        note(fri, job_id, entry)
+    except OSError as exc:
+        LOG.warning('Requester notice send not noted: %s', type(exc).__name__)
+    return entry
+
+
+def forget(fri, job_id, lease):
+    """Only this lease's: a later tap may have noted its own since. A malformed one goes whatever its lease."""
+    entries = noted(fri)
+    entry = entries.get(job_id)
+    if job_id in entries and (not isinstance(entry, dict) or entry.get('lease') == lease):
+        entries.pop(job_id)
+        try:
+            private_json(fri.data/PENDING, entries)
+        except OSError as exc:
+            LOG.warning('Requester notice send not forgotten: %s', type(exc).__name__)
+
+
+async def settle(agent):
+    """Heartbeat stage, whether Fri is switched on or not and whatever the controller offers: taking a reply back
+    is never a post, and a note can outlive the controller that cleared its send. Waited on like check, and
+    never cancelled."""
+    task = SETTLING.get(agent)
+    if task is None or task.done():
+        if not noted(agent.fri):
+            return
+        task = SETTLING[agent] = asyncio.create_task(settle_all(agent.fri))
+        task.add_done_callback(ended)
+    done, _ = await asyncio.wait({task}, timeout=PASS)
+    if not done:
+        raise TimeoutError('Requester notice pass still running')
+    task.result()
+
+
+async def settle_all(fri):
+    """Each cleared send whose tap never saw it through: a lost answer, a shutdown, a take-back cut off."""
+    for job_id, entry in noted(fri).items():
+        if TELLING.get(job_id):
+            continue
+        try:
+            if not JOB.fullmatch(job_id) or not isinstance(entry, dict):
+                done = True
+            elif time.time()-float(entry['at']) > KEEP:
+                LOG.warning('Gave up settling a requester notice send')
+                done = True
+            else:
+                done = await settle_one(fri, job_id, entry)
+        except MALFORMED:
+            done = True
+        except (commands.UserFeedbackCheckFailure, discord.DiscordException, TimeoutError, OSError) as exc:
+            LOG.info('Requester notice send not settled yet: %s', type(exc).__name__)
+            continue
+        if done:
+            forget(fri, job_id, entry.get('lease') if isinstance(entry, dict) else None)
+
+
+async def settle_one(fri, job_id, entry):
+    """Record what a noted send did, then take it back if it no longer holds. True once nothing's left to do.
+
+    A send cut off before Fri heard its outcome is recorded as unconfirmed once it was cleared (it may be up),
+    and as failed before then: Fri never sends without the controller's go."""
+    message_id = str(entry.get('message_id') or '')
+    if not message_id and time.time()-float(entry['since']) < GAVE_UP:
+        return False  # A send from a tap that just stopped may still land.
+    if not entry.get('take_back'):
+        state = 'sent' if message_id else 'uncertain' if entry.get('cleared') else 'failed'
+        try:
+            recorded = await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
+                                     {'guild_id': str(fri.guild_id), 'user_id': str(entry['actor']),
+                                      'lease': entry['lease'], 'state': state, 'message_id': message_id})
+        except ControllerRejected:
+            return True  # No claim of this lease (another tap's, or recorded), or no such route: an older controller.
+        if not (state == 'sent' and isinstance(recorded, dict) and recorded.get('state') == 'invalidated'):
+            return True
+        keep(fri, job_id, {**entry, 'take_back': True})
+    outcome = await retract(await reach(fri, entry), message_id)
+    if outcome == 'refused':
         LOG.warning('A reply whose claim stopped holding could not be taken back')
-        return notice_text(f'it posted, but {why}, and discord wouldn’t let me take it back: {report.jump_url}')
-    return notice_text(f'took the reply back: {why}.')
+    return outcome != 'unconfirmed'
+
+
+async def reach(fri, entry):
+    """Where the reply went. Gone or unreadable, the pass tries again later, until KEEP."""
+    return fri.get_channel(int(entry['channel_id'])) or await fri.fetch_channel(int(entry['channel_id']))
 
 
 class TellReporter(discord.ui.DynamicItem[discord.ui.Button], template=TELL_ID):

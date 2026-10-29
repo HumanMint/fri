@@ -2576,6 +2576,7 @@ class Agent:
             LOG.warning('Fri heartbeat deferred: %s; no authority or approval inferred', type(exc).__name__)
         else:
             from .fri_fixes import check as check_fixes
+            from .fri_fixes import settle as settle_notices
             from .fri_member_summary import CAPABILITY as SUMMARIES
             from .fri_member_summary import build as build_summary
             from .fri_reply_checks import CAPABILITY
@@ -2595,6 +2596,7 @@ class Agent:
                        await self.stage('learning', self.learn, 'enabled'),
                        await self.stage('attention', self.attend, 'enabled'),
                        await self.stage('fixes', lambda: check_fixes(self), 'enabled'),
+                       await self.stage('notices', lambda: settle_notices(self)),
                        await self.stage('memes', self.check_memes, 'enabled', 'meme_enabled'),
                        await self.stage('reply_checks', lambda: check_replies(self), 'enabled', 'reply_check_enabled',
                                         when=lambda: CAPABILITY in self.fri.capabilities),
