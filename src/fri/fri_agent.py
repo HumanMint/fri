@@ -157,6 +157,7 @@ class Rechecks:
 
     def __init__(self):
         self.retired, self.spent, self.failed = set(), 0.0, False
+        self.summaries = {}  # One Gene still holds as said: the summaries it drew on, from its answer (fri #193).
 
 
 class Agent:
@@ -378,8 +379,10 @@ class Agent:
                                      'text': clean(text, 500), 'at': time.time(), 'gene_error': False, 'fri': True,
                                      'provenance': echo['provenance']})
         if echo.get('summarized'):
-            now = time.time()  # As long as the live view keeps a row (see messages).
-            self.summarized = {mid: at for mid, at in self.summarized.items() if at > now-900}
+            # Kept an hour, though the live view drops the row at 15 minutes (see messages): a turn that copied it may
+            # still be running, and its last checks recheck only what's marked (fri #193).
+            now = time.time()
+            self.summarized = {mid: at for mid, at in self.summarized.items() if at > now-REDELIVERY_SECONDS}
             self.summarized[str(sent.id)] = now
 
     @staticmethod
@@ -416,14 +419,28 @@ class Agent:
             turn.spent += time.monotonic()-began
         gone = {mid for mid in asked if not (found.get(mid) or {}).get('verbatim')}
         turn.retired |= gone
+        turn.summaries.update((mid, found[mid].get('summaries', [])) for mid in asked if mid not in gone)
         if gone:  # For good: out of the live view too, so later turns don't ask again.
             for key, kept in self.recent.items():
                 self.recent[key] = deque((r for r in kept if r['id'] not in gone), maxlen=30)
         return known | gone
 
-    def unsend(self, channel, ids):
+    def saved_in(self, event):
+        """The server Fri saves exchanges said where a raw edit or delete happened under, so one it saved before it
+        started is withdrawn too (see SavedTurns.withdraw): its own for a DM (an event naming no server), the event's
+        in a channel it chats in. None anywhere else, or for an event that names nothing."""
+        if not hasattr(event, 'guild_id'):
+            return None
+        if event.guild_id is None:
+            return self.fri.guild_id
+        channel = self.fri.get_channel(event.channel_id)
+        if channel is None:  # A thread not in the cache, say.
+            return event.guild_id if event.guild_id == self.fri.guild_id else None
+        return event.guild_id if self.allowed(channel) else None
+
+    def unsend(self, channel, ids, saved_in=None):
         """Messages taken back, by their author or a moderator: they leave Fri's live view and any burst
-        still gathering, and a reply being composed for one is neither sent nor saved.
+        still gathering, and a reply being composed for one is neither sent nor saved. saved_in: see saved_in.
 
         Gene's error posts stay until they expire, so a quick delete can't hide one from the repair
         investigation."""
@@ -467,7 +484,7 @@ class Agent:
                     self.active[key] = replaced
         self.unjoin(ids, deleted=True)  # Before the bursts below: a question that gave way answers alone.
         self.bursts.unsend(channel, ids)
-        self.saved_turns.withdraw(ids)  # Their saved exchanges too, so their words don't come back as history.
+        self.saved_turns.withdraw(ids, saved_in)  # Their saved exchanges too, so their words don't come back as history.
         self.receipts.withdraw(ids)  # And Fri's outside answers that drew on them, or were them.
 
     def gone(self, i):
@@ -488,8 +505,9 @@ class Agent:
         while self.looked and now-next(iter(self.looked.values()))[0] > REDELIVERY_SECONDS:
             del self.looked[next(iter(self.looked))]
 
-    def edit(self, channel, message):
-        """A member's edit shows in Fri's live view as they left it. Fri's and Gene's rows keep what they
+    def edit(self, channel, message, saved_in=None):
+        """A member's edit shows in Fri's live view as they left it, and takes their saved exchange with it, however long
+        ago Fri last carried it (fri #174; saved_in: see saved_in). Fri's and Gene's rows keep what they
         said, and in-flight bursts and reply fences keep comparing against what arrived. A member's message
         still being handled is withdrawn instead: what handles it holds what it said before, maybe with no
         row yet (its arrival reads), and its last check before the model then refuses it (see Fri.chat_once).
@@ -510,6 +528,8 @@ class Agent:
             self.receipts.withdraw([message.id])  # receipt naming it.
         else:  # Any other update of a member's post one names too, a card suppressed during a check's last wait say.
             self.receipts.changed(message.id)
+        if edited:
+            self.saved_turns.withdraw([message.id], saved_in)
         if edited and message.id in self.looked:
             self.revise(message.id)
         if (self.handling[message.id] or message.id in self.rerunning) and edited:
