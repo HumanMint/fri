@@ -207,6 +207,17 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, This Is What You Want', 'This Is What You Want', True),
     ('wrong song, Love Story like alex wanted', 'Love Story like alex wanted', False),
     ('wrong song, Love Story is what they want', 'Love Story is what they want', False),
+    # gene #126 round 2: "like you say" and "what we want" are someone else's words or a denial, and a withdrawal
+    # can end with "please" or "again".
+    ('wrong song, Love Story, like you say', 'Love Story like you say', False),
+    ('wrong song, Love Story as you say', 'Love Story as you say', False),
+    ('wrong song, Love Story is not what we want', 'Love Story is not what we want', False),
+    ('wrong song, Love Story is not what we want', 'Love Story', False),
+    ('wrong song, Love Story, i said no to that one please', 'Love Story', False),
+    ('wrong song, Love Story, i said not to do it again', 'Love Story', False),
+    ('wrong song, We Want the Airwaves', 'We Want the Airwaves', True),
+    ('wrong song, Say No to This', 'Say No to This', True),
+    ('wrong song, Love Story again please', 'Love Story', True),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
