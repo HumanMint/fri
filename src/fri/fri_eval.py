@@ -240,6 +240,11 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
         async for case, result in times(chat, model, effort, voice_notes):
             yield case, result
         return
+    if suite == 'memory':
+        from .fri_memory_eval import evaluate as memory
+        async for case, result in memory(chat, model, effort, voice_notes):
+            yield case, result
+        return
     for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': lambda: [*image_cases(), *link_cases()], 'sass': sass_cases, 'model-text': model_text_cases}[suite]():
         name = case.get('display_name', 'Mint')
         context = {'model': model, 'effort': effort, 'facts': [],
@@ -602,7 +607,7 @@ async def main(suite='voice', baseline=False):
                 'response_kind': result.response_kind, 'reaction': result.reaction,
                 'allow_closing': result.allow_closing,
                 'error': result.error, 'counters': result.counters,
-                **{k: case[k] for k in ('passed', 'evidence') if k in case}}), flush=True)
+                **{k: case[k] for k in ('passed', 'evidence', 'message', 'keep', 'proposed') if k in case}}), flush=True)
             if case.get('passed') is False:
                 failed.append(case['name'])
         if failed:
@@ -612,7 +617,7 @@ async def main(suite='voice', baseline=False):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'loops', 'times', 'sass', 'model-text'), default='voice')
+    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'loops', 'times', 'memory', 'sass', 'model-text'), default='voice')
     parser.add_argument('--baseline', action='store_true', help='ASCII-escape model input, for comparison')
     args = parser.parse_args()
     asyncio.run(main(args.suite, args.baseline))
