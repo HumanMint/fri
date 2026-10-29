@@ -215,6 +215,44 @@ def test_a_link_after_an_escaped_bracket_is_read_as_a_bare_one(reply, sent):
     assert link_posts(reply, read()) == sent
 
 
+# fri #231: markdown undoes a masked link's escapes ("\\" before punctuation) before a browser reads its target, and
+# an escaped bracket, ">" or space doesn't end it. As written, "\\" splits a path as "/" does, so "x\\(y/.." resolves
+# to "x"; undone, "x(y/.." resolves away.
+ESCAPED = ['https://discord.com/x\\(y/../'+PATH, 'https://discord.com/x\\)y/../'+PATH, 'https://discord.com/x\\<y/../'+PATH,
+           'https://discord.com/x\\>y/../'+PATH, 'https://discord.com/a\\ b/../../'+PATH, 'https://discord.com/a\\\tb/../../'+PATH,
+           'https://discord.com/x/\\%2e\\%2e/'+PATH, 'https://discord\\.com/'+PATH, 'https\\://discord.com/'+PATH]
+
+
+@pytest.mark.parametrize('url', ESCAPED)
+@pytest.mark.parametrize('form, sent', [('[clip]({})', 'clip'), ('[clip](<{}>)', 'clip'), ('see [clip]( {} ) ok', 'see clip ok'),
+                                        # One the pattern doesn't take (its label holds a newline): read to a space.
+                                        ('[kev\n]({})', '[kev\n]()')])
+def test_an_escape_in_a_masked_links_target_hides_no_post_link(url, form, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(form.format(url), read()) == sent
+
+
+@pytest.mark.parametrize('reply, sent', [
+    # Only the exact link shown stays: undone, these are the shown one, but as written they aren't.
+    ('[clip](https://discord.com\\/channels/123/2/1300000000000000005)', 'clip'),
+    ('[clip](https\\://discord.com/channels/123/2/1300000000000000005)', 'clip'),
+    ('[kev\n](https\\://discord.com/channels/123/2/1300000000000000005)', '[kev\n]()'),
+    (f'[kev’s clip](<{FOUND}>)', f'[kev’s clip](<{FOUND}>)'),
+    # The escaped ")" is the target's own, so the one after it closes the link.
+    (f'[clip]({MADE_UP}\\))', 'clip'),
+    # Out of a masked link, markdown reads a link as written: "\\" is a "/" to a browser, and "https\\:" is no link.
+    ('see https://discord.com/x\\(y/../'+PATH, 'see https://discord.com/x\\(y/../'+PATH),
+    ('see https\\://discord.com/'+PATH+' ok', 'see https\\://discord.com/'+PATH+' ok'),
+    ('see <https\\://discord.com/'+PATH+'> ok', 'see <https\\://discord.com/'+PATH+'> ok'),
+    # A "\\" before a letter or a digit escapes nothing, in a target too: "x\\y/.." resolves to "x" either way.
+    ('[clip](https://discord.com/x\\y/../'+PATH+')', '[clip](https://discord.com/x\\y/../'+PATH+')'),
+    ('[clip](https://example.com/a\\(b)', '[clip](https://example.com/a\\(b)'),  # Not a post link: left as it is.
+])
+def test_a_masked_target_is_read_with_its_escapes_undone_and_kept_only_as_shown(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
 # Spaces as Discord's markdown reads them (JavaScript's): <…> ends only at a plain space, while a bare link or a masked
 # link's target ends at any of these, but not at a control character Python also calls a space (review of fri #219).
 @pytest.mark.parametrize('space, ends', [('\u2003', True), ('\xa0', True), ('\v', True), ('\x1c', False), ('\x85', False)])
@@ -589,8 +627,9 @@ def test_a_reply_built_from_receipts_fits_discord_in_utf_16_units(value):
     assert units(sent) <= 1800 and sent.startswith('gene returned:\n')
 
 
-@pytest.mark.parametrize('before', ['🙂'*880+' ', '🙂'*890+' ', '🙂'*870+' ', '🙂'*860+'\n'],
-                         ids=['link-at-the-cut', 'link-past-the-cut', 'cut-after-the-link', 'fits'])
+@pytest.mark.parametrize('before', ['🙂'*880+' ', '🙂'*890+' ', '🙂'*870+' ', '🙂'*860+'\n', '🙂'*885, '🙂'*870],
+                         ids=['link-at-the-cut', 'link-past-the-cut', 'cut-after-the-link', 'fits', 'first-word-cut',
+                              'first-word-fits'])
 @pytest.mark.parametrize('source', [FOUND, {'url': FOUND}], ids=['string', 'record'])
 def test_a_reply_cut_to_fit_keeps_a_shown_link_whole_or_leaves_it_out(before, source):
     """The cut falls between links, never through one (a cut post link names another post), and the filter runs again
@@ -600,3 +639,13 @@ def test_a_reply_cut_to_fit_keeps_a_shown_link_whole_or_leaves_it_out(before, so
     assert units(sent) <= 1800
     assert f'<{FOUND}>' in sent or 'discord' not in sent
     assert 'discord' not in sent.replace(f'<{FOUND}>', '')
+
+
+@pytest.mark.parametrize('answer', ['🙂'*885+f'[clip]({FOUND})', '🙂'*885+FOUND, FOUND+'🙂'*900, f'[clip]({FOUND})'+'🙂'*900],
+                         ids=['masked', 'bare', 'link-first', 'masked-first'])
+def test_a_first_word_holding_a_link_goes_whole_and_the_reply_says_so_if_nothing_is_left(answer):
+    """fri #231: the word holding the link starts the reply, so the cut can't fall after it. It goes whole too, and
+    with nothing left the reply says it can't link it, as with a reply that was only a dropped link."""
+    from fri.fri_links import EMPTY
+    from fri.fri_outcomes import fallback, receipt
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': [{'url': FOUND}]})]) == EMPTY
