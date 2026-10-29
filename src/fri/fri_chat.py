@@ -765,6 +765,9 @@ class Chat:
                                     reply, action, response_kind = LINK_EMPTY, None, 'reply'
                                 else:
                                     action = {**action, 'question': question}
+                                    # A kept link gains <…>: the question must still fit, or the reply is unreadable.
+                                    from .fri_pending import Clarification
+                                    Clarification.model_validate({k: v for k, v in action.items() if k != 'kind'})
                             result.reply, result.draft, result.notes, result.action = reply, draft, notes, action
                             result.response_kind, result.reaction = response_kind, reaction
                             result.allow_closing = allow_closing

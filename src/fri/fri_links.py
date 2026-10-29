@@ -7,9 +7,10 @@ URL = (r'https?://(?:[^\s/@<>]*@)?(?:(?:www|ptb|canary)\.)?discord(?:app)?\.com\
        r'/+channels/+(?:[0-9]{1,25}|@me)/+[0-9]{1,25}/+[0-9]{1,25}')
 POST = re.compile(URL, re.I)
 # Then the rest of it: a trailing slash, query or fragment is part of it. Sentence punctuation or markdown at its
-# end isn't, nor an emoji or other non-URL text right after it, nor a word after closing markdown ("**…**this").
+# end isn't, nor an emoji or other non-URL text right after it, nor a word after closing markdown ("**…**this"):
+# inside it, "_" and "~" are its own (?utm_source=…), but it never ends on them, "*" or "|".
 # Inside <…> or a masked link's (…), it runs to the bracket.
-TAIL = r'(?:(?=[/?#])[A-Za-z0-9\-.:/?#@!$&+,;=%]*[A-Za-z0-9\-/#@$&+=%])?'
+TAIL = r'(?:(?=[/?#])[A-Za-z0-9\-._~:/?#@!$&+,;=%]*[A-Za-z0-9\-/#@$&+=%])?'
 LINK = re.compile(rf'\[(?P<label>[^\]\n]{{1,100}})\]\(\s*<?(?P<masked>{URL}[^\s<>()]*)>?\s*\)|'
                   rf'<(?P<angled>{URL}[^\s<>]*)>|<?(?P<bare>{URL}{TAIL})>?', re.I)
 # Where the model reads a post's own link: a read's or search's rows, a pin list, nearby posts, the images it
