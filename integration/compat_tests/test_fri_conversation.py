@@ -1,4 +1,5 @@
 import asyncio
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -100,21 +101,51 @@ def test_notes_expire_on_idle_health_and_erasure(store):
     assert not store.chat_context('guild', 'public:1', 'one')['personal_memory']['enabled']
 
 
-def test_natural_privacy_controls_work_while_busy_without_inference(monkeypatch):
+@pytest.mark.parametrize('text', ['Fri, forget me please', 'Fri, forget me pls', 'fri forget about me plz'])
+def test_natural_privacy_controls_work_while_busy_without_inference(monkeypatch, text):
     async def scenario():
         fri = configured(monkeypatch)
         fri.busy.add(10)
         fri.api = AsyncMock(return_value={'ok': True})
         fri.chat.respond = AsyncMock()
-        result = await fri.talk(123, 456, 10, 'Fri, forget me please', 'public', event=event(content='Fri, forget me please'))
+        result = await fri.talk(123, 456, 10, text, 'public', event=event(content=text))
         # The parser accepts friendly trailing "please" too.
         assert 'erased' in result.reply
         assert fri.api.call_args.args[1] == '/chat/memory/control'
         assert fri.api.call_args.args[2]['user_id'] == '10'
+        assert fri.api.call_args.args[2]['action'] == 'disable'
         fri.chat.respond.assert_not_awaited()
         await fri.close()
     asyncio.run(scenario())
     assert memory_intent('fri says "forget me"') is None
+
+
+@pytest.mark.parametrize('text,expected', [
+    # fri #133: "pls" and "plz" wherever "please" is stripped, "u" and "abt" in "show", and "forget about me".
+    ('forget me pls', 'disable'), ('forget me, plz', 'disable'), ('pls forget me', 'disable'),
+    ('plz fri, clear my memory', 'disable'), ('fri forget about me', 'disable'), ('forget about me pls fri', 'disable'),
+    ('what do u remember about me', 'show'), ('what do you remember abt me?', 'show'), ('fri what do u know abt me', 'show'),
+    ('what have u remembered abt me pls', 'show'), ('show my memory plz', 'show'), ('turn memory on pls', 'enable'),
+    # "u" and "abt" only ask to see; nothing that erases reads them.
+    ('forget abt me', None), ('forget everything abt me', None), ('forget what u know about me', None),
+    ('forget what you remember abt me', None), ('remember me again abt', None),
+    # Still exact: no trailing "lol", emoji or extra words, and someone else's words aren't a request.
+    ('forget about me lol', None), ('forget about me 💀', None), ('ugh forget about me', None), ('just forget about me', None),
+    ('fri says "forget about me"', None), ('forget about me please please', None), ('forget about menu', None),
+    ('what do uu remember about me', None), ('pls pls forget me', None), ('forget me plss', None),
+])
+def test_memory_controls_take_the_ways_people_type_them(text, expected):
+    assert memory_intent(text) == expected
+
+
+@pytest.mark.parametrize('separator', ['\u2003', ' ', ',', ', ', '\n'])
+def test_a_long_separator_run_is_crossed_once(separator):
+    # Discord's 4,000-character cap; each suffix strip used to retry from every spot inside the run (gene #87).
+    text = 'x' + (separator * 4000)[:3998] + 'x'
+    started = time.perf_counter()
+    for _ in range(10):
+        assert memory_intent(text) is None
+    assert time.perf_counter() - started < 0.1
 
 
 def test_public_replies_are_plain_and_scoped(monkeypatch):
