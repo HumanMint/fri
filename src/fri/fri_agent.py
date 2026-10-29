@@ -1706,9 +1706,10 @@ class Agent:
             else:
                 await asyncio.sleep(1.5)
         except BaseException as exc:
+            # Its mark in pending goes, even with its burst voided meanwhile (fri #210); a newer message's stays.
+            if self.pending.get(key) == message.id:
+                self.pending.pop(key, None)
             if self.bursts.latest(message):  # No later message will answer this burst now.
-                if self.pending.get(key) == message.id:
-                    self.pending.pop(key, None)
                 self.bursts.drop(message, type(exc).__name__)
             raise
         if not self.bursts.latest(message):
