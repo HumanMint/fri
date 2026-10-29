@@ -1250,17 +1250,14 @@ class Fri(discord.Client):
         text = await addressed_text(message, self.user.id)
         if text is None:
             return
+        if memory_intent(text) in ('disable', 'enable'):
+            # Without the agent nothing fences an edit or delete that takes a control back while it runs, and an
+            # erasure can't be undone, so memory changes go through the /fri panel here.
+            await message.reply('can’t change memory from here right now. use /fri for that.', mention_author=False,
+                                allowed_mentions=NO_MENTIONS)
+            return
         try:
             async with message.channel.typing():
-                if memory_intent(text) in ('disable', 'enable'):
-                    # Read again once typing started, right before it runs: an edit or delete takes a control back,
-                    # and an erasure can't be undone.
-                    try:
-                        current = await message.channel.fetch_message(message.id)
-                    except discord.HTTPException:
-                        return
-                    if current.content != message.content or await addressed_text(current, self.user.id) != text:
-                        return
                 result = await self.talk(message.guild.id, message.channel.id, message.author.id, text, 'public',
                                          message.author.display_name, event=message)
             view = DraftView(self, message.author.id, result.draft, public=True, fence=result.turn) if result.draft else None
