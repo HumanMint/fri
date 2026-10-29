@@ -130,14 +130,16 @@ def test_what_fri_couldnt_have_saved_asks_nothing(monkeypatch, tmp_path):
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         elsewhere = SimpleNamespace(id=2, guild=SimpleNamespace(id=123), parent_id=None)
+        abroad = SimpleNamespace(id=3, guild=SimpleNamespace(id=456), parent_id=None)
         get_channel = w.fri.get_channel
-        w.fri.get_channel = lambda cid: elsewhere if cid == 2 else get_channel(cid)
+        w.fri.get_channel = lambda cid: {2: elsewhere, 3: abroad}.get(cid) or get_channel(cid)
         try:
             unrelated = w.said('just chatting')
             restarted(w)
             await edit(w, edited(unrelated), channel=2)  # A channel Fri doesn't chat in.
             await delete(w, unrelated.id, channel=2)
-            await edit(w, edited(unrelated), guild=456)  # Another server.
+            await edit(w, edited(unrelated), guild=456, channel=3)  # Another server.
+            await edit(w, edited(unrelated), guild=456, channel=4)  # One whose channel Fri hasn't cached.
             old = SimpleNamespace(id=discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=8)),
                                   content='x', edited_at=discord.utils.utcnow(), author=SimpleNamespace(id=20, bot=False))
             await edit(w, old)  # Older than any exchange the controller keeps.
