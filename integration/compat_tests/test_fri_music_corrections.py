@@ -1,6 +1,7 @@
 """Right after Gene played the wrong song for them, "not that one, X" queues X, and Fri says the other's still on."""
 import ast
 import asyncio
+import gc
 import inspect
 import time
 from unittest.mock import AsyncMock, patch
@@ -254,6 +255,77 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, Love Story, we said no to that', 'Love Story', False),
     ('wrong song, Love Story, we said not to play it', 'Love Story', False),
     ('not that one, we said Love Story', 'Love Story', False),  # Only "i said" may lead the song.
+    # gene #133 (1): "no more" and "not now" take the song back after "i said" or "we said", like "no" and "not".
+    ('wrong song, Love Story, we said no more', 'Love Story', False),
+    ('wrong song, Love Story, we said not now', 'Love Story', False),
+    ('wrong song, Love Story, i said no more', 'Love Story', False),
+    ('wrong song, Love Story, i said not now', 'Love Story', False),
+    ('wrong song, Love Story, we said not right now lol', 'Love Story', False),
+    ('wrong song, Love Story, i told you not anymore', 'Love Story', False),
+    ('wrong song, Love Story, we said no more of that please', 'Love Story', False),
+    ('wrong song, Love Story, i said not rn', 'Love Story', False),
+    ('wrong song, Love Story, we said not for now', 'Love Story', False),
+    ('wrong song, Love Story, i said no more of those songs', 'Love Story', False),
+    ('wrong song, Love Story, i said now', 'Love Story', True),
+    ('wrong song, Love Story, we said no more Shake It Off', 'Love Story', True),
+    ("wrong song, 'We Said No More'", 'We Said No More', True),
+    # So do a closing "not now" or "no more" after a pause or a "no", like a closing "no".
+    ('wrong song, Love Story, not now', 'Love Story', False),
+    ('wrong song, Love Story. no more lol', 'Love Story', False),
+    ('wrong song, Love Story nah not now', 'Love Story', False),
+    ('wrong song, Love Story, no, not right now', 'Love Story', False),
+    ('wrong song, Love Story, i said no, not now', 'Love Story', False),
+    ('wrong song, Love Story, No More Drama', 'Love Story', True),
+    ('wrong song, If Not Now', 'If Not Now', True),
+    ('wrong song, No More', 'No More', True),
+    # A title that is itself a "not now" or "no more" is the title, after "i said" as anywhere (Sol r1 on #151).
+    ('not that one, i said Not Today', 'Not Today', True),
+    ("not that one, i said 'Not Today'", 'Not Today', True),
+    ('not that one, i meant Not Today', 'Not Today', True),
+    # gene #133 (2): their own denial with someone else alongside ("alex and i") is still theirs.
+    ("wrong song, Love Story isn't what alex and i asked for", 'Love Story', False),
+    ('wrong song, Love Story is not what you and i wanted', 'Love Story', False),
+    ("wrong song, Love Story is what alex and i didn't ask for", 'Love Story', False),
+    ("wrong song, Love Story isn't the one alex, sam and i picked", 'Love Story', False),
+    ('wrong song, Love Story is not what alex & i had in mind', 'Love Story', False),
+    ("wrong song, Love Story by Taylor Swift isn't what alex and i asked for", 'Love Story', False),
+    ("wrong song, Love Story isn't what me and alex asked for", 'Love Story', False),
+    ('wrong song, Love Story is what alex and i asked for', 'Love Story', True),
+    ("wrong song, 'Love Story Isn't What You and I Wanted'", "Love Story Isn't What You and I Wanted", True),
+    # gene #133 (3): an artist's name is no one's words, after a quoted title as after a plain one.
+    ("wrong song, 'All I Got' by Said The Sky", 'All I Got', True),
+    ('wrong song, "Love" by Said The Sky', 'Love', True),
+    ('wrong song, Love by Said The Sky', 'Love', True),
+    ('wrong song, All I Got by Said The Sky', 'All I Got', True),
+    ("wrong song, 'Love' by Mentioned Band", 'Love', True),
+    ("wrong song, 'All I Got' by Said The Sky, alex said so", 'All I Got', False),
+    ("wrong song, 'All I Got', alex said so", 'All I Got', False),
+    ("wrong song, 'Love' by Alex said Taylor", 'Love', False),
+    # Masking it keeps its words: their own words after a two-word artist stay out of reach, as on main.
+    ("wrong song, 'It Wasn't Me' by The Wanted i suggested lol", "It Wasn't Me", True),
+    ("wrong song, 'It Wasn't Me' by The Wanted we mentioned lol", "It Wasn't Me", True),
+    # Sol r1 on #151: a closing "not now" or "no more" is read only after the song they named. Inside it, it's the
+    # title, as on main, and so is the song said again; another one after it still takes it back.
+    ('wrong song, No More, No More', 'No More No More', True),
+    ('wrong song, No, Not Now', 'No Not Now', True),
+    ('wrong song, We Said No More', 'We Said No More', True),
+    ('wrong song, No More, No More', 'No More', True),
+    ('wrong song, Not Now, i said not now', 'Not Now', True),
+    ('wrong song, No More, not now', 'No More', False),
+    ('wrong song, Not Now, no more lol', 'Not Now', False),
+    ('wrong song, No, not now', 'No', False),
+    # Sol r2 on #151: the song said again is its title, without an artist they named after it.
+    ("wrong song, 'Not Now' by Blink-182, i said 'Not Now'", 'Not Now Blink-182', True),
+    ('wrong song, Not Now by Blink-182, i said not now', 'Not Now Blink-182', True),
+    ('wrong song, Not Now by Blink-182, not now', 'Not Now Blink-182', True),
+    ('wrong song, Love Story by Taylor Swift, not now', 'Love Story Taylor Swift', False),
+    ("wrong song, 'No More' by Blink-182, not now", 'No More Blink-182', False),
+    # Their own subject first, with someone after it ("i and alex", "me and the boys"), and "no more tracks".
+    ("wrong song, Love Story isn't what i and alex chose", 'Love Story', False),
+    ("wrong song, Love Story isn't what me and the boys picked", 'Love Story', False),
+    ("wrong song, Love Story is what i and alex didn't ask for", 'Love Story', False),
+    ("wrong song, 'Love Story Isn't What I and Alex Chose'", "Love Story Isn't What I and Alex Chose", True),
+    ('wrong song, Love Story, we said no more tracks', 'Love Story', False),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
@@ -288,24 +360,73 @@ def test_fri_and_gene_share_the_correction_code_word_for_word():
     assert ours == correction_source(genes)
 
 
+# Worst cases for each check: a head, a unit repeated to the length wanted, and a tail.
+SHAPES = [("'", "a' ", ''), ("'", "rockin' ", ''), ('', "''a ", ''), ('', "' ", ''), ('"', 'a ', ''),
+          ('love story nah', ' lol', ' x'), ('love story', ', no lol', ' x'), ('love story', ' ,', 'x'),
+          ('love story', ', a b said', ''), ('love ', 'by ', ''), ('love', ' from x', ''), ('love story', ' i just', ' said'),
+          ('love story ', "don't ", ''), ('i meant ', 'to ', ''), ('love story', ' is not what', ''), ('love ', 'by the ', ''),
+          ('love story', ' i said no', ''), ('love story', ', say', ''), ('love story ', 'x ', 'is not what i meant'),
+          ('love story', ' is absolutely', ''), ('love story', ', i said no to that', ''), ('love story', ' not to ever', ''),
+          ('i like ', 'you say ', ''), ('love story', " isn't what", ''), ('love story, i said no', ' this time', ' x'),
+          ('love story', ' we just', ' said'), ('love story', ', we said no to that', ''),
+          ('love story, i said not to', ' ever again', ' x'), ('love story', ', we said no more', ''),
+          ('love story, i said not right now', ' lol', ' x'), ('love story', " isn't what alex and", ' i said'),
+          ("'all i got'", ' by said the sky', ''), ('love story', ', not now', ' x'), ('love story', ' nah not now', ' x'),
+          ('love story', ', no more of those songs', ''), ('love story', ' is what x, y and', ' i never asked'),
+          ('love story', " isn't what i and", ' x chose'), ('no more', ', no more', ' x')]
+
+
+def message(shape, length=4000):
+    """The shape as a correction of about `length` characters, its head and tail whole."""
+    head, unit, tail = shape
+    return 'wrong song, '+head+unit*((length-12-len(head)-len(tail))//len(unit))+tail
+
+
+def read(text):
+    """Every check, for the arguments a correction might propose."""
+    for argument in ('love story', 'a', text[12:200]):
+        correction(text, argument)
+
+
 def test_a_long_message_is_read_without_backtracking():
     """Each check runs in about linear time, so a 4000-character worst case takes milliseconds, not minutes."""
-    shapes = ["'"+"a' "*1330, "'"+"rockin' "*498, "''a "*997, "' "*1994, '"'+'a '*1993, 'love story nah'+' lol'*990+' x',
-              'love story'+', no lol'*497+' x', 'love story'+' ,'*1990+'x', 'love story'+', a b said'*398, 'love '+'by '*1328,
-              'love'+' from x'*568, 'love story'+' i just'*664+' said', "love story "+"don't "*664, 'i meant '+'to '*1328,
-              'love story'+' is not what'*331, 'love '+'by the '*664, 'love story'+' i said no'*398, 'love story'+', say'*797,
-              'love story '+'x '*1990+'is not what i meant', 'love story'+' is absolutely'*363,
-              'love story'+', i said no to that'*222, 'love story'+' not to ever'*363, 'i like '+'you say '*499,
-              "love story"+" isn't what"*363, 'love story, i said no'+' this time'*397+' x', 'love story'+' we just'*568+' said',
-              'love story'+', we said no to that'*210, 'love story, i said not to'+' ever again'*361+' x']
-    correction('wrong song, '+shapes[0], 'love story')  # Warmed up first: a slow CI runner's first call isn't backtracking.
-    for shape in shapes:
-        text = ('wrong song, '+shape)[:4000]
+    read(message(SHAPES[0]))  # Warmed up first: a slow CI runner's first call isn't backtracking.
+    for shape in SHAPES:
         began = time.perf_counter()
-        for argument in ('love story', 'a', text[12:200]):
-            correction(text, argument)
+        read(message(shape))
         # Milliseconds here; backtracking would take seconds to minutes, so the bound has room for a busy runner.
-        assert time.perf_counter()-began < 2, shape[:20]
+        assert time.perf_counter()-began < 2, shape
+
+
+def fastest_reads(texts, runs=5):
+    """Each text's fastest read in CPU time, taking turns so a slow spell on the runner hits them alike."""
+    best = [float('inf')]*len(texts)
+    for _ in range(runs):
+        for i, text in enumerate(texts):
+            began = time.thread_time()  # Not the runner's other work.
+            read(text)
+            best[i] = min(best[i], time.thread_time()-began)
+    return best
+
+
+def test_reading_time_grows_with_the_length_not_its_square():
+    """The ceiling above only catches backtracking slow enough to cross it (gene #140). Four times the characters
+    takes about four times as long when every check reads in linear time, and about sixteen when one backtracks
+    quadratically, however fast it still is, so the ratio of each shape's 4000-character read to its 1000 must stay
+    under 8."""
+    gc.collect()
+    gc.disable()  # A collection during a read is noise, not reading time.
+    try:
+        for shape in SHAPES:
+            texts = [message(shape, length) for length in (1000, 4000)]
+            fastest_reads(texts, runs=1)  # Warmed up first.
+            ratios = []
+            while len(ratios) < 3 and (not ratios or ratios[-1] >= 8):  # Backtracking is slow on every try; noise, rarely.
+                small, large = fastest_reads(texts)
+                ratios.append(large/small)
+            assert ratios[-1] < 8, (shape, ratios)
+    finally:
+        gc.enable()
 
 
 @pytest.mark.parametrize('case', ['corrects', 'no recent play', 'old play', 'not their words', 'plain title',
