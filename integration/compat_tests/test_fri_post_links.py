@@ -94,6 +94,8 @@ def test_a_post_link_in_any_form_goes_unless_it_is_the_exact_one_shown(url, form
     (f'here: {FOUND}.', f'here: <{FOUND}>.'),  # Sentence punctuation isn't part of the link, as Discord reads it.
     (f'(here: {FOUND})', f'(here: <{FOUND}>)'), (f'here: {FOUND}, ok', f'here: <{FOUND}>, ok'),
     (f'"{FOUND}"', f'"<{FOUND}>"'), (f'[kev’s clip]( <{FOUND}> )', f'[kev’s clip](<{FOUND}>)'),
+    (f'is it {FOUND}?', f'is it <{FOUND}>?'), (f'**{FOUND}**', f'**<{FOUND}>**'), (f'||{FOUND}||', f'||<{FOUND}>||'),
+    (f'_{FOUND}_', f'_<{FOUND}>_'), (f'~~{FOUND}~~!', f'~~<{FOUND}>~~!'), (f"'{FOUND}'", f"'<{FOUND}>'"),
     # Not a Discord post: a channel, an invite or another site.
     ('https://discord.com/channels/123/2', 'https://discord.com/channels/123/2'),
     ('https://discord.com/invite/abc', 'https://discord.com/invite/abc'),
