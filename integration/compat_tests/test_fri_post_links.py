@@ -178,18 +178,24 @@ def test_a_split_scheme_never_passes_for_the_shown_link_or_hides_another(reply, 
 
 
 @pytest.mark.parametrize('reply, sent', [
-    # fri #209: inside <…> or a masked link's (…), its whole path is the link's, so a browser resolves ".." through to
-    # the end: these name the channel, not a post.
+    # fri #209: inside <…>, its whole path is the link's, so a browser resolves ".." through to the end: these name
+    # the channel, not a post.
     ('<https://discord.com/x/../channels/123/2/1300000000000000009/..>',
      '<https://discord.com/x/../channels/123/2/1300000000000000009/..>'),
-    ('[the channel](https://discord.com/x/../'+PATH+'/%2e%2e)', '[the channel](https://discord.com/x/../'+PATH+'/%2e%2e)'),
-    ('[the channel](<https://%64iscord.com/'+PATH+'/../>)', '[the channel](<https://%64iscord.com/'+PATH+'/../>)'),
+    ('[the channel](<https://%64iscord.com/x/../'+PATH+'/%2e%2e/>)', '[the channel](<https://%64iscord.com/x/../'+PATH+'/%2e%2e/>)'),
+    (f'see <https://discord.com/x/../{PATH}/..?next={MADE_UP}> ok', 'see  ok'),  # A post link inside one still goes.
     # Still a post: as written, or once its path is resolved.
     (f'<{MADE_UP}/..>', 'can’t link that one.'), ('<https://discord.com/x/../'+PATH+'/x/..>', 'can’t link that one.'),
     ('<https://discord.com/x/../'+PATH+'/../8>', 'can’t link that one.'),
-    ('[clip](https://discord.com/x/../'+PATH+'/..\\))', 'clip)'),  # Its escaped ")" is the link's: a post.
-    # A bare link never ends on "." (see TAIL), so the ".." after it isn't its own, and it links the post.
-    ('https://discord.com/x/../'+PATH+'/..', '..'),
+    # A bare link never ends on "." (see TAIL), so the ".." after it isn't its own, and it links the post. Out of <…>,
+    # a masked link's target is read as a bare one would be, since Discord can refuse the masked link; and a "\\" can
+    # escape a masked link's ">" or ")", making what follows its own.
+    ('https://discord.com/x/../'+PATH+'/..', '..'), ('[clip](https://discord.com/x/../'+PATH+'/%2e%2e)', 'clip'),
+    ('[clip](<https://discord.com/x/../'+PATH+'/..\\>)', 'clip'), ('[clip](https://discord.com/x/../'+PATH+'/..\\))', 'clip)'),
+    # In <…> but maybe a masked link's target this pattern doesn't take (an empty label), where "\\." is an escape and
+    # a ")" can end it: its starts count too.
+    ('[](<https://discord.com/x/../'+PATH+'/\\..>)', '[]()'), ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', '[](\ufeff )'),
+    ('<https://discord.com/x/../'+PATH+'\\..>', 'can’t link that one.'),
 ])
 def test_a_link_in_brackets_names_a_post_only_once_its_whole_path_is_read(reply, sent):
     from fri.fri_links import link_posts

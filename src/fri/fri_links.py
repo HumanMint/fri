@@ -70,29 +70,32 @@ def discord(host):
         return False
 
 
-def post(url):
+def post(url, whole=False):
     """The length of the post link at the start of `url`, through its message's ID, as written or as a browser reads
     it; None if `url` doesn't start with one. A tab or newline in it counts as nothing, and so does a control
-    character or space before it."""
+    character or space before it. `whole`: `url` is all of the link (its <…> ends it), so as a browser reads it, its
+    path's "." and ".." resolve to the end before it names a post or not (fri #209). Otherwise its end is Discord's
+    to find (a bare link never ends on ".", see TAIL), so any start of it that names a post is one."""
     kept = None
     if url[0] <= ' ' or DROPPED.search(url):
         kept = [at for at, char in enumerate(url) if char not in '\t\n\r']
         start = next((index for index, at in enumerate(kept) if url[at] > ' '), len(kept))
         kept = kept[start:]
         url = ''.join(url[at] for at in kept)
-    if (length := read(url)) is None:
+    if (length := read(url, whole)) is None:
         return None
     return kept[length-1]+1 if kept else length  # Where it ends in `url` as written.
 
 
-def read(url):
+def read(url, whole):
     """post, for a `url` with nothing in it a browser drops."""
     if written := POST.match(url):
         return written.end()
     authority = AUTHORITY.match(url, url.index(':')+1)
     if not discord(authority[1].rpartition('@')[2].partition(':')[0]):
         return None
-    path, names, at = [], [], authority.end()  # Its segments, and the ones that count: as written, "//" doesn't.
+    # Its segments, and the ones that count, each with where its message's ID would end: as written, "//" doesn't.
+    path, names, at = [], [], authority.end()
     while part := SEGMENT.match(url, at):
         segment, at = part[1], part.end()
         name = unquote(segment)
@@ -100,12 +103,19 @@ def read(url):
             if path and path.pop():
                 names.pop()
         elif name != '.':
-            if (len(names) == 3 and names[0].lower() == 'channels' and re.fullmatch(r'[0-9]{1,25}|@me', names[1], re.I)
-                    and re.fullmatch(r'[0-9]{1,25}', names[2]) and (message := DIGITS.match(segment))):
-                return part.start(1)+message.end()
             path.append(name)
             if name:
-                names.append(name)
+                names.append((name, part.start(1)+message.end() if (message := DIGITS.match(segment)) else None))
+                if len(names) == 4 and not whole and (ends := message_end(names)):
+                    return ends
+    return message_end(names) if whole else None
+
+
+def message_end(names):
+    """Where the post's message ID ends, if a path's first four segments name a post; None if they don't."""
+    if (len(names) >= 4 and names[0][0].lower() == 'channels' and re.fullmatch(r'[0-9]{1,25}|@me', names[1][0], re.I)
+            and re.fullmatch(r'[0-9]{1,25}', names[2][0])):
+        return names[3][1]
     return None
 
 
@@ -116,12 +126,29 @@ def opened(marks, text):
     return marks
 
 
+def targeted(text, at):
+    """Whether what starts at `at` may be a masked link's target: only spaces, as JavaScript reads them, after a "("."""
+    while at and (text[at-1].isspace() or text[at-1] == '\ufeff'):
+        at -= 1
+    return text[at-1:at] == '('
+
+
 def once(text, allowed):
     """`text` with each post link in it kept, as <link>, or dropped (see link_posts), once."""
-    parts, done, at, marks = [], 0, 0, frozenset()
+    parts, done, at, marks, channels = [], 0, 0, frozenset(), set()
     while match := LINK.search(text, at):
-        url = match['masked'] or match['angled'] or match['bare']
-        if (length := post(url)) is None:
+        name = next(group for group in ('masked', 'angled', 'bare') if match[group])
+        url, scheme = match[name], LINKED.search(text, match.start(name)).start()
+        # Only <…> ends a link for certain, so only then is its whole path its own (see post). Not a masked link's
+        # target out of <…>: Discord can refuse the masked link and read it bare. Nor <…> right after a "(": it may be
+        # the target of a masked link LINK doesn't take ("[](…)"), and end at a ")" in it. Nor one with a "\\" in it,
+        # which may escape its ">".
+        whole = '\\' not in url and (
+            name == 'masked' and text[match.start(name)-1] == '<' and text.startswith('>', match.end(name)) or
+            name == 'angled' and not targeted(text, match.start()))
+        if scheme in channels or (length := post(url, whole)) is None:
+            if whole:
+                channels.add(scheme)  # Not a post link, so not one read bare from the same start either.
             at = match.start()+1  # Not a post link: one may still start inside it (…?next=https://discord.com/…).
             continue
         marks, end = opened(marks, text[done:match.start()]), match.end()
