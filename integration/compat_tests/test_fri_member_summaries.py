@@ -306,7 +306,7 @@ def test_an_older_controller_means_no_builder_and_no_field(monkeypatch, tmp_path
     run(scenario)
 
 
-def test_the_builder_runs_as_its_own_stage_only_against_a_capable_controller(monkeypatch):
+def test_the_builder_runs_as_its_own_stage_only_against_a_capable_controller(monkeypatch, tmp_path):
     built = AsyncMock()
     monkeypatch.setattr('fri.fri_member_summary.build', built)
     for name in ('fri.fri_workspace.deliver_one', 'fri.fri_social.deliver_one', 'fri.fri_fixes.check'):
@@ -315,7 +315,8 @@ def test_the_builder_runs_as_its_own_stage_only_against_a_capable_controller(mon
     async def api(method, path, payload=None):
         return {'/agent/state': STATE, '/agent/reports': []}[path]
     fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=AsyncMock(side_effect=api),
-                          get_user=lambda _: None, wait_until_ready=AsyncMock(), capabilities=frozenset())
+                          get_user=lambda _: None, wait_until_ready=AsyncMock(), capabilities=frozenset(),
+                          data=tmp_path)
     agent = Agent(fri)
     agent.learn, agent.attend, agent.check_memes = AsyncMock(), AsyncMock(), AsyncMock()
     asyncio.run(agent.heartbeat.coro(agent))

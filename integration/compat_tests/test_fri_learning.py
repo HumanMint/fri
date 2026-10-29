@@ -261,13 +261,13 @@ def test_old_claim_refund_cannot_credit_another_budget_day(learning):
 
 
 @pytest.mark.parametrize('failure', [False, True])
-def test_heartbeat_records_actual_tick_outcome(learning, failure, monkeypatch):
+def test_heartbeat_records_actual_tick_outcome(learning, failure, monkeypatch, tmp_path):
     monkeypatch.setattr('fri.fri_workspace.deliver_one', AsyncMock())
     monkeypatch.setattr('fri.fri_social.deliver_one', AsyncMock())
     monkeypatch.setattr('fri.fri_fixes.check', AsyncMock())
     clock, _, _, scheduler = learning
     async def scenario():
-        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456,
+        fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, data=tmp_path,
             api=AsyncMock(return_value=scheduler.state()))
         agent = Agent(fri)
         agent.send_reports = AsyncMock()
