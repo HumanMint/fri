@@ -107,6 +107,12 @@ class Ledger:
     def parked(self, i):
         return self.again.get(i)
 
+    def restart(self, i):
+        """Its handling starts over, as it first came in: a question answered alone after the burst it gave way to
+        was voided (see Agent.answer_alone). What that burst's turn marked doesn't carry over."""
+        if entry := self.pending.get(i):
+            entry.update(reason=None, composed=False, notice=None)
+
     def abandon(self, i, entry, reason):
         """A rerun ended without handling its message again: quiet, for `reason`. `entry` is what was parked for that
         rerun; once its handling took it, or parked it again for the next rerun, there's nothing left to settle."""

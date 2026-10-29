@@ -188,3 +188,42 @@ def test_a_history_search_leaves_out_started_a_thread_notices(monkeypatch, tmp_p
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_started_a_thread_notice_stays_out_of_the_live_channel_view(monkeypatch, tmp_path):
+    """fri #179: the notice's text is the thread's name, so a later question doesn't show it as the member's words."""
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        contexts = []
+        fri.chat_once.side_effect = lambda _, context: contexts.append(context) or ChatResult(
+            status='completed', reply='friday works')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(message('who is in for friday', user=30, age=120))
+                name = message('movie night', user=40, age=60)
+                name.type = discord.MessageType.thread_created
+                await agent.handle(name)
+                await agent.handle(message('fri what is the plan'))
+            [context] = contexts
+            texts = [row['text'] for row in context['recent']]
+            assert 'who is in for friday' in texts and 'movie night' not in texts
+            assert [row['text'] for row in agent.recent[1]].count('movie night') == 0
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('name', ['fri movie night', '<@99> movie night'])
+def test_a_started_a_thread_notice_naming_fri_is_not_answered(monkeypatch, tmp_path, name):
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        item = notice(lambda text, user: message(text, user=user), name)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(item)
+            fri.chat_once.assert_not_awaited()
+            item.reply.assert_not_awaited()
+            assert not agent.recent[1]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
