@@ -192,9 +192,10 @@ def test_a_split_scheme_never_passes_for_the_shown_link_or_hides_another(reply, 
     # escape a masked link's ">" or ")", making what follows its own.
     ('https://discord.com/x/../'+PATH+'/..', '..'), ('[clip](https://discord.com/x/../'+PATH+'/%2e%2e)', 'clip'),
     ('[clip](<https://discord.com/x/../'+PATH+'/..\\>)', 'clip'), ('[clip](https://discord.com/x/../'+PATH+'/..\\))', 'clip)'),
-    # In <…> but maybe a masked link's target this pattern doesn't take (an empty label), where "\\." is an escape and
-    # a ")" can end it: its starts count too.
-    ('[](<https://discord.com/x/../'+PATH+'/\\..>)', '[]()'), ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', '[](\ufeff )'),
+    # In <…> but maybe a masked link's target, where "\\." is an escape and a ")" can end it: its starts count too. An
+    # empty label is a masked link's (fri #220), and one this pattern doesn't take (after a "\ufeff") still counts.
+    ('[](<https://discord.com/x/../'+PATH+'/\\..>)', 'can’t link that one.'),
+    ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', '[](\ufeff )'),
     ('<https://discord.com/x/../'+PATH+'\\..>', 'can’t link that one.'),
 ])
 def test_a_link_in_brackets_names_a_post_only_once_its_whole_path_is_read(reply, sent):
@@ -427,3 +428,167 @@ def test_a_reply_built_from_receipts_keeps_only_post_links_they_showed(kind, val
     search answer goes out only if the receipts showed it as a source (review of fri #219)."""
     from fri.fri_outcomes import fallback, receipt
     assert fallback([receipt(kind, value)]) == sent
+
+
+@pytest.mark.parametrize('reply, sent', [
+    # fri #220: Discord's <…> runs to a plain space or ">", so a "<" can sit inside it, and a browser encodes it in the
+    # path: the dot segments after it still resolve.
+    ('<https://discord.com/x<y/../'+PATH+'>', 'can’t link that one.'),
+    ('see <https://discord.com/x<y/../'+PATH+'> ok', 'see  ok'),
+    ('<https://discord.com/x<<y/../'+PATH+'/?a<b>', 'can’t link that one.'),
+    (f'<{FOUND}<x>', 'can’t link that one.'),  # Not the exact link shown.
+    ('[clip](<https://discord.com/x<y/../'+PATH+'>)', 'clip'),
+    ('[clip](https://discord.com/x<y/../'+PATH+')', 'clip'),  # A masked link's target holds one too.
+    # A post link starting inside another <…> link is its own, and a "<" in it that isn't a link's stays.
+    ('<https://example.com/<https://discord.com/x<y/../'+PATH+'>', '<https://example.com/'),
+    ('<https://discord.com/x<y/../channels/123/2> ok', '<https://discord.com/x<y/../channels/123/2> ok'),
+    (f'<{FOUND}> <https://discord.com/x<y/../channels/123/2/1300000000000000005/..>',
+     f'<{FOUND}> <https://discord.com/x<y/../channels/123/2/1300000000000000005/..>'),
+    # A masked link with an empty label is one too, and its target holds a "<" as well.
+    ('see [](https://discord.com/x<y/../'+PATH+') ok', 'see  ok'), (f'see []({FOUND}) ok', f'see <{FOUND}> ok'),
+    # Discord's autolink needs a "/" after the scheme, so without one the <…> isn't a link's end for certain.
+    ('<https:discord.com/'+PATH[:-3]+'<009/../>', 'can’t link that one.'),
+    ('<htt\tps\n:discordapp.com/'+PATH[:-3]+'<009/../>', 'can’t link that one.'),
+])
+def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+@pytest.mark.parametrize('filler', [
+    '<https:'*660, '<https://discord.com/x/../'*160, '<\x01htt\tps://discord.com/x/..'*140, '<https://a<'*400,
+    '<https://discord.com/'+'x/'*1990, '[a](<https://discord.com/x/../'*130, '<https://discord.com/a/'*180,
+    'https://discord.com/x/../'*160, 'https://discord.com/a/'*180, '<h\ttps:'*500, '<https://discord.com\\x/..'*150,
+])
+@pytest.mark.parametrize('end', ['', '>'])
+def test_a_4000_character_reply_full_of_links_in_brackets_is_filtered_well_under_100_ms(filler, end):
+    """fri #220: a "<" no longer ends a <…> link, so many can start inside one. Each pass reads that run once for all
+    of them, as it reads a bare one (fri #223)."""
+    import time
+
+    from fri.fri_links import link_posts
+    nested = MADE_UP
+    for _ in range(8):
+        nested = MADE_UP[:30] + '<' + nested + '>' + MADE_UP[30:]
+    reply = (nested + ' ' + filler)[:4000-len(end)] + end
+    took = []
+    for _ in range(3):
+        started = time.perf_counter()
+        assert link_posts(reply, read()) == 'can’t link that one.'
+        took.append(time.perf_counter() - started)
+    assert min(took) < 0.1
+
+
+@pytest.mark.parametrize('filler', ['https://discord.com/x/../', '<https://discord.com/x/../', 'https://discord.com/a/',
+                                    '<https://discord.com/a/'])
+def test_links_starting_inside_one_run_read_its_path_once(monkeypatch, filler):
+    """fri #223: every link starting inside one run has the run's path from where its own address ends, so the path is
+    read once for all of them, not once each: the work grows with the reply, not with its square."""
+    import fri.fri_links as links
+
+    class Counted:
+        def __init__(self, pattern):
+            self.pattern, self.calls = pattern, 0
+
+        def match(self, *args):
+            self.calls += 1
+            return self.pattern.match(*args)
+    counted = Counted(links.SEGMENT)
+    monkeypatch.setattr(links, 'SEGMENT', counted)
+    for size in (2000, 4000, 8000):
+        counted.calls = 0
+        end = '>' if filler.startswith('<') else ''  # One <…> link, with links starting all through it.
+        reply = (filler*(size//len(filler)+1))[:size-len(end)] + end
+        assert links.link_posts(reply, read()) == reply  # Nothing in it names a post.
+        assert counted.calls <= size//2
+
+
+CITED = 'citeturn0search0'
+
+
+@pytest.mark.parametrize('channel_id', [1, 8])  # Asked in Fri's channel, and pinged elsewhere.
+@pytest.mark.parametrize('answer', [
+    f'it’s this one <https:/discord.com/channels/123/1/{CITED}9>',
+    'it’s this one <https:/discord.com/channels/123/1/[source 1](https://www.python.org/downloads/)9>',
+])
+def test_citation_formatting_never_builds_a_post_link_the_filter_passed(monkeypatch, tmp_path, channel_id, answer):
+    """fri #222: removing a citation marker, or a source link the member didn't ask for, can join what's around it
+    into a post link the model was never shown. The reply is filtered again once citations are formatted."""
+    import datetime as dt
+
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        question = 'what is the current Python release?'
+        event = message('<@99> '+question)
+        receipt = {'kind': 'web_search', 'query': question, 'answer': 'public evidence',
+                   'sources': ['https://www.python.org/downloads/'],
+                   'checked_at': dt.datetime.now(dt.timezone.utc).isoformat()}
+        monkeypatch.setattr('fri.fri_actions.lookup', AsyncMock(return_value=(receipt, {}, 'completed')))
+        model(fri, tmp_path, [{'action': {'kind': 'web_search', 'query': question}}, answer])
+        texts = delivered(event)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert len(texts) == 1 and texts[0].startswith('it’s this one') and 'discord.com' not in texts[0]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_source_the_member_asked_for_stays_when_it_is_a_post_link(monkeypatch, tmp_path):
+    """A verified web source is a link the model was shown (fri #223), so filtering again after citations keeps it."""
+    import datetime as dt
+
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        question = 'what did the python discord say about the release, with sources'
+        event = message('<@99> '+question)
+        receipt = {'kind': 'web_search', 'query': question, 'answer': 'public evidence', 'sources': [FOUND],
+                   'checked_at': dt.datetime.now(dt.timezone.utc).isoformat()}
+        monkeypatch.setattr('fri.fri_actions.lookup', AsyncMock(return_value=(receipt, {}, 'completed')))
+        model(fri, tmp_path, [{'action': {'kind': 'web_search', 'query': question}}, f'they posted it [here]({FOUND})'])
+        texts = delivered(event)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            assert texts == [f'they posted it [here](<{FOUND}>)']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('kind', ['web_search', 'web_refine', 'web_sources'])
+def test_a_reply_built_from_a_web_receipt_keeps_a_post_link_it_cites(kind):
+    """fri #223: a web receipt lists its verified sources as strings. Those count as shown; links in its prose don't."""
+    from fri.fri_outcomes import fallback, receipt
+    assert fallback([receipt(kind, {'answer': f'it is {FOUND}', 'sources': [FOUND]})]) == f'it is <{FOUND}>'
+    assert fallback([receipt(kind, {'answer': f'it is {MADE_UP}', 'sources': [FOUND]})]) == 'it is '
+    assert fallback([receipt(kind, {'answer': f'it is {FOUND} or {MADE_UP}', 'sources': [FOUND, MADE_UP+'/']})]) == (
+        f'it is <{FOUND}> or ')
+    assert fallback([receipt('gene_command', {'output': f'queued {FOUND}', 'sources': [FOUND]})]) == 'gene returned:\nqueued '
+
+
+def units(text):
+    return len(text.encode('utf-16-le'))//2
+
+
+@pytest.mark.parametrize('value', [{'output': '🙂'*1000}, {'output': '🙂'*600+'x'*500}, {'output': 'x'*1600}],
+                         ids=['emoji', 'mixed', 'ascii'])
+def test_a_reply_built_from_receipts_fits_discord_in_utf_16_units(value):
+    """fri #223: Discord counts UTF-16 units, so an emoji counts twice."""
+    from fri.fri_outcomes import fallback, receipt
+    sent = fallback([receipt('gene_command', value)])
+    assert units(sent) <= 1800 and sent.startswith('gene returned:\n')
+
+
+@pytest.mark.parametrize('before', ['🙂'*880+' ', '🙂'*890+' ', '🙂'*870+' ', '🙂'*860+'\n'],
+                         ids=['link-at-the-cut', 'link-past-the-cut', 'cut-after-the-link', 'fits'])
+@pytest.mark.parametrize('source', [FOUND, {'url': FOUND}], ids=['string', 'record'])
+def test_a_reply_cut_to_fit_keeps_a_shown_link_whole_or_leaves_it_out(before, source):
+    """The cut falls between links, never through one (a cut post link names another post), and the filter runs again
+    after it."""
+    from fri.fri_outcomes import fallback, receipt
+    sent = fallback([receipt('web_search', {'answer': before+FOUND+' and more', 'sources': [source]})])
+    assert units(sent) <= 1800
+    assert f'<{FOUND}>' in sent or 'discord' not in sent
+    assert 'discord' not in sent.replace(f'<{FOUND}>', '')
