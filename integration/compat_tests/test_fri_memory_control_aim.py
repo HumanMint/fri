@@ -1,6 +1,7 @@
 """A memory control must be said to Fri: in the dedicated channel, where Fri also answers plain chat, a member's
 "forget me" said to someone else never erases their memory (review of fri #195)."""
 import asyncio
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -118,6 +119,81 @@ def test_a_forget_me_said_to_someone_else_leaves_local_context_alone(monkeypatch
             await agent.handle(control)
             assert agent.forgotten.get(20, 0) == before
             assert memory(store) == (True, True)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['fri forget about me', 'fri forget me pls'])
+def test_the_no_agent_fallback_rechecks_a_memory_control_after_typing_starts(monkeypatch, tmp_path, text):
+    """Without the agent, a control edited while Fri started typing is read as it is now, not as it came in
+    (review of fri #195, round 3)."""
+    from contextlib import asynccontextmanager
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            await remembered(agent, store, message)
+            fri.agent = None
+            fri.workshop_id = 1
+            control = message(text)
+
+            @asynccontextmanager
+            async def typing():  # Edited into ordinary chat while typing starts.
+                edited = copy.copy(control)
+                edited.content = 'fri what about the game tonight'
+                rows[control.id] = edited
+                yield
+            channel.typing = typing
+            await fri.on_message(control)
+            assert memory(store) == (True, True)
+            assert not any(path == '/chat/memory/control' for path, _ in calls)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['forget about me', 'forget me pls'])
+def test_an_unaddressed_forget_me_outside_a_conversation_leaves_local_context_alone(monkeypatch, tmp_path, text):
+    """In an ordinary watched channel, with no conversation going, a bare "forget me" isn't said to Fri: it's dropped
+    without clearing anything (review of fri #195, round 3)."""
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            agent.dedicated = 0
+            await remembered(agent, store, message)
+            agent.active.clear()
+            before = agent.forgotten.get(20, 0)
+            await agent.handle(message(text))
+            assert agent.forgotten.get(20, 0) == before
+            assert memory(store) == (True, True)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_reply_to_fri_found_on_a_second_look_is_still_a_memory_control(monkeypatch, tmp_path):
+    """The first read of its reply target failed for a moment; the second shows it's a reply to Fri, so the control
+    goes ahead (review of fri #195, round 3)."""
+    import discord
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            agent.dedicated = 0
+            await remembered(agent, store, message)
+            agent.active.clear()
+            frisays = message('noted', user=99)
+            control = message('forget about me')
+            control.reference = SimpleNamespace(message_id=frisays.id, channel_id=1, resolved=None)
+            original, failed = channel.fetch_message.side_effect, []
+            def fetch(mid):
+                if mid == frisays.id and not failed:
+                    failed.append(mid)
+                    raise discord.HTTPException(SimpleNamespace(status=503, reason='unavailable'), 'try again')
+                return original(mid)
+            channel.fetch_message.side_effect = fetch
+            await agent.handle(control)
+            assert failed
+            assert memory(store) == (False, False)
         finally:
             await fri.close()
     asyncio.run(scenario())
