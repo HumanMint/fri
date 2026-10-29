@@ -342,9 +342,9 @@ class Continuations:
         Either its message or a line taken back before the burst a line reopened from it committed voids that
         burst: it goes quietly (its turn gives way too, if it began), and nothing the line said reaches the model.
         A turn that hadn't given way yet answers, or re-answers, itself (see Agent.reply_once). One that had is
-        returned, to be answered alone after all if a line went, or again as edited if its own message was edited.
-        Returns (to answer alone, to answer again, turns that gave way just now)."""
-        ids, alone, again, voided = set(ids), [], [], []
+        returned, to be answered alone after all if a line went, again as edited if its own message was edited, or
+        not at all if it was deleted. Returns (to answer alone, to answer again, gone, turns that gave way just now)."""
+        ids, alone, again, gone, voided = set(ids), [], [], [], []
         for token in list(self.turns.values()):
             own = any(row[1].id in ids for row in token.rows)
             if own:
@@ -367,7 +367,9 @@ class Continuations:
                 alone.append(token)
             elif not deleted:
                 again.append(token)
-        return alone, again, voided
+            else:
+                gone.append(token)
+        return alone, again, gone, voided
 
     def forget(self, user):
         for token in self.turns.values():
@@ -667,6 +669,8 @@ async def unchanged(agent, message, context):
             try:
                 current = await message.channel.fetch_message(int(row['source']['id']))
             except discord.NotFound:
+                if hasattr(agent, 'gone'):  # Deleted, as its delete event, which may never come, would mark it.
+                    agent.gone(int(row['source']['id']))
                 await withdrawn(row, MAX_TEXT, None)
                 unchanged = False
                 continue

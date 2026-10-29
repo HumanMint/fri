@@ -73,6 +73,17 @@ def burst_of(context):
     return [row['text'] for row in context.get('message_burst', [])]
 
 
+def counted(agent):
+    """The silence ledger's account of the messages addressed to Fri (see fri_ledger): their kinds, how many are still
+    being handled, and how each was settled."""
+    outcomes = agent.ledger.snapshot()
+    return (outcomes['addressed'], outcomes['in_flight'],
+            {key: outcomes[key] for key in ('answered', 'told_why', 'quiet', 'withheld')})
+
+
+ANSWERED = ({'name': 1}, 0, {'answered': 1, 'told_why': {}, 'quiet': {}, 'withheld': {}})  # The question, once.
+
+
 def deleted(channel, rows, event):
     """Discord has it deleted from now on: fetching it or replying to it is refused."""
     rows.pop(event.id)
@@ -124,6 +135,7 @@ def test_a_short_line_sent_while_fri_composes_is_answered_with_the_question_once
             assert [row['source']['id'] for row in turn['burst']] == [str(question.id), str(detail.id)]
             assert sum(path == '/agent/admit' for path, _ in calls) == 1  # One exchange, one allowance.
             assert context['fence']['actions'].reopened  # A reopened burst completes no request.
+            assert counted(agent) == ANSWERED  # Answered by the turn for both, not left quiet by its own (fri #189).
         finally:
             await finish(fri, tasks)
     asyncio.run(scenario())
@@ -265,6 +277,10 @@ def test_a_line_taken_back_before_the_turn_commits_leaves_the_question_answered_
             assert all(DETAIL not in burst_of(context) for _, context in model.requests)
             assert not any(DETAIL in [row['text'] for row in context['recent']] for _, context in model.requests)
             assert all(turn['source']['id'] == str(question.id) for turn in saved(calls))
+            # Counted once, by its own turn: not settled as "message changed" when the line's burst was voided.
+            kinds, handling, outcomes = counted(agent)
+            assert kinds == {'name': 1} and not handling and not outcomes['quiet']
+            assert outcomes['answered'] == 1 or change == 'edited' and sum(outcomes['told_why'].values()) == 1
         finally:
             model.hold[1].set()
             await finish(fri, tasks)
@@ -401,6 +417,7 @@ def test_a_question_that_waited_out_its_turn_after_a_line_joined_says_nothing_of
             assert text == DETAIL and burst_of(context) == [QUESTION, DETAIL]
             detail.reply.assert_awaited_once()
             assert len(saved(calls)) == 1
+            assert counted(agent) == ANSWERED
         finally:
             await finish(fri, tasks)
     asyncio.run(scenario())
@@ -490,6 +507,48 @@ def test_a_line_taken_back_after_the_question_gave_way_leaves_the_question_answe
             assert all(row['id'] != str(detail.id) for row in model.requests[0][1]['recent'])
             [turn] = saved(calls)
             assert turn['source']['id'] == str(question.id) and not turn['burst']
+            assert counted(agent) == ANSWERED  # Its recovery counts it, once (fri #189).
+        finally:
+            for hold in model.hold.values():
+                hold.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('end', ['question deleted while gathering', 'question deleted while composing',
+                                 'turn for both stays quiet'])
+def test_a_question_that_gave_way_is_counted_once_however_the_turn_for_both_ends(monkeypatch, tmp_path, end):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        if end != 'question deleted while gathering':
+            no_debounce(monkeypatch)
+        # The question's own request never goes out (it gives way), so the turn for both gets the first result.
+        model = Model(fri, tmp_path, {'response_kind': 'quiet', 'reply': ''}, waits={1: 'before', 2: 'before'})
+        question = message(QUESTION)
+        tasks = [asyncio.create_task(agent.handle(question))]
+        try:
+            await asyncio.wait_for(model.reached[1].wait(), 5)
+            detail = message(DETAIL)
+            tasks.append(asyncio.create_task(agent.handle(detail)))
+            await until(lambda: tasks[1].done() or detail.id in agent.replying or
+                        agent.bursts.group(detail) is not None)
+            model.hold[1].set()
+            await asyncio.wait_for(tasks[0], 5)  # It gave way: the burst the line reopened counts it now.
+            assert agent.ledger.snapshot()['in_flight'] == 1
+            if end == 'question deleted while composing':
+                await asyncio.wait_for(model.reached[2].wait(), 5)
+            if end.startswith('question deleted'):  # Voided, and nothing answers the question now.
+                deleted(channel, rows, question)
+                agent.unsend(1, [question.id])
+            model.hold[2].set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 10)
+            await until(lambda: not agent.reruns)
+            question.reply.assert_not_awaited()
+            detail.reply.assert_not_awaited()
+            reason = 'chose quiet' if end == 'turn for both stays quiet' else 'message deleted'
+            assert counted(agent) == ({'name': 1}, 0, {'answered': 0, 'told_why': {}, 'quiet': {reason: 1},
+                                                       'withheld': {}})
         finally:
             for hold in model.hold.values():
                 hold.set()
@@ -555,6 +614,7 @@ def test_a_line_and_a_reply_added_to_a_question_spend_one_allowance(monkeypatch,
             reply.reply.assert_awaited_once()
             assert len(saved(calls)) == 1
             assert sum(path == '/agent/admit' for path, _ in calls) == 1  # One exchange, one allowance.
+            assert counted(agent) == ({'name': 2}, 0, {'answered': 2, 'told_why': {}, 'quiet': {}, 'withheld': {}})
         finally:
             model.hold[1].set()
             await finish(fri, tasks)
@@ -662,6 +722,7 @@ def test_a_question_edited_after_it_gave_way_is_answered_again_as_edited(monkeyp
             detail.reply.assert_not_awaited()  # No "that changed" notice for the line either.
             [turn] = saved(calls)
             assert turn['source']['id'] == str(question.id)
+            assert counted(agent) == ANSWERED  # Kept for its re-run, not settled when it gave way (fri #189).
         finally:
             for hold in model.hold.values():
                 hold.set()

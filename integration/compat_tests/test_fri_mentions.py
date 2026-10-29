@@ -2885,6 +2885,7 @@ def test_on_demand_meme_read_checks_sources_before_reply_and_prevents_persistenc
     ('controls', 'music controls:', 20),
     ('what do you remember about me?', 'memory is on', 20),
     ('forget me', 'erased our saved chats', 20),
+    ('what do u remember abt me', 'memory is on', 20), ('forget about me pls', 'erased our saved chats', 20),
     ('show usage', 'nothing recorded', 10),
 ])
 def test_configured_local_utilities_keep_addressing_parity_during_cooldown(monkeypatch, tmp_path, prefix, utility, expected, user):
