@@ -146,6 +146,105 @@ def test_sentence_punctuation_and_other_links_are_read_as_discord_reads_them(rep
     assert link_posts(reply, read()) == sent
 
 
+# fri #208: a browser drops a tab or newline anywhere in a link, the scheme too, and a control character before it.
+SPLIT = [MADE_UP.replace('https', 'htt\tps'), MADE_UP.replace('https', 'h\nttps'), MADE_UP.replace('https', 'HTTPS\r\n'),
+         MADE_UP.replace('https:', 'h\tt\tt\tp\ts\t:'), MADE_UP.replace('https', 'http\ns')]
+
+
+@pytest.mark.parametrize('url', SPLIT)
+@pytest.mark.parametrize('form, sent', [
+    ('this one: <{}>', 'this one: '),  # Nothing else in it reads as a link, so this is the preflight's.
+    ('docs at https://example.com/a, this one: <{}>', 'docs at https://example.com/a, this one: '),  # The pattern's.
+    ('[kev’s clip]({})', 'kev’s clip'), ('[kev’s clip](<{}>)', 'kev’s clip'),
+    ('this one: {} ok', 'this one:  ok'),
+])
+def test_a_post_link_with_a_tab_or_newline_in_its_scheme_goes(url, form, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(form.format(url), read()) == sent
+
+
+@pytest.mark.parametrize('reply, sent', [
+    # Another form of the shown link: only the exact one stays.
+    ('this one: <'+FOUND.replace('https', 'htt\tps')+'>', 'this one: '),
+    (f'{FOUND} or <'+MADE_UP.replace('https', 'htt\nps')+'>', f'<{FOUND}> or '),
+    # A tab, newline or control character before the scheme, with more in the host.
+    ('this one: <\thttps://disc\tord.com/'+PATH+'>', 'this one: '),
+    ('this one: <\x0bhtt\tps://disc\nord.com/'+PATH+'>', 'this one: '),
+    ('this one: [kev’s clip](<\x01htt\tps://discord.com/'+PATH+'>)', 'this one: kev’s clip'),
+])
+def test_a_split_scheme_never_passes_for_the_shown_link_or_hides_another(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+@pytest.mark.parametrize('reply, sent', [
+    # fri #209: inside <…>, its whole path is the link's, so a browser resolves ".." through to the end: these name
+    # the channel, not a post.
+    ('<https://discord.com/x/../channels/123/2/1300000000000000009/..>',
+     '<https://discord.com/x/../channels/123/2/1300000000000000009/..>'),
+    ('[the channel](<https://%64iscord.com/x/../'+PATH+'/%2e%2e/>)', '[the channel](<https://%64iscord.com/x/../'+PATH+'/%2e%2e/>)'),
+    (f'see <https://discord.com/x/../{PATH}/..?next={MADE_UP}> ok', 'see  ok'),  # A post link inside one still goes.
+    # Still a post: as written, or once its path is resolved.
+    (f'<{MADE_UP}/..>', 'can’t link that one.'), ('<https://discord.com/x/../'+PATH+'/x/..>', 'can’t link that one.'),
+    ('<https://discord.com/x/../'+PATH+'/../8>', 'can’t link that one.'),
+    # A bare link never ends on "." (see TAIL), so the ".." after it isn't its own, and it links the post. Out of <…>,
+    # a masked link's target is read as a bare one would be, since Discord can refuse the masked link; and a "\\" can
+    # escape a masked link's ">" or ")", making what follows its own.
+    ('https://discord.com/x/../'+PATH+'/..', '..'), ('[clip](https://discord.com/x/../'+PATH+'/%2e%2e)', 'clip'),
+    ('[clip](<https://discord.com/x/../'+PATH+'/..\\>)', 'clip'), ('[clip](https://discord.com/x/../'+PATH+'/..\\))', 'clip)'),
+    # In <…> but maybe a masked link's target this pattern doesn't take (an empty label), where "\\." is an escape and
+    # a ")" can end it: its starts count too.
+    ('[](<https://discord.com/x/../'+PATH+'/\\..>)', '[]()'), ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', '[](\ufeff )'),
+    ('<https://discord.com/x/../'+PATH+'\\..>', 'can’t link that one.'),
+])
+def test_a_link_in_brackets_names_a_post_only_once_its_whole_path_is_read(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+@pytest.mark.parametrize('reply, sent', [
+    # An escaped "<" is only text, so the link after it is a bare one, which never ends on "." (see TAIL): it links the
+    # post (review of fri #219). An escaped backslash before the "<" escapes nothing.
+    ('see \\<https://discord.com/x/../'+PATH+'/..>', 'see \\'),
+    ('see \\\\\\<https://discord.com/x/../'+PATH+'/..>', 'see \\\\\\'),
+    ('see \\\\<https://discord.com/x/../'+PATH+'/..>', 'see \\\\<https://discord.com/x/../'+PATH+'/..>'),
+])
+def test_a_link_after_an_escaped_bracket_is_read_as_a_bare_one(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+# Spaces as Discord's markdown reads them (JavaScript's): <…> ends only at a plain space, while a bare link or a masked
+# link's target ends at any of these, but not at a control character Python also calls a space (review of fri #219).
+@pytest.mark.parametrize('space, ends', [('\u2003', True), ('\xa0', True), ('\v', True), ('\x1c', False), ('\x85', False)])
+@pytest.mark.parametrize('form', ['<{}>', '{}', '[clip]({})'])
+def test_a_post_link_holding_a_space_a_browser_keeps_goes(space, ends, form):
+    """A browser keeps such a character inside a link's path (encoded), so "x{space}/.." resolves away."""
+    from fri.fri_links import link_posts
+    reply = form.format('https://discord.com/x'+space+'/../'+PATH)
+    kept = ends and form != '<{}>'  # Discord links only "https://discord.com/x" here, which names no post.
+    assert link_posts(reply, read()) == (reply if kept else 'clip' if form.startswith('[') else 'can’t link that one.')
+
+
+@pytest.mark.parametrize('filler', ['https:'*330 + '@' + '%61'*700, 'https://discord.com/x/../'*160, 'https:'*700])
+def test_a_4000_character_reply_is_filtered_well_under_100_ms(filler):
+    """Every refilter forced (each drop joins the halves around it into another link), then many links starting inside
+    one bare run: each pass reads the run once, not once for every link in it, and each link once per reply."""
+    import time
+
+    from fri.fri_links import link_posts
+    nested = MADE_UP
+    for _ in range(8):
+        nested = MADE_UP[:30] + '<' + nested + '>' + MADE_UP[30:]
+    reply = (nested + ' ' + filler)[:4000]
+    took = []
+    for _ in range(3):
+        started = time.perf_counter()
+        assert link_posts(reply, read()) == 'can’t link that one.'
+        took.append(time.perf_counter() - started)
+    assert min(took) < 0.1
+
+
 def respond_with(action, context, **fields):
     import json
 
@@ -246,8 +345,85 @@ def test_a_request_draft_the_link_rule_lengthens_past_its_limit_fails_safely(len
         assert result.draft == draft.replace(FOUND, f'<{FOUND}>') and len(result.draft) == 4000
 
 
-@pytest.mark.parametrize('draft', [MADE_UP, f'fix {MADE_UP}', f'<{MADE_UP}>'])
+# fri #209: the controller takes a draft at least 5 characters long once stripped, so "fix: " and "  fix " are too short.
+@pytest.mark.parametrize('draft', [MADE_UP, f'fix {MADE_UP}', f'<{MADE_UP}>', f'fix: {MADE_UP}', f'  fix {MADE_UP}',
+                                   f'fix:\n{MADE_UP}'])
 def test_a_request_draft_left_too_short_by_a_dropped_link_fails_safely(draft):
     context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high', **read()}
     result = respond_with(None, context, reply='drafted it', request_draft=draft)
     assert result.status == 'invalid_output' and result.draft is None
+
+
+def diagnosed(monkeypatch, tmp_path, proposal, receipts=()):
+    """A Gene check whose diagnosis, having read `receipts`, proposes `proposal`: the turn it ends in."""
+    from compat_tests.test_fri_actions import harness
+    from compat_tests.test_fri_chat import CONTEXT
+    from compat_tests.test_fri_runtime import event
+    from fri.fri_actions import Actions
+    from fri.fri_chat import ChatResult
+
+    async def scenario():
+        fri, _, _, _ = harness(monkeypatch, tmp_path)
+        source = event(user=20, channel=1, content='gene doesnt reply')
+        calls = []
+
+        async def api(method, path, body=None):
+            calls.append(path)
+            if path == '/agent/admit':
+                return {'allowed': True}
+            if path == '/chat/context':
+                return {**CONTEXT, 'revision': 0}
+            return {}
+        fri.api = api
+        fri.chat.respond = AsyncMock(side_effect=[
+            ChatResult(status='completed', action={'kind': 'gene_diagnose', 'channel_id': ''}),
+            ChatResult(status='completed', reply='gene restarted, cause is still unclear. got a repair preview for you')])
+        receipt = {'kind': 'gene_diagnose', 'receipts': list(receipts), 'proposed_request': proposal,
+                   'diagnosis_status': 'completed'}
+        try:
+            with patch.object(Actions, 'execute', new=AsyncMock(return_value=receipt)):
+                return await fri.talk(123, 1, 20, source.content, 'public', event=source), calls
+        finally:
+            await fri.close()
+    return asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('proposal, draft', [
+    (f'Investigate the missed command at {MADE_UP} again', 'Investigate the missed command at  again'),
+    (f'Check [the report]({MADE_UP}) and the restart', 'Check the report and the restart'),
+    ('Investigate the missed command', 'Investigate the missed command'),
+])
+def test_a_diagnosis_draft_keeps_only_post_links_its_check_was_shown(monkeypatch, tmp_path, proposal, draft):
+    """fri #207: a diagnosis's proposal becomes the turn's draft, shown in its preview and submitted as Fri's words, so
+    it gets the reply's filter, against what the diagnosis read."""
+    result, _ = diagnosed(monkeypatch, tmp_path, proposal)
+    assert result.draft == draft
+
+
+def test_a_post_link_in_genes_output_is_not_one_the_diagnosis_was_shown(monkeypatch, tmp_path):
+    """Red's output can echo anyone's words: a link in it isn't a post's source."""
+    receipts = [{'channel_id': '1', 'action': 'play', 'result': {'output': f'queued from {FOUND}'}}]
+    result, _ = diagnosed(monkeypatch, tmp_path, f'Investigate the play at {FOUND}', receipts)
+    assert result.draft == 'Investigate the play at '
+
+
+@pytest.mark.parametrize('proposal', [MADE_UP, f'<{MADE_UP}>', f'fix: {MADE_UP}', f'fix\n{MADE_UP}'])
+def test_a_diagnosis_draft_left_too_short_by_a_dropped_link_is_unreadable(monkeypatch, tmp_path, proposal):
+    """What's left must still be a request the controller takes (5 characters once stripped); otherwise the turn says
+    the reply was unreadable, without hiding that the check ran, rather than a preview whose submit fails."""
+    result, calls = diagnosed(monkeypatch, tmp_path, proposal)
+    assert result.draft is None and 'unreadable' in result.reply and 'that check completed.' in result.reply
+    assert '/requests' not in calls
+
+
+@pytest.mark.parametrize('kind, value, sent', [
+    ('gene_command', {'output': f'queued {MADE_UP}'}, 'gene returned:\nqueued '),
+    ('gene_command', {'output': f'queued <{MADE_UP}>'}, 'gene returned:\nqueued '),
+    ('web_search', {'answer': f'it is {FOUND}', 'sources': [{'url': FOUND}]}, f'it is <{FOUND}>'),
+    ('web_search', {'answer': f'it is {MADE_UP}', 'sources': [{'url': FOUND}]}, 'it is '),
+])
+def test_a_reply_built_from_receipts_keeps_only_post_links_they_showed(kind, value, sent):
+    """When the model's own words can't be used, Fri answers from the step's receipt: a post link in Gene's output or a
+    search answer goes out only if the receipts showed it as a source (review of fri #219)."""
+    from fri.fri_outcomes import fallback, receipt
+    assert fallback([receipt(kind, value)]) == sent

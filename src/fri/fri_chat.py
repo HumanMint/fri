@@ -508,6 +508,12 @@ def loops_view(loops, source=None):
                   else None, 'chosen': date(row.get('chosen'))} for row in game_nights]}
 
 
+def submittable(draft):
+    """Whether a request draft fits its preview (4000 characters) and is one the controller takes: 5 characters or
+    more once cleaned as it cleans them, stripped (fri #209)."""
+    return len(draft) <= 4000 and len(clean(draft)) >= 5
+
+
 @dataclass
 class ChatResult:
     reply: str = ''
@@ -763,7 +769,7 @@ class Chat:
                                 # link gains <…> and a dropped one shortens it: it must still fit, or the reply is
                                 # unreadable.
                                 draft = link_posts(draft, context, empty='')
-                                if not 5 <= len(draft) <= 4000:
+                                if not submittable(draft):
                                     raise ValueError('Invalid draft once its links are checked')
                             elif isinstance(action, dict) and action.get('kind') == 'clarify':
                                 # Its question goes out and is saved as a reply would; the topic stays an exact excerpt.

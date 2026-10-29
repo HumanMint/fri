@@ -2,6 +2,7 @@
 
 from enum import Enum
 
+from .fri_links import link_posts
 from .fri_notices import notice_text
 from .privacy import clean
 
@@ -36,10 +37,11 @@ def receipt(kind, value):
 
 
 def fallback(receipts):
-    """Never infer playback, publish a private read, or repeat a side effect."""
+    """Never infer playback, publish a private read, or repeat a side effect. A post link in it (Gene's output, a search
+    answer) goes out only if the receipts showed it as a source, as with the model's own reply (see fri_links)."""
     earlier = [one(r) for r in receipts[:-1] if r['outcome'] == Outcome.COMPLETED
                and r['kind'] in ('work_save', 'reminder_cancel')]
-    return '\n'.join([*earlier, one(receipts[-1])])[:1800]
+    return link_posts('\n'.join([*earlier, one(receipts[-1])])[:1800], {'action_results': receipts})
 
 
 def one(last):

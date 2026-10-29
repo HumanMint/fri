@@ -16,7 +16,7 @@ from discord.ext import tasks
 from . import feedback as commands
 from .fri_actions import Actions
 from .fri_addressing import addressed_text
-from .fri_chat import Chat, ChatResult
+from .fri_chat import Chat, ChatResult, submittable
 from .fri_context import discord_source
 from .fri_errors import (
     UNREACHABLE,
@@ -28,6 +28,7 @@ from .fri_errors import (
 )
 from .fri_images import CHANGED as IMAGES_CHANGED
 from .fri_images import unchanged as images_unchanged
+from .fri_links import link_posts
 from .fri_memory import (
     DEPENDENCIES,
     GENERATIONS,
@@ -866,8 +867,16 @@ class Fri(discord.Client):
                                  else receipt.get('gene_result', receipt).get('diagnostic', {}))
                     # An action's proposal used to be discarded here. Keep the checked diagnosis
                     # as a real preview unless the controller accepted it for automatic verification.
-                    proposal = diagnosis.get('proposed_request', '')
-                    result.draft = proposal if len(proposal) >= 5 and not actions.private_evidence else None
+                    proposal, result.draft = diagnosis.get('proposed_request', ''), None
+                    if len(proposal) >= 5 and not actions.private_evidence:
+                        # Shown in the preview and submitted as Fri's words, so its post links follow the reply's
+                        # rule, against what the diagnosis read (fri #207). It must still be a draft the controller
+                        # takes, or the reply is unreadable.
+                        proposal = link_posts(proposal, {'action_result': diagnosis}, empty='')
+                        if not submittable(proposal):
+                            return ChatResult(reply=unrecorded(receipts, reason='Fri received an unreadable reply.'),
+                                              status='completed')
+                        result.draft = proposal
                     if research or receipt.get('sources'):
                         from .fri_web import cite_reply, links_requested
                         link_request = links_requested(text) or links_requested((actions.pending or {}).get('request_text', ''))
