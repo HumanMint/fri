@@ -73,18 +73,20 @@ def post(url):
     authority = AUTHORITY.match(url, url.index(':')+1)
     if not discord(authority[1].rpartition('@')[2].partition(':')[0]):
         return None
-    path, at = [], authority.end()
+    path, names, at = [], [], authority.end()  # Its segments, and the ones that count: as written, "//" doesn't.
     while part := SEGMENT.match(url, at):
         segment, at = part[1], part.end()
         name = unquote(segment)
         if name == '..':
-            path = path[:-1]
+            if path and path.pop():
+                names.pop()
         elif name != '.':
-            names = [name for name in path if name]  # As written, empty segments ("//") don't count.
             if (len(names) == 3 and names[0].lower() == 'channels' and re.fullmatch(r'[0-9]{1,25}|@me', names[1], re.I)
                     and re.fullmatch(r'[0-9]{1,25}', names[2]) and (message := DIGITS.match(segment))):
                 return part.start(1)+message.end()
             path.append(name)
+            if name:
+                names.append(name)
     return None
 
 
