@@ -26,7 +26,7 @@ STATE = {'config': {**DEFAULTS, 'enabled': True, 'meme_enabled': True}, 'version
 
 
 @pytest.fixture
-def heartbeat(monkeypatch):
+def heartbeat(monkeypatch, tmp_path):
     monkeypatch.setattr('fri.fri_workspace.deliver_one', AsyncMock())
     monkeypatch.setattr('fri.fri_social.deliver_one', AsyncMock())
     monkeypatch.setattr('fri.fri_fixes.check', AsyncMock())
@@ -37,7 +37,7 @@ def heartbeat(monkeypatch):
         return {'/agent/state': STATE, '/agent/reports': reports}[path]
 
     fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=AsyncMock(side_effect=api),
-                          get_user=lambda _: owner, wait_until_ready=AsyncMock())
+                          get_user=lambda _: owner, wait_until_ready=AsyncMock(), data=tmp_path)
     agent = Agent(fri)
     agent.learn, agent.attend, agent.check_memes = AsyncMock(), AsyncMock(), AsyncMock()
     return SimpleNamespace(agent=agent, fri=fri, owner=owner, reports=reports)

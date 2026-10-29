@@ -1185,33 +1185,27 @@ def test_a_take_back_discord_did_not_confirm_is_tried_again(world, monkeypatch, 
 
 @pytest.mark.parametrize('shutdown', ['before', 'after'])
 def test_a_send_cut_off_by_a_shutdown_is_settled_by_the_next_pass(world, monkeypatch, shutdown):
-    """Fri stopped once the send was cleared. The next pass looks for the reply in Discord: one it finds is
-    recorded with the usual checks (here the reporter erased since, so it's taken back), and none frees the tap."""
+    """Fri stopped once the send was cleared, before it heard back. Whether the reply posted or not, it may be up,
+    so the next pass records it as unconfirmed, and it's never sent again or looked for."""
     report, job_id, _ = reported(world)
     authorize_offered(world)
-    posted = history(world, monkeypatch, shutdown)
+    history(world, monkeypatch, shutdown)
     deleted = reply_deletions(world)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(tell(world.fri, job_id, OWNER))
     [entry] = pending(world).values()
-    assert entry['report_id'] == str(report.id) and 'message_id' not in entry
-    asyncio.run(fri_fixes.settle_all(world.fri))
+    assert entry['cleared'] and 'message_id' not in entry
+    asyncio.run(fri_fixes.settle(world.agent))
     assert pending(world)  # Too soon: a send may still be on its way.
     monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
-    if shutdown == 'after':
-        world.store.erase_user(str(MEMBER))
-    asyncio.run(fri_fixes.settle_all(world.fri))
-    assert not pending(world)
-    if shutdown == 'after':
-        assert notice_row(world, job_id)[0] == 'invalidated' and [str(id) for id in deleted] == [str(posted[0].id)]
-    else:
-        assert notice_row(world, job_id)[0] == 'failed' and not deleted
-        history(world, monkeypatch)
-        text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
-        assert sent and len(world.sent) == 1
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not pending(world) and not deleted and not world.room.history.called
+    assert notice_row(world, job_id)[0] == 'uncertain'
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and 'may already have posted' in text and len(world.sent) == (shutdown == 'after')
 
 
-def stuck(world, job_id, report, posted=None):
+def stuck(world, job_id, report):
     """A tap that was cleared to send an hour ago and stopped: its outcome was never recorded."""
     owner = {'guild_id': '123', 'user_id': str(OWNER)}
     route = f'/requests/{job_id}/requester-notice'
@@ -1219,34 +1213,6 @@ def stuck(world, job_id, report, posted=None):
     assert world.client.post(route+'/authorize', headers=headers('fri'), json={**owner, 'lease': lease}).status_code == 200
     with world.store.connection() as db:
         db.execute('UPDATE requester_notices SET at=at-3600 WHERE job_id=?', (job_id,))
-    if posted is not None:
-        reply = SimpleNamespace(id=snowflake(3600-5), author=SimpleNamespace(id=FRI),
-                                reference=SimpleNamespace(message_id=report.id))
-        posted.append(reply)
-        return reply
-
-
-@pytest.mark.parametrize('earlier', ['posted', 'not_posted', 'unreadable'])
-def test_a_tap_after_a_send_that_never_recorded_looks_for_it_first(world, monkeypatch, earlier):
-    """gene #139: a claim stuck on a send Fri never recorded was refused for good. Now the next tap looks for that
-    reply in Discord: one that posted is recorded and never sent twice, and only none found sends."""
-    report, job_id, _ = reported(world)
-    authorize_offered(world)
-    posted = history(world, monkeypatch)
-    reply = stuck(world, job_id, report, posted if earlier == 'posted' else None)
-    if earlier == 'unreadable':
-        world.room.history = Mock(side_effect=discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'no'))
-    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
-    state, message_id = notice_row(world, job_id)
-    if earlier == 'posted':
-        assert sent and not world.sent and text == 'it already went out, so i didn’t send it twice: '+report.jump_url
-        assert (state, message_id) == ('sent', str(reply.id))
-    elif earlier == 'not_posted':
-        assert sent and len(world.sent) == 1 and state == 'sent'
-    else:
-        assert not sent and not world.sent and state == 'uncertain'
-        assert text == 'couldn’t tell whether the last reply went out, so not sending it twice.'
-    assert not pending(world)
 
 
 def test_an_older_controller_gets_no_prepared_claim(world):
