@@ -187,7 +187,7 @@ REFUSED = re.compile(
 # ("nah, lol"; "Hell No" stays a title), or a closing "i said no (to that)" or "i told you not to". Checked after the
 # correction only, since "actually no, wrong song, X" opens one.
 CLOSING = (r"(?:[\s,;:.!?…—–\-'\"”]|\b(?:lol|lmao|lmfao|haha|bro|bruh|dude|man|fri|thanks|thank you|thx|ty|tho|though"
-           r"|sorry)\b)*+$")
+           r"|sorry|please|pls|plz|again)\b)*+$")
 WITHDRAWN = re.compile(r"\b(?:actually,?\s+(?:no(?:pe|t that)?|nah)|no,?\s+wait|wait,?\s+no|(?:i\s+)?change[ds]?\s+my\s+mind"
                        r"|on second thought|never\s+mind|leave it|nope|n(?:o|ah)[\s,]+(?:thanks|thank you|thx|ty)"
                        r"|not\s+(?:(?:that|this|the|it)\s+)?(?:(?:one|song|track)\s+)?either)\b"
@@ -210,18 +210,18 @@ BREAK = re.compile(r"[,;:!?…—–()\[\]\"“”]|\.(?!\w)|\s-+(?=\s|$)|'s\b|\
                    r"|plus|actually|wait|lol|lmao|nah|no|oh|please|pls|examples?|for instance|e\.?g|hypothetical(?:ly)?"
                    r"|such as|according to|quot\w*)\b")
 PAUSE = re.compile(r"[,;:.!?…—–()\[\]\"“”]\s?$")
-ADDRESSED = re.compile(r"\b(?:you|u|we)\s$")
+ADDRESSED = re.compile(r"(?<!\blike )(?<!\bas )\b(?:you|u|we)\s$")  # Not "like you say", which is someone else's.
 # Right after the song (and its artist), in the same clause, their own words denying it: "... is (absolutely) not what i meant",
-# "... isn't the one i asked for", "... is what i didn't ask for". ("..., that's not what i asked for" is about the
+# "... isn't the one i asked for", "... is what i didn't ask for", "... is not what we want". ("..., that's not what i asked for" is about the
 # song Gene played.)
 DENIAL = (r"(?:said|say(?:ing)?|told|tell(?:ing)?|ask(?:ed|ing)?|want(?:ed|ing)?|meant|mean(?:ing)?|pick(?:ed|ing)?"
           r"|request(?:ed|ing)?|cho(?:se|ose|osing)|had\s+in\s+mind)\b")
 HEDGE = r"(?:really|quite|exactly|even|at\s+all|absolutely|definitely|certainly|totally|clearly|honestly|literally|actually|just|so|simply)"
 DISOWNED = re.compile(rf"[^,;:.!?…—–()\[\]\"“”]*?\b(?:(?:(?:is|was|are|were)\s+(?:{HEDGE}\s+){{0,2}}not|(?:isn|wasn|aren|weren|ain)'?t)\s+"
                       rf"(?:{HEDGE}\s+){{0,2}}(?:what|who|the\s+(?:one|song|track))\s+(?:that\s+)?"
-                      r"i(?:'ve|'d|'m)?\s+(?:(?:just|already|literally|clearly|even|actually|originally|been)\s+){0,2}"
+                      r"(?:i(?:'ve|'d|'m)?|we(?:'ve|'d|'re)?)\s+(?:(?:just|already|literally|clearly|even|actually|originally|been)\s+){0,2}"
                       r"|(?:is|was|are|were)\s+(?:(?:really|exactly|just)\s+)?(?:what|who|the\s+(?:one|song|track))\s+"
-                      r"(?:that\s+)?i\s+(?:didn'?t|did\s+not|don'?t|do\s+not|never)\s+(?:(?:even|really|ever)\s+)?)"+DENIAL)
+                      r"(?:that\s+)?(?:i|we)\s+(?:didn'?t|did\s+not|don'?t|do\s+not|never)\s+(?:(?:even|really|ever)\s+)?)"+DENIAL)
 # Between a title and its artist: "Love Story by Taylor Swift" may be named "Love Story Taylor Swift", though
 # "Stand By Me" can't be "Stand Me". In the title or right after it, the word after one names the artist, never a
 # withdrawal ("by Nope"), and with a leading "the" the artist's name is no one's words ("by The Wanted"), though
