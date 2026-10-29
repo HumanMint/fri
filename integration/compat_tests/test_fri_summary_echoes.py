@@ -122,15 +122,16 @@ def test_attention_drops_its_batch_when_a_summary_reply_in_it_is_retired(monkeyp
 
 
 def test_current_replies_stay_in_view(monkeypatch, tmp_path):
-    """A summary-derived reply whose summary is still there, and an ordinary one, which costs no extra request."""
+    """A summary-derived reply whose summary is still there, and an ordinary one, which costs no extra request. The
+    ordinary one comes first: a reply whose request carried a summary-derived one depends on it too (fri #193)."""
     async def scenario():
         w = world(monkeypatch, tmp_path)
         try:
             await summarized_from(monkeypatch, w)
             model(w, recalls)
-            await echoed(w)
             before = len(w.calls)
-            assert await echoed(w, 'fri hi', user=30) == [CONTINUATION, 'nothing to recall']
+            assert await echoed(w, 'fri hi', user=30) == ['nothing to recall']
+            assert await echoed(w) == ['nothing to recall', CONTINUATION]
             carried = later(w)
             await w.say(GENERAL, 'fri what is going on', user=31)
             assert CONTINUATION in str(carried) and 'nothing to recall' in str(carried)

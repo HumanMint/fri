@@ -261,13 +261,17 @@ advertises it, so the controller must be released first.
   An older controller gets the per-author profile reads, which an erasure through Gene during them
   can still slip past.
 - **Withdrawn messages' saved exchanges.** When a member's message Fri saved an exchange with is
-  withdrawn (edited while handled or while a model request carried it, or deleted), Fri asks a
-  controller that offers `turn-withdrawal` to drop that exchange through `/chat/turn/withdraw`, so the
-  old words stop coming back as history (fri #129). A message withdrawn while its save was on the
-  way is caught once the save returns. Fri remembers which messages it saved exchanges with for as
-  long as the controller keeps them, in memory only, so a message saved before a restart isn't asked
-  about. A failed call is logged with the message ID and error type only, and the turn goes on. An
-  older controller is never asked. Not covered yet (fri #101): Fri's own saved replies and echo rows,
+  edited, however long ago Fri last carried it (fri #174), or deleted, Fri asks a controller that
+  offers `turn-withdrawal` to drop that exchange through `/chat/turn/withdraw`, so the old words stop
+  coming back as history (fri #129). A message withdrawn while its save was on the way is caught once
+  the save returns. Fri remembers which messages it saved exchanges with for as long as the controller
+  keeps them, in memory only. So any other message edited or deleted where Fri saves exchanges (its
+  chat channels, their threads and DMs), sent within the week a saved exchange lasts, is asked about
+  by ID through `/chat/turn/withdraw/saved`, ten at a time, when the controller also offers
+  `saved-turn-withdrawal`: that covers a message saved before a restart. The controller drops only an
+  exchange that holds it, so an unrelated edit changes nothing. A failed call is logged with the
+  message IDs and error type only, and the turn goes on. An older controller is never asked, and one
+  with `turn-withdrawal` only is asked about the messages Fri saved since it started. Not covered yet (fri #101): Fri's own saved replies and echo rows,
   and other members' exchanges, that drew on the message record authors and revisions, not message
   IDs, so they stay.
 - **What a turn drawing on the member summary writes or keeps.** A turn whose model request had Fri's
@@ -285,7 +289,19 @@ advertises it, so the controller must be released first.
   lookup waits 3 seconds at most and a turn's 6 in all. Within a turn, one Gene retired isn't asked
   about again, and once a lookup gets no answer none is asked: every marked echo counts as retired,
   so an outage costs the turn one short wait (fri #193). A turn with no marked echo asks nothing, and
-  one without the summary, or a controller without summary generations, runs as before.
+  one without the summary, or a controller without summary generations, runs as before. A mark lasts
+  an hour, though the live view drops the row at 15 minutes, so a turn still holding a copy rechecks
+  it before delivery.
+- **What repeats a summary-derived reply.** A controller offering `summary-dependencies` reports,
+  with each reply `/chat/messages/sources` holds as said, the summaries it drew on (fri #193). A turn
+  whose request carries such a reply of Fri's, a marked echo in the live view or a reply target Fri
+  wrote, depends on those summaries whether or not its answer repeats them, as with provenance. It
+  sends them as `summary_dependencies` with every `/chat/turn/check` and its `/chat/turn`, kept with
+  the turn's fence so a tool step's later requests keep an earlier one's. Gene refuses the turn once
+  one of those summaries goes, so the answer is withheld, and retires its saved reply when one goes
+  later. Its echo is marked like the first, so a reply repeating that one depends on the same
+  summary. A turn that carried none sends nothing new, and a controller without the capability is
+  sent none.
 - **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
   research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
   an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead
