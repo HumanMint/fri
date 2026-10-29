@@ -5,6 +5,7 @@ CAPABILITIES = ('scoped-context', 'gene-controls', 'owner-reviews', 'privacy-rev
                 'workspace-outbox', 'social-outbox', 'research-receipts', 'agent-learning', 'event-mention-chat',
                 'turn-provenance')
 OPTIONAL = ('reply-checks', 'member-profiles', 'requester-notices', 'usage-window', 'memory-moves',
+            'requester-notice-authorize',
             'member-summaries', 'author-fence', 'turn-withdrawal',
             'summary-generations', 'summary-generation-writes',
             'requester-notice-recheck')  # Used when offered; an older controller still runs Fri.

@@ -1138,9 +1138,9 @@ def test_a_reply_taken_back_after_a_lost_answer_is_taken_back_by_the_next_pass(w
     [entry] = pending(world).values()
     assert entry['message_id'] and 'report_id' not in entry  # Kept to take it back, and nothing more.
     assert notice_row(world, job_id)[0] == 'invalidated'
-    asyncio.run(fri_fixes.settle_all(world.fri))
+    asyncio.run(fri_fixes.settle(world.agent))  # The heartbeat's stage.
     assert [str(id) for id in deleted] == [entry['message_id']] and not pending(world)
-    asyncio.run(fri_fixes.settle_all(world.fri))
+    asyncio.run(fri_fixes.settle(world.agent))
     assert len(deleted) == 1
 
 

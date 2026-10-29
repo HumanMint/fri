@@ -71,6 +71,22 @@ def test_meme_failure_is_recorded_and_the_next_tick_recovers(heartbeat):
     assert agent.stages['memes']['last_ok'] >= failed_at
 
 
+def test_cut_off_requester_notice_sends_are_settled_even_while_fri_is_off(heartbeat, tmp_path, monkeypatch):
+    """Taking a reply back is never a post, so it doesn't wait for Fri to be switched on (fri #214)."""
+    agent, settled = heartbeat.agent, []
+
+    async def settle(agent):
+        settled.append(agent)
+
+    monkeypatch.setattr('fri.fri_fixes.settle', settle)
+    asyncio.run(agent.heartbeat.coro(agent))
+    assert 'notices' not in agent.stages and not settled  # An older controller: nothing was ever noted.
+    heartbeat.fri.capabilities, heartbeat.fri.data = frozenset({'requester-notice-authorize'}), tmp_path
+    monkeypatch.setitem(STATE, 'config', {**STATE['config'], 'enabled': False})
+    asyncio.run(agent.heartbeat.coro(agent))
+    assert settled == [agent] and agent.stages['notices']['error'] is None
+
+
 def test_disabled_stages_do_not_run_or_report(heartbeat, monkeypatch):
     agent = heartbeat.agent
     asyncio.run(agent.heartbeat.coro(agent))
