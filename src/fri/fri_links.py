@@ -2,10 +2,17 @@
 
 import re
 
-URL = (r'https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/(?:[0-9]{1,25}|@me)/[0-9]{1,25}/[0-9]{1,25}'
-       r'(?![\w/])')
-POST = re.compile(URL)
-LINK = re.compile(rf'\[(?P<label>[^\]\n]{{1,100}})\]\(\s*<?(?P<masked>{URL})>?\s*\)|<?(?P<bare>{URL})>?')
+# A post's link in any form Discord opens it: any case, http, a sign-in or port, the www, ptb or canary host.
+URL = (r'https?://(?:[^\s/@<>]*@)?(?:(?:www|ptb|canary)\.)?discord(?:app)?\.com\.?(?::[0-9]*)?'
+       r'/+channels/+(?:[0-9]{1,25}|@me)/+[0-9]{1,25}/+[0-9]{1,25}')
+POST = re.compile(URL, re.I)
+# Then the rest of it: a trailing slash, query or fragment is part of it. Sentence punctuation or markdown at its
+# end isn't, nor an emoji or other non-URL text right after it, nor a word after closing markdown ("**…**this"):
+# inside it, "_" and "~" are its own (?utm_source=…), but it never ends on them, "*" or "|".
+# Inside <…> or a masked link's (…), it runs to the bracket.
+TAIL = r'(?:(?=[/?#])[A-Za-z0-9\-._~:/?#@!$&+,;=%]*[A-Za-z0-9\-/#@$&+=%])?'
+LINK = re.compile(rf'\[(?P<label>[^\]\n]{{1,100}})\]\(\s*<?(?P<masked>{URL}[^\s<>()]*)>?\s*\)|'
+                  rf'<(?P<angled>{URL}[^\s<>]*)>|<?(?P<bare>{URL}{TAIL})>?', re.I)
 # Where the model reads a post's own link: a read's or search's rows, a pin list, nearby posts, the images it
 # looked at, the current message. Never someone's words, saved turns or summaries.
 SHOWN = ('source', 'reply_target', 'message_burst', 'invited_context', 'inspected_images', 'action_result',
@@ -30,17 +37,26 @@ def shown(context):
     return found
 
 
-def link_posts(reply, context):
-    """A post link the model was shown stays, as <link> so it shows no preview. Any other one (made up, mangled or
-    copied from someone's words) goes, and a masked one keeps its label. Other links are left as they are."""
+def link_posts(reply, context, empty=EMPTY):
+    """A post link the model was shown stays, as <link> so it shows no preview. Any other one (made up, mangled,
+    another form of a shown one, or copied from someone's words) goes, and a masked one keeps its label. Other
+    links are left as they are. `empty`: what to send when only a dropped link was there."""
     if not POST.search(reply):
         return reply
     allowed = shown(context)
 
     def kept(match):
-        url = match['masked'] or match['bare']
+        url = match['masked'] or match['angled'] or match['bare']
         if match['masked']:
-            return f"[{match['label']}](<{url}>)" if url in allowed else match['label']
+            label = LINK.sub(kept, match['label'])  # A label's own post links follow the same rule.
+            if url not in allowed:
+                return label
+            return f'[{label}](<{url}>)' if label.strip() else f'<{url}>'
         return f'<{url}>' if url in allowed else ''
-    result = LINK.sub(kept, reply)
-    return result if result.strip() else EMPTY  # Only a dropped link: nothing left to send.
+    result = reply
+    for _ in range(8):  # Dropping one link can join the text around it into another, so go until nothing changes.
+        filtered = LINK.sub(kept, result)
+        if filtered == result:
+            return result if result.strip() else empty  # Only a dropped link: nothing left to send.
+        result = filtered
+    return empty  # Still changing: send nothing it could have made.

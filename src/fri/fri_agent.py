@@ -32,7 +32,7 @@ from .fri_errors import (
     ControllerUnavailable,
     GateClosed,
 )
-from .fri_images import forwarded, media
+from .fri_images import forwarded, media, started_a_thread
 from .fri_ledger import COOLDOWN, Ledger, addressed, notice_reason
 from .fri_memory import before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
@@ -1502,6 +1502,8 @@ class Agent:
         parent = getattr(message.channel, 'parent_id', None) or channel
         if not dm and not message.author.bot:
             self.continuations.heard(message)  # Someone else's line here ends another's continuation window.
+        if started_a_thread(message):  # Its text is the thread's name, not their words: not for the live view,
+            return self.miss(message, 'thread notice')  # attention or a reply (fri #179).
         raw = message.content
         if message.author.bot:
             if message.author.id != self.gene_id or message.guild.id != self.fri.guild_id:
