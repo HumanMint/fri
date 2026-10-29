@@ -197,3 +197,23 @@ def test_a_reply_to_fri_found_on_a_second_look_is_still_a_memory_control(monkeyp
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['fri forget about me', 'fri forget me', 'fri remember me again'])
+def test_the_no_agent_fallback_leaves_memory_changes_to_the_panel(monkeypatch, tmp_path, text):
+    """Without the agent nothing can fence an edit or delete that takes a control back while it runs, and an erasure
+    can't be undone, so the fallback points to /fri instead of changing memory (review of fri #195, round 4)."""
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            await remembered(agent, store, message)
+            fri.agent = None
+            fri.workshop_id = 1
+            control = message(text)
+            await fri.on_message(control)
+            assert memory(store) == (True, True)
+            assert not any(path == '/chat/memory/control' for path, _ in calls)
+            assert '/fri' in control.reply.await_args.args[0]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
