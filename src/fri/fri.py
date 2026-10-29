@@ -1287,6 +1287,8 @@ class Fri(discord.Client):
             self.agent.edit(payload.channel_id, payload.message, self.agent.saved_in(payload))
 
     async def on_message(self, message):
+        from .fri_fixes import seen
+        seen(self, message)  # A requester notice whose send's answer was lost, as Discord posted it (fri #221).
         if self.agent:
             try:
                 await self.agent.handle(message)

@@ -1310,3 +1310,148 @@ def test_a_note_a_day_old_is_dropped_whatever_the_controller_offers(world):
     world.fri.api.reset_mock()
     asyncio.run(fri_fixes.settle(world.agent))
     assert not pending(world) and not world.fri.api.await_args_list
+
+
+class Answer:
+    """One of Discord's HTTP answers, as discord.py's client reads it."""
+
+    def __init__(self, status, body=None):
+        self.status, self.body = status, body
+        self.headers = {'Via': '1.1 google', 'content-type': 'application/json'} if body is not None else {}
+
+    async def text(self, encoding=None):
+        return json.dumps(self.body) if self.body is not None else ''
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def test_a_take_back_held_up_by_a_global_rate_limit_never_stalls_discord(monkeypatch):
+    """fri #226: Discord answers the take-back with a global 429 that lasts longer than the take-back waits. discord.py
+    holds every call at its global gate meanwhile; cancelling the delete inside that wait left the gate shut for good.
+    The wait gives up, the delete is left to finish, and later calls go through once the 429 is over."""
+    monkeypatch.setattr(fri_fixes, 'TAKE_BACK', 0.05)
+    calls = []
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            calls.append(method)
+            if len(calls) == 1:
+                return Answer(429, {'message': 'You are being rate limited.', 'retry_after': 0.3, 'global': True})
+            return Answer(204)
+
+    async def scenario():
+        http = discord.http.HTTPClient(asyncio.get_running_loop())
+        http._HTTPClient__session = Session()
+        http._global_over = asyncio.Event()
+        http._global_over.set()
+        room = SimpleNamespace(id=456, get_partial_message=lambda id: SimpleNamespace(
+            id=id, delete=lambda: http.delete_message(456, id)))
+        reply = str(snowflake(60))
+        assert await fri_fixes.retract(room, reply) == 'unconfirmed'  # Still waiting out the 429.
+        assert await fri_fixes.retract(room, reply) == 'unconfirmed'  # The same delete, waited on again.
+        await asyncio.wait_for(http.request(discord.http.Route('GET', '/gateway')), 2)  # Not stuck at the gate.
+        assert calls == ['DELETE', 'DELETE', 'GET']  # The 429, then the delete itself once: never a second one.
+    asyncio.run(scenario())
+
+
+def claim_nonce(world, job_id):
+    """The nonce Fri's notice for this claim carries, as send_once derives it from the post's id."""
+    [entry] = pending(world).values()
+    return str(int(fri_fixes.notice_id(job_id, entry['lease'])[:20], 16))
+
+
+def lose_the_answer(world, monkeypatch, *, seen=None, erase=True):
+    """Discord posts the notice and its answer never reaches Fri. seen: what Fri's gateway delivers meanwhile, given
+    the post and its message ID."""
+    posted = []
+
+    async def send_once(_, post, *, reply_to=None, **__):
+        message_id = snowflake()
+        posted.append(message_id)
+        world.sent.append({**post, 'reply_to': reply_to})
+        if erase:
+            world.store.erase_user(str(MEMBER))
+        if seen:
+            fri_fixes.seen(world.fri, seen(post, message_id))
+        raise TimeoutError
+
+    monkeypatch.setattr('fri.fri_workspace.send_once', send_once)
+    return posted
+
+
+def own(post, message_id, **change):
+    """Fri's own message as the gateway delivers it, with the nonce send_once gave it."""
+    return SimpleNamespace(**{'id': message_id, 'author': SimpleNamespace(id=FRI), 'channel': SimpleNamespace(id=456),
+                              'nonce': str(int(post['id'][:20], 16)), **change})
+
+
+def test_an_unconfirmed_notice_discord_posted_is_taken_back_when_the_reporter_erased(world, monkeypatch):
+    """fri #221: Discord posted the notice and the reporter erased meanwhile, but its answer was lost. Fri's own
+    message came back over the gateway with its claim's nonce, so Fri knows it exactly: recorded as sent, the
+    controller says it no longer holds, and Fri takes it back."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = lose_the_answer(world, monkeypatch, seen=own)
+    deleted = reply_deletions(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and text == 'took the reply back: the report is no longer on record.'
+    assert [str(id) for id in deleted] == [str(posted[0])] and notice_row(world, job_id)[0] == 'invalidated'
+    assert not pending(world)
+
+
+def test_an_unconfirmed_notice_seen_later_is_taken_back_by_the_next_pass(world, monkeypatch):
+    """Its copy came back over the gateway after the tap gave up on Discord's answer: the next pass records it as sent
+    and takes it back. Until then the claim stays open, so no tap sends again."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = lose_the_answer(world, monkeypatch)
+    deleted = reply_deletions(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and 'might have posted' in text and not deleted
+    [entry] = pending(world).values()
+    assert entry['cleared'] and 'message_id' not in entry and notice_row(world, job_id)[0] == 'sending'
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and len(world.sent) == 1
+    fri_fixes.seen(world.fri, own(world.sent[0], posted[0]))
+    monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(posted[0])] and notice_row(world, job_id)[0] == 'invalidated'
+    assert not pending(world)
+
+
+@pytest.mark.parametrize('other', ['no_nonce', 'job_nonce', 'another_channel', 'another_author', 'later_claim'])
+def test_only_the_claims_own_notice_is_ever_taken_for_it(world, monkeypatch, other):
+    """Fri's other messages, even ones replying to the same report, never stand in for the notice: not one without
+    a nonce, nor the one Fri's "fixed now" line carries (its job's alone), nor one in another channel or by another
+    author, nor another claim's. Unseen, the next pass records the notice as unconfirmed and touches nothing."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+
+    def unrelated(post, message_id):
+        return own(post, message_id, **{
+            'no_nonce': {'nonce': None}, 'job_nonce': {'nonce': str(int(job_id, 16))},
+            'another_channel': {'channel': SimpleNamespace(id=457)}, 'another_author': {'author': SimpleNamespace(id=GENE)},
+            'later_claim': {'nonce': str(int(fri_fixes.notice_id(job_id, 'e'*32)[:20], 16))}}[other])
+
+    lose_the_answer(world, monkeypatch, seen=unrelated)
+    deleted = reply_deletions(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and 'might have posted' in text
+    [entry] = pending(world).values()
+    assert 'message_id' not in entry
+    monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not deleted and not pending(world) and notice_row(world, job_id)[0] == 'uncertain'
+
+
+def test_a_notice_nonce_is_its_claims_and_never_the_fixed_lines():
+    """send_once takes a post's nonce from its id's first 20 hex digits, which Discord holds to 25 characters."""
+    lease = 'a1b2c3d4'+'0'*24
+    notice = fri_fixes.notice_id('0123456789ab', lease)
+    assert notice[:20] == '0123456789ab'+lease[:8] and len(str(int(notice[:20], 16))) <= 25
+    assert int(notice[:20], 16) != int('0123456789ab', 16)
+    assert fri_fixes.notice_id('0123456789ab', 'not-hex') == '0123456789ab'  # No claim of its own: never matched.
