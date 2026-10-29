@@ -26,7 +26,7 @@ STATE = {'config': {**DEFAULTS, 'enabled': True, 'meme_enabled': True}, 'version
 
 
 @pytest.fixture
-def heartbeat(monkeypatch):
+def heartbeat(monkeypatch, tmp_path):
     monkeypatch.setattr('fri.fri_workspace.deliver_one', AsyncMock())
     monkeypatch.setattr('fri.fri_social.deliver_one', AsyncMock())
     monkeypatch.setattr('fri.fri_fixes.check', AsyncMock())
@@ -37,7 +37,7 @@ def heartbeat(monkeypatch):
         return {'/agent/state': STATE, '/agent/reports': reports}[path]
 
     fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=AsyncMock(side_effect=api),
-                          get_user=lambda _: owner, wait_until_ready=AsyncMock())
+                          get_user=lambda _: owner, wait_until_ready=AsyncMock(), data=tmp_path)
     agent = Agent(fri)
     agent.learn, agent.attend, agent.check_memes = AsyncMock(), AsyncMock(), AsyncMock()
     return SimpleNamespace(agent=agent, fri=fri, owner=owner, reports=reports)
@@ -69,6 +69,22 @@ def test_meme_failure_is_recorded_and_the_next_tick_recovers(heartbeat):
     asyncio.run(agent.heartbeat.coro(agent))
     assert agent.heartbeat_status == 'ok' and agent.stages['memes']['error'] is None
     assert agent.stages['memes']['last_ok'] >= failed_at
+
+
+def test_cut_off_requester_notice_sends_are_settled_whatever_fri_or_the_controller_says(heartbeat, monkeypatch):
+    """Taking a reply back is never a post, and a note can outlive the controller that cleared its send (a
+    rollback): the stage runs whether Fri is switched on or not, whatever the controller offers (fri #214)."""
+    agent, settled = heartbeat.agent, []
+
+    async def settle(agent):
+        settled.append(agent)
+
+    monkeypatch.setattr('fri.fri_fixes.settle', settle)
+    asyncio.run(agent.heartbeat.coro(agent))  # A controller without requester-notice-authorize.
+    assert settled == [agent] and agent.stages['notices']['error'] is None
+    monkeypatch.setitem(STATE, 'config', {**STATE['config'], 'enabled': False})
+    asyncio.run(agent.heartbeat.coro(agent))
+    assert settled == [agent, agent]
 
 
 def test_disabled_stages_do_not_run_or_report(heartbeat, monkeypatch):
