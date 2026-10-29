@@ -29,6 +29,7 @@ from .fri_errors import (
 from .fri_images import CHANGED as IMAGES_CHANGED
 from .fri_images import unchanged as images_unchanged
 from .fri_memory import (
+    DEPENDENCIES,
     GENERATIONS,
     PROFILES,
     SUMMARIES,
@@ -99,6 +100,12 @@ def summarized_elsewhere(context):
     fence = context.get('fence') or {}
     here = (fence.get('turn') or {}).get('conversation_id', '')
     return here.startswith('public:') and any(origin != here for origin in fence.get('summarized', ()))
+
+
+def draws_on_summary(turn):
+    """A staged turn drew on a member's summary: the speaker's own, or another's through Fri's earlier replies it
+    carried (fri #193). Its echo is then rechecked before each reuse (see Agent.retired)."""
+    return 'summary_generation' in turn or bool(turn.get('summary_dependencies'))
 
 
 def audience(context):
@@ -448,8 +455,11 @@ class Fri(discord.Client):
                 # during them is caught (see talk).
                 if fence.get('gate'):
                     await fence['gate']()
+                # With the summaries Fri's replies in view (and one it answers) drew on, as they stand now: refused
+                # if one went. They count for the save only once the request still carries them (see depend).
                 await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
-                    context, fence['turn']['user_id'], fence['actions']), **self.summary_generation(context)})
+                    context, fence['turn']['user_id'], fence['actions']), **self.summary_generation(
+                        context, also=self.dependencies(context))})
             # A message its author edited or deleted since the live view was copied: its old words stay out.
             # A row read again after that, as an edited message answered again is, holds what it says now.
             # So does one the live view no longer holds as copied: pushed out by newer lines while the turn
@@ -531,6 +541,7 @@ class Fri(discord.Client):
             # by now is answered with it instead, and one after this is answered on its own (see Continuation).
             if fence and fence.get('commit') and not fence['commit']():
                 raise Continued()
+            self.depend(context)  # What the request carries now drew on those summaries (fri #193).
         # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
         seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
         result = await self.chat.respond(text, context, ready=ready)
@@ -901,7 +912,7 @@ class Fri(discord.Client):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
                     elif not private and not crossed and not recalled:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored,
-                                                'summary_generation' in result.turn)
+                                                draws_on_summary(result.turn))
                     await looked(result)
                     try:  # The save's privacy fence, applied before anything is shown.
                         await self.echoes_standing(context)
@@ -956,7 +967,7 @@ class Fri(discord.Client):
             **(self.summary_generation(context) if derived else {}),
             **({'audience': audience(context)} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
-            result.echo = self.echo(scope, context, provenance, reply, 'summary_generation' in result.turn)
+            result.echo = self.echo(scope, context, provenance, reply, draws_on_summary(result.turn))
         return result
 
     async def echoes_standing(self, context):
@@ -1001,7 +1012,7 @@ class Fri(discord.Client):
             return None
         return summary
 
-    def summary_generation(self, context):
+    def summary_generation(self, context, also=()):
         """What a turn's checks and save carry for Fri's summary of the member its model request had (gene #91): that
         summary's generation, from the same /chat/context response. A withdrawal dropping the summary since moves it,
         so the controller refuses the turn and its reply is withheld. The first one a request carried (see chat_once),
@@ -1011,7 +1022,31 @@ class Fri(discord.Client):
             return {}
         fence = context.get('fence') or {}
         generation = fence.get('summary_generation', (context.get('member_summary') or {}).get('generation'))
-        return {'summary_generation': generation} if type(generation) is int else {}
+        carried = {'summary_generation': generation} if type(generation) is int else {}
+        depends = set(fence.get('summary_dependencies', ())) | set(also)  # `also`: a check's prospective ones.
+        if DEPENDENCIES in self.capabilities and depends:  # See depend.
+            carried['summary_dependencies'] = [{'user_id': user, 'generation': number} for user, number in sorted(depends)]
+        return carried
+
+    def dependencies(self, context):
+        """The summaries Fri's earlier replies in this context drew on: an echo in the channel's view (as Gene answered
+        its recheck) or a reply of Fri's the member answered (see resolve_references), as (user, generation) pairs.
+        Nothing from a controller without summary dependencies, or for an ordinary turn."""
+        fence = context.get('fence')
+        if fence is None or DEPENDENCIES not in self.capabilities:
+            return set()
+        known = getattr(fence.get('rechecks'), 'summaries', {})
+        carried = [item for row in context.get('recent', []) for item in known.get(row.get('id'), ())]
+        carried += context.get('reference_summaries', [])
+        return {(str(item['user_id']), int(item['generation'])) for item in carried}
+
+    def depend(self, context):
+        """Last thing before a request, once nothing more leaves its context: the turn depends on the summaries what it
+        carries drew on, from here to its save, so Gene refuses it once one goes, and retires its saved reply then, and
+        its echo is rechecked like theirs (fri #193). One that dropped out before the request (deleted meanwhile, say)
+        doesn't count. Kept with the fence, which tool steps share: an earlier request's still count."""
+        if found := self.dependencies(context):
+            context['fence'].setdefault('summary_dependencies', set()).update(found)
 
     async def memory_overview(self, scope, profile, private, summary=None):
         """Everything for the member's own eyes in private; in public, only what that channel can see."""
@@ -1056,6 +1091,9 @@ class Fri(discord.Client):
             context['reply_target'] = [{**row, 'text': UNAVAILABLE} if row['source']['id'] in unresolved else row
                                        for row in context['reply_target']]
         context['reference_provenance'] = [item for mid in own for item in found.get(mid, {}).get('provenance', [])]
+        # And the summaries a shown one drew on, which the turn then depends on (see depend). Never what the model reads.
+        context['reference_summaries'] = [item for mid in own if mid not in unresolved
+                                          for item in found.get(mid, {}).get('summaries', [])]
 
     def posted_notes(self):
         """Message id -> channel id of every patch-notes part Discord confirmed, in #fri-chat or the owner's DM.
