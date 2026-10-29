@@ -1,10 +1,15 @@
 """Typed tool evidence and truthful replies that do not depend on another model."""
 
+import re
 from enum import Enum
 
-from .fri_links import link_posts
+from .fri_links import LINKED, SPACE, link_posts
+from .fri_memory import clip, units
 from .fri_notices import notice_text
 from .privacy import clean
+
+LIMIT = 1800  # UTF-16 units, as Discord counts a message's length.
+GAP, WORD = re.compile(f'[{SPACE}]'), re.compile(f'[^{SPACE}]*')
 
 
 class Outcome(str, Enum):
@@ -41,7 +46,22 @@ def fallback(receipts):
     answer) goes out only if the receipts showed it as a source, as with the model's own reply (see fri_links)."""
     earlier = [one(r) for r in receipts[:-1] if r['outcome'] == Outcome.COMPLETED
                and r['kind'] in ('work_save', 'reminder_cancel')]
-    return link_posts('\n'.join([*earlier, one(receipts[-1])])[:1800], {'action_results': receipts})
+    evidence = {'action_results': receipts}
+    return fit(link_posts('\n'.join([*earlier, one(receipts[-1])]), evidence), evidence)
+
+
+def fit(text, evidence, limit=LIMIT):
+    """At most `limit` UTF-16 units, as Discord counts them: an emoji counts two (fri #223). The cut falls between
+    links, never through one, since part of a post link can name another post, and what's left is filtered again."""
+    budget = limit
+    while units(text) > limit:
+        cut = start = len(clip(text, budget))
+        while start and not GAP.match(text, start-1):
+            start -= 1
+        if start and LINKED.search(text, start, WORD.match(text, cut).end()):
+            cut = start  # A word holding a link goes whole.
+        text, budget = link_posts(text[:cut].rstrip(), evidence), budget-2
+    return text
 
 
 def one(last):

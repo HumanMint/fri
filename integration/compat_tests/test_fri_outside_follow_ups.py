@@ -496,7 +496,7 @@ def test_an_answer_expiring_while_fri_replies_stops_the_reply(monkeypatch, tmp_p
         w.fri.data = tmp_path
         try:
             _, _, answer = await opened(w)
-            w.clock[0] = 15*60-1
+            w.clock[0] = 15*60-30  # Half a minute of real time to spare before the request goes out, on a slow runner too.
             event = follow_up(w, answer)
             event.reply.return_value = w.fri_post(AGAIN)
             shown = []
