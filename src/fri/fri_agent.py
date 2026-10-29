@@ -504,8 +504,11 @@ class Agent:
                     self.active[key] = replaced
         self.unjoin(ids, deleted=True)  # Before the bursts below: a question that gave way answers alone.
         self.bursts.unsend(channel, ids)
-        # Their saved exchanges too, so their words don't come back as history, and what carried them (gene #141).
-        self.saved_turns.withdraw(ids, saved_in, deleted=True)
+        # Their saved exchanges too, so their words don't come back as history, and what carried them (gene #141). Who
+        # wrote one the live view held is known, so its withdrawal goes with their "forget me" (fri #224 r2).
+        authors = {int(row['id']): row['user_id'] for row in rows or ()
+                   if not row.get('fri') and not row['gene_error'] and str(row['id']).isdigit()}
+        self.saved_turns.withdraw(ids, saved_in, deleted=True, authors=authors)
         self.receipts.withdraw(ids)  # And Fri's outside answers that drew on them, or were them.
 
     def gone(self, i):
@@ -550,7 +553,7 @@ class Agent:
         else:  # Any other update of a member's post one names too, a card suppressed during a check's last wait say.
             self.receipts.changed(message.id)
         if edited:
-            self.saved_turns.withdraw([message.id], saved_in)
+            self.saved_turns.withdraw([message.id], saved_in, authors={message.id: sender.id} if sender else None)
         if edited and message.id in self.looked:
             self.revise(message.id)
         if (self.handling[message.id] or message.id in self.rerunning) and edited:

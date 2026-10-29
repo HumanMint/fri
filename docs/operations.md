@@ -284,7 +284,10 @@ advertises it, so the controller must be released first.
   be kept (a week, or a note's 90 days, below), and at most 20,000, the oldest messages' going first.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the
-  controller writes nothing for it. Meanwhile, and for an hour after (past any turn still holding a
+  controller writes nothing for it, and a save whose answer comes after it records nothing. Only a
+  withdrawal whose author Fri knows (one it saved an exchange for, or a message its live view or the edit
+  named), of a message sent after that member's last "forget me" it knows of, is kept on disk; one by ID
+  whose author it can't name is retried in memory only, so a restart loses it, as before this queue. Meanwhile, and for an hour after (past any turn still holding a
   copy), what a turn read that holds a taken-back message stays out of its request, checked right before
   each one: an exchange of its history, a pending question, an exchange elsewhere, a note learned from
   it, and the member's summary, which may have read it. What's left counts as carried, so if one of those

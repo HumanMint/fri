@@ -13,7 +13,9 @@ restart sends it again later, and sent by one worker, one call at a time, ten ID
 many events name it. Meanwhile, and for an hour after (past any turn still holding a copy), what holds a taken-back
 message stays out of every request and memory view: saved history, a pending question, an exchange elsewhere, a note
 learned from it and the member's summary (see withhold and screen); once deleted, a reply of Fri's in the channel's
-view that carried it too (see Agent.withdrawn_from). A member's "forget me" takes their queued withdrawals with it.
+view that carried it too (see Agent.withdrawn_from). A member's "forget me" takes their queued withdrawals with it:
+only one whose author Fri knows, and sent after their last "forget me" it knows of, is kept on disk (see lasting).
+One by ID whose author it can't name is retried in memory only, so a restart loses it, as main never retried it.
 """
 
 import asyncio
@@ -50,6 +52,8 @@ class SavedTurns:
         self._pending = None  # Message ID (str) -> what to send for it; read from disk on first use.
         self.timer = None
         self.generation = 0  # Each queued entry's own number: a reply to an older one never settles a newer one.
+        self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
+        self.erased_at = {}  # Member (str) -> when they last did, so nothing they sent before is kept on disk again.
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -80,8 +84,9 @@ class SavedTurns:
                         self._pending[str(i)] = self.entry(scope={key: str(entry['scope'].get(key, '')) for key in (
                             'guild_id', 'channel_id', 'conversation_id', 'user_id')}, deleted=deleted,
                             revision=revision if type(revision) is int and revision >= 0 else None)
-                    elif str(entry.get('server', '')).isdigit():
-                        self._pending[str(i)] = self.entry(server=str(entry['server']), deleted=deleted)
+                    elif str(entry.get('server', '')).isdigit() and str(entry.get('user_id', '')).isdigit():
+                        self._pending[str(i)] = self.entry(server=str(entry['server']), deleted=deleted,
+                                                           user_id=str(entry['user_id']))
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 LOG.warning('Pending withdrawals could not be read, so none are resent: %s', type(exc).__name__)
             self.prune(time.time())
@@ -94,19 +99,32 @@ class SavedTurns:
         data = getattr(self.agent.fri, 'data', None)
         return None if data is None else data/RECORD
 
+    def lasting(self, i, entry):
+        """Whether a queued withdrawal goes to disk: only one Fri can name the author of, so their "forget me" finds it,
+        and of a message sent after the last one it knows of, as nothing from before it holds anything now."""
+        user = (entry.get('scope') or {}).get('user_id') or entry.get('user_id')
+        return bool(user) and sent_at(int(i)) > self.erased_at.get(str(user), 0)
+
     def persist(self):
         if path := self.record():
             try:
                 private_json(path, {'pending': {i: {key: value for key, value in entry.items() if key != 'gen'}
-                                                for i, entry in self.pending.items()}})
+                                                for i, entry in self.pending.items() if self.lasting(i, entry)}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
                 LOG.warning('Pending withdrawals could not be saved: %s', type(exc).__name__)
 
-    def kept(self, payload, saved, began):
+    def erasure(self, user):
+        """How many times the member said "forget me": a save sent before one answers too late to record (see kept)."""
+        return self.erasures.get(str(user), 0)
+
+    def kept(self, payload, saved, began, erasure=None):
         """The controller saved this turn, or may have (`saved` None: no answer came). `began`: time.time() and
         time.monotonic() just before it was sent. One of its messages withdrawn since went while the save was on its
-        way, before anything here knew of it, so its exchange goes now."""
+        way, before anything here knew of it, so its exchange goes now. erasure: the member's (see erasure) as it was
+        sent; once they've said "forget me" since, the controller erased it, so nothing of it is recorded here."""
         if not self.offered() or payload.get('mention_grant'):  # A mention keeps only a placeholder.
+            return
+        if erasure is not None and self.erasure(payload.get('user_id')) != erasure:
             return
         if saved is not None and saved.get('kept', True) is False:  # Memory off, or a removal since: nothing kept.
             return
@@ -130,12 +148,14 @@ class SavedTurns:
         self.withdraw(i for i in ids if i not in deleted and (agent.withdrawn.get(str(i), 0) >= wall or
                                                               agent.revised.get(i, 0) >= wall))
 
-    def withdraw(self, ids, server=None, deleted=False):
+    def withdraw(self, ids, server=None, deleted=False, authors=None):
         """Messages taken back: each exchange Fri saved with one goes, asked for once. server: the one Fri saves
         exchanges said where they were taken back under (see Agent.saved_in); any other one young enough to be in an
         exchange still (or in a note, from a controller offering SOURCES) is then asked about by ID, ten at a time,
-        from a controller offering it. deleted: not edited, so what carried them goes too (gene #141, #150). Each is
+        from a controller offering it. deleted: not edited, so what carried them goes too (gene #141, #150). authors:
+        message ID -> its author, where Fri knows it, so that one by ID can be kept on disk (see lasting). Each is
         held back from requests from now on (see withhold). A change to a queued one is a new entry (see drain)."""
+        authors = {int(i): str(user) for i, user in (authors or {}).items() if str(user).isdigit()}
         ids = [int(i) for i in ids]
         horizon = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
         queued, now = False, time.time()
@@ -154,8 +174,10 @@ class SavedTurns:
                             self.pending[str(i)] = self.entry(**{key: known[key] for key in ('scope', 'revision')},
                                                               deleted=True)
                             queued = True
-                    elif not known or (deleted and not known.get('deleted')):
-                        self.pending[str(i)] = self.entry(server=str(server), deleted=deleted)
+                    elif not known or (deleted and not known.get('deleted')) or (i in authors and 'user_id' not in known):
+                        author = authors.get(i, known.get('user_id'))
+                        self.pending[str(i)] = self.entry(server=str(server), deleted=deleted or known.get('deleted')
+                                                          is True, **({'user_id': author} if author else {}))
                         queued = True
             else:
                 continue  # Nothing Fri saves could hold it.
@@ -175,13 +197,15 @@ class SavedTurns:
         about them stays queued, on disk or here, to bring their IDs back. One already on its way carries the revision
         it was saved under, which the erasure moved, so the controller writes nothing for it (gene #141)."""
         user = str(user)
+        self.erasures[user] = self.erasures.get(user, 0)+1
+        self.erased_at[user] = time.time()
         for i in [i for i, entry in self.saved.items() if entry[1].get('user_id') == user]:
             del self.saved[i]
-        mine = [i for i, entry in self.pending.items() if (entry.get('scope') or {}).get('user_id') == user]
+        mine = [i for i, entry in self.pending.items()
+                if (entry.get('scope') or {}).get('user_id') == user or entry.get('user_id') == user]
         for i in mine:
             del self.pending[i]
-        if mine:
-            self.persist()
+        self.persist()
 
     def prune(self, now):
         """Marks an hour, and queued withdrawals as long as anything they name can be kept (a week, or a note's 90 days

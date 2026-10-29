@@ -1099,7 +1099,11 @@ class Fri(discord.Client):
         screening = turns is not None and turns.withholding()
         if private:
             state = await self.api('POST', '/chat/memory/notes', profiled(self, scope, screening))
-            if screening:
+            # Again once read: a withdrawal may have started, or failed, meanwhile (fri #224 r2). Then nothing waits
+            # between the screen and the reply it shapes.
+            if turns is not None and turns.withholding():
+                if not screening and SOURCES in self.capabilities:
+                    state = await self.api('POST', '/chat/memory/notes', profiled(self, scope, True))
                 state = turns.screen(context, state)
             enabled, rows = state['enabled'], state['entries']
             summary = escape(state['summary']['text']) if state.get('summary') else None
@@ -1185,15 +1189,17 @@ class Fri(discord.Client):
                 self.get_channel(int(payload['conversation_id'].split(':', 1)[1]))):
             payload = {**payload, 'audience': 'conversation'}  # Closed while Fri replied: it stays where it was said.
         began = time.time(), time.monotonic()
+        # A "forget me" before the answer comes erased it: nothing of it is recorded then (see SavedTurns.kept).
+        erasure = self.agent.saved_turns.erasure(payload.get('user_id')) if self.agent else None
         try:
             saved = await self.api('POST', '/chat/turn', payload)
         except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError) as exc:
             LOG.warning('Delivered turn was not recorded: %s', type(exc).__name__)  # Includes privacy changes mid-reply.
             if isinstance(exc, (TimeoutError, ControllerUnavailable)) and self.agent:  # A lost reply, not a refusal:
-                self.agent.saved_turns.kept(payload, None, began)  # it may have landed all the same.
+                self.agent.saved_turns.kept(payload, None, began, erasure)  # it may have landed all the same.
             return None
         if self.agent:  # So its messages taken back later take it with them (fri #129).
-            self.agent.saved_turns.kept(payload, saved, began)
+            self.agent.saved_turns.kept(payload, saved, began, erasure)
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
             notice = self.first_memory(saved)
             content = (sent.content or '')+notice
