@@ -285,7 +285,19 @@ advertises it, so the controller must be released first.
   lookup waits 3 seconds at most and a turn's 6 in all. Within a turn, one Gene retired isn't asked
   about again, and once a lookup gets no answer none is asked: every marked echo counts as retired,
   so an outage costs the turn one short wait (fri #193). A turn with no marked echo asks nothing, and
-  one without the summary, or a controller without summary generations, runs as before.
+  one without the summary, or a controller without summary generations, runs as before. A mark lasts
+  an hour, though the live view drops the row at 15 minutes, so a turn still holding a copy rechecks
+  it before delivery.
+- **What repeats a summary-derived reply.** A controller offering `summary-dependencies` reports,
+  with each reply `/chat/messages/sources` holds as said, the summaries it drew on (fri #193). A turn
+  whose request carries such a reply of Fri's, a marked echo in the live view or a reply target Fri
+  wrote, depends on those summaries whether or not its answer repeats them, as with provenance. It
+  sends them as `summary_dependencies` with every `/chat/turn/check` and its `/chat/turn`, kept with
+  the turn's fence so a tool step's later requests keep an earlier one's. Gene refuses the turn once
+  one of those summaries goes, so the answer is withheld, and retires its saved reply when one goes
+  later. Its echo is marked like the first, so a reply repeating that one depends on the same
+  summary. A turn that carried none sends nothing new, and a controller without the capability is
+  sent none.
 - **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
   research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
   an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead

@@ -244,3 +244,24 @@ def test_an_ordinary_turn_sends_nothing_new(monkeypatch, tmp_path):
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_reply_whose_request_carried_one_depends_on_it_whether_or_not_it_repeats_it(monkeypatch, tmp_path):
+    """Fri can't tell a paraphrase from a reply that drew on nothing, so, as with provenance, what the request carried
+    counts: B's reply goes with A's summary too, and its echo is rechecked like A's."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await summarized_from(monkeypatch, w)
+            model(w, recalls)
+            await echoed(w)
+            assert await echoed(w, 'fri hi', user=30) == [CONTINUATION, 'nothing to recall']
+            assert len(w.fri.agent.summarized) == 2
+            await deleted(w, events[0])
+            assert 'nothing to recall' not in saved_replies(w, 30)
+            carried = later(w)
+            await w.say(GENERAL, 'fri what is going on', user=31)
+            assert carried and 'nothing to recall' not in str(carried)
+        finally:
+            await w.fri.close()
+    run(scenario)

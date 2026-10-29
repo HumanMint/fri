@@ -15,6 +15,9 @@ SUMMARIES = 'member-summaries'  # The controller keeps Fri's own short summary o
 GENERATIONS = 'summary-generations'
 # It also takes that generation on writes of the model's words (saved work, reminders) and refuses a moved one (fri #171).
 GENERATION_WRITES = 'summary-generation-writes'
+# It reports the summaries a reply of Fri's drew on, and takes a turn's dependencies on them through Fri's earlier replies
+# it carried, refusing and retiring it once one goes (fri #193).
+DEPENDENCIES = 'summary-dependencies'
 PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_thread)
 
 

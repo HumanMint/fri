@@ -157,6 +157,7 @@ class Rechecks:
 
     def __init__(self):
         self.retired, self.spent, self.failed = set(), 0.0, False
+        self.summaries = {}  # One Gene still holds as said: the summaries it drew on, from its answer (fri #193).
 
 
 class Agent:
@@ -378,8 +379,10 @@ class Agent:
                                      'text': clean(text, 500), 'at': time.time(), 'gene_error': False, 'fri': True,
                                      'provenance': echo['provenance']})
         if echo.get('summarized'):
-            now = time.time()  # As long as the live view keeps a row (see messages).
-            self.summarized = {mid: at for mid, at in self.summarized.items() if at > now-900}
+            # Kept an hour, though the live view drops the row at 15 minutes (see messages): a turn that copied it may
+            # still be running, and its last checks recheck only what's marked (fri #193).
+            now = time.time()
+            self.summarized = {mid: at for mid, at in self.summarized.items() if at > now-REDELIVERY_SECONDS}
             self.summarized[str(sent.id)] = now
 
     @staticmethod
@@ -416,6 +419,7 @@ class Agent:
             turn.spent += time.monotonic()-began
         gone = {mid for mid in asked if not (found.get(mid) or {}).get('verbatim')}
         turn.retired |= gone
+        turn.summaries.update((mid, found[mid].get('summaries', [])) for mid in asked if mid not in gone)
         if gone:  # For good: out of the live view too, so later turns don't ask again.
             for key, kept in self.recent.items():
                 self.recent[key] = deque((r for r in kept if r['id'] not in gone), maxlen=30)
