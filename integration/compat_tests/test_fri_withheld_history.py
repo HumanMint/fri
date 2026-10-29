@@ -332,3 +332,197 @@ def test_a_message_old_enough_only_for_a_note_is_asked_about_by_a_capable_contro
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+# Sol round 1 of fri #224.
+
+def held_answers(w, path):
+    """Each call to `path` reaches the controller, and its answer is held until released."""
+    api, asked, gate = w.fri.api, asyncio.Event(), asyncio.Event()
+    async def calling(method, called, payload=None):
+        result = await api(method, called, payload)
+        if called == path:
+            asked.set()
+            await gate.wait()
+        return result
+    w.fri.api = calling
+    return api, asked, gate
+
+
+def test_a_late_answer_by_id_never_drops_a_withdrawal_queued_since(monkeypatch, tmp_path):
+    """Deleted while its save was on the way: asked about by ID (nothing held it yet), then the save lands and names
+    it. The by-ID answer, arriving late, must not take the withdrawal its save queued with it."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        if 'saved-turn-withdrawal' not in w.fri.capabilities:
+            pytest.skip('needs a controller offering saved-turn-withdrawal')
+        try:
+            api, asked, gate = held_answers(w, SAVED)
+            earlier = w.said('fri explain '+MARKER)
+            async def saving(method, path, payload=None):
+                if path == '/chat/turn':  # Delivered; deleted before the save reaches the controller.
+                    await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=1, guild_id=123,
+                                                                      message_id=earlier.id))
+                    await asked.wait()  # Asked by ID, and answered: nothing held it yet.
+                return await held(method, path, payload)
+            held, w.fri.api = w.fri.api, saving
+            await w.agent.handle(earlier)
+            w.fri.api = held
+            gate.set()
+            await settled(w)
+            assert MARKER not in saved(w)
+            assert not w.agent.saved_turns.pending
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def queued(tmp_path):
+    path = tmp_path/'withdrawals.json'
+    return json.loads(path.read_text())['pending'] if path.exists() else {}
+
+
+def test_forget_me_takes_their_queued_withdrawals_with_it(monkeypatch, tmp_path):
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = await earlier_exchange(w)
+            state = failing(w, WITHDRAW)
+            await delete(w, earlier)
+            assert str(earlier.id) in queued(tmp_path)
+            await w.agent.handle(w.said('fri forget me'))
+            assert queued(tmp_path) == {} and str(earlier.id) not in (tmp_path/'withdrawals.json').read_text()
+            state['down'] = False
+            w.agent.saved_turns.retry()
+            await settled(w)
+            with w.store.connection() as db:
+                assert db.execute("SELECT count(*) FROM chat_turn_withdrawals WHERE user_id='20'").fetchone()[0] == 0
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_withdrawal_reaching_the_controller_after_forget_me_writes_nothing(monkeypatch, tmp_path):
+    """On its way when they said "forget me", then "remember me again": it arrives under a revision that moved."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        needs_sources(w)
+        try:
+            earlier = await earlier_exchange(w)
+            api, gate, sent = w.fri.api, asyncio.Event(), asyncio.Event()
+            async def slow(method, path, payload=None):
+                if path == WITHDRAW:
+                    sent.set()
+                    await gate.wait()  # Sent, not yet arrived.
+                return await api(method, path, payload)
+            w.fri.api = slow
+            await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=1, message_id=earlier.id))
+            await sent.wait()
+            await w.agent.handle(w.said('fri forget me'))
+            await w.agent.handle(w.said('fri remember me again'))
+            gate.set()
+            await settled(w)
+            with w.store.connection() as db:
+                assert db.execute("SELECT count(*) FROM chat_turn_withdrawals WHERE user_id='20'").fetchone()[0] == 0
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_edit_leaves_fris_reply_in_view_and_other_members_saved_replies(monkeypatch, tmp_path):
+    """gene #150: only a deletion takes the replies that carried a message. An edit takes the member's own exchange,
+    as before, and what it taught."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        needs_sources(w)
+        try:
+            nearby = w.said('my plan is '+MARKER)
+            w.agent.recent[1].append({'id': str(nearby.id), 'user_id': '20', 'name': 'member', 'text': nearby.content,
+                                      'at': discord.utils.utcnow().timestamp(), 'revision': 0, 'gene_error': False})
+            asked = w.said('fri what did they say?', user=30)
+            asked.reply.return_value = SimpleNamespace(id=asked.id+100, content='they said '+MARKER, edit=AsyncMock())
+            await w.agent.handle(asked)
+            await edit(w, edited(nearby))
+            assert any(row['text'] == 'they said '+MARKER for row in w.agent.recent[1])
+            assert 'they said '+MARKER in saved(w, '30')
+            assert all(not payload.get('deleted') for path, payload in w.calls if path == SAVED)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_queue_drops_what_no_longer_matters_and_stays_bounded(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    async def scenario():
+        import datetime as dt
+
+        import fri.fri_turn_withdrawal as withdrawal
+        w = await world(monkeypatch, tmp_path)
+        if 'saved-turn-withdrawal' not in w.fri.capabilities:
+            pytest.skip('needs a controller offering saved-turn-withdrawal')
+        failing(w, SAVED)
+        monkeypatch.setattr(withdrawal, 'MOST', 5)
+        try:
+            turns = w.agent.saved_turns
+            stale = str(discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=100)))
+            turns.pending[stale] = {'server': '123', 'tries': 3, 'due': 0}  # Older than anything it could hold.
+            first = w.said('one of many').id
+            for i in range(8):
+                await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=1, guild_id=123, message_id=first+i))
+            await settled(w)
+            assert stale not in turns.pending and len(turns.pending) <= 5
+            assert set(turns.pending) == {str(first+i) for i in range(3, 8)}  # The newest kept.
+            assert any('pending withdrawals' in line for line in caplog.messages)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_memory_views_hold_back_what_a_pending_withdrawal_holds(monkeypatch, tmp_path):
+    """Pre-existing: "what do you remember about me" and My memory showed a note, and the summary that may have read
+    the message, while its withdrawal was still on its way. Neither shows until it lands."""
+    async def scenario():
+        from unittest.mock import Mock
+
+        from compat_tests.test_fri_member_profiles import DM, GENERAL, dm_control, note
+        from compat_tests.test_fri_member_profiles import world as profiles
+        from compat_tests.test_fri_member_summaries import SUMMARY, summarize
+        from fri.fri_memory import profiled
+        from fri.fri_memory_panel import show
+        w = profiles(monkeypatch, tmp_path)
+        if SOURCES not in w.fri.capabilities:
+            pytest.skip('needs a controller offering '+SOURCES)
+        shown = AsyncMock()
+        monkeypatch.setattr('fri.fri_panel.reply', shown)
+        monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+        try:
+            said = w.message(GENERAL, 'fri '+LIKE)
+            await w.say(GENERAL, 'fri '+LIKE, 'noted', note(LIKE, 'hobbies'), event=said)
+            await summarize(monkeypatch, w)
+            dm, _, _ = await w.say(DM, 'what do you remember about me')
+            assert LIKE in dm.reply and SUMMARY in dm.reply  # Shown while nothing is withdrawn.
+            api = w.fri.api
+            async def down(method, path, payload=None):
+                if path.startswith('/chat/turn/withdraw'):
+                    raise TimeoutError()
+                return await api(method, path, payload)
+            w.fri.api = down
+            w.fri.agent.saved_turns.withdraw([said.id], 123)  # Edited, say; its withdrawal timed out.
+            await asyncio.gather(*w.fri.agent.saved_turns.tasks)
+            dm, _, _ = await w.say(DM, 'what do you remember about me')
+            assert LIKE not in dm.reply and SUMMARY not in dm.reply
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            interaction = Mock(spec=discord.Interaction, id=int(dm_control()['id']), guild_id=None, channel_id=DM,
+                               user=SimpleNamespace(id=20, display_name='friend'))
+            await show(w.fri, interaction, scope)
+            body = shown.await_args.kwargs['embed'].description
+            assert LIKE not in body and SUMMARY not in body
+            w.fri.api = api
+            w.fri.agent.saved_turns.retry()
+            await asyncio.gather(*w.fri.agent.saved_turns.tasks)
+            dm, _, _ = await w.say(DM, 'what do you remember about me')
+            assert LIKE not in dm.reply  # Gone for good once it lands.
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
