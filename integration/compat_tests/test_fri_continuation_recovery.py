@@ -164,3 +164,35 @@ def test_a_line_taken_back_while_its_burst_gathers_leaves_nothing_pending(monkey
             model.hold[1].set()
             await finish(fri, tasks)
     asyncio.run(scenario())
+
+
+def test_an_earlier_line_of_a_burst_leaves_the_newer_ones_pending_mark(monkeypatch, tmp_path):
+    """fri #199's counterpart: a burst's earlier message, answered for by a later one, lets go of only its own mark."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path)
+        real_sleep, gathering = asyncio.sleep, []
+        async def held(delay, *args, **kwargs):  # Each burst's wait for its rest ends when the test says.
+            if delay != 1.5:
+                return await real_sleep(0)
+            gathering.append(asyncio.Event())
+            await gathering[-1].wait()
+        monkeypatch.setattr('fri.fri_agent.asyncio.sleep', held)
+        first, second = message(QUESTION), message(DETAIL)
+        tasks = [asyncio.create_task(agent.handle(first))]
+        try:
+            await until(lambda: len(gathering) == 1)
+            tasks.append(asyncio.create_task(agent.handle(second)))
+            await until(lambda: len(gathering) == 2)
+            gathering[0].set()
+            await asyncio.wait_for(tasks[0], 5)  # The first defers to the second...
+            assert agent.pending[(channel.id, second.author.id)] == second.id  # ...whose mark stays.
+            gathering[1].set()
+            await asyncio.wait_for(tasks[1], 5)
+            assert [text for text, _ in model.requests] == [DETAIL] and not agent.pending
+        finally:
+            for event in gathering:
+                event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
