@@ -52,6 +52,9 @@ TAILS = {opened: re.compile(TAIL.format('|'.join(f'{mark[0]}(?!{mark[1]})' if ma
 # looked at, the current message. Never someone's words, saved turns or summaries.
 SHOWN = ('source', 'reply_target', 'message_burst', 'invited_context', 'inspected_images', 'action_result',
          'action_results')
+# A web lookup's receipt lists the pages it cited as plain strings: each is a verified source too (fri #223). Its
+# answer's words aren't.
+WEB = ('web_search', 'web_refine', 'web_sources', 'image_search')
 EMPTY = 'can’t link that one.'
 
 
@@ -61,6 +64,8 @@ def shown(context):
 
     def walk(value, key=None):
         if isinstance(value, dict):
+            if value.get('kind') in WEB and isinstance(value.get('sources'), list):
+                walk([{'url': source} for source in value['sources']])
             for name, item in value.items():
                 walk(item, name)
         elif isinstance(value, (list, tuple)):
