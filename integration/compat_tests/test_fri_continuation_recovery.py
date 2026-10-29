@@ -196,3 +196,155 @@ def test_an_earlier_line_of_a_burst_leaves_the_newer_ones_pending_mark(monkeypat
                 event.set()
             await finish(fri, tasks)
     asyncio.run(scenario())
+
+
+def gathered(monkeypatch):
+    """Each burst's wait for its rest, held until the test sets its event (in the order they began)."""
+    real_sleep, gathering = asyncio.sleep, []
+    async def held(delay, *args, **kwargs):
+        if delay != 1.5:
+            return await real_sleep(0)
+        gathering.append(asyncio.Event())
+        await gathering[-1].wait()
+    monkeypatch.setattr('fri.fri_agent.asyncio.sleep', held)
+    return gathering
+
+
+async def gave_way(agent, model, message, gathering):
+    """The question, composing, gives way to the burst its line reopened, which is still gathering."""
+    question = message(QUESTION)
+    tasks = [asyncio.create_task(agent.handle(question))]
+    await until(lambda: len(gathering) == 1)
+    gathering[0].set()  # The question's own burst: just it.
+    await asyncio.wait_for(model.reached[1].wait(), 5)
+    detail = message(DETAIL)
+    tasks.append(asyncio.create_task(agent.handle(detail)))
+    await until(lambda: len(gathering) == 2)  # The line's reopened burst, gathering.
+    model.hold[1].set()
+    await asyncio.wait_for(tasks[0], 5)
+    return question, detail, tasks
+
+
+def test_attention_waits_for_a_question_answered_alone_once_its_line_lets_go(monkeypatch, tmp_path):
+    """fri #210 (1): the line is edited while its burst gathers, and the question's recovery waits on its privacy read
+    when the line's handler lets go of its pending mark. The question is still to be answered: ambient attention
+    doesn't answer an earlier message of theirs before it, though nothing of theirs is busy or pending."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        reading, release, erasure = asyncio.Event(), asyncio.Event(), agent.erasure
+        async def read(user, *since):  # The recovery's privacy read waits until the test says.
+            if asyncio.current_task() in agent.reruns:
+                reading.set()
+                await release.wait()
+            return await erasure(user, *since)
+        agent.erasure = read
+        before = channel.history
+        async def history(**kwargs):  # Attention's last look reads what came after its pick, too.
+            if 'before' in kwargs:
+                async for item in before(**kwargs):
+                    yield item
+                return
+            for item in sorted((m for m in rows.values() if m.id > kwargs['after'].id), key=lambda m: m.id):
+                yield item
+        channel.history = history
+        earlier = message('anyone know if the server is down?')  # Not said to Fri.
+        tasks = []
+        try:
+            question, detail, tasks = await gave_way(agent, model, message, gathering)
+            agent.edit(1, edited(rows, detail))  # The question is to be answered alone after all.
+            await asyncio.wait_for(reading.wait(), 5)
+            gathering[1].set()
+            await asyncio.wait_for(tasks[1], 5)  # The line's handler is done: its pending mark went with it.
+            assert (channel.id, detail.author.id) not in agent.pending and 20 not in fri.busy
+            assert not agent.ambient_ready(channel.id, 20)  # Its recovery hasn't answered them yet.
+            await agent.ambient_reply(channel, {'id': str(earlier.id)})
+            earlier.reply.assert_not_awaited()
+            release.set()
+            await until(lambda: not agent.reruns, 10)
+            question.reply.assert_awaited_once()  # Answered alone, and nothing else answered first.
+            assert [text for text, _ in model.requests] == [QUESTION]
+            agent.last_spoke.clear()
+            assert agent.ambient_ready(channel.id, 20)  # Once it's done, after the usual cooldown.
+        finally:
+            model.hold[1].set()
+            release.set()
+            for event in gathering:
+                event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+def test_a_line_whose_handler_is_cancelled_after_its_burst_was_voided_leaves_nothing_pending(monkeypatch, tmp_path):
+    """fri #210 (2): an edit voids the line's gathering burst, then its handler is cancelled during that wait. Its
+    pending mark still goes, as when it ends normally (fri #199), so attention comes back once the question is
+    answered alone."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        tasks = []
+        try:
+            question, detail, tasks = await gave_way(agent, model, message, gathering)
+            agent.edit(1, edited(rows, detail))
+            tasks[1].cancel()  # Still in its burst's wait.
+            await asyncio.gather(tasks[1], return_exceptions=True)
+            assert tasks[1].cancelled()
+            await until(lambda: not agent.reruns, 10)
+            question.reply.assert_awaited_once()
+            assert question.reply.await_args.args[0] == ANSWER
+            assert (channel.id, detail.author.id) not in agent.pending
+            agent.last_spoke.clear()
+            assert agent.ambient_ready(channel.id, 20)
+        finally:
+            model.hold[1].set()
+            for event in gathering:
+                event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+def test_a_recovery_cancelled_before_it_starts_gives_back_the_questions_place(monkeypatch, tmp_path, change):
+    """fri #210 (3): the line is taken back and the question's recovery, scheduled, is cancelled before its first
+    step, so its own cleanup never runs. Its place in their queue and its count in the ledger still go: their next
+    question is answered, not told it took too long."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        monkeypatch.setattr('fri.fri_agent.QUEUE_SECONDS', 3)  # How long the next one would wait behind it.
+        tasks = []
+        try:
+            question, detail, tasks = await gave_way(agent, model, message, gathering)
+            if change == 'deleted':
+                deleted(channel, rows, detail)
+                agent.unsend(1, [detail.id])
+            else:
+                agent.edit(1, edited(rows, detail))
+            [recovery] = agent.reruns
+            recovery.cancel()  # Nothing awaited since it was scheduled: it never starts.
+            await asyncio.gather(recovery, return_exceptions=True)
+            gathering[1].set()
+            await asyncio.wait_for(tasks[1], 5)
+            await until(lambda: not agent.reruns)
+            assert 20 not in agent.turns.arrived  # Nothing holds their queue...
+            assert agent.ledger.snapshot()['in_flight'] == 0  # ...or stays counted as being handled.
+            question.reply.assert_not_awaited()
+            nxt = message('fri whats a good shader pack')
+            tasks.append(asyncio.create_task(agent.handle(nxt)))
+            await until(lambda: len(gathering) == 3)
+            gathering[2].set()
+            await asyncio.wait_for(tasks[2], 10)
+            nxt.reply.assert_awaited_once()
+            assert nxt.reply.await_args.args[0] == ANSWER  # Not "took me too long".
+        finally:
+            model.hold[1].set()
+            for event in gathering:
+                event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
