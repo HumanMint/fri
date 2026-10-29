@@ -202,6 +202,30 @@ def test_a_link_in_brackets_names_a_post_only_once_its_whole_path_is_read(reply,
     assert link_posts(reply, read()) == sent
 
 
+@pytest.mark.parametrize('reply, sent', [
+    # An escaped "<" is only text, so the link after it is a bare one, which never ends on "." (see TAIL): it links the
+    # post (review of fri #219). An escaped backslash before the "<" escapes nothing.
+    ('see \\<https://discord.com/x/../'+PATH+'/..>', 'see \\'),
+    ('see \\\\\\<https://discord.com/x/../'+PATH+'/..>', 'see \\\\\\'),
+    ('see \\\\<https://discord.com/x/../'+PATH+'/..>', 'see \\\\<https://discord.com/x/../'+PATH+'/..>'),
+])
+def test_a_link_after_an_escaped_bracket_is_read_as_a_bare_one(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+# Spaces as Discord's markdown reads them (JavaScript's): <…> ends only at a plain space, while a bare link or a masked
+# link's target ends at any of these, but not at a control character Python also calls a space (review of fri #219).
+@pytest.mark.parametrize('space, ends', [('\u2003', True), ('\xa0', True), ('\v', True), ('\x1c', False), ('\x85', False)])
+@pytest.mark.parametrize('form', ['<{}>', '{}', '[clip]({})'])
+def test_a_post_link_holding_a_space_a_browser_keeps_goes(space, ends, form):
+    """A browser keeps such a character inside a link's path (encoded), so "x{space}/.." resolves away."""
+    from fri.fri_links import link_posts
+    reply = form.format('https://discord.com/x'+space+'/../'+PATH)
+    kept = ends and form != '<{}>'  # Discord links only "https://discord.com/x" here, which names no post.
+    assert link_posts(reply, read()) == (reply if kept else 'clip' if form.startswith('[') else 'can’t link that one.')
+
+
 @pytest.mark.parametrize('filler', ['https:'*330 + '@' + '%61'*700, 'https://discord.com/x/../'*160, 'https:'*700])
 def test_a_4000_character_reply_is_filtered_well_under_100_ms(filler):
     """Every refilter forced (each drop joins the halves around it into another link), then many links starting inside
@@ -390,3 +414,16 @@ def test_a_diagnosis_draft_left_too_short_by_a_dropped_link_is_unreadable(monkey
     result, calls = diagnosed(monkeypatch, tmp_path, proposal)
     assert result.draft is None and 'unreadable' in result.reply and 'that check completed.' in result.reply
     assert '/requests' not in calls
+
+
+@pytest.mark.parametrize('kind, value, sent', [
+    ('gene_command', {'output': f'queued {MADE_UP}'}, 'gene returned:\nqueued '),
+    ('gene_command', {'output': f'queued <{MADE_UP}>'}, 'gene returned:\nqueued '),
+    ('web_search', {'answer': f'it is {FOUND}', 'sources': [{'url': FOUND}]}, f'it is <{FOUND}>'),
+    ('web_search', {'answer': f'it is {MADE_UP}', 'sources': [{'url': FOUND}]}, 'it is '),
+])
+def test_a_reply_built_from_receipts_keeps_only_post_links_they_showed(kind, value, sent):
+    """When the model's own words can't be used, Fri answers from the step's receipt: a post link in Gene's output or a
+    search answer goes out only if the receipts showed it as a source (review of fri #219)."""
+    from fri.fri_outcomes import fallback, receipt
+    assert fallback([receipt(kind, value)]) == sent
