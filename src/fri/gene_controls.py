@@ -350,8 +350,11 @@ def replacement(text, song, start, named):
     plain = masked(text, [(m.end(1), m.end('first')) for m in artists])
     nameless = masked(text, [(m.end(1), m.end()) for m in artists])
     stopped = STOPPED.search(plain, song_end)  # Past the song they named, and not that song again.
+    # Its title is what they quoted, or the words before an artist they named in it ("Not Now by Blink-182").
+    own = end if quoted else min((m.start() for m in artists if m.start() < song_end), default=song_end)
+    again = stopped and song_words(stopped['later']) in (named, [word for word, at, _ in said if at < own])
     return not (REFUSED.search(text) or ATTRIBUTED.search(plain) or WITHDRAWN.search(plain[song:])
-                or stopped and song_words(stopped['later']) != named
+                or stopped and not again
                 or DISOWNED.match(nameless, clause) or DISOWNED.match(nameless, song_end)
                 or handed_off(nameless, clause, song_end))
 

@@ -314,6 +314,12 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, No More, not now', 'No More', False),
     ('wrong song, Not Now, no more lol', 'Not Now', False),
     ('wrong song, No, not now', 'No', False),
+    # Sol r2 on #151: the song said again is its title, without an artist they named after it.
+    ("wrong song, 'Not Now' by Blink-182, i said 'Not Now'", 'Not Now Blink-182', True),
+    ('wrong song, Not Now by Blink-182, i said not now', 'Not Now Blink-182', True),
+    ('wrong song, Not Now by Blink-182, not now', 'Not Now Blink-182', True),
+    ('wrong song, Love Story by Taylor Swift, not now', 'Love Story Taylor Swift', False),
+    ("wrong song, 'No More' by Blink-182, not now", 'No More Blink-182', False),
     # Their own subject first, with someone after it ("i and alex", "me and the boys"), and "no more tracks".
     ("wrong song, Love Story isn't what i and alex chose", 'Love Story', False),
     ("wrong song, Love Story isn't what me and the boys picked", 'Love Story', False),
