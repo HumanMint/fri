@@ -32,6 +32,7 @@ from .fri_memory import (
     DEPENDENCIES,
     GENERATIONS,
     PROFILES,
+    SOURCES,
     SUMMARIES,
     describe_memory,
     describe_profile,
@@ -66,6 +67,7 @@ FIRST_PROFILE = ('\n\n-# i kept a small note from this, and it follows you aroun
 FIRST_HERE = ('\n\n-# i kept a small note from this, something you like or are working on, just for this chat. '
               'ask “what do you remember about me?” or say “forget me” any time.')
 MAX_PROVENANCE = 200
+MAX_DRAWN = 1000  # As many messages as the controller keeps for a turn (gene #141).
 ERROR_BODY = 5  # Seconds for a refusal's small body, well inside the watch's 10 s read.
 CONTRACT_RETRY = 10  # Seconds between contract reads while the controller is down at startup.
 HEARD_SECONDS = 1800  # Longer than any message waits for its reply; ambient attention looks back 15 minutes.
@@ -112,6 +114,14 @@ def audience(context):
     """Where the turn's words may follow the member (see Fri.talk): no further than their channel, once a check
     before a model request read it from Discord keeping anyone out, whatever the cache said (fri #97)."""
     return 'conversation' if (context.get('fence') or {}).get('restricted') else context.get('audience')
+
+
+def carried(context):
+    """Every message the turn's model requests carried, as strings: its own, the live view, what it answers or quotes,
+    what it looked at or read, and the saved context left after withholding (see chat_once)."""
+    turn = ((context.get('fence') or {}).get('turn') or {})
+    own = [turn.get('source', {}).get('id'), *(row['source']['id'] for row in context.get('message_burst', []))]
+    return sorted({str(i) for i in [*own, *(context.get('fence') or {}).get('messages', ())] if str(i).isdigit()}, key=int)
 
 
 async def noop(stage):
@@ -468,6 +478,11 @@ class Fri(discord.Client):
                 where = ((fence or {}).get('turn') or {}).get('conversation_id', '')
                 live = self.agent.versions(int(where[7:]) if where.startswith('public:') and where[7:].isdigit() else None)
                 context['recent'] = [row for row in context['recent'] if self.agent.current(row, live)]
+            # Saved context holding a message its author took back since it was read, or whose withdrawal the
+            # controller hasn't taken yet (a timeout, a restart): its words stay out. What's left counts as carried, so
+            # a take-back from here on withholds the answer, and keeps nothing at the save (fri #215).
+            if self.agent:
+                seen.update(int(i) for i in self.agent.saved_turns.withhold(context))
             # One this turn quotes or replies to refuses it instead: the answer would be about words taken back,
             # which saved turns may still hold. So does one the turn itself answers, its own message or one of
             # its burst, if taken back since it came in (see Agent.rerun).
@@ -580,7 +595,7 @@ class Fri(discord.Client):
         # Privacy controls must work while inference is busy or the subscription is down.
         intent = memory_intent(text)
         if intent == 'show' and self.profiles:
-            context = place_notes(self.get_channel, await self.api('POST', '/chat/context', profiled(self, scope)),
+            context = place_notes(self.get_channel, await self.api('POST', '/chat/context', profiled(self, scope, True)),
                                   scope['conversation_id'])
             return ChatResult(reply=await self.memory_overview(scope, context['personal_memory'], visibility == 'private',
                                                                context.get('member_summary')),
@@ -618,7 +633,7 @@ class Fri(discord.Client):
         try:
             async with self.chat_slots:
                 context = place_notes(self.get_channel, attributed(await self.api(
-                    'POST', '/chat/context', profiled(self, scope))), scope['conversation_id'])
+                    'POST', '/chat/context', profiled(self, scope, True))), scope['conversation_id'])
                 if revision is not None and context['revision'] != revision:
                     raise AuthorErased()
                 if self.profiles:
@@ -908,11 +923,16 @@ class Fri(discord.Client):
                     if len(result.turn['provenance']) > MAX_PROVENANCE:
                         return ChatResult(reply=unrecorded(receipts, reason='too many people were in that context to '
                                                            'track safely.'), status='completed')
+                    try:
+                        result.turn.update(self.drawn_on(context))
+                    except commands.UserFeedbackCheckFailure:
+                        return ChatResult(reply=unrecorded(receipts, reason='that drew on too many messages to track '
+                                                           'safely.'), status='completed')
                     if context.get('unattributed_reference'):
                         result.turn.update(reply=UNATTRIBUTED, verbatim=False)
                     elif not private and not crossed and not recalled:
                         result.echo = self.echo(scope, context, result.turn['provenance'], stored,
-                                                draws_on_summary(result.turn))
+                                                draws_on_summary(result.turn), carried(context))
                     await looked(result)
                     try:  # The save's privacy fence, applied before anything is shown.
                         await self.echoes_standing(context)
@@ -965,9 +985,10 @@ class Fri(discord.Client):
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
             **(self.summary_generation(context) if derived else {}),
+            **(self.drawn_on(context) if derived else {}),
             **({'audience': audience(context)} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
-            result.echo = self.echo(scope, context, provenance, reply, draws_on_summary(result.turn))
+            result.echo = self.echo(scope, context, provenance, reply, draws_on_summary(result.turn), carried(context))
         return result
 
     async def echoes_standing(self, context):
@@ -1048,6 +1069,20 @@ class Fri(discord.Client):
         if found := self.dependencies(context):
             context['fence'].setdefault('summary_dependencies', set()).update(found)
 
+    def drawn_on(self, context):
+        """For a controller offering withdrawal-sources: the messages the turn's model requests carried besides its own
+        (see chat_once), so a withdrawal of one retires its saved reply, or refuses it before then (gene #141). Never
+        dropped to fit: too many refuse it, as too many people do. Nothing for an older controller."""
+        if SOURCES not in self.capabilities or not context.get('fence'):
+            return {}
+        own = {str((context['fence'].get('turn') or {}).get('source', {}).get('id', '')),
+               *(str(row['source']['id']) for row in context.get('message_burst', []))}
+        ids = sorted(set(carried(context))-own, key=int)
+        if len(ids) > MAX_DRAWN:
+            raise commands.UserFeedbackCheckFailure('that drew on too many messages for me to keep track of safely. '
+                                                    'ask again in a bit.')
+        return {'drew_on': ids} if ids else {}
+
     async def memory_overview(self, scope, profile, private, summary=None):
         """Everything for the member's own eyes in private; in public, only what that channel can see."""
         escape = discord.utils.escape_markdown
@@ -1110,14 +1145,15 @@ class Fri(discord.Client):
         return posted
 
     @staticmethod
-    def echo(scope, context, provenance, reply, summarized=False):
+    def echo(scope, context, provenance, reply, summarized=False, drew_on=()):
         """Fri's delivered public reply for the shared channel view, tagged with whose words shaped it. summarized:
-        its turn carries a summary generation, so Gene retires it if that summary goes (see Agent.retired)."""
+        its turn carries a summary generation, so Gene retires it if that summary goes (see Agent.retired). drew_on:
+        the messages its turn carried, so it leaves the view once one is taken back (see Agent.withdrawn_from)."""
         if not scope['conversation_id'].startswith('public:') or not context.get('personal_memory', {}).get('enabled', True):
             return None
         return {'text': reply, 'provenance': provenance + [{'user_id': str(scope['user_id']),
                                                             'revision': context['revision']}],
-                **({'summarized': True} if summarized else {})}
+                **({'summarized': True} if summarized else {}), 'drew_on': sorted(drew_on)}
 
     async def record_turn(self, result, sent=None):
         """Save a staged turn once delivered. Delivery is the evidence Fri actually said it."""

@@ -166,6 +166,9 @@ class Agent:
         self.state = {'config': dict(DEFAULTS), 'version': 0, 'channels': [], 'history_channels': []}
         self.recent = defaultdict(lambda: deque(maxlen=30))
         self.summarized = {}  # Fri's echoed replies that drew on a member's summary: message ID -> when (see retired).
+        # Fri's echoed replies -> (when, the messages its turn carried, its own included), oldest first: one goes from
+        # the live view once any of them is taken back (see withdrawn_from).
+        self.drawn = {}
         self.active = {}
         self.replying = set()  # Discord message IDs whose reply isn't delivered and recorded yet.
         self.handling = Counter()  # Discord message IDs being handled now, burst members included.
@@ -260,6 +263,7 @@ class Agent:
 
     async def start(self):
         self.state = await self.fri.api('GET', '/agent/state')
+        self.saved_turns.retry()  # Withdrawals the controller hadn't taken before a restart (fri #215).
         self.heartbeat.start()
 
     def close(self):
@@ -378,12 +382,28 @@ class Agent:
         self.recent[channel].append({'id': str(sent.id), 'user_id': str(self.fri.user.id), 'name': 'Fri',
                                      'text': clean(text, 500), 'at': time.time(), 'gene_error': False, 'fri': True,
                                      'provenance': echo['provenance']})
+        now = time.time()
+        while self.drawn and next(iter(self.drawn.values()))[0] < now-REDELIVERY_SECONDS:
+            del self.drawn[next(iter(self.drawn))]
+        self.drawn[str(sent.id)] = (now, frozenset(echo.get('drew_on', ())))
         if echo.get('summarized'):
             # Kept an hour, though the live view drops the row at 15 minutes (see messages): a turn that copied it may
             # still be running, and its last checks recheck only what's marked (fri #193).
             now = time.time()
             self.summarized = {mid: at for mid, at in self.summarized.items() if at > now-REDELIVERY_SECONDS}
             self.summarized[str(sent.id)] = now
+
+    def withdrawn_from(self, ids):
+        """Messages taken back: Fri's replies in the channel's view whose turn carried one leave it, and so do those
+        that carried one of those, since each may repeat the words (gene #141). Returns their IDs, which count as taken
+        back too, for a turn that already holds a copy (see SavedTurns.withdraw)."""
+        gone, found = {str(i) for i in ids}, set()
+        while more := {mid for mid, (_, carried) in self.drawn.items() if mid not in found and carried & (gone | found)}:
+            found |= more
+        if found:
+            for key, kept in self.recent.items():
+                self.recent[key] = deque((r for r in kept if not (r.get('fri') and r['id'] in found)), maxlen=30)
+        return found
 
     @staticmethod
     def rechecks(fence):
@@ -1942,9 +1962,11 @@ class Agent:
         own = {event.id for event in events}
 
         def changed(ids):
-            """Those of `ids` deleted, or edited since this turn began: what the model saw of them may be gone."""
+            """Those of `ids` deleted, or edited since this turn began: what the model saw of them may be gone. Saved
+            context included: a message its history, a note or an exchange elsewhere holds (fri #215)."""
             edited = {int(i) for i, at in self.withdrawn.items() if at >= began and i.isdigit()}
             edited |= {i for i, at in self.revised.items() if at >= began and i not in own}  # Not its own: see taken.
+            edited |= {int(i) for i, at in self.saved_turns.marked.items() if at >= began and int(i) not in own}
             return (self.unsent.keys() | edited) & set(ids)
 
         def taken(event):  # One this turn answers, deleted or edited (an edit may take it back) while it ran.

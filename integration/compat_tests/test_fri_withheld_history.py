@@ -313,3 +313,22 @@ def test_pending_withdrawals_hold_no_words_and_tolerate_a_damaged_record(monkeyp
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+def test_a_message_old_enough_only_for_a_note_is_asked_about_by_a_capable_controller(monkeypatch, tmp_path):
+    """A note lasts 90 days, an exchange a week: past the week, only a controller that drops notes with their message
+    is asked."""
+    async def scenario():
+        import datetime as dt
+        w = await world(monkeypatch, tmp_path)
+        if 'saved-turn-withdrawal' not in w.fri.capabilities:
+            pytest.skip('needs a controller offering saved-turn-withdrawal')
+        try:
+            old = discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=30))
+            await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=1, guild_id=123, message_id=old))
+            await settled(w)
+            asked = [payload['message_ids'] for path, payload in w.calls if path == SAVED]
+            assert asked == ([[str(old)]] if SOURCES in w.fri.capabilities else [])
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
