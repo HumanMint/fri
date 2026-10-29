@@ -24,11 +24,14 @@ DIGITS = re.compile(r'(?:[0-9]|%3[0-9]){1,25}')
 SCHEME = r'h[\t\n\r]*t[\t\n\r]*t[\t\n\r]*p[\t\n\r]*(?:s[\t\n\r]*)?:'
 LINKED = re.compile(SCHEME, re.I)
 DROPPED = re.compile(r'[\t\n\r]')
-# Where a link can be: masked, in <…> (which can hold the tabs and newlines a browser drops), or bare up to a space
-# or "<" (RUN, found once for the links that start inside it), whatever its host and path (see post).
-LINK = re.compile(r'\[(?P<label>[^\]\n]{1,100})\]\(\s*<?(?P<masked>[\x00-\x1f]*'+SCHEME+r'[^\s<>()]*)>?\s*\)|'
-                  r'<(?P<angled>[\x00-\x1f]*'+SCHEME+r'(?:[^\s<>]|[\t\n\r])*)>|<?(?P<bare>'+SCHEME+r')', re.I)
-RUN = re.compile(r'[^\s<]*')
+# A space as Discord's markdown reads one (JavaScript's \s): not a control character Python also calls a space, which a
+# browser keeps in a link (encoded), as it does any of these but the plain space inside <…>.
+SPACE = '\t\n\v\f\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff'
+# Where a link can be: masked, in <…> (to a plain space), or bare up to a space or "<" (RUN, found once for the links
+# that start inside it), whatever its host and path (see post).
+LINK = re.compile(r'\[(?P<label>[^\]\n]{1,100})\]\(\s*<?(?P<masked>[\x00-\x1f]*'+SCHEME+r'[^'+SPACE+r'<>()]*)>?\s*\)|'
+                  r'<(?P<angled>[\x00-\x1f]*'+SCHEME+r'[^ <>]*)>|<?(?P<bare>'+SCHEME+r')', re.I)
+RUN = re.compile(r'[^'+SPACE+r'<]*')
 # The rest of a bare one: a trailing slash, query or fragment is part of it. Sentence punctuation or markdown at its
 # end isn't, nor an emoji or other non-URL text right after it, nor a word after closing markdown ("**…**this"):
 # inside it, "_" and "~" are its own (?utm_source=…), but it never ends on them, "*" or "|". Markdown opened before
@@ -133,6 +136,14 @@ def opened(marks, text):
     return marks
 
 
+def escaped(text, at):
+    """Whether the character at `at` is escaped: an odd number of backslashes right before it."""
+    start = at
+    while start and text[start-1] == '\\':
+        start -= 1
+    return (at-start) % 2 == 1
+
+
 def targeted(text, at):
     """Whether what starts at `at` may be a masked link's target: only spaces, as JavaScript reads them, after a "("."""
     while at and (text[at-1].isspace() or text[at-1] == '\ufeff'):
@@ -156,10 +167,10 @@ def once(text, allowed, found):
         # Only <…> ends a link for certain, so only then is its whole path its own (see post). Not a masked link's
         # target out of <…>: Discord can refuse the masked link and read it bare. Nor <…> right after a "(": it may be
         # the target of a masked link LINK doesn't take ("[](…)"), and end at a ")" in it. Nor one with a "\\" in it,
-        # which may escape its ">".
+        # which may escape its ">". Nor one whose "<" is escaped ("\\<"): only text, so the link is a bare one.
         whole = '\\' not in url and (
             name == 'masked' and text[match.start(name)-1] == '<' and text.startswith('>', match.end(name)) or
-            name == 'angled' and not targeted(text, match.start()))
+            name == 'angled' and not targeted(text, match.start()) and not escaped(text, match.start()))
         if scheme not in channels and (key := (url, whole, name == 'angled')) not in found:
             found[key] = post(*key)
         if scheme in channels or (length := found[key]) is None:
