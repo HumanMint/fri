@@ -274,7 +274,8 @@ def test_tools_prepare_preview_then_explicit_bound_button_schedules_without_mode
             **UNTOUCHED)
         fri = SimpleNamespace(api=call, data=tmp_path, agent=agent, guild_id=123, workshop_id=456, user=SimpleNamespace(id=50))
         actions = SimpleNamespace(event=message, public=False, guild=123, user=10, agent=agent, fri=fri,
-            scope=DM, revision=0, private_evidence=False, message=message.content, conversation={})
+            scope=DM, revision=0, private_evidence=False, message=message.content, conversation={},
+            summary_generation=dict)  # No summary in this turn (fri #171).
         action = {'kind': 'reminder_prepare', 'body': 'update the mods', 'local_time': future(), 'timezone': 'UTC'}
         result = await execute(actions, action)
         await show_preview(fri, message, result['social_preview'])

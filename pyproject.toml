@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "fri-agent"
 version = "0.1.0"
 description = "Private Discord companion using a bounded Gene controller contract"
+license = "MIT"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "discord.py==2.7.1", "aiohttp==3.9.5", "httpx==0.28.1",

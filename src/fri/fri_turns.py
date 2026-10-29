@@ -1,22 +1,27 @@
 """Direct replies to a member go one at a time, in the order their messages were sent."""
 
 import asyncio
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 
 class Turns:
     def __init__(self, fri):
         self.fri = fri  # Its busy set also covers panel and ambient replies, which take no turn.
-        self.arrived = defaultdict(set)  # member: IDs of their messages still being handled.
+        # member: IDs of their messages still being handled, each by how many handlers: a message answered alone
+        # after all keeps its place while the handler it gave way through winds down (see Agent.unjoin).
+        self.arrived = defaultdict(Counter)
         self.holders = {}  # member: the message whose reply holds their turn.
         self.wakers = {}  # member: set when their turn, busy state or earlier messages change.
 
     def arrive(self, user, message_id):
-        self.arrived[user].add(message_id)
+        self.arrived[user][message_id] += 1
 
     def leave(self, user, message_id):
-        self.arrived[user].discard(message_id)
-        if not self.arrived[user]:
+        handlers = self.arrived[user]
+        handlers[message_id] -= 1
+        if handlers[message_id] <= 0:
+            del handlers[message_id]
+        if not handlers:
             del self.arrived[user]
         self.wake(user)
 

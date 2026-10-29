@@ -7,7 +7,7 @@ import discord
 from . import feedback as commands
 from .fri_actions import Actions
 from .fri_chat import ChatResult
-from .fri_errors import ControllerRejected
+from .fri_errors import Continued, ControllerRejected
 from .fri_notices import notice_text
 from .fri_outcomes import fallback, receipt, unrecorded
 from .gene_controls import current_music_context, requested
@@ -66,6 +66,8 @@ async def admit(fri, event, source, scope, text, context):
         offered = (await fri.api('GET', '/controls/catalog')).get('actions', [])
         if selected['action'] not in offered:
             return Admission(result=ChatResult(reply=fri.watcher.refusal(offered), status='completed'))
+    if not fri.agent.commit(event):  # Before anything is reserved or run: a short line joined it (see Continuation).
+        raise Continued()
     grant = await fri.api('POST', '/chat/operations/admit', {**scope, 'source': source.model_dump(),
         'revision': context['revision'], 'input': text, 'continuation': not bool(selected)})
     if not grant['allowed']:

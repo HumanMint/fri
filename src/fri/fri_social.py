@@ -167,7 +167,10 @@ async def execute(actions, action):
         payload['request_text'] = request_text
     if taken_back(actions):
         return {'blocked': CHANGED}
-    row = await actions.fri.api('POST', route, {**payload, **{key: value for key, value in action.items() if key != 'kind'}})
+    # A reminder's text is the model's: refused once the summary the turn drew on has moved (fri #171).
+    written = actions.summary_generation() if kind == 'reminder_prepare' else {}
+    row = await actions.fri.api('POST', route, {**payload, **{key: value for key, value in action.items()
+                                                           if key != 'kind'}, **written})
     return {'social_preview': {'kind': 'reminder' if kind == 'reminder_prepare' else 'plan', 'item': row}}
 
 

@@ -17,7 +17,8 @@ def setup(user=10, guild=None):
     event = SimpleNamespace(user=SimpleNamespace(id=user), guild_id=guild, channel_id=456, channel=SimpleNamespace(id=456),
         type=discord.InteractionType.component, data={'custom_id': 'fri:request:preview:'+'a'*32},
         message=SimpleNamespace(author=cog.user, flags=SimpleNamespace(ephemeral=False)),
-        response=SimpleNamespace(defer=AsyncMock(), edit_message=AsyncMock(), send_message=AsyncMock()),
+        response=SimpleNamespace(defer=AsyncMock(), edit_message=AsyncMock(), send_message=AsyncMock(),
+                                 is_done=lambda: False),
         edit_original_response=AsyncMock())
     return cog, event
 
@@ -66,6 +67,12 @@ def test_dm_and_public_drafts_cannot_be_approved_by_other_people_or_scope(denial
             event.guild_id, event.channel_id, event.channel.id = 123, 999, 999
         await draft.submit(event)
         cog.api.assert_not_awaited()
+        if denial == 'other_user':  # Someone else's draft says so, instead of failing.
+            assert event.response.send_message.await_args.kwargs['content'] == 'not your button.'
+        elif denial == 'nonmember':  # Their own, when the member lookup comes back empty: said too (fri #183).
+            assert event.response.send_message.await_args.kwargs['content'] == 'couldn’t check you’re still here. try again.'
+        else:
+            event.response.send_message.assert_not_awaited()
     asyncio.run(scenario())
 
 

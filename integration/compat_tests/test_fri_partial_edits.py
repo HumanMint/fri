@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import discord
 import pytest
 
+from compat_tests.test_fri_evicted_copies import flood
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_unsend import heard, model, no_debounce, row
 from fri.fri_chat import ChatResult
@@ -138,6 +139,68 @@ def test_a_partial_update_to_fris_or_genes_own_row_leaves_an_ordinary_answer_alo
             await ready()
             await partially_edited(fri, rows, channel, bot, 'bot added a notice')
             assert cached in agent.recent[1]
+            return ChatResult(status='completed', reply='safe answer')
+        model(fri, tmp_path, respond)
+        try:
+            await agent.handle(trigger)
+            assert trigger.reply.await_args.args[0].startswith('safe answer')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('when', ['before', 'after'])
+@pytest.mark.parametrize('kind', ['fri', 'gene_error'])
+def test_fris_or_genes_own_row_pushed_out_then_partially_updated_leaves_an_ordinary_answer_alone(
+        monkeypatch, tmp_path, kind, when):
+    """fri #149: thirty newer lines push the row out of the live view, 'before' the request's last checks or
+    'after' the request carried it, then an authorless update for it comes in. Whose it was is kept with the
+    request's hold on it, so it's still no member's edit."""
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        bot = message('earlier bot line', user=99 if kind == 'fri' else 77)
+        bot.author.bot = True
+        cached = row(bot.id, user=str(bot.author.id), **({'fri': True, 'provenance': [{'user_id': '21', 'revision': 0}]}
+                                                          if kind == 'fri' else {'gene_error': True}))
+        agent.recent[1].append(cached)
+        trigger = message('fri hello there')
+        trigger.reply.return_value = SimpleNamespace(id=trigger.id+100, content='safe answer', edit=AsyncMock())
+        async def respond(context, ready):
+            if when == 'before':
+                await flood(agent, message, bot)
+            await ready()
+            if when == 'after':  # Fri's own row was carried; Gene's error rows never are.
+                await flood(agent, message, bot, looked=kind == 'fri')
+            await partially_edited(fri, rows, channel, bot, 'bot added a notice')
+            assert bot.id not in agent.revised
+            return ChatResult(status='completed', reply='safe answer')
+        model(fri, tmp_path, respond)
+        try:
+            await agent.handle(trigger)
+            assert trigger.reply.await_args.args[0].startswith('safe answer')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_partial_update_to_fris_own_reply_target_leaves_an_ordinary_answer_alone(monkeypatch, tmp_path):
+    """fri #149: a member replies to an older Fri message, out of the live view. Fri's own words are no member's
+    edit, so an update with no author for it, while the model writes, doesn't refuse the answer."""
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        mine = message('an older fri line', user=99)
+        mine.author.bot = True
+        trigger = message('fri what did you mean')
+        trigger.reference = SimpleNamespace(message_id=mine.id, channel_id=1)
+        trigger.reply.return_value = SimpleNamespace(id=trigger.id+100, content='safe answer', edit=AsyncMock())
+        async def respond(context, ready):
+            assert context.get('reply_target')
+            await ready()
+            assert mine.id in agent.looked
+            await partially_edited(fri, rows, channel, mine, 'an older fri line')
+            assert mine.id not in agent.revised
             return ChatResult(status='completed', reply='safe answer')
         model(fri, tmp_path, respond)
         try:

@@ -6,6 +6,7 @@ import discord
 from discord.state import ConnectionState
 
 from fri.fri_context import discord_source, same_source
+from fri.fri_images import forwarded, media
 from fri.fri_mentions import fingerprint
 
 BOT, GUILD, CHANNEL, MEMBER, MESSAGE = 99, 123, 8, 20, 1300000000000000000
@@ -33,12 +34,12 @@ def channel():
     return state, text
 
 
-def message(state, text, *, gateway, nick='server nickname', content=None, author=MEMBER, edited=None):
+def message(state, text, *, gateway, nick='server nickname', content=None, author=MEMBER, edited=None, **extra):
     data = {'id': str(MESSAGE), 'channel_id': str(CHANNEL), 'guild_id': str(GUILD), 'type': 0,
-            'content': content or f'<@{BOT}> you there?', 'author': user(author, 'member', 'global name'),
+            'content': f'<@{BOT}> you there?' if content is None else content, 'author': user(author, 'member', 'global name'),
             'timestamp': '2026-10-24T11:33:00+00:00', 'edited_timestamp': edited, 'tts': False,
             'mention_everyone': False, 'mentions': [user(BOT, 'fri', 'Fri', True)], 'mention_roles': [],
-            'attachments': [], 'embeds': [], 'pinned': False}
+            'attachments': [], 'embeds': [], 'pinned': False, **extra}
     if gateway:  # MESSAGE_CREATE carries the author's guild member; GET /messages/{id} does not.
         data['member'] = {'roles': [], 'joined_at': None, 'deaf': False, 'mute': False, 'flags': 0, 'nick': nick}
     return discord.Message(state=state, channel=text, data=data)
@@ -62,3 +63,22 @@ def test_fetched_copies_still_detect_real_changes():
                     message(state, text, gateway=False, author=30)):
         assert fingerprint(changed) != fingerprint(event)
     assert not same_source(discord_source(event), discord_source(message(state, text, gateway=False, author=30)))
+
+
+def snapshot(content):
+    return {'message': {'type': 0, 'content': content, 'embeds': [], 'flags': 0, 'mentions': [], 'mention_roles': [],
+                        'timestamp': '2026-10-24T11:30:00+00:00', 'edited_timestamp': None, 'components': [],
+                        'attachments': [{'id': '7', 'filename': 'meme.png', 'size': 10, 'url': 'https://x/meme.png',
+                                         'proxy_url': 'https://y/meme.png', 'content_type': 'image/png'}]}}
+
+
+def test_a_forward_is_told_apart_from_a_reply_as_discord_delivers_them():
+    state, text = channel()
+    reference = {'channel_id': '4242', 'guild_id': '9999', 'message_id': '555'}
+    forward = message(state, text, gateway=True, content='', mentions=[], message_reference={**reference, 'type': 1},
+                      message_snapshots=[snapshot('a hot take')])
+    assert forward.reference.type is discord.MessageReferenceType.forward and forward.message_snapshots
+    assert forwarded(forward) and not forward.content and not media(forward)  # Nothing of its own.
+    reply = message(state, text, gateway=True, message_reference={**reference, 'channel_id': str(CHANNEL), 'type': 0})
+    assert reply.reference.type is discord.MessageReferenceType.default and not forwarded(reply)
+    assert not forwarded(message(state, text, gateway=True))

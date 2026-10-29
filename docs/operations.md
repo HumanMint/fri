@@ -270,6 +270,14 @@ advertises it, so the controller must be released first.
   older controller is never asked. Not covered yet (fri #101): Fri's own saved replies and echo rows,
   and other members' exchanges, that drew on the message record authors and revisions, not message
   IDs, so they stay.
+- **What a turn drawing on the member summary writes or keeps.** A turn whose model request had Fri's
+  summary of the member carries its generation (gene #91). Before every tool step, Fri checks that
+  generation with `/chat/turn/check`, whether or not typing had already started, so a step the model
+  chose while the summary's source was withdrawn is blocked (fri #171). A controller offering
+  `summary-generation-writes` also takes the generation on saved work and reminder previews and
+  refuses a moved one inside the write. The same controller retires a saved reply that drew on a
+  summary since gone: history shows a breadcrumb instead, and a question it left pending goes (fri
+  #172). A turn without the summary, or a controller without summary generations, runs as before.
 - **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
   research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
   an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead
@@ -647,7 +655,7 @@ Fri can't restart anything. It only notices and says so.
    without network access. Auth and state mounts retain their separate permissions.
 
 3. Create `/srv/fri/install.json`, owned by the trusted maintainer and mode `0600`.
-   On the current installation the values are:
+   With Gene's default `/srv/gene` layout the values are:
 
    ```json
    {

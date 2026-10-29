@@ -38,7 +38,10 @@ class Session:
 def test_runtime_client_handshake_and_wrong_service_actions(client):
     async def scenario():
         runtime=SimpleNamespace(url='http://controller',token='fri-'+'x'*32,session=Session(client))
-        assert await Fri.api(runtime,'GET','/fri/contract')==contract()
+        # Fri's own acceptance check, not equality: a newer Gene may offer optional capabilities Fri doesn't use
+        # (gene #97's summary-generations, say), and Fri still requires every one it does.
+        offered=await Fri.api(runtime,'GET','/fri/contract')
+        assert compatible(offered) and offered['protocol']==contract()['protocol']
         assert runtime.session.calls[0][2]['X-Fri-Contract']==PROTOCOL
         for path in ('/worker/claim','/deploy/claim'):
             with pytest.raises(ControllerRejected):
@@ -82,3 +85,11 @@ def test_turn_withdrawal_is_offered_and_optional():
     # still runs Fri, which then asks nothing.
     assert 'turn-withdrawal' in contract()['capabilities'] and 'turn-withdrawal' not in CAPABILITIES
     assert compatible({**contract(), 'capabilities': [c for c in contract()['capabilities'] if c != 'turn-withdrawal']})
+
+
+def test_summary_generations_are_offered_and_optional():
+    # Fri carries the member summary's generation on a turn that drew on it when offered (gene #91); an older
+    # controller still runs Fri, which then sends nothing new.
+    assert 'summary-generations' in contract()['capabilities'] and 'summary-generations' not in CAPABILITIES
+    assert compatible({**contract(), 'capabilities': [c for c in contract()['capabilities']
+                                                      if c != 'summary-generations']})

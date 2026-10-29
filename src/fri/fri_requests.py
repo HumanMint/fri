@@ -8,7 +8,7 @@ import discord
 
 from . import feedback as commands
 from .fri_notices import notice_text
-from .previews import PagedPreview
+from .previews import PagedPreview, strip
 from .reviews import request_reference
 
 NO_MENTIONS = discord.AllowedMentions.none()
@@ -33,6 +33,7 @@ class DraftView(PagedPreview):
         self.owner = user_id == cog.owner_id
         self.reviewed = reviewed
         self.preview_interaction = None
+        self.message = None  # The reply it went out on, if any: its button comes off when it times out.
         if reviewed:
             super().__init__('Review your request', draft,
                 'Submit allows coding; deployment needs a separate review.' if self.owner else
@@ -48,13 +49,19 @@ class DraftView(PagedPreview):
             self.add_item(button)
 
     async def interaction_check(self, interaction):
+        from .fri_buttons import answers, not_yours, unchecked
+        if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
+            return False
         if interaction.user.id != self.user_id:
+            await not_yours(interaction)
             return False
         if getattr(getattr(interaction.message, 'author', None), 'id', None) != self.cog.user.id:
             return False
         if interaction.guild_id is None:
-            return bool(self.cog.agent and await self.cog.agent.member(self.user_id, fresh=True,
-                                                                       guild_id=self.cog.guild_id))
+            if self.cog.agent and await self.cog.agent.member(self.user_id, fresh=True, guild_id=self.cog.guild_id):
+                return True
+            await unchecked(interaction)
+            return False
         channel = getattr(interaction.channel, 'parent_id', None) or interaction.channel_id
         return bool(interaction.guild_id == self.cog.guild_id and (channel == self.cog.workshop_id or
                     (self.cog.agent and self.cog.agent.allowed(interaction.channel))))
@@ -69,6 +76,7 @@ class DraftView(PagedPreview):
         if interaction.guild_id is None or getattr(getattr(interaction.message, 'flags', None), 'ephemeral', False):
             await interaction.response.edit_message(content=view.content, embed=None, attachments=[], view=view,
                                                      allowed_mentions=NO_MENTIONS)
+            self.message = None  # The preview shows there now, and takes its own controls off (see on_timeout).
         else:
             from .fri_panel import sessions
             await sessions(self.cog).show(interaction, content=view.content, attachments=[], view=view)
@@ -116,6 +124,7 @@ class DraftView(PagedPreview):
     async def on_timeout(self):
         from .fri_panel import sessions
         await sessions(self.cog).close((self.cog.guild_id, self.user_id), self)
+        await strip(self.message)
         if self.preview_interaction and self.preview_interaction.guild_id is None:
             try:
                 await self.preview_interaction.edit_original_response(view=None)
