@@ -669,6 +669,8 @@ async def unchanged(agent, message, context):
             try:
                 current = await message.channel.fetch_message(int(row['source']['id']))
             except discord.NotFound:
+                if hasattr(agent, 'gone'):  # Deleted, as its delete event, which may never come, would mark it.
+                    agent.gone(int(row['source']['id']))
                 await withdrawn(row, MAX_TEXT, None)
                 unchanged = False
                 continue

@@ -470,6 +470,12 @@ class Agent:
         self.saved_turns.withdraw(ids)  # Their saved exchanges too, so their words don't come back as history.
         self.receipts.withdraw(ids)  # And Fri's outside answers that drew on them, or were them.
 
+    def gone(self, i):
+        """Discord says message `i` was deleted (a fetch found it gone), though its delete event hasn't come: marked
+        deleted, as that event would mark it (see unsend), so a notice never goes to it (see reply_once)."""
+        if i not in self.unsent:
+            self.unsent[i] = time.monotonic()
+
     def saw(self, ids, ours=()):
         """Messages a turn's model request carries, wherever they came from (the live view, a reply target, a
         read, a look): a delete is marked for an hour, past any reply still running, even once one leaves the
@@ -893,11 +899,13 @@ class Agent:
             return False
 
     async def take_turn(self, message, text, dm, *, burst=(), invitation=None, forgotten=None, revision=None,
-                        waited=False, addressed=False):
+                        waited=False, addressed=False, alone=False):
         """One direct reply per member at a time, in the order their messages were sent. A message that
         comes in mid-reply waits through that reply's delivery and save, then is answered, unless its
         author erased since it came in: since `forgotten` local erasures and privacy `revision`. One
-        that `waited` already, for a reply to be saved, is held to the same deadline."""
+        that `waited` already, for a reply to be saved, is held to the same deadline. One answered `alone`
+        after all (see answer_alone), edited since, is answered again as it reads now, as if it had never
+        given way (see unjoin)."""
         from .fri_pending import cancelled
         user = message.author.id
         events = [message, *(event for _, event, _ in burst if event is not message)]
@@ -980,6 +988,9 @@ class Agent:
                 # Each message as Discord has it now: one edited or deleted while it waited, maybe to take
                 # it back, is neither answered nor saved. A ping's invitation checks its own message.
                 if not invitation and not await self.unedited(events):
+                    if (alone and message.id not in self.unsent and  # Edited, not deleted, as reply_once has it.
+                            self.taken_back(message.id, self.arrival([message.id])) and self.answer_again(message)):
+                        return self.missed(events, 'message edited')
                     return self.missed(events, 'message changed')
                 if reason := await self.excluded(message, dm, invitation, privacy, text):
                     return self.missed(events, reason)
@@ -1133,7 +1144,7 @@ class Agent:
             self.handling[message.id] += 1
             try:
                 await self.respond(message, token.text, False, waited=True, forgotten=token.since[0],
-                                   revision=token.since[1], addressed=token.addressed)
+                                   revision=token.since[1], addressed=token.addressed, alone=True)
             finally:
                 self.handling -= Counter([message.id])
                 self.continuations.close(alone)
