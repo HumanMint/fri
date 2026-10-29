@@ -218,6 +218,42 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, We Want the Airwaves', 'We Want the Airwaves', True),
     ('wrong song, Say No to This', 'Say No to This', True),
     ('wrong song, Love Story again please', 'Love Story', True),
+    # gene #128 (1): a contracted denial ends an unquoted title like "is not" does, whatever the proposed song
+    # covers, though a quoted title, or one with a contraction that denies nothing, still counts.
+    ("wrong song, Love Story isn't what i asked for", "Love Story isn't what i asked for", False),
+    ("wrong song, Love Story wasn't what i meant", "Love Story wasn't what i meant", False),
+    ("wrong song, Love Story ain't what i asked for", "Love Story ain't what i asked for", False),
+    ('wrong song, Love Story isnt the one i wanted', 'Love Story isnt the one i wanted', False),
+    ("wrong song, Love Story isn't what alex wants", "Love Story isn't what alex wants", False),
+    ("wrong song, 'Love Story isn't what i asked for'", "Love Story isn't what i asked for", True),
+    ("wrong song, It Ain't Me", "It Ain't Me", True),
+    ("wrong song, Love Isn't Easy", "Love Isn't Easy", True),
+    # gene #128 (2): a closing withdrawal may end "this time" or "ever again".
+    ('wrong song, Love Story, i said no to that one this time', 'Love Story', False),
+    ('wrong song, Love Story, i said not to do it ever again', 'Love Story', False),
+    ('wrong song, Love Story, i said no this time lol', 'Love Story', False),
+    ('wrong song, Love Story... nah this time', 'Love Story', False),
+    ("wrong song, 'I Said No to That One This Time'", 'I Said No to That One This Time', True),
+    ('wrong song, Love Story this time', 'Love Story', True),
+    ('wrong song, Love Story, i said it this time', 'Love Story', True),
+    # gene #128 (3): an inclusive "we" is the speaker's own, though a collective denial or withdrawal still counts,
+    # and so does someone else's words after it.
+    ('wrong song, Love Story is what we want', 'Love Story', True),
+    ('wrong song, Love Story is what we wanted', 'Love Story', True),
+    ('wrong song, Love Story is what we meant', 'Love Story', True),
+    ("wrong song, Love Story isn't what we wanted", 'Love Story', False),
+    ("wrong song, Love Story is what we didn't ask for", 'Love Story', False),
+    ('wrong song, Love Story is what we never wanted', 'Love Story', False),
+    ("wrong song, Love Story is what we don't want", 'Love Story', False),
+    ('wrong song, Love Story by Taylor Swift we said no to that', 'Love Story', False),
+    ('wrong song, Love Story by Taylor Swift we told you not to', 'Love Story', False),
+    ('wrong song, Love Story is what we heard alex say', 'Love Story', False),
+    ('wrong song, Love Story is what we were told', 'Love Story', False),
+    ('wrong song, Love Story is what we said alex wanted', 'Love Story', False),
+    ('wrong song, Love Story, we said it already', 'Love Story', True),
+    ('wrong song, Love Story, we said no to that', 'Love Story', False),
+    ('wrong song, Love Story, we said not to play it', 'Love Story', False),
+    ('not that one, we said Love Story', 'Love Story', False),  # Only "i said" may lead the song.
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
@@ -259,7 +295,9 @@ def test_a_long_message_is_read_without_backtracking():
               'love'+' from x'*568, 'love story'+' i just'*664+' said', "love story "+"don't "*664, 'i meant '+'to '*1328,
               'love story'+' is not what'*331, 'love '+'by the '*664, 'love story'+' i said no'*398, 'love story'+', say'*797,
               'love story '+'x '*1990+'is not what i meant', 'love story'+' is absolutely'*363,
-              'love story'+', i said no to that'*222, 'love story'+' not to ever'*363, 'i like '+'you say '*499]
+              'love story'+', i said no to that'*222, 'love story'+' not to ever'*363, 'i like '+'you say '*499,
+              "love story"+" isn't what"*363, 'love story, i said no'+' this time'*397+' x', 'love story'+' we just'*568+' said',
+              'love story'+', we said no to that'*210, 'love story, i said not to'+' ever again'*361+' x']
     for shape in shapes:
         text = ('wrong song, '+shape)[:4000]
         began = time.perf_counter()
