@@ -202,6 +202,25 @@ def test_a_link_in_brackets_names_a_post_only_once_its_whole_path_is_read(reply,
     assert link_posts(reply, read()) == sent
 
 
+@pytest.mark.parametrize('filler', ['https:'*330 + '@' + '%61'*700, 'https://discord.com/x/../'*160, 'https:'*700])
+def test_a_4000_character_reply_is_filtered_well_under_100_ms(filler):
+    """Every refilter forced (each drop joins the halves around it into another link), then many links starting inside
+    one bare run: each pass reads the run once, not once for every link in it, and each link once per reply."""
+    import time
+
+    from fri.fri_links import link_posts
+    nested = MADE_UP
+    for _ in range(8):
+        nested = MADE_UP[:30] + '<' + nested + '>' + MADE_UP[30:]
+    reply = (nested + ' ' + filler)[:4000]
+    took = []
+    for _ in range(3):
+        started = time.perf_counter()
+        assert link_posts(reply, read()) == 'can’t link that one.'
+        took.append(time.perf_counter() - started)
+    assert min(took) < 0.1
+
+
 def respond_with(action, context, **fields):
     import json
 
