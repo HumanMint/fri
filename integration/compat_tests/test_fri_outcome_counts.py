@@ -2,11 +2,14 @@
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import discord
 import pytest
 
+from compat_tests.test_fri_edit_reanswer import edit
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_unsend import delete, heard, model, no_debounce
 from fri import feedback as commands
@@ -14,7 +17,7 @@ from fri.fri import CONVERSATION_CHANGED
 from fri.fri_agent import QUEUE_SECONDS
 from fri.fri_chat import ChatResult
 from fri.fri_errors import UNREACHABLE, ControllerUnavailable
-from fri.fri_ledger import AGAIN, REASONS, Ledger, describe
+from fri.fri_ledger import REASONS, UNRESOLVED, Ledger, describe
 
 EMPTY = {'told_why': {}, 'quiet': {}, 'withheld': {}, 'outage': 0, 'cooldown': 0}
 
@@ -147,7 +150,7 @@ def test_outcomes_reach_the_health_file_and_fri_health_without_ids_names_or_word
     asyncio.run(scenario())
 
 
-def test_the_ledger_caps_reasons_skips_an_edit_answered_again_and_ranks_latency(monkeypatch):
+def test_the_ledger_caps_reasons_and_ranks_latency(monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr('fri.fri_ledger.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
     ledger = Ledger()
@@ -160,9 +163,6 @@ def test_the_ledger_caps_reasons_skips_an_edit_answered_again_and_ranks_latency(
         i = one('ping')
         clock[0] += seconds
         ledger.answered([i])
-    i = one()
-    ledger.miss(i, AGAIN)  # Answered again as edited: that handling counts instead.
-    ledger.settle(i)
     for n in range(REASONS+2):
         i = one('name')
         ledger.settle(i, f'gate {n}')
@@ -177,3 +177,156 @@ def test_the_ledger_caps_reasons_skips_an_edit_answered_again_and_ranks_latency(
     line = describe(outcomes)
     assert line.startswith('- addressed to me since <t:1000:R>: 53 (10 pings, 42 by name, 1 dm), 10 answered (p50 5s, p90 9s)')
     assert line.endswith(f'{REASONS+3} quiet (other ×3, gate 0, gate 1, …)')
+
+
+def test_a_reply_to_fri_found_only_by_fetching_its_reference_counts_from_its_arrival(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        clock = [5000.0]
+        monkeypatch.setattr('fri.fri_ledger.time', SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+        mine, theirs = message('the second one is better'), message('nah the first', user=21)
+        mine.author = SimpleNamespace(id=99, display_name='Fri', bot=True)  # Fri's own earlier answer.
+        reply, chatter = message('wait why', user=20), message('lol', user=22)
+        # Discord left the replied-to message out, so only Fri's fetch of it shows who it answers.
+        reply.reference = SimpleNamespace(message_id=mine.id, resolved=None)
+        chatter.reference = SimpleNamespace(message_id=theirs.id, resolved=None)  # A reply to someone else.
+        fetch, slow = channel.fetch_message.side_effect, []
+        def fetched(mid):
+            if mid == mine.id and not slow:  # The reference fetch takes 30 s; the latency still counts from arrival.
+                slow.append(mid)
+                clock[0] += 30
+            return fetch(mid)
+        channel.fetch_message.side_effect = fetched
+        try:
+            for event in (reply, chatter):
+                await agent.handle(event)
+            reply.reply.assert_awaited_once()
+            chatter.reply.assert_not_awaited()
+            outcomes = agent.ledger.snapshot()
+            assert outcomes['addressed'] == {'name': 1} and outcomes['in_flight'] == 0
+            assert settled(outcomes) == {'answered': 1, **EMPTY}
+            assert outcomes['latency'] == {'p50': 30.0, 'p90': 30.0, 'samples': 1}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('case', ['name dropped', 'gone before the rerun'])
+def test_an_edit_while_fri_composes_still_settles_its_message_once(monkeypatch, tmp_path, case):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        trigger = message('fri whats teh best album')
+        edited = []
+        async def respond(context, ready):
+            await ready()
+            if not edited:  # Edited while the model wrote its answer: it's answered again as it reads now.
+                edited.append(await edit(fri, rows, trigger, 'whats the best album' if case == 'name dropped'
+                                         else 'fri whats the best album'))
+            return ChatResult(status='completed', reply='that one')
+        model(fri, tmp_path, respond)
+        try:
+            await agent.handle(trigger)
+            if case == 'gone before the rerun':
+                channel.fetch_message.side_effect = discord.NotFound(SimpleNamespace(status=404, reason='Not Found'),
+                                                                     'gone')
+            await asyncio.gather(*agent.reruns)
+            assert not trigger.reply.await_count and not edited[0].reply.await_count
+            outcomes = agent.ledger.snapshot()
+            assert outcomes['addressed'] == {'name': 1} and outcomes['in_flight'] == 0
+            reason = 'not a visible user mention' if case == 'name dropped' else 'message deleted'
+            assert settled(outcomes) == {'answered': 0, **EMPTY, 'quiet': {reason: 1}}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_rerun_cancelled_while_it_fetches_counts_as_cancelled_once(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        trigger = message('fri whats teh best album')
+        edited, fetching = [], asyncio.Event()
+        async def respond(context, ready):
+            await ready()
+            if not edited:
+                edited.append(await edit(fri, rows, trigger, 'fri whats the best album'))
+            return ChatResult(status='completed', reply='that one')
+        model(fri, tmp_path, respond)
+
+        async def hang(*_):  # The rerun's fetch of the edited message never returns.
+            fetching.set()
+            await asyncio.Event().wait()
+        try:
+            await agent.handle(trigger)
+            channel.fetch_message.side_effect = hang
+            await asyncio.wait_for(fetching.wait(), 5)
+            for task in list(agent.reruns):
+                task.cancel()
+            await asyncio.gather(*agent.reruns, return_exceptions=True)
+            outcomes = agent.ledger.snapshot()
+            assert outcomes['in_flight'] == 0
+            assert settled(outcomes) == {'answered': 0, **EMPTY, 'quiet': {'CancelledError': 1}}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_edit_answered_again_counts_its_latency_from_the_first_arrival(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, _, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        clock = [5000.0]
+        monkeypatch.setattr('fri.fri_ledger.time', SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+        trigger = message('fri whats teh best album')
+        edited = []
+        async def respond(context, ready):
+            await ready()
+            if not edited:  # A 100 s first try, refused for the edit, then a 10 s answer to the edit.
+                clock[0] += 100
+                edited.append(await edit(fri, rows, trigger, 'fri whats the best album'))
+            else:
+                clock[0] += 10
+            return ChatResult(status='completed', reply='that one')
+        model(fri, tmp_path, respond)
+        try:
+            await agent.handle(trigger)
+            await asyncio.gather(*agent.reruns)
+            assert edited[0].reply.await_count == 1
+            outcomes = agent.ledger.snapshot()
+            assert outcomes['addressed'] == {'name': 1} and settled(outcomes) == {'answered': 1, **EMPTY}
+            assert outcomes['latency'] == {'p50': 110.0, 'p90': 110.0, 'samples': 1}
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_ledger_keeps_an_edit_answered_again_as_it_first_came_in_and_counts_unconfirmed_replies_never(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr('fri.fri_ledger.time', SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0]))
+    ledger = Ledger()
+    first, second, third, reply, chatter = (SimpleNamespace(id=i) for i in range(1, 6))
+    for message in (first, second, third):
+        ledger.track(message, 'name')
+        ledger.miss(message.id, 'message edited')
+        ledger.park(message.id)  # To be answered again as it reads now.
+    parked = ledger.parked(third.id)
+    assert ledger.snapshot()['in_flight'] == 3 and not ledger.snapshot()['addressed']
+    clock[0] += 40
+    ledger.track(first, None)  # Its rerun: no longer addressed, still counted as it came in.
+    ledger.answered([first.id])
+    ledger.track(second, 'ping')
+    ledger.abandon(second.id, ledger.parked(second.id), 'should not count')  # Its rerun's handling took it.
+    ledger.settle(second.id, 'not a visible user mention')
+    ledger.abandon(third.id, parked, 'message deleted')  # Its rerun ended before handling it again.
+    ledger.abandon(third.id, parked, 'message deleted')  # Once.
+    ledger.track(reply, UNRESOLVED)
+    ledger.track(chatter, UNRESOLVED)
+    assert ledger.snapshot()['in_flight'] == 0  # Not known to be to Fri yet.
+    ledger.confirm(reply.id)  # Its reference fetch found Fri's message.
+    ledger.answered([reply.id, chatter.id])
+    outcomes = ledger.snapshot()
+    assert outcomes['addressed'] == {'name': 4} and outcomes['in_flight'] == 0 and outcomes['answered'] == 2
+    assert outcomes['quiet'] == {'not a visible user mention': 1, 'message deleted': 1}
+    assert outcomes['latency'] == {'p50': 0.0, 'p90': 40.0, 'samples': 2}

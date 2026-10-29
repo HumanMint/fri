@@ -24,7 +24,9 @@ RELAPSE = 1800  # A new outage this soon after the last DM edits that DM instead
 READ = 10  # A watch read that hangs this long counts as an unreachable controller.
 PROBE = 4  # Each live read in the owner's health report.
 DELIVERY = 30  # How long a pass waits on the owner DM's delivery before moving on. It never cancels it.
-STALL = 900  # A heartbeat tick running this long is stuck: past a slow learning backlog or several attention calls.
+# A heartbeat tick that hasn't taken a step (see Agent.progressed) in this long is stuck. Its steps include each
+# model call's start and end, and a call ends by fri_agent_model.DEADLINE, well inside this.
+STALL = 900
 GENE = frozenset({'stale', 'offline', 'stopped'})
 NOT_TAKING = 'gene isn’t taking commands right now, so i didn’t send that.'
 NOT_OFFERED = 'gene isn’t offering that command right now, so i didn’t send it.'
@@ -87,6 +89,7 @@ class Watch:
         self.state = None
         self.delivering = None
         self.read_at = None  # time.monotonic() at this process's last read.
+        self.stall = None  # The heartbeat progress mark the last stalled read was timed from (see observe).
 
     @property
     def path(self):
@@ -152,12 +155,20 @@ class Watch:
         """Fri's own heartbeat, once Gene and its controller read fine: a tick that hasn't moved forward for STALL or
         longer, by the monotonic clock, is stuck in the step it's on. A long tick that keeps reaching new stages or
         channels isn't. The time since it last moved dates the start, as Gene's heartbeat does, and a step forward
-        ends the stall, so the DM never names a stage the tick has left."""
+        ends the stall, so the DM never names a stage the tick has left. `moved`, that last progress mark, tells one
+        stall from the next even when no read saw the tick moving in between (see observe)."""
         agent = self.fri.agent
         moved, current = (getattr(agent, 'heartbeat_progress', None), agent.heartbeat_current) if agent else (None, None)
         if moved is None or current is None or (age := time.monotonic()-moved) < STALL:
             return 'ok', {}
-        return 'stalled', {'age': age, 'stage': current['stage']}
+        return 'stalled', {'age': age, 'stage': current['stage'], 'moved': moved}
+
+    @staticmethod
+    def recovered(alert, at):
+        """The open DM's outage ended at `at`: it gets its "back at" note."""
+        if alert and alert['open']:
+            minutes = max(1, round((at-alert['since'])/60))
+            alert.update(open=False, ended=at, text=alert['text']+f'\n-# back at <t:{int(at)}:t>, down about {minutes} min.')
 
     async def check(self, observe=True):
         # A watchdog loop that stops on one odd error watches nothing, and a DM that fails waits for the next pass.
@@ -185,12 +196,17 @@ class Watch:
             state['bad'] = 0  # Fri was away, or can't tell how long: reads from before don't make a streak.
         state['checked'], self.read_at = now, time.monotonic()
         alert = state['alert']
+        if kind == 'stalled':
+            if alert and alert['open'] and alert['kind'] == 'stalled' and detail['moved'] != self.stall:
+                # The tick moved on since the stall the DM names (or Fri restarted), unseen, and is stuck again: that
+                # stall ended when it moved, as an `ok` read would have said, and this one starts a streak of its own.
+                # The DM keeps its nonce and delivery state, so the new stall edits it as any relapse would.
+                self.recovered(alert, now-detail['age'])
+                state['bad'] = 0
+            self.stall = detail['moved']
         if kind == 'ok':
             state.update(bad=0, kind='')
-            if alert and alert['open']:
-                minutes = max(1, round((now-alert['since'])/60))
-                alert.update(open=False, ended=now,
-                             text=alert['text']+f'\n-# back at <t:{int(now)}:t>, down about {minutes} min.')
+            self.recovered(alert, now)
             self.save()
             return
         if not state['bad']:

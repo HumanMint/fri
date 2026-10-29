@@ -286,6 +286,76 @@ def test_a_long_tick_that_keeps_moving_is_not_stuck_and_a_stage_change_ends_a_st
     asyncio.run(scenario())
 
 
+def test_a_missed_recovery_still_ends_the_stall_the_dm_names_and_the_next_one_edits_the_same_dm(
+        monkeypatch, tmp_path, controls_api):  # noqa: F811
+    async def scenario():
+        client, controls = controls_api
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        routed(fri, client)
+        dm = owner_dm(fri)
+        agent, clock = stuck_tick(monkeypatch, fri, 'attention')
+        began = clock[0]
+        async def checks(count):
+            for _ in range(count):
+                clock[0] += 120
+                beat(controls)
+                await fri.watcher.check()
+        try:
+            clock[0] += STALL
+            await checks(CHECKS)
+            assert len(dm.sends) == 1 and 'stuck in attention' in dm.sends[0]
+            nonce = fri.watcher.state['alert']['nonce']
+            # It moves on to memes, which sticks too, all before the watch looks again: no `ok` read in between.
+            moved = clock[0]+60
+            agent.heartbeat_current, agent.heartbeat_progress = {'stage': 'memes', 'since': moved}, moved
+            clock[0] = moved+STALL
+            await checks(1)
+            alert = fri.watcher.state['alert']
+            minutes = round((moved-began)/60)
+            assert not alert['open'] and dm.edits[-1][1].endswith(f'-# back at <t:{int(moved)}:t>, down about {minutes} min.')
+            assert 'memes' not in dm.edits[-1][1] and fri.watcher.state['bad'] == 1  # A streak of its own.
+            await checks(CHECKS-1)
+            alert = fri.watcher.state['alert']
+            assert alert['open'] and alert['nonce'] == nonce and len(dm.sends) == 1  # The same DM, edited.
+            assert dm.edits[-1][1].startswith(f'my heartbeat’s been stuck in memes since <t:{int(moved)}:t>')
+            assert dm.edits[-1][1].endswith(f'-# again. it came back at <t:{int(moved)}:t>.')
+            await checks(1)
+            assert len(dm.edits) == 2  # Still that stall: nothing more to say.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_stall_streak_restarts_when_the_tick_moved_on_between_reads(monkeypatch, tmp_path, controls_api):  # noqa: F811
+    async def scenario():
+        client, controls = controls_api
+        fri = configured(monkeypatch)
+        fri.data = tmp_path
+        routed(fri, client)
+        dm = owner_dm(fri)
+        agent, clock = stuck_tick(monkeypatch, fri, 'attention')
+        async def checks(count):
+            for _ in range(count):
+                clock[0] += 120
+                beat(controls)
+                await fri.watcher.check()
+        try:
+            clock[0] += STALL
+            await checks(CHECKS-1)
+            assert not dm.sends and fri.watcher.state['bad'] == CHECKS-1
+            moved = clock[0]+60  # On to memes, stuck there too before the next read.
+            agent.heartbeat_current, agent.heartbeat_progress = {'stage': 'memes', 'since': moved}, moved
+            clock[0] = moved+STALL
+            await checks(1)
+            assert not dm.sends and fri.watcher.state['bad'] == 1
+            await checks(CHECKS-1)
+            assert len(dm.sends) == 1 and dm.sends[0].startswith(f'my heartbeat’s been stuck in memes since <t:{int(moved)}:t>')
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('down', ['gene', 'controller'])
 def test_gene_and_its_controller_come_before_a_stuck_heartbeat(monkeypatch, tmp_path, controls_api, down):  # noqa: F811
     async def scenario():

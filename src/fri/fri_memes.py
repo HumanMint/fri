@@ -168,6 +168,7 @@ class Memes:
         remaining = 2
         # One maintainer-scoped channel initially; bounded even if configured with more.
         for channel_id in self.agent.state.get('meme_channels', [])[:3]:
+            self.agent.progressed()  # Each channel and post a step of the heartbeat: two long looks aren't a stall.
             channel = self.fri.get_channel(int(channel_id))
             chat = self.chat(channel_id)
             if not self.readable(channel):
@@ -183,6 +184,7 @@ class Memes:
                     state['channels'][channel_id] = {**state['channels'].get(channel_id, {}),
                         'name': clean(channel.name, 60), 'last_check': now, 'status': 'checked'}
                 for message in messages:
+                    self.agent.progressed()
                     if remaining <= 0:
                         break
                     with self.state() as state:
