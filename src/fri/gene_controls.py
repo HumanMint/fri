@@ -182,9 +182,10 @@ REFUSED = re.compile(
     r"|\bi meant to\b(?!\s+(?:the|a|an|my|your|his|her|our|their|this|that|these|those|me|you|him|us|them|all)\b)")
 # Someone else's words introducing more ("alex said X"; a title like "She Said" ends there). Their own "i said ..." or
 # "we said ..." aren't someone else's, nor is an artist's name ("'All I Got' by Said The Sky"), so it's read with the
-# first word of that masked, as WITHDRAWN reads it, which keeps the count of words before a verb.
-ATTRIBUTED = re.compile(rf"{CLAUSE}(?!(?:i|we)\b)(?:[\w']+\s+){{1,3}}?(?:said|says|asked for|suggested|suggests|recommended"
-                        r"|recommends|requested|requests|mentioned)\b(?=[\s,:]*[\w\"'‘“])")
+# first word of that masked (all of it, if they quoted it), as WITHDRAWN reads it, which keeps the count of words before
+# a verb.
+SAYS = r"(?:said|says|asked for|suggested|suggests|recommended|recommends|requested|requests|mentioned)"
+ATTRIBUTED = re.compile(rf"{CLAUSE}(?!(?:i|we)\b)(?:[\w']+\s+){{1,3}}?{SAYS}\b(?=[\s,:]*[\w\"'‘“])")
 # After the song, a change of heart withdraws it: "wrong song, Love Story, actually no", "... not that one either",
 # a bare "nope" or "no thanks", or a closing "nah" or "no" after a pause, whatever punctuation or filler follows
 # ("nah, lol"; "Hell No" stays a title), or a closing "i said no (to that)", "i told you not to" or "we said no", which
@@ -206,6 +207,9 @@ WITHDRAWN = re.compile(r"\b(?:actually,?\s+(?:no(?:pe|t that)?|nah)|no,?\s+wait|
 LATER = (r"(?:not\s+(?:(?:right|just)\s+)?(?:now|rn)|not\s+(?:for\s+now|any\s*more|today|tonight)|no\s+more"
          r"(?:\s+(?:of\s+)?(?:(?:that|this|these|those|it|them)(?:\s+(?:ones?|songs?|tracks?))?|music|songs?|tracks?))?)\b")
 STOPPED = re.compile(rf"(?:[,;:.!?…—–\-'\"]|\bn(?:o|ah)\b[,.!]?|{SAID})\s*(?P<later>{LATER}){CLOSING}")
+# Their own closing "i said not now" or "we said no more" counts even when the song they proposed took it in ("Love
+# Story, we said no more" as "Love Story we said no more"), though not when it starts the song ("We Said No More").
+SAID_STOPPED = re.compile(rf"{SAID}(?:n(?:o|ah)\b[,.!]?\s*)?(?P<later>{LATER}){CLOSING}")
 # After the song, a clause handing it to someone else, quoting someone or calling it an example takes it back too:
 # "'Love Story' was an example", "... is what i heard alex say", "..., alex said", "... was a quote from alex". Their
 # own "i said" or "i asked for it" doesn't, nor does an inclusive "we want".
@@ -243,8 +247,15 @@ DISOWNED = re.compile(rf"[^,;:.!?…—–()\[\]\"“”]*?\b(?:(?:(?:is|was|are
 CONNECTORS = {'by', 'from', 'ft', 'feat', 'featuring'}
 NOT_ARTISTS = {'me', 'you', 'u', 'him', 'her', 'us', 'them', 'it', 'my', 'your', 'his', 'its', 'our', 'their', 'this',
                'that'}
-ARTIST = re.compile(r"\b((?:by|from|featuring|ft\.?|feat\.?)\s+)(?P<first>[\w']+)"
+ARTIST = re.compile(r"\b((?:by|from|featuring|ft\.?|feat\.?)\s+)(?P<first>[\w']+|(?=[\"“‘]))"
                     r"(?:(?<=\bthe)\s+(?!(?:examples?|quot\w*|hypothetical\w*|hear[sd]?)\b)[\w']+)?")
+# A hand-off or denial is read past an artist's whole name: what they quoted, or its words up to a clause break, another
+# artist, their own "i" or "we", or the end, at most four and none after the first a pronoun ("by She Wants Revenge",
+# not "by Taylor wants they chose"). In it, a verb handing the song to someone is the name's only as its second word,
+# with a name after it ("by Taylor wants" and "by Alex asked for" aren't), and never one introducing someone's words,
+# which stay theirs ("by Alex said Taylor").
+OBJECTLESS = {'to', 'for', 'of', 'about'}
+SPEAKER = re.compile(r"(?:i|we)(?:'\w+)?")  # Their own subject: "i", "we", "i'm", "we've".
 CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
 
 
@@ -309,6 +320,39 @@ def masked(text, spans):
     return ''.join(parts)+text[at:]
 
 
+def artist_spans(text, artist):
+    """The spans to mask for the artist named at this ARTIST match, and where an artist they quoted ends: where a
+    withdrawal or someone else's words are read, its first word, or each word they quoted, its opening mark with the
+    first, so the count of words before a verb stays; where a hand-off or denial is, its whole name up to a closing
+    mark, or what ARTIST matched when the words after that can't all be the name's."""
+    at = artist.end(1)
+    first = [(at, artist.end('first'))]
+    if text[at:at+1] in ('"', '“', "'", '‘'):
+        close = quoted_title(text, at)
+        if not (close and close > 0):
+            return first, (at, artist.end()), None
+        spans = [[m.start(), m.end()] for m in WORD.finditer(text, at+1, close-1)]
+        if spans:
+            spans[0][0] = at
+        return spans, (at, close-1), close
+    name, end = song_words(artist[0])[1:], artist.end()
+    if name[0] in NOT_ARTISTS or SPEAKER.fullmatch(name[0]):  # No artist's name ("Stand By Me").
+        return first, (at, end), None
+    for word in WORD.finditer(text, end):
+        said = word[0].strip("'")
+        if not said or said in CONNECTORS or SPEAKER.fullmatch(said) or BREAK.search(text, end, word.end()):
+            break
+        if said in NOT_ARTISTS or said in ('he', 'she', 'they') or len(name) == 4:
+            return first, (at, artist.end()), None
+        name.append(said)
+        end = word.end()
+    if any(TRAILING.fullmatch(said) and not (i == 1 and name[0] != 'the' and not re.fullmatch(SAYS, said)
+                                             and name[2:] and name[2] not in OBJECTLESS)
+           for i, said in enumerate(name[1:], 1)):
+        end = artist.end()
+    return first, (at, end), None
+
+
 def handed_off(text, clause, song_end):
     """From `clause`, the title's end, the words hand the song to someone else or call it an example. Their own "i
     said" or "we want" doesn't, unless the "i" or "we" was part of the song they named; nor does a verb opening a
@@ -337,6 +381,10 @@ def replacement(text, song, start, named):
         return False
     title = said[0][2]  # An artist follows the title's first word, never starts it.
     if quoted:  # Only this title is protected, never another quote in the message, and it ends where they closed it.
+        # Its own title is what they quoted, up to an artist they quoted with it ("Not Now by Blink-182"), though not
+        # a connector before a pronoun ("Stand By Me").
+        own = next((m.start() for m in ARTIST.finditer(text, title, end) if m['first'].strip("'") not in NOT_ARTISTS),
+                   end)
         text = text[:start]+'"'+' '*(end-start-2)+'"'+text[end:]
         song_end = clause = end
     else:
@@ -346,17 +394,29 @@ def replacement(text, song, start, named):
     # Only an artist in the song they named or right after it, never one in a later clause ("... was a quote from
     # Nope"). A clause break can be part of a title ("Say You, Say Me by Nope").
     limit = next((at for _, at, _ in said if at >= song_end), len(text))
-    artists = [m for m in ARTIST.finditer(text, title) if m.start() <= limit]
-    plain = masked(text, [(m.end(1), m.end('first')) for m in artists])
-    nameless = masked(text, [(m.end(1), m.end()) for m in artists])
-    stopped = STOPPED.search(plain, song_end)  # Past the song they named, and not that song again.
-    # Its title is what they quoted, or the words before an artist they named in it ("Not Now by Blink-182").
-    own = end if quoted else min((m.start() for m in artists if m.start() < song_end), default=song_end)
-    again = stopped and song_words(stopped['later']) in (named, [word for word, at, _ in said if at < own])
-    return not (REFUSED.search(text) or ATTRIBUTED.search(plain) or WITHDRAWN.search(plain[song:])
-                or stopped and not again
-                or DISOWNED.match(nameless, clause) or DISOWNED.match(nameless, song_end)
-                or handed_off(nameless, clause, song_end))
+    artists = []
+    for m in ARTIST.finditer(text, title):
+        if m.start() > limit:
+            break
+        if not artists or m.start() >= artists[-1][2][1]:  # Not one inside an artist they quoted.
+            artists.append((m, *artist_spans(text, m)))
+    plain = masked(text, [span for _, first, _, _ in artists for span in first])
+    nameless = masked(text, [name for _, _, name, _ in artists])
+    # A denial right after the last artist, if they quoted it, is read past its closing mark ("by "Taylor" isn't what
+    # we chose"). Only the last: any before it is in the song they named.
+    after = artists[-1][3] if artists else None
+    denials = (clause, song_end, after) if after else (clause, song_end)
+    if not quoted:  # Its own title is the words before an artist they named in it ("Not Now by Blink-182").
+        own = min((m.start() for m, *_ in artists if m.start() < song_end), default=song_end)
+    # Past the song they named, or their own "i said not now" it took in, and not that song said again: the named
+    # song, or its own title before that, grounded as the named song is ("the Not Now" may be "Not Now").
+    stopped = STOPPED.search(plain, song_end) or SAID_STOPPED.search(plain, title)
+    if stopped:
+        title_words = [word for word, at, _ in said if at < min(own, stopped.start())]
+        later = song_words(stopped['later'])
+        stopped = later != named and grounded_song(title_words, later, quoted and len(title_words)) < len(title_words)
+    return not (REFUSED.search(text) or ATTRIBUTED.search(plain) or WITHDRAWN.search(plain[song:]) or stopped
+                or any(DISOWNED.match(nameless, at) for at in denials) or handed_off(nameless, clause, song_end))
 
 
 def correction(text, argument):
