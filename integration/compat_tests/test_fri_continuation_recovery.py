@@ -1,7 +1,10 @@
 """A question that gave way to a short line's burst (round-2 MA2), when that line goes: its recovery and notices."""
 
 import asyncio
+import time
+from types import SimpleNamespace
 
+import discord
 import pytest
 
 from compat_tests.test_fri_continuations import (
@@ -18,6 +21,8 @@ from compat_tests.test_fri_continuations import (
 )
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_timing import no_debounce
+from fri import fri_agent
+from fri.fri_agent import REFETCH_BACKOFF, UNREAD, Agent
 
 EDITED = 'fri whats a good starter modpack'
 
@@ -476,4 +481,189 @@ def test_an_edited_questions_rerun_cancelled_lets_attention_come_back(monkeypatc
                 if event:
                     event.set()
             await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+def server_error():
+    return discord.HTTPException(SimpleNamespace(status=500, reason='Internal Server Error'), 'synthetic')
+
+
+def failing_rerun_fetch(channel, failures, error=server_error, during=None):
+    """From now, the rerun's first `failures` fetches fail (`during(n)` runs as the n-th, from 1, fails); later ones
+    read it. Returns the rerun's fetches, made so far."""
+    fetch, made = channel.fetch_message.side_effect, []
+    async def refetch(mid):
+        if asyncio.current_task().get_coro().__name__ == 'rerun':
+            made.append(mid)
+            if len(made) <= failures:
+                if during:
+                    during(len(made))
+                raise error()
+        return await fetch(mid)
+    channel.fetch_message.side_effect = refetch
+    return made
+
+
+def test_an_edited_questions_rerun_whose_fetch_keeps_failing_tells_them_so(monkeypatch, tmp_path):
+    """fri #243, the issue's ordering: the edited question's rerun can't fetch it, a server error each time. That's
+    no sign it was deleted: it's tried again, a few times, then the question hears Fri couldn't read it, a fixed
+    notice, instead of being settled as deleted with nothing said."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        tasks, release, fetched = [], None, None
+        try:
+            question, tasks, fetching, fetched, release = await edited_while_recovering(
+                agent, model, message, gathering, channel, rows)
+            fetched.set()
+            made = failing_rerun_fetch(channel, 99)
+            await until(lambda: not agent.reruns, 10)
+            assert len(made) == 1+len(REFETCH_BACKOFF)  # Tried again after each backoff, not taken as deleted.
+            assert not model.requests  # Nothing it can't read reaches the model...
+            question.reply.assert_awaited_once()  # ...but they're told, once.
+            assert question.reply.await_args.args[0] == UNREAD
+            assert question.reply.await_args.kwargs['allowed_mentions'] == discord.AllowedMentions.none()
+            outcomes = agent.ledger.snapshot()
+            assert outcomes['told_why'].get('fetch failed: HTTPException') == 1
+            assert 'message deleted' not in outcomes['quiet'] and outcomes['in_flight'] == 0
+            agent.last_spoke.clear()
+            assert agent.ambient_ready(channel.id, 20)
+        finally:
+            model.hold[1].set()
+            for event in (release, fetched, *gathering):
+                if event:
+                    event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('error', [server_error, TimeoutError], ids=['server error', 'timeout'])
+def test_an_edited_questions_rerun_reads_it_once_a_failed_fetch_goes_through(monkeypatch, tmp_path, error):
+    """fri #243: one failed fetch, then Discord shows it: the question is answered as edited, once, with no notice."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        tasks, release, fetched = [], None, None
+        try:
+            question, tasks, fetching, fetched, release = await edited_while_recovering(
+                agent, model, message, gathering, channel, rows)
+            fetched.set()
+            made = failing_rerun_fetch(channel, 1, error)
+            await until(lambda: len(gathering) == 3)  # Taken in again as it reads now: its own burst, just it.
+            gathering[2].set()
+            await until(lambda: not agent.reruns, 10)
+            assert len(made) == 2
+            assert [text for text, _ in model.requests] == [EDITED]
+            question.reply.assert_awaited_once()
+            assert question.reply.await_args.args[0] == ANSWER
+        finally:
+            model.hold[1].set()
+            for event in (release, fetched, *gathering):
+                if event:
+                    event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['erased', 'deleted', 'fri disabled', 'left the server'])
+def test_an_unreadable_rerun_stays_quiet_once_its_question_no_longer_stands(monkeypatch, tmp_path, change):
+    """fri #243's notice is fenced: past the rerun's tries, it goes only while the question stands as far as Fri
+    knows. An erasure ("forget me" here; Gene's revision is read then compared last for the others), a deletion
+    event, Fri going off or its author leaving, during those tries, leaves it quiet."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        tasks, release, fetched = [], None, None
+        member = agent.member
+        async def left(user, *args, **kwargs):
+            return None if change == 'left the server' and user == 20 and kwargs.get('fresh') else await member(
+                user, *args, **kwargs)
+        try:
+            question, tasks, fetching, fetched, release = await edited_while_recovering(
+                agent, model, message, gathering, channel, rows)
+            fetched.set()
+            def meanwhile(n):
+                if n != 2:
+                    return
+                if change == 'erased':
+                    agent.forget(20, erased=True)
+                elif change == 'deleted':
+                    agent.unsend(1, [question.id])
+                elif change == 'fri disabled':
+                    agent.config['enabled'] = False
+                else:
+                    agent.member = left
+            made = failing_rerun_fetch(channel, 99, during=meanwhile)
+            await until(lambda: not agent.reruns, 10)
+            assert len(made) == 1+len(REFETCH_BACKOFF)
+            assert not model.requests
+            question.reply.assert_not_awaited()
+            outcomes = agent.ledger.snapshot()
+            assert not outcomes['told_why'].get('fetch failed: HTTPException') and outcomes['in_flight'] == 0
+        finally:
+            model.hold[1].set()
+            for event in (release, fetched, *gathering):
+                if event:
+                    event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('error, reason', [
+    (lambda: discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'gone'), 'message deleted'),
+    (lambda: discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'no'), 'missing permissions'),
+], ids=['not found', 'forbidden'])
+def test_an_edited_questions_rerun_told_it_is_gone_or_closed_stays_quiet(monkeypatch, tmp_path, error, reason):
+    """Only Discord saying it isn't there settles it as deleted, at once; one Fri may no longer read is a closed gate,
+    quiet too. Neither is tried again or told anything."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        tasks, release, fetched = [], None, None
+        try:
+            question, tasks, fetching, fetched, release = await edited_while_recovering(
+                agent, model, message, gathering, channel, rows)
+            fetched.set()
+            made = failing_rerun_fetch(channel, 99, error)
+            await until(lambda: not agent.reruns, 10)
+            assert len(made) == 1 and not model.requests
+            question.reply.assert_not_awaited()
+            outcomes = agent.ledger.snapshot()
+            assert outcomes['quiet'].get(reason) and outcomes['in_flight'] == 0
+        finally:
+            model.hold[1].set()
+            for event in (release, fetched, *gathering):
+                if event:
+                    event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('deadline, waits', [(60, [1, 2, 4]), (5, [1, 2]), (0, [])])
+def test_a_reruns_failed_fetch_is_tried_again_only_within_its_turns_deadline(monkeypatch, deadline, waits):
+    """The backoff never runs past the turn's deadline, QUEUE_SECONDS after the message was sent: a try that would
+    start after it isn't made."""
+    async def scenario():
+        clock, slept, fetches = [time.time()], [], []
+        message_id = discord.utils.time_snowflake(discord.utils.utcnow())
+        async def fetch(_):
+            fetches.append(clock[0])
+            raise server_error()
+        async def sleep(delay):
+            slept.append(delay)
+            clock[0] += delay
+        monkeypatch.setattr(fri_agent, 'time', SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic))
+        monkeypatch.setattr(fri_agent.asyncio, 'sleep', sleep)
+        monkeypatch.setattr(fri_agent, 'QUEUE_SECONDS', deadline)
+        agent = Agent(SimpleNamespace(get_channel=lambda _: SimpleNamespace(fetch_message=fetch)))
+        await agent.rerun(1, message_id)
+        assert slept == waits and len(fetches) == len(waits)+1
     asyncio.run(scenario())
