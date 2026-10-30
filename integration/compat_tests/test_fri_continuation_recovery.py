@@ -348,3 +348,132 @@ def test_a_recovery_cancelled_before_it_starts_gives_back_the_questions_place(mo
                 event.set()
             await finish(fri, tasks)
     asyncio.run(scenario())
+
+
+async def edited_while_recovering(agent, model, message, gathering, channel, rows, cancel_at_once=False):
+    """fri #228's ordering, up to the edited question's rerun: the line is edited while its burst gathers, so the
+    question is to be answered alone, and the question is edited while that recovery waits on its privacy read.
+    Released, the recovery finds the edit, lets go of its place in their queue and schedules the rerun (see
+    Agent.rerun), whose fetch waits until `fetched` is set. `cancel_at_once`: the rerun is cancelled as soon as it's
+    scheduled, before its first step."""
+    reading, release, fetching, fetched = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+    erasure, fetch = agent.erasure, channel.fetch_message.side_effect
+
+    def running(name):
+        return asyncio.current_task().get_coro().__name__ == name
+
+    async def read(user, *since):  # The recovery's privacy read waits until the test says.
+        if running('answer_alone'):
+            reading.set()
+            await release.wait()
+        return await erasure(user, *since)
+
+    async def refetch(mid):  # And so does the rerun's fetch.
+        if running('rerun'):
+            fetching.set()
+            await fetched.wait()
+        return fetch(mid)
+    agent.erasure, channel.fetch_message.side_effect = read, refetch
+    if cancel_at_once:
+        schedule = agent.answer_edits
+        def answer_edits():
+            before = set(agent.reruns)
+            schedule()
+            for task in agent.reruns - before:
+                task.cancel()
+        agent.answer_edits = answer_edits
+    question, detail, tasks = await gave_way(agent, model, message, gathering)
+    agent.edit(1, edited(rows, detail))  # The question is to be answered alone after all...
+    await asyncio.wait_for(reading.wait(), 5)
+    gathering[1].set()
+    await asyncio.wait_for(tasks[1], 5)  # The line's handler is done: its pending mark went with it.
+    agent.edit(1, edited(rows, question, EDITED))  # ...but they edit it while its recovery reads.
+    release.set()
+    return question, tasks, fetching, fetched, release
+
+
+def ambient_history(channel, rows):
+    """Attention's last look reads what came after its pick, too."""
+    before = channel.history
+    async def history(**kwargs):
+        if 'before' in kwargs:
+            async for item in before(**kwargs):
+                yield item
+            return
+        for item in sorted((m for m in rows.values() if m.id > kwargs['after'].id), key=lambda m: m.id):
+            yield item
+    channel.history = history
+
+
+def test_attention_waits_for_an_edited_questions_rerun_until_it_is_handled(monkeypatch, tmp_path):
+    """fri #228: the edited question's recovery is over and its rerun waits on its fetch. Nothing of theirs is busy,
+    pending or in their queue, but the question is still to be answered as edited: ambient attention doesn't answer
+    an earlier message of theirs before it. The question is answered once, as edited."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        ambient_history(channel, rows)
+        earlier = message('anyone know if the server is down?')  # Not said to Fri.
+        tasks, release, fetched = [], None, None
+        try:
+            question, tasks, fetching, fetched, release = await edited_while_recovering(
+                agent, model, message, gathering, channel, rows)
+            await asyncio.wait_for(fetching.wait(), 5)
+            assert 20 not in agent.turns.arrived and 20 not in fri.busy  # Its reservation has ended...
+            assert (channel.id, 20) not in agent.pending and not agent.handling[question.id]
+            assert not agent.ambient_ready(channel.id, 20)  # ...but it hasn't been answered yet.
+            await agent.ambient_reply(channel, {'id': str(earlier.id)})
+            earlier.reply.assert_not_awaited()
+            fetched.set()
+            await until(lambda: len(gathering) == 3)  # Taken in again as it reads now: its own burst, just it.
+            gathering[2].set()
+            await until(lambda: not agent.reruns, 10)
+            question.reply.assert_awaited_once()  # Answered as edited, and nothing else answered first.
+            assert [text for text, _ in model.requests] == [EDITED]
+            agent.last_spoke.clear()
+            assert agent.ambient_ready(channel.id, 20)  # Once it's done, after the usual cooldown.
+        finally:
+            model.hold[1].set()
+            for event in (release, fetched, *gathering):
+                if event:
+                    event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('when', ['before it starts', 'during its fetch'])
+def test_an_edited_questions_rerun_cancelled_lets_attention_come_back(monkeypatch, tmp_path, when):
+    """fri #228's counterpart: the rerun is cancelled (as teardown does) before its first step, so its own cleanup
+    never runs, or while it fetches. Either way nothing of theirs is still waiting to be answered, so attention
+    comes back after the usual cooldown."""
+    async def scenario():
+        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        tasks, release, fetched = [], None, None
+        try:
+            question, tasks, fetching, fetched, release = await edited_while_recovering(
+                agent, model, message, gathering, channel, rows, cancel_at_once=when == 'before it starts')
+            if when == 'during its fetch':
+                await asyncio.wait_for(fetching.wait(), 5)
+                [rerun] = agent.reruns
+                rerun.cancel()
+                await asyncio.gather(rerun, return_exceptions=True)
+                assert rerun.cancelled()
+            await until(lambda: not agent.reruns, 10)
+            assert question.id not in agent.reanswer  # It was scheduled...
+            assert fetching.is_set() == (when == 'during its fetch')  # ...and, cancelled at once, never fetched.
+            question.reply.assert_not_awaited()
+            assert agent.ledger.snapshot()['in_flight'] == 0
+            agent.last_spoke.clear()
+            assert agent.ambient_ready(channel.id, 20)
+        finally:
+            model.hold[1].set()
+            for event in (release, fetched, *gathering):
+                if event:
+                    event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())

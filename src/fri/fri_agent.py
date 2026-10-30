@@ -197,6 +197,7 @@ class Agent:
         self.acted = {}  # Discord message ID -> when a turn for it ran a tool that may change something.
         self.reruns = set()  # Those answers again still going (see answer_edits).
         self.rerunning = {}  # Message ID -> the newest edited_at seen while it waits to be answered again.
+        self.requeued = {}  # Message ID -> its author, from being queued to be answered again until that ends.
         self.edit_seen = {}  # Message ID -> the newest edited_at seen while it was handled (see saw_edit).
         self.last_attention = {}
         self.last_spoke = {}
@@ -1166,6 +1167,7 @@ class Agent:
         while len(self.reanswered) > MAX_DELIVERED:
             del self.reanswered[next(iter(self.reanswered))]
         self.reanswer[message.id] = message.channel.id
+        self.requeued[message.id] = message.author.id  # Attention waits for it meanwhile (see ambient_ready).
         return True
 
     async def answer_alone(self, token):
@@ -1277,6 +1279,7 @@ class Agent:
         if task.cancelled():
             self.rerunning.pop(i, None)
             self.edit_seen.pop(i, None)
+            self.requeued.pop(i, None)
             self.ledger.abandon(i, parked, 'CancelledError')
 
     async def rerun(self, channel_id, message_id):
@@ -1317,6 +1320,7 @@ class Agent:
         finally:
             self.rerunning.pop(message_id, None)
             self.edit_seen.pop(message_id, None)
+            self.requeued.pop(message_id, None)
             self.ledger.abandon(message_id, parked, reason)
 
     def saw_edit(self, i, edited):
@@ -1951,10 +1955,11 @@ class Agent:
     def ambient_ready(self, channel, user):
         """Nothing of theirs is being answered: no reply to them running, no burst gathering here, and nothing they
         said to Fri still being handled or waiting to be answered alone (see unjoin), even before its turn starts
-        (fri #210). And Fri hasn't spoken here for a while."""
+        (fri #210). Nor one edited to be answered again, from then until that rerun ends, its fetch included, when
+        it's in no queue (fri #228). And Fri hasn't spoken here for a while."""
         return (user not in self.fri.busy and (channel, user) not in self.pending and
                 not any(str(i) in self.direct for i in self.turns.arrived.get(user, ())) and
-                time.time()-self.last_spoke.get(channel, 0) >= 600)
+                user not in self.requeued.values() and time.time()-self.last_spoke.get(channel, 0) >= 600)
 
     async def respond(self, message, text, dm=False, **options):
         # The turn, and an invitation's grant, are consumed only by the save after delivery, so a
