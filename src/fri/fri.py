@@ -880,8 +880,11 @@ class Fri(discord.Client):
                     if research or receipt.get('sources'):
                         from .fri_web import cite_reply, links_requested
                         link_request = links_requested(text) or links_requested((actions.pending or {}).get('request_text', ''))
-                        result.reply = cite_reply(result.reply, research or receipt,
-                            include_sources=action_kind == 'web_sources' or (link_request and action_kind != 'image_search'))
+                        # Dropping a citation can join what's around it into a post link: the reply's filter runs
+                        # again, against what the reply was written from (fri #222).
+                        result.reply = link_posts(cite_reply(result.reply, research or receipt,
+                            include_sources=action_kind == 'web_sources' or (link_request and action_kind != 'image_search')),
+                            {**context, 'action_result': receipt, 'action_results': receipts})
                     if action_kind == 'image_search' and receipt.get('image_status') == 'prepared':
                         result.media = actions.image_share.prepared
                     stored, private = result.reply, private_read(receipts)
@@ -1220,8 +1223,9 @@ class Fri(discord.Client):
                     receipt = research or receipts[-1]
                     if receipt.get('sources'):
                         from .fri_web import cite_reply, links_requested
-                        result.reply = cite_reply(result.reply, receipt,
-                            include_sources=receipts[-1]['kind'] == 'web_sources' or links_requested(text))
+                        result.reply = link_posts(cite_reply(result.reply, receipt,  # Filtered again, as in talk (fri #222).
+                            include_sources=receipts[-1]['kind'] == 'web_sources' or links_requested(text)),
+                            {**context, 'action_result': receipts[-1], 'action_results': receipts})
                 result = force_text(result)
                 result.draft, result.notes = None, []
                 # Its last check before sending (Agent.reply_once) covers it and its image.
@@ -1283,6 +1287,8 @@ class Fri(discord.Client):
             self.agent.edit(payload.channel_id, payload.message, self.agent.saved_in(payload))
 
     async def on_message(self, message):
+        from .fri_fixes import seen
+        seen(self, message)  # A requester notice whose send's answer was lost, as Discord posted it (fri #221).
         if self.agent:
             try:
                 await self.agent.handle(message)

@@ -10,8 +10,10 @@ controller checked stopped holding while the reply went out, Fri takes the reply
 A controller that offers it has Fri ask for the send itself once its last Discord read is done, so the
 reporter's erasure or a release landing meanwhile stops the reply before it posts (fri #214). The send is
 noted first, and a heartbeat pass settles one a lost answer or a shutdown left, whatever the controller
-offers by then: it records what happened and takes back a reply that no longer holds. A send whose outcome
-never came back stays unconfirmed: Discord can't tell the notice from another reply of Fri's to the report.
+offers by then: it records what happened and takes back a reply that no longer holds. A send whose answer
+was lost is known only by Discord's own copy of it, which Fri's gateway delivers with its claim's nonce
+(fri #221): seen, it's recorded as sent and so checked again, and unseen it stays unconfirmed, since nothing
+in Discord tells the notice from another reply of Fri's to the report.
 """
 
 import asyncio
@@ -49,6 +51,8 @@ PENDING = 'requester-notices.json'
 GAVE_UP = 60  # Fri gives a send 25 s: noted this long ago with no tap running, it has posted or never will.
 KEEP = 86400  # A noted send still unsettled after this (a channel gone, say) is dropped, and logged.
 TELLING = collections.Counter()  # Taps replying for each job in this process, which a pass leaves alone.
+TAKE_BACK = 10  # How long a take-back waits on Discord's answer. It never cancels the delete (see retract).
+DELETING = {}  # Each delete still on its way after its take-back moved on, by message, so none is doubled.
 SETTLING = weakref.WeakKeyDictionary()  # Each agent's settling pass, waited on like check's.
 JOB = re.compile(r'[a-f0-9]{12}')
 TELL_ID = re.compile(r'^fri:tell:(?P<job_id>[a-f0-9]{12})$')
@@ -429,7 +433,7 @@ async def tell_once(fri, job_id, actor):
             note(fri, job_id, entry)  # Raises if it can't be noted, and then nothing is sent.
             postable(fri, channel)  # Again, after the controller's answer: nothing is awaited from here to the send.
         sending = True
-        result = await send_once(fri, {'id': job_id, 'target_id': str(channel.id),
+        result = await send_once(fri, {'id': notice_id(job_id, lease), 'target_id': str(channel.id),
                                        'body': told_line(job['approved_sha'])}, reply_to=message.id)
         message_id, state = str(int(result['id'])), 'sent'
         if entry:
@@ -448,6 +452,11 @@ async def tell_once(fri, job_id, actor):
         state = 'uncertain' if sending else 'failed'
         text = ('discord didn’t confirm the reply, so it might have posted. not sending it twice.' if sending
                 else 'didn’t send it. tap again later.')
+    if state == 'uncertain' and entry:  # Its answer lost, the notice is known only by Discord's copy (see seen).
+        current = noted(fri).get(job_id)
+        if not (isinstance(current, dict) and current.get('lease') == lease and current.get('message_id')):
+            return text, False  # Not seen yet: the next pass records it, as sent once seen (see settle_one).
+        entry, message_id, state, text = current, str(current['message_id']), 'sent', f'told them: {message.jump_url}'
     recorded, answered = None, False
     try:
         recorded = await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
@@ -477,11 +486,46 @@ async def cleared(fri, job_id, scope, lease):
         raise Unreachable(notice_text(str(exc)).strip().rstrip('.')[:300] or 'gene said no') from None
 
 
+def notice_id(job_id, lease):
+    """The notice's post id: its job's, then its claim's, so the nonce send_once gives it is this claim's alone,
+    never the "fixed now" line's (its job's) or another claim's. A lease that isn't hex adds nothing (see seen)."""
+    return job_id+lease[:8] if re.fullmatch(r'[0-9a-f]{8,}', str(lease)) else job_id
+
+
+def seen(fri, message):
+    """Fri's own message as the gateway delivered it: the notice of a cleared send whose answer was lost, if it
+    carries that claim's nonce in that channel (fri #221). Noted as sent, so the tap or the next pass records it,
+    the controller checks it again and Fri takes it back if it no longer holds. Nothing else of Fri's matches:
+    each claim's nonce is its own. Never raises."""
+    nonce = getattr(message, 'nonce', None)
+    if nonce is None or getattr(getattr(message, 'author', None), 'id', None) != getattr(fri.user, 'id', None):
+        return
+    try:
+        for job_id, entry in noted(fri).items():
+            if (isinstance(entry, dict) and entry.get('cleared') and not entry.get('message_id') and
+                    (notice := notice_id(job_id, entry.get('lease'))) != job_id and
+                    str(nonce) == str(int(notice[:20], 16)) and str(message.channel.id) == entry.get('channel_id')):
+                keep(fri, job_id, {**entry, 'message_id': str(int(message.id))})
+    except (*MALFORMED, AttributeError):
+        LOG.info('A requester notice copy could not be matched')
+
+
 async def retract(channel, message_id):
     """Fri's own reply down: 'gone' once it is (or already was), 'refused' when Discord won't, 'unconfirmed'
-    when Discord didn't answer, which a later try may settle."""
+    when Discord didn't answer, which a later try may settle.
+
+    Waits up to TAKE_BACK and never cancels the delete: discord.py can't recover from a cancel inside its global
+    rate-limit wait, and every later Discord call would stall (fri #226). One still going is left to finish, and
+    a later try waits on it again instead of starting another."""
     try:
-        await asyncio.wait_for(channel.get_partial_message(int(message_id)).delete(), 10)
+        task = deleting(channel, int(message_id))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return 'refused'
+    done, _ = await asyncio.wait({task}, timeout=TAKE_BACK)
+    if not done:
+        return 'unconfirmed'
+    try:
+        task.result()
     except discord.NotFound:
         return 'gone'
     except discord.HTTPException as exc:
@@ -491,6 +535,24 @@ async def retract(channel, message_id):
     except (ValueError, KeyError, TypeError, AttributeError):
         return 'refused'
     return 'gone'
+
+
+def deleting(channel, message_id):
+    """The delete as its own task, or the one already on its way for that message, like eyes."""
+    task = DELETING.get(message_id)
+    if task is None or task.done():
+        task = DELETING[message_id] = asyncio.create_task(channel.get_partial_message(message_id).delete(),
+                                                          name=f'fri-take-back:{message_id}')
+        task.add_done_callback(lambda done: deleted(message_id, done))
+    return task
+
+
+def deleted(message_id, task):
+    """A delete that ends after its take-back moved on is still retrieved, and the next try starts afresh."""
+    if DELETING.get(message_id) is task:
+        del DELETING[message_id]
+    if not task.cancelled() and task.exception() is not None:
+        LOG.info('Requester notice delete ended: %s', type(task.exception()).__name__)
 
 
 def taken_back(outcome, reason, report, retried=False):
@@ -588,7 +650,8 @@ async def settle_one(fri, job_id, entry):
     """Record what a noted send did, then take it back if it no longer holds. True once nothing's left to do.
 
     A send cut off before Fri heard its outcome is recorded as unconfirmed once it was cleared (it may be up),
-    and as failed before then: Fri never sends without the controller's go."""
+    and as failed before then: Fri never sends without the controller's go. One whose copy Fri saw is recorded
+    as sent (see seen), so the controller checks it again."""
     message_id = str(entry.get('message_id') or '')
     if not message_id and time.time()-float(entry['since']) < GAVE_UP:
         return False  # A send from a tap that just stopped may still land.
