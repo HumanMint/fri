@@ -110,24 +110,38 @@ class Actions:
         generation = fence.get('summary_generation')
         return generation if type(generation) is int and 'turn' in fence else None
 
+    def depends(self):
+        """The summaries the turn's requests carried through Fri's earlier replies (see Fri.depend), for its steps and
+        writes: only once they reached the model, and only from a controller that takes them (fri #216)."""
+        from .fri_memory import DEPENDENCIES
+        fence = (self.turn_context or {}).get('fence') or {}
+        if 'turn' not in fence or DEPENDENCIES not in self.fri.capabilities:
+            return []
+        return [{'user_id': user, 'generation': number}
+                for user, number in sorted(fence.get('summary_dependencies', ()))]
+
     async def summary_unchanged(self):
-        """Before every step: the summary the model chose it with is still the controller's (fri #171). Typing usually
-        started before the model ran, so the check before a tool (see Fri.talk) can't be relied on for this."""
-        generation = self.summarized()
-        if generation is None:
+        """Before every step: the summary the model chose it with is still the controller's (fri #171), and so is each
+        one it depends on, which a turn may do without a summary of its own (fri #216). Typing usually started before
+        the model ran, so the check before a tool (see Fri.talk) can't be relied on for this."""
+        generation, depends = self.summarized(), self.depends()
+        if generation is None and not depends:
             return
         from .fri import turn_provenance
         fence = self.turn_context['fence']
         await self.fri.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
-            self.turn_context, self.user, self), 'summary_generation': generation})
+            self.turn_context, self.user, self), **({} if generation is None else {'summary_generation': generation}),
+            **({'summary_dependencies': depends} if depends else {})})
 
     def summary_generation(self):
         """For a write of the model's words: that generation, which the controller refuses inside the write once it has
-        moved (fri #171). Only to a controller that takes it on writes; an older one rejects the field."""
-        from .fri_memory import GENERATION_WRITES
-        generation = self.summarized()
-        return {} if generation is None or GENERATION_WRITES not in self.fri.capabilities else {
+        moved (fri #171), and the summaries the turn depends on, refused the same way and kept with what's written, so
+        it goes when one does (fri #216). Each only to a controller that takes it on writes; an older one rejects it."""
+        from .fri_memory import GENERATION_WRITES, SAVED
+        generation, depends = self.summarized(), self.depends()
+        written = {} if generation is None or GENERATION_WRITES not in self.fri.capabilities else {
             'summary_generation': generation}
+        return {**written, **({'summary_dependencies': depends} if depends and SAVED in self.fri.capabilities else {})}
 
     def derived(self):
         """Other members' words are in this turn's context, so they could reach a write."""

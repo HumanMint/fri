@@ -333,6 +333,17 @@ advertises it, so the controller must be released first.
   later. Its echo is marked like the first, so a reply repeating that one depends on the same
   summary. A turn that carried none sends nothing new, and a controller without the capability is
   sent none.
+- **Saved history and tool writes.** A controller offering `saved-dependencies` is asked, with the
+  turn's chat context, which summaries each of the member's saved exchanges drew on (fri #216). A
+  request carrying one depends on them too, so a member repeating their own earlier, summary-derived
+  answer is refused, retired and rechecked like a reply repeating an echo. An exchange withheld
+  before the request (fri #215) doesn't count. A tool step is checked against the turn's dependencies
+  even when the member has no summary of their own, and saved work and reminders the model writes
+  carry them: Gene refuses the write once one goes and retires it if one goes later.
+- **A check before a request** counts only what the request could still carry: rows of the live view
+  taken back by then and withheld history are left out (fri #217). If the check is refused and rows
+  left the view while it waited, taking with them every row that drew on some summary, it's asked
+  once more without those. What the turn's earlier requests already carried always counts.
 - **Text the model reads.** Every JSON block sent to a model (conversation, internal tasks, web
   research) goes through `privacy.model_json`. Emoji and Korean arrive as written, so
   an emoji is one character instead of a 12-character `\u` escape and a Hangul syllable one instead
