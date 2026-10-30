@@ -342,6 +342,31 @@ def test_shown_links_a_masked_target_may_run_on_past_read_their_runs_once(monkey
         assert counted.calls <= 8
 
 
+# Review of fri #236, round 3: a "\\" right before a kept <link> escapes its "<", so Discord links the bare run after it
+# instead, through the ">" ("<A>/../../3/…" resolves to another post). Dropping an escaped link could leave one there,
+# and one the model wrote already did. A kept link's "<" is never escaped: an odd run of "\\" before it gets one more.
+RUN_ON = '/../../3/'+ID
+
+
+@pytest.mark.parametrize('reply, sent', [
+    ('\\[](https\\://discord.com/channels/123/2/1300000000000000009)<'+FOUND+'>'+RUN_ON, '\\\\<'+FOUND+'>'+RUN_ON),
+    ('\\'+FOUND+'>'+RUN_ON, '\\\\<'+FOUND+'>'+RUN_ON), ('\\<'+FOUND+'>'+RUN_ON, '\\\\<'+FOUND+'>'+RUN_ON),
+    ('\\\\\\'+FOUND+'>'+RUN_ON, '\\'*4+'<'+FOUND+'>'+RUN_ON), ('[x\\]('+MADE_UP+')<'+FOUND+'>'+RUN_ON, 'x\\\\<'+FOUND+'>'+RUN_ON),
+    ('see \\<'+FOUND+'>', 'see \\\\<'+FOUND+'>'),
+    # An even run escapes nothing, and with none the <link> is Discord's whole link already.
+    ('\\\\'+FOUND+'>'+RUN_ON, '\\\\<'+FOUND+'>'+RUN_ON), (FOUND+'>'+RUN_ON, '<'+FOUND+'>'+RUN_ON),
+])
+def test_a_kept_links_bracket_is_never_escaped(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+def test_a_reply_built_from_receipts_never_escapes_a_kept_links_bracket():
+    from fri.fri_outcomes import fallback, receipt
+    answer = '\\[](https\\://discord.com/channels/123/2/1300000000000000009)<'+FOUND+'>'+RUN_ON
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': [FOUND]})]) == '\\\\<'+FOUND+'>'+RUN_ON
+
+
 # Spaces as Discord's markdown reads them (JavaScript's): <…> ends only at a plain space, while a bare link or a masked
 # link's target ends at any of these, but not at a control character Python also calls a space (review of fri #219).
 @pytest.mark.parametrize('space, ends', [('\u2003', True), ('\xa0', True), ('\v', True), ('\x1c', False), ('\x85', False)])
