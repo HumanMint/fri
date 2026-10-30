@@ -297,7 +297,9 @@ def test_a_topic_or_query_stays_an_exact_excerpt_of_the_message():
 
     async def scenario():
         chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(model_reply))
+        # Sent the morning of the final, so the check doesn't depend on today's date (fri #154).
         context = {'turns': [], 'facts': [], 'model': 'gpt-6.1-sol', 'effort': 'high',
+                   'source': {'at': '2026-10-28T09:00:00+00:00'},
                    'actions': {'clarify': {'goals': ['web']}, 'web_search': {}}}
         clarify = await chat.respond(topic, context)
         assert clarify.action['topic'] == topic and clarify.action['question'] == 'final or semifinal, at <t:1793217600:F>?'
