@@ -1039,6 +1039,13 @@ def pending(world):
     return json.loads(path.read_text()) if path.exists() else {}
 
 
+def nonce_left(world, job_id):
+    """What's kept of a send settled unconfirmed, for a copy that comes later (fri #238): its claim's nonce, a piece
+    of its lease, the channel and when it was tapped. Nothing of the owner's or the reporter's."""
+    [(key, left)] = pending(world).items()
+    return key == job_id and set(left) == {'nonce', 'lease', 'channel_id', 'at'}
+
+
 def notice_row(world, job_id):
     with world.store.connection() as db:
         return db.execute('SELECT state,message_id FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()
@@ -1199,7 +1206,7 @@ def test_a_send_cut_off_by_a_shutdown_is_settled_by_the_next_pass(world, monkeyp
     assert pending(world)  # Too soon: a send may still be on its way.
     monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
     asyncio.run(fri_fixes.settle(world.agent))
-    assert not pending(world) and not deleted and not world.room.history.called
+    assert nonce_left(world, job_id) and not deleted and not world.room.history.called
     assert notice_row(world, job_id)[0] == 'uncertain'
     text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
     assert not sent and 'may already have posted' in text and len(world.sent) == (shutdown == 'after')
@@ -1278,7 +1285,7 @@ def test_a_send_cut_off_is_settled_whatever_the_controller_offers_after(world, m
     monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
     deleted = reply_deletions(world)
     asyncio.run(fri_fixes.settle(world.agent))
-    assert not pending(world) and not deleted
+    assert (nonce_left(world, job_id) if cut == 'after_cleared' else not pending(world)) and not deleted
     assert notice_row(world, job_id)[0] == ('failed' if cut == 'before_cleared' else 'uncertain')
 
 
@@ -1519,7 +1526,7 @@ def test_only_the_claims_own_notice_is_ever_taken_for_it(world, monkeypatch, oth
     assert 'message_id' not in entry
     monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
     asyncio.run(fri_fixes.settle(world.agent))
-    assert not deleted and not pending(world) and notice_row(world, job_id)[0] == 'uncertain'
+    assert not deleted and nonce_left(world, job_id) and notice_row(world, job_id)[0] == 'uncertain'
 
 
 def test_a_notice_nonce_is_its_claims_and_never_the_fixed_lines():
@@ -1551,8 +1558,8 @@ def test_a_notice_seen_after_its_send_was_settled_unconfirmed_is_still_taken_bac
     owner's or the reporter's, and the copy that matches it exactly is taken back."""
     deleted = reply_deletions(world)
     job_id, posted, nonce = settled_unconfirmed(world, monkeypatch)
-    [(key, left)] = pending(world).items()
-    assert key == job_id and set(left) == {'nonce', 'lease', 'channel_id', 'at'}
+    assert nonce_left(world, job_id)
+    left = pending(world)[job_id]
     assert left['nonce'] == nonce and len(left['lease']) == 8 and left['channel_id'] == '456' and not deleted
     asyncio.run(fri_fixes.settle(world.agent))  # Nothing to do until its copy comes.
     assert not deleted and pending(world)
@@ -1604,7 +1611,7 @@ def owner_dm(world):
     told = []
 
     async def send(text, **kwargs):
-        assert kwargs['allowed_mentions'] == discord.AllowedMentions.none()
+        assert kwargs['allowed_mentions'].to_dict() == discord.AllowedMentions.none().to_dict()
         told.append(text)
 
     owner = SimpleNamespace(dm_channel=None, create_dm=AsyncMock(return_value=SimpleNamespace(send=send)))
