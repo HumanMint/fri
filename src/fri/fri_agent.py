@@ -199,7 +199,9 @@ class Agent:
         self.acted = {}  # Discord message ID -> when a turn for it ran a tool that may change something.
         self.reruns = set()  # Those answers again still going (see answer_edits).
         self.rerunning = {}  # Message ID -> the newest edited_at seen while it waits to be answered again.
-        self.requeued = {}  # Message ID -> the message as it came in, from being queued to be answered again until that ends.
+        # Message ID -> (the message as it came in, its author's (local erasures, privacy revision) then or None), from
+        # being queued to be answered again until that ends.
+        self.requeued = {}
         self.edit_seen = {}  # Message ID -> the newest edited_at seen while it was handled (see saw_edit).
         self.last_attention = {}
         self.last_spoke = {}
@@ -1040,7 +1042,8 @@ class Agent:
                 # it back, is neither answered nor saved. A ping's invitation checks its own message.
                 if not invitation and not await self.unedited(events):
                     if (alone and message.id not in self.unsent and  # Edited, not deleted, as reply_once has it.
-                            self.taken_back(message.id, self.arrival([message.id])) and self.answer_again(message)):
+                            self.taken_back(message.id, self.arrival([message.id])) and
+                            self.answer_again(message, since)):
                         return self.missed(events, 'message edited')
                     return self.missed(events, 'message changed')
                 if reason := await self.excluded(message, dm, invitation, privacy, text):
@@ -1148,7 +1151,7 @@ class Agent:
             self.reruns.add(task)
             task.add_done_callback(lambda task, token=token: self.alone_cancelled(task, token))
             task.add_done_callback(self.reruns.discard)
-        answering = [self.answer_again(token.message) for token in again]
+        answering = [self.answer_again(token.message, token.since) for token in again]
         for token in again + gone:  # Kept for its re-run (see settle), or settled: nothing answers it now.
             self.settle(token.message, 'message deleted' if token in gone else 'message changed')
         if any(answering):
@@ -1159,9 +1162,10 @@ class Agent:
         for token in voided:
             self.turns.wake(token.key[1])  # A turn waiting for theirs, given way, stops waiting.
 
-    def answer_again(self, message):
+    def answer_again(self, message, since):
         """Answer an edited message again, once, as it reads now, after nothing handles it any more (see rerun).
-        Not after a tool that may change something ran for it, for a privacy control or after a second edit."""
+        Not after a tool that may change something ran for it, for a privacy control or after a second edit.
+        `since`: its author's (local erasures, privacy revision) as it came in, or None if not known."""
         if (message.id in self.acted or self.memory_control(message) or
                 self.reanswered.get(message.id, 0) >= MAX_REANSWERS):
             return False
@@ -1169,7 +1173,7 @@ class Agent:
         while len(self.reanswered) > MAX_DELIVERED:
             del self.reanswered[next(iter(self.reanswered))]
         self.reanswer[message.id] = message.channel.id
-        self.requeued[message.id] = message  # Attention waits for its author meanwhile (see ambient_ready).
+        self.requeued[message.id] = (message, since)  # Attention waits for its author meanwhile (see ambient_ready).
         return True
 
     async def answer_alone(self, token):
@@ -1295,16 +1299,12 @@ class Agent:
         so it never joins a burst sent after it. If it ends before handling it again, its count from the first
         handling settles here, for why (see Ledger.park)."""
         parked, reason, told = self.ledger.parked(message_id), 'no reply', False
-        first = self.requeued.get(message_id)  # As it came in: all a notice can go on if it can't be read now.
-        forgotten = self.forgotten.get(first.author.id, 0) if first is not None else 0
+        # As it came in, and its author's (local erasures, privacy revision) then: all a notice can go on if it can't
+        # be read now. Not read again here, where a read could already hold an erasure since.
+        first, since = self.requeued.get(message_id) or (None, None)
+        forgotten, revision = since or (0, None)
         until = discord.utils.snowflake_time(message_id).timestamp()+QUEUE_SECONDS
         try:
-            revision = None  # Gene's privacy revision for its author before the first fetch; unknown, no notice.
-            if first is not None:
-                try:
-                    revision = await self.revision(first.author.id)
-                except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, OSError, KeyError, TypeError):
-                    pass
             changing = failed = 0
             while True:
                 began = time.time()
@@ -1362,10 +1362,10 @@ class Agent:
         so, a fixed notice carrying nothing it said or anything else, rather than nothing (fri #243). Only while
         it still stands as far as Fri can tell without reading it: no deletion of it came in, it would still be
         answered where it was sent by the gates it passed coming in (see excluded: outside Fri's channels, where
-        only reading a ping shows it still stands, that's never), and its author hasn't erased since the rerun
-        began: `forgotten` local erasures then, and Gene's `revision`, read before its first fetch (None if that
-        failed: then nothing goes) and compared last, as a ping's notice is (see Invitation.notice). True once
-        it's out; the caller clears the waiting notices it replaces."""
+        only reading a ping shows it still stands, that's never), and its author hasn't erased since it
+        came in: `forgotten` local erasures then, and Gene's `revision` then (None if not known: then nothing goes),
+        compared last, as a ping's notice is (see Invitation.notice). True once it's out; the caller clears the
+        waiting notices it replaces."""
         if message is None or revision is None or message.id in self.unsent:
             return False
         user = message.author.id
@@ -2016,7 +2016,7 @@ class Agent:
         it's in no queue (fri #228). And Fri hasn't spoken here for a while."""
         return (user not in self.fri.busy and (channel, user) not in self.pending and
                 not any(str(i) in self.direct for i in self.turns.arrived.get(user, ())) and
-                all(queued.author.id != user for queued in self.requeued.values()) and
+                all(queued.author.id != user for queued, _ in self.requeued.values()) and
                 time.time()-self.last_spoke.get(channel, 0) >= 600)
 
     async def respond(self, message, text, dm=False, **options):
@@ -2066,7 +2066,7 @@ class Agent:
             """Its one message edited, not deleted, since it came in, and no tool that may change something ran
             for it: nothing goes out, and once this turn is done it's answered again as it reads now (see rerun).
             Not an unprompted reply, a ping (its invitation says why), a burst, a privacy control or a second edit."""
-            if ambient or invitation or burst or not edited() or not self.answer_again(message):
+            if ambient or invitation or burst or not edited() or not self.answer_again(message, since):
                 return False
             missed('message edited')
             return True
