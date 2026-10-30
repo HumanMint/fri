@@ -1529,3 +1529,132 @@ def test_a_notice_nonce_is_its_claims_and_never_the_fixed_lines():
     assert notice[:20] == '0123456789ab'+lease[:8] and len(str(int(notice[:20], 16))) <= 25
     assert int(notice[:20], 16) != int('0123456789ab', 16)
     assert fri_fixes.notice_id('0123456789ab', 'not-hex') == '0123456789ab'  # No claim of its own: never matched.
+
+
+def settled_unconfirmed(world, monkeypatch):
+    """Discord posted the notice, its answer was lost and the reporter erased, and the next pass recorded it as
+    unconfirmed before its copy came over the gateway (fri #238)."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = lose_the_answer(world, monkeypatch)
+    asyncio.run(tell(world.fri, job_id, OWNER))
+    nonce = str(int(fri_fixes.notice_id(job_id, pending(world)[job_id]['lease'])[:20], 16))
+    monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert notice_row(world, job_id)[0] == 'uncertain'
+    return job_id, posted, nonce
+
+
+def test_a_notice_seen_after_its_send_was_settled_unconfirmed_is_still_taken_back(world, monkeypatch):
+    """fri #238: settling the send forgot where it went, so the copy that came later was ignored and the reply
+    stayed up. What's kept instead is the claim's nonce, a piece of its lease and the channel, nothing of the
+    owner's or the reporter's, and the copy that matches it exactly is taken back."""
+    deleted = reply_deletions(world)
+    job_id, posted, nonce = settled_unconfirmed(world, monkeypatch)
+    [(key, left)] = pending(world).items()
+    assert key == job_id and set(left) == {'nonce', 'lease', 'channel_id', 'at'}
+    assert left['nonce'] == nonce and len(left['lease']) == 8 and left['channel_id'] == '456' and not deleted
+    asyncio.run(fri_fixes.settle(world.agent))  # Nothing to do until its copy comes.
+    assert not deleted and pending(world)
+    fri_fixes.seen(world.fri, own(world.sent[0], posted[0]))
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(posted[0])] and not pending(world)
+    fri_fixes.seen(world.fri, own(world.sent[0], posted[0]))
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert len(deleted) == 1 and len(world.sent) == 1 and notice_row(world, job_id)[0] == 'uncertain'
+
+
+@pytest.mark.parametrize('other', ['no_nonce', 'job_nonce', 'another_channel', 'another_author', 'later_claim'])
+def test_only_the_claims_own_copy_is_taken_back_once_it_was_settled_unconfirmed(world, monkeypatch, other):
+    """What's left once the send is settled matches nothing but the claim's own notice, and goes once KEEP is up."""
+    deleted = reply_deletions(world)
+    job_id, posted, _ = settled_unconfirmed(world, monkeypatch)
+    post = world.sent[0]
+    fri_fixes.seen(world.fri, own(post, posted[0], **{
+        'no_nonce': {'nonce': None}, 'job_nonce': {'nonce': str(int(job_id, 16))},
+        'another_channel': {'channel': SimpleNamespace(id=457)}, 'another_author': {'author': SimpleNamespace(id=GENE)},
+        'later_claim': {'nonce': str(int(fri_fixes.notice_id(job_id, 'e'*32)[:20], 16))}}[other]))
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not deleted and pending(world)
+    monkeypatch.setattr(fri_fixes, 'KEEP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not pending(world)
+    fri_fixes.seen(world.fri, own(post, posted[0]))  # Too late: nothing's left to match it.
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not deleted and not pending(world)
+
+
+def test_what_is_kept_of_sends_settled_unconfirmed_is_bounded(world, monkeypatch):
+    from fri.private_files import private_json
+    now = time.time()
+    private_json(world.fri.data/'requester-notices.json', {
+        '0'*12: {'nonce': '1', 'lease': '0'*8, 'channel_id': '456', 'at': now-200},
+        '1'*12: {'nonce': '2', 'lease': '1'*8, 'channel_id': '456', 'at': now-100}})
+    monkeypatch.setattr(fri_fixes, 'ECHOES', 2, raising=False)
+    job_id, _, _ = settled_unconfirmed(world, monkeypatch)
+    assert sorted(pending(world)) == sorted(['1'*12, job_id])  # The oldest went to make room.
+
+
+def forbidden():
+    return discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Permissions')
+
+
+def owner_dm(world):
+    """The owner's DM with Fri, and what Fri says there."""
+    told = []
+
+    async def send(text, **kwargs):
+        assert kwargs['allowed_mentions'] == discord.AllowedMentions.none()
+        told.append(text)
+
+    owner = SimpleNamespace(dm_channel=None, create_dm=AsyncMock(return_value=SimpleNamespace(send=send)))
+    world.fri.get_user = lambda id: owner if id == OWNER else None
+    return told
+
+
+def test_a_take_back_discord_refuses_during_the_tap_is_tried_again_once_it_may(world, monkeypatch):
+    """fri #238: a 403 on the take-back used to end it, so the reply stayed up once Fri's permissions came back.
+    The owner hears once, in the tap's answer, and later passes keep trying quietly until Discord lets them."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    erase_while_it_sends(world, monkeypatch)
+    reply_deletions(world, forbidden())
+    told = owner_dm(world)
+    text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not sent and text == ('it posted, but the report is no longer on record, and discord wouldn’t let me take '
+                                 'it back. i’ll keep trying: '+report.jump_url)
+    [entry] = pending(world).values()
+    assert entry['take_back'] and entry['message_id']
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert pending(world) and not told
+    deleted = reply_deletions(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [entry['message_id']] and not pending(world) and not told
+
+
+@pytest.mark.parametrize('until', ['allowed', 'expired'])
+def test_a_take_back_discord_refuses_during_a_pass_tells_the_owner_once(world, monkeypatch, until):
+    """fri #238: the copy came before the pass, the controller said the reply no longer held, and Discord refused
+    the delete. The pass tells the owner once where the reply is and keeps trying, until it's down or KEEP is up."""
+    report, job_id, _ = reported(world)
+    authorize_offered(world)
+    posted = lose_the_answer(world, monkeypatch)
+    asyncio.run(tell(world.fri, job_id, OWNER))
+    fri_fixes.seen(world.fri, own(world.sent[0], posted[0]))
+    reply_deletions(world, forbidden())
+    told = owner_dm(world)
+    monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert notice_row(world, job_id)[0] == 'invalidated'
+    [entry] = pending(world).values()
+    assert entry['take_back'] and entry['message_id'] == str(posted[0])
+    assert told == ['my reply to a reporter has to come down, and discord won’t let me delete it. i’ll keep trying: '
+                    f'https://discord.com/channels/123/456/{posted[0]}']
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert pending(world) and len(told) == 1
+    deleted = reply_deletions(world)
+    if until == 'expired':
+        monkeypatch.setattr(fri_fixes, 'KEEP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not pending(world) and len(told) == 1
+    assert [str(id) for id in deleted] == ([str(posted[0])] if until == 'allowed' else [])
