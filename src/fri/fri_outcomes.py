@@ -3,7 +3,7 @@
 import re
 from enum import Enum
 
-from .fri_links import LINKED, SPACE, link_posts
+from .fri_links import EMPTY, SPACE, link_posts, linked
 from .fri_memory import clip, units
 from .fri_notices import notice_text
 from .privacy import clean
@@ -52,13 +52,17 @@ def fallback(receipts):
 
 def fit(text, evidence, limit=LIMIT):
     """At most `limit` UTF-16 units, as Discord counts them: an emoji counts two (fri #223). The cut falls between
-    links, never through one, since part of a post link can name another post, and what's left is filtered again."""
+    links, never through one, since part of a post link can name another post, and what's left is filtered again.
+    A word holding a link goes whole, the reply's first one too (fri #231): with nothing before it, the reply says it
+    can't link it, as link_posts does when only a dropped link was there."""
     budget = limit
     while units(text) > limit:
         cut = start = len(clip(text, budget))
         while start and not GAP.match(text, start-1):
             start -= 1
-        if start and LINKED.search(text, start, WORD.match(text, cut).end()):
+        if linked(text, start, WORD.match(text, cut).end()):
+            if not text[:start].strip():
+                return EMPTY
             cut = start  # A word holding a link goes whole.
         text, budget = link_posts(text[:cut].rstrip(), evidence), budget-2
     return text
