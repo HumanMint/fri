@@ -195,7 +195,7 @@ def test_a_split_scheme_never_passes_for_the_shown_link_or_hides_another(reply, 
     # In <…> but maybe a masked link's target, where "\\." is an escape and a ")" can end it: its starts count too. An
     # empty label is a masked link's (fri #220), and one this pattern doesn't take (after a "\ufeff") still counts.
     ('[](<https://discord.com/x/../'+PATH+'/\\..>)', 'can’t link that one.'),
-    ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', '[](\ufeff )'),
+    ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', ')'),
     ('<https://discord.com/x/../'+PATH+'\\..>', 'can’t link that one.'),
 ])
 def test_a_link_in_brackets_names_a_post_only_once_its_whole_path_is_read(reply, sent):
@@ -225,8 +225,9 @@ ESCAPED = ['https://discord.com/x\\(y/../'+PATH, 'https://discord.com/x\\)y/../'
 
 @pytest.mark.parametrize('url', ESCAPED)
 @pytest.mark.parametrize('form, sent', [('[clip]({})', 'clip'), ('[clip](<{}>)', 'clip'), ('see [clip]( {} ) ok', 'see clip ok'),
-                                        # One the pattern doesn't take (its label holds a newline): read to a space.
-                                        ('[kev\n]({})', '[kev\n]()')])
+                                        # One the pattern doesn't take (its label holds a newline): read to a space,
+                                        # and all of its target goes with the link (review of fri #236, round 2).
+                                        ('[kev\n]({})', 'kev\n')])
 def test_an_escape_in_a_masked_links_target_hides_no_post_link(url, form, sent):
     from fri.fri_links import link_posts
     assert link_posts(form.format(url), read()) == sent
@@ -236,7 +237,7 @@ def test_an_escape_in_a_masked_links_target_hides_no_post_link(url, form, sent):
     # Only the exact link shown stays: undone, these are the shown one, but as written they aren't.
     ('[clip](https://discord.com\\/channels/123/2/1300000000000000005)', 'clip'),
     ('[clip](https\\://discord.com/channels/123/2/1300000000000000005)', 'clip'),
-    ('[kev\n](https\\://discord.com/channels/123/2/1300000000000000005)', '[kev\n]()'),
+    ('[kev\n](https\\://discord.com/channels/123/2/1300000000000000005)', 'kev\n'),
     (f'[kev’s clip](<{FOUND}>)', f'[kev’s clip](<{FOUND}>)'),
     # The escaped ")" is the target's own, so the one after it closes the link.
     (f'[clip]({MADE_UP}\\))', 'clip'),
@@ -256,22 +257,21 @@ def test_a_masked_target_is_read_with_its_escapes_undone_and_kept_only_as_shown(
 # Review of fri #236: right after a "](", a kept link may be a masked link's target, which runs on to its ")". What comes
 # after the link there is its target's too ("<A>(x)/../../3/…" resolves to another post), so it stays only when a space
 # or ")" ends it. Dropping an escaped link can join the text around it into one, and an <…> one can be the target too.
+# A dropped one takes all of its masked link with it but the label (round 2), its title too.
 SUFFIX = '(x)/../../3/1300000000000000009'
 ESCAPED_SPLICE = '[clip](h[](https\\://discord.com/channels/123/2/1300000000000000009)'+FOUND[1:]+SUFFIX+')'
 
 
 @pytest.mark.parametrize('reply, sent', [
-    (ESCAPED_SPLICE, '[clip]('+SUFFIX+')'), (f'[clip]({FOUND}{SUFFIX})', '[clip]('+SUFFIX+')'),
-    (f'[kev\n](<{FOUND}>{SUFFIX})', '[kev\n]('+SUFFIX+')'), (f'[kev\n]({FOUND}<x/../../3/{ID})', f'[kev\n](<x/../../3/{ID})'),
-    (f'[kev\n]({FOUND}>x/../../3/{ID})', f'[kev\n](x/../../3/{ID})'), (f'[clip]({FOUND}\\(x/../../3/{ID})', 'clip'),
-    (f'[clip](\n{FOUND}{SUFFIX})', '[clip](\n'+SUFFIX+')'), (f'[kev\n]({FOUND}<x)', '[kev\n](<x)'),
+    (ESCAPED_SPLICE, 'clip'), (f'[clip]({FOUND}{SUFFIX})', 'clip'), (f'[kev\n](<{FOUND}>{SUFFIX})', 'kev\n'),
+    (f'[kev\n]({FOUND}<x/../../3/{ID})', 'kev\n'), (f'[kev\n]({FOUND}>x/../../3/{ID})', 'kev\n'),
+    (f'[clip]({FOUND}\\(x/../../3/{ID})', 'clip'), (f'[clip](\n{FOUND}{SUFFIX})', 'clip'), (f'[kev\n]({FOUND}<x)', 'kev\n'),
     # A space or ")" ends the target there, and the end of the text leaves no masked link.
     (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'), (f'[clip]({FOUND} "the clip")', f'[clip](<{FOUND}> "the clip")'),
     (f'[kev\n](<{FOUND}> )', f'[kev\n](<{FOUND}> )'), (f'[clip]({FOUND}', f'[clip](<{FOUND}>'),
     # Past a space, the target ends unless a ")" or a title closes it, or a "(" before the space runs on through it.
     (f'[kev\n](\n{FOUND}? ok', f'[kev\n](\n<{FOUND}>? ok'), (f'[kev\n]({FOUND}? ok)', f'[kev\n](<{FOUND}>? ok)'),
-    (f'[kev\n]({FOUND}? )', '[kev\n](? )'), (f'[kev\n]({FOUND}? "t")', '[kev\n](? "t")'),
-    (f'[kev\n]({FOUND}?(a b)/../../3/{ID})', f'[kev\n](?(a b)/../../3/{ID})'),
+    (f'[kev\n]({FOUND}? )', 'kev\n'), (f'[kev\n]({FOUND}? "t")', 'kev\n'), (f'[kev\n]({FOUND}?(a b)/../../3/{ID})', 'kev\n'),
     # Not after a "](": no masked link's target, so what follows is only text.
     (f'see ({FOUND}{SUFFIX})', f'see (<{FOUND}>{SUFFIX})'), (f'see ({FOUND}.) ok', f'see (<{FOUND}>.) ok'),
 ])
@@ -283,7 +283,7 @@ def test_a_shown_link_a_masked_target_runs_on_past_stays_only_once_its_target_en
 def test_a_reply_built_from_receipts_never_keeps_a_shown_link_a_masked_target_runs_on_past():
     from fri.fri_outcomes import fallback, receipt
     sent = fallback([receipt('web_search', {'answer': f'[clip]({FOUND}{SUFFIX})', 'sources': [FOUND]})])
-    assert sent == '[clip]('+SUFFIX+')'
+    assert sent == 'clip'
 
 
 # Review of fri #236, round 2: dropping a link inside a masked link's target used to leave the rest of that target,
@@ -295,7 +295,8 @@ INNER = ['[](https\\://discord.com/channels/123/2/1300000000000000009)', '<'+MAD
 
 @pytest.mark.parametrize('inner', INNER, ids=['escaped', 'angled', 'bare'])
 @pytest.mark.parametrize('form, sent', [('[clip](h{}'+GROUP+')', 'clip'), ('[kev\n](h{}'+GROUP+')', 'kev\n'),
-                                        ('[a](x[b](h{}'+GROUP+')y)', 'a'), ('see [clip]( h{}'+GROUP+' ) ok', 'see clip ok')])
+                                        # The outer one ends at its first ")", so what follows that stays.
+                                        ('[a](x[b](h{}'+GROUP+')y)', 'ay)'), ('see [clip]( h{}'+GROUP+' ) ok', 'see clip ok')])
 def test_a_link_dropped_inside_a_masked_target_takes_the_whole_target(inner, form, sent):
     from fri.fri_links import link_posts
     assert link_posts(form.format(inner), read()) == sent
@@ -579,8 +580,8 @@ def test_a_reply_built_from_receipts_keeps_only_post_links_they_showed(kind, val
     ('[kev](<htt\tps://discord.com/'+PATH+'/..>)', 'kev'),
     # A masked link this pattern doesn't take (its label holds a newline, or a "]" Discord allows): right after the "(",
     # its target is read to a space, through a "<" or ">".
-    ('[kev\n](https://discord.com/x<y/../'+PATH+')', '[kev\n]()'), ('[a]b](https://discord.com/x<y/../'+PATH+')', '[a]b]()'),
-    ('[kev\n](<https://discord.com/a>b<c/../'+PATH+'>)', '[kev\n](<)'),
+    ('[kev\n](https://discord.com/x<y/../'+PATH+')', 'kev\n'), ('[a]b](https://discord.com/x<y/../'+PATH+')', '[a]b]'),
+    ('[kev\n](<https://discord.com/a>b<c/../'+PATH+'>)', 'kev\n'),
     (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'),
 ])
 def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
@@ -598,6 +599,9 @@ def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
     '[a](<https://discord.com/x\\>/..'*130, '(https\\:'*500,
     # Review of fri #236: shown links a masked target may run on past, dropped or kept.
     ('[a]('+FOUND+'(x)/../')*60, ('](\n'+FOUND+'? ')*60, ('[a]('+FOUND+' ')*60,
+    # Round 2: targets a dropped link was inside, groups with spaces, unclosed groups and titles.
+    ('[a](h'+MADE_UP+'ttps://discord.com/(a b)/../')*40, '[a](https://discord.com/x(a b)'*130, '[a](x('*600,
+    ('[a]('+MADE_UP+' "t" ')*60, '[a](x'*700, ('](('+MADE_UP+' ')*60,
 ])
 @pytest.mark.parametrize('end', ['', '>'])
 def test_a_4000_character_reply_full_of_links_in_brackets_is_filtered_well_under_100_ms(filler, end):

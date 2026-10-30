@@ -49,10 +49,17 @@ RUN = re.compile(r'[^'+SPACE+r'<]*')
 # Right after a "(", one may be the target of a masked link LINK doesn't take (a label holding a newline, or a "]"
 # Discord allows), which a "<" doesn't end either: it's read to a space instead (see aimed), or past an escaped one.
 TARGET = re.compile(r'(?:'+PAIR+r'|[^'+SPACE+r'])*')
-# What ends a masked link's target right after a link kept in it (see past): a space or its ")". Past a space, only a
-# ")" or a title's quote closes it.
-CLOSED = re.compile(r'[)'+SPACE+r']')
-CLOSES = re.compile(r'['+SPACE+r']*[)\'"]')
+# What ends a masked link right after its target (see Runs.close): its ")", or a title (a quote, then one right before
+# the ")"); and where a target may end, so where to look for one.
+SHUT = re.compile(r'['+SPACE+r']*\)')
+TITLED = re.compile(r'['+SPACE+r']+[\'"]')
+TITLE_END = re.compile(r'[\'"]['+SPACE+r']*\)')
+SPECIAL = re.compile(r'[()>\\'+SPACE+r']')
+GAPS = re.compile(r'['+SPACE+r']')
+# A masked link's "(", and where its target starts (see Runs.frame).
+FRAME = re.compile(r'\](\()['+SPACE+r']*')
+# A link's start, as the receipt reply's cut keeps it whole (see linked): a scheme with an address after it.
+ADDRESS = re.compile(SCHEME[:-1]+r'(?P<escape>\\)?:[/\\]+[^'+SPACE+r'/\\]', re.I)
 # The rest of a bare one: a trailing slash, query or fragment is part of it. Sentence punctuation or markdown at its
 # end isn't, nor an emoji or other non-URL text right after it, nor a word after closing markdown ("**…**this"):
 # inside it, "_" and "~" are its own (?utm_source=…), but it never ends on them, "*" or "|". Markdown opened before
@@ -254,21 +261,169 @@ def framed(text, at):
     return at >= 2 and text[at-2:at] == ']('
 
 
-def past(text, end, closing):
-    """Whether a masked link's target holding a link that ends at `end` may run on past it (fri #236): over what follows
-    up to a space, or through one from a "(" in that, to a ")" or a title that closes it. Not past the last ")"
-    (`closing`), where nothing closes one."""
-    if end > closing or CLOSED.match(text, end):
-        return False
-    run = TARGET.match(text, end).end()
-    return '(' in text[end:run] or ')' in text[end:run] or bool(CLOSES.match(text, run))
+def past(runs, end):
+    """Whether a masked link's target holding a link that ends at `end` may run on past it (fri #236): unless it closes
+    right there (the link's own ">" is the one before its ")"), its target goes on over that ">" and what follows, to
+    wherever it closes (see Runs.close)."""
+    return end <= runs.closing and runs.closer(end, False) is None and runs.close(end) is not None
+
+
+def linked(text, start, stop):
+    """Whether a link starts in text[start:stop] as the filter reads one: a scheme with an address after it, its ":"
+    escaped only where a masked link's target may start (review of fri #236)."""
+    return any(not found['escape'] or aimed(text, found.start()) for found in ADDRESS.finditer(text, start, stop))
+
+
+class Runs:
+    """A text's masked-target runs (see TARGET), each read once for every start inside it."""
+
+    def __init__(self, text):
+        self.text, self.closing, self.last, self.closes, self.titled = text, text.rfind(')'), (1, 0), {}, None
+
+    def run(self, at):
+        """Where TARGET's run from `at` ends. A start inside the last run read is on its own step (nothing but a
+        "\\" escapes the character after it, and no start follows one), so that run's end is its end too."""
+        first, end = self.last
+        if not first <= at <= end:
+            end = TARGET.match(self.text, at).end()
+            self.last = (at, end)
+        return end
+
+    def reach(self, at):
+        """How far a masked link's target from `at` may run at the most. Discord's target takes a "(…)" group whole, a
+        space in it too (fri #235): an unescaped "(" after the run's last ")" runs on to the next one, past the run,
+        and the target may go on from there."""
+        text = self.text
+        while True:
+            run = self.run(at)
+            opened = self.unescaped('(', max(at, text.rfind(')', at, run)+1), run)
+            if opened < 0 or opened > self.closing:
+                return run
+            at = text.find(')', run)+1
+
+    def unescaped(self, char, start, end):
+        """The last `char` in text[start:end] that no "\\" escapes, or -1."""
+        found = self.text.rfind(char, start, end)
+        while found >= 0 and escaped(self.text, found):
+            found = self.text.rfind(char, start, found)
+        return found
+
+    def closer(self, at, mark=True):
+        """Where a masked link ends if its target ends at `at`: past a ">" (`mark`), its ")" or a title; None if
+        neither."""
+        text = self.text
+        at += mark and text.startswith('>', at)
+        if shut := SHUT.match(text, at):
+            return shut.end()
+        if quote := TITLED.match(text, at):
+            if self.titled is None:
+                self.titled = [end.start() for end in TITLE_END.finditer(text)]
+            ending = bisect.bisect_left(self.titled, quote.end())
+            if ending < len(self.titled):
+                return TITLE_END.match(text, self.titled[ending]).end()
+        return None
+
+    def close(self, at):
+        """Where the masked link whose target starts at `at` ends, as Discord's markdown reads it, or None if it
+        doesn't: at the first place its target may end (see closer), taking a "(…)" group whole before a "(" alone,
+        a space in it too (fri #235). Each place is read once, whatever start reaches it."""
+        text, memo, stack = self.text, self.closes, [at]
+        while stack:
+            place = stack[-1]
+            if place in memo:
+                stack.pop()
+                continue
+            char = text[place:place+1]
+            if not char or GAPS.match(char):  # Only a ")" or a title may follow it here.
+                memo[place] = self.closer(place)
+                stack.pop()
+                continue
+            if char in ')>' and (end := self.closer(place)) is not None:
+                memo[place] = end
+                stack.pop()
+                continue
+            if char == '\\':  # An escape takes the character after it, but not a line break.
+                options = [] if text[place+1:place+2] in ('', '\n', '\r', '\u2028', '\u2029') else [place+2]
+            elif char == '(':  # Its group whole, if a ")" comes after it, then the "(" alone.
+                options = ([text.find(')', place+1)+1] if place < self.closing else []) + [place+1]
+            elif char in ')>':
+                options = [place+1]
+            else:  # Nothing ends the target before the next mark.
+                found = SPECIAL.search(text, place+1)
+                options = [found.start() if found else len(text)]
+            for option in options:  # The first that closes, in order; one not read yet is read first.
+                if option not in memo:
+                    stack.append(option)
+                    break
+                if memo[option] is not None:
+                    memo[place] = memo[option]
+                    stack.pop()
+                    break
+            else:
+                memo[place] = None
+                stack.pop()
+        return memo[at]
+
+
+def assemble(runs, edits):
+    """`text` with `edits` (where each starts and ends, what goes there, whether a link was dropped) made, but a link
+    dropped inside a masked link's target that may close takes all of that target, the outermost one's, with the label
+    kept as a dropped masked link's is (review of fri #236). What's left of a target can never be joined into
+    another link. `edits` are in order and apart, and so are the targets, so each is read once."""
+    text, regions = runs.text, []
+    if dropped := [edit[0] for edit in edits if edit[3]]:
+        frames, index = [(found.start(1), found.end()) for found in FRAME.finditer(text)], 0
+        for begin in dropped:
+            while index < len(frames) and frames[index][0] < begin:  # The outermost that holds it, in "(" order.
+                opening, start = frames[index]
+                if (end := runs.close(start)) is not None and end > begin:
+                    if regions and opening < regions[-1][1]:
+                        regions[-1][1] = max(regions[-1][1], end)
+                    else:
+                        regions.append([opening, end, opening])
+                    break
+                index += 1
+    merged, index = [], 0
+    for region in regions:  # An edit across a region's edge goes with it, and regions that meet are one.
+        while index < len(edits) and edits[index][1] <= region[0]:
+            index += 1
+        while index < len(edits) and edits[index][0] < region[1]:
+            region[0], region[1] = min(region[0], edits[index][0]), max(region[1], edits[index][1])
+            index += 1
+        if merged and region[0] < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], region[1])
+        else:
+            merged.append(region)
+    starts = [edit[0] for edit in edits]
+
+    def edited(place):
+        at = bisect.bisect_right(starts, place)-1
+        return at >= 0 and place < edits[at][1]
+    pieces, before = [], 0
+    for start, end, opening in merged:
+        pieces.append((start, end, ''))
+        bracket = text.rfind('[', before, opening-1)  # A plain label's brackets go, as a dropped masked link's do.
+        if (start == opening and bracket >= 0 and text.find(']', bracket+1, opening-1) < 0 and not edited(bracket) and
+                not edited(opening-1)):
+            pieces += [(bracket, bracket+1, ''), (opening-1, opening, '')]
+        before = end
+    index = 0
+    for begin, end, kept, _ in edits:
+        while index < len(merged) and merged[index][1] <= begin:
+            index += 1
+        if not (index < len(merged) and merged[index][0] <= begin):
+            pieces.append((begin, end, kept))
+    parts, done = [], 0
+    for start, end, kept in sorted(pieces):
+        parts += [text[done:start], kept]
+        done = end
+    return ''.join(parts)+text[done:]
 
 
 def once(text, allowed, found):
     """`text` with each post link in it kept, as <link>, or dropped (see link_posts), once. `found`: what ends found for
     each run of text read so far."""
-    parts, done, at, marks, channels, runs = [], 0, 0, frozenset(), set(), {}
-    closing = text.rfind(')')  # Past the last ")", no masked link closes.
+    edits, done, at, marks, channels, runs, targets = [], 0, 0, frozenset(), set(), {}, Runs(text)
     bare, angled, target = (1, 0), (1, 0), (1, 0)
 
     def length(scheme, start, stop, whole, plain=True):
@@ -295,9 +450,9 @@ def once(text, allowed, found):
                 match, name = BARE.search(text, begin), 'bare'
                 begin = match.start()
         undone = name == 'masked' or name == 'bare' and aimed(text, match.start(name))  # Its escapes may be undone.
-        if name == 'bare' and undone:  # Maybe a masked link's target: to a space.
+        if name == 'bare' and undone:  # Maybe a masked link's target: to a space, or past one through a group.
             if not target[0] <= match.end() <= target[1]:
-                target = (match.end(), TARGET.match(text, match.end()).end())
+                target = (match.end(), targets.reach(match.end()))
             start, stop = match.start(name), target[1]
         elif name == 'bare' and '\\' in match[name]:  # "https\\:" out of a target: markdown shows it as text, no link.
             at = begin+1
@@ -331,16 +486,18 @@ def once(text, allowed, found):
         marks, end = opened(marks, text[done:begin]), match.end() if name == 'masked' else stop+1
         if name == 'masked':
             label = once(match['label'], allowed, found)  # A label's own post links follow the same rule.
-            kept = (f'[{label}](<{url}>)' if label.strip() else f'<{url}>') if url in allowed else label
+            shown = url in allowed
+            kept = (f'[{label}](<{url}>)' if label.strip() else f'<{url}>') if shown else label
         else:
             if name == 'bare':
                 tail = TAILS[marks].match(text, start+size).end()
                 url, end = text[start:tail], tail+text.startswith('>', tail)
             # Exactly a shown link, and a masked link's whole target if it may be one ("<A>(x)/../.." isn't A).
-            kept = f'<{url}>' if url in allowed and not (framed(text, start) and past(text, end, closing)) else ''
-        parts += [text[done:begin], kept]
+            shown = url in allowed and not (framed(text, start) and past(targets, end))
+            kept = f'<{url}>' if shown else ''
+        edits.append((begin, end, kept, not shown))
         done = at = end
-    return ''.join(parts)+text[done:]
+    return assemble(targets, edits)
 
 
 def link_posts(reply, context, empty=EMPTY):
