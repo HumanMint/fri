@@ -369,7 +369,8 @@ def assemble(runs, edits):
     """`text` with `edits` (where each starts and ends, what goes there, whether a link was dropped) made, but a link
     dropped inside a masked link's target that may close takes all of that target, the outermost one's, with the label
     kept as a dropped masked link's is (review of fri #236). What's left of a target can never be joined into
-    another link. `edits` are in order and apart, and so are the targets, so each is read once."""
+    another link. An edit across a target's edge is left undone, its text outside the target as it was: link_posts
+    reads again until nothing changes. `edits` are in order and apart, and so are the targets, so each is read once."""
     text, regions = runs.text, []
     if dropped := [edit[0] for edit in edits if edit[3]]:
         frames, index = [(found.start(1), found.end()) for found in FRAME.finditer(text)], 0
@@ -383,13 +384,8 @@ def assemble(runs, edits):
                         regions.append([opening, end, opening])
                     break
                 index += 1
-    merged, index = [], 0
-    for region in regions:  # An edit across a region's edge goes with it, and regions that meet are one.
-        while index < len(edits) and edits[index][1] <= region[0]:
-            index += 1
-        while index < len(edits) and edits[index][0] < region[1]:
-            region[0], region[1] = min(region[0], edits[index][0]), max(region[1], edits[index][1])
-            index += 1
+    merged = []
+    for region in regions:  # Regions that meet are one.
         if merged and region[0] < merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], region[1])
         else:
@@ -403,15 +399,14 @@ def assemble(runs, edits):
     for start, end, opening in merged:
         pieces.append((start, end, ''))
         bracket = text.rfind('[', before, opening-1)  # A plain label's brackets go, as a dropped masked link's do.
-        if (start == opening and bracket >= 0 and text.find(']', bracket+1, opening-1) < 0 and not edited(bracket) and
-                not edited(opening-1)):
+        if bracket >= 0 and text.find(']', bracket+1, opening-1) < 0 and not edited(bracket) and not edited(opening-1):
             pieces += [(bracket, bracket+1, ''), (opening-1, opening, '')]
         before = end
     index = 0
-    for begin, end, kept, _ in edits:
+    for begin, end, kept, _ in edits:  # Only those clear of every region.
         while index < len(merged) and merged[index][1] <= begin:
             index += 1
-        if not (index < len(merged) and merged[index][0] <= begin):
+        if not (index < len(merged) and merged[index][0] < end):
             pieces.append((begin, end, kept))
     parts, done = [], 0
     for start, end, kept in sorted(pieces):

@@ -195,7 +195,7 @@ def test_a_split_scheme_never_passes_for_the_shown_link_or_hides_another(reply, 
     # In <…> but maybe a masked link's target, where "\\." is an escape and a ")" can end it: its starts count too. An
     # empty label is a masked link's (fri #220), and one this pattern doesn't take (after a "\ufeff") still counts.
     ('[](<https://discord.com/x/../'+PATH+'/\\..>)', 'can’t link that one.'),
-    ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', ')'),
+    ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', '/..>)'),  # That masked link ends at its first ")".
     ('<https://discord.com/x/../'+PATH+'\\..>', 'can’t link that one.'),
 ])
 def test_a_link_in_brackets_names_a_post_only_once_its_whole_path_is_read(reply, sent):
