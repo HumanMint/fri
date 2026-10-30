@@ -322,10 +322,20 @@ def masked(text, spans):
 
 
 def artist_first(text, artist):
-    """The first word of the artist named at this ARTIST match, inside the quote if they quoted it ("by ‘Me’")."""
+    """The first word of the artist named at this ARTIST match. If they quoted it, the word inside the quote when it's
+    all they quoted ("by ‘Me’"), else none: a name of several words they quoted is a name, whatever its first word
+    ("by ‘My Chemical Romance’"). A closing ’ reads as ' here (see correction), so it ends the word it closes."""
     at = artist.end(1)
-    word = WORD.match(text, at+(text[at] in '"“‘'))
-    return word[0].strip("'") if word else ''
+    opened = text[at] in '"“‘'
+    word = WORD.match(text, at+opened)
+    if not word:
+        return ''
+    said = word[0]
+    if said.startswith("'"):  # A straight quote opened it.
+        opened, said = True, said[1:]
+    if opened and not (said.endswith("'") or text[word.end():word.end()+1] in '"”'):
+        return ''  # They quoted more than this word.
+    return said.strip("'")
 
 
 def artist_spans(text, artist):
