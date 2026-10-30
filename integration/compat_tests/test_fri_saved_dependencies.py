@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from compat_tests.test_api import headers
 from compat_tests.test_fri_member_profiles import DM, GENERAL, model, run, world
 from compat_tests.test_fri_member_summaries import CONTINUATION, SUMMARY
 from compat_tests.test_fri_summary_dependencies import (
@@ -38,7 +39,7 @@ from compat_tests.test_fri_summary_generation_tools import (
     kept,
     reply,
 )
-from compat_tests.test_fri_summary_generations import deleted, summarized_from
+from compat_tests.test_fri_summary_generations import deleted, summarized_from, withdrawal
 from fri import feedback as commands
 from fri.fri_chat import ChatResult
 
@@ -246,18 +247,15 @@ def test_an_older_controller_gets_no_dependencies_on_writes(monkeypatch, tmp_pat
     run(scenario)
 
 
-def raced(w, echo, events, withdraw=True):
-    """While member 30's first check waits: A's echo is deleted (if `echo`) and A's summary source withdrawn."""
+def raced(w, during):
+    """Member 30's checks: `during` runs while the first one waits."""
     api, seen = w.fri.api, []
 
     async def checking(method, path, payload=None):
         if path == CHECK and (payload or {}).get('user_id') == '30':
             seen.append(payload)
             if len(seen) == 1:
-                if echo is not None:
-                    w.fri.agent.unsend(GENERAL, [echo])
-                if withdraw:
-                    await deleted(w, events[0])
+                await during()
         return await api(method, path, payload)
     w.fri.api = checking
     return seen
@@ -274,7 +272,11 @@ def test_a_turn_isnt_refused_for_a_dependency_its_request_wont_carry(monkeypatch
             model(w, recalls)
             assert await echoed(w) == [CONTINUATION]
             echo = next(int(row['id']) for row in agent.recent[GENERAL] if row['text'] == CONTINUATION)
-            checks = raced(w, echo, events)
+
+            async def gone():  # The echo is deleted, and its summary's source withdrawn.
+                agent.unsend(GENERAL, [echo])
+                await deleted(w, events[0])
+            checks = raced(w, gone)
 
             async def unrelated(text, context):
                 assert not any(CONTINUATION in row.get('text', '') for row in context.get('recent', []))
@@ -292,14 +294,19 @@ def test_a_turn_isnt_refused_for_a_dependency_its_request_wont_carry(monkeypatch
 
 
 def test_a_dependency_the_request_still_carries_refuses_it_without_a_retry(monkeypatch, tmp_path):
-    """The echo stays in view, so the request would carry it: refused, as before, with no second check."""
+    """The echo stays in view, so the request would carry it: refused, as before, with no second check. The controller
+    learns of the withdrawal from elsewhere (another process's queue, say), so Fri's view still holds the echo."""
     async def scenario():
         w = world(monkeypatch, tmp_path)
         try:
             events = await summarized_from(monkeypatch, w)
             model(w, recalls)
             await echoed(w)
-            checks = raced(w, None, events)
+
+            async def elsewhere():
+                answer = w.client.post('/chat/turn/withdraw', headers=headers('fri'), json=withdrawal(events[0]))
+                assert answer.json()['removed'] == 1
+            checks = raced(w, elsewhere)
             before = len(w.calls)
             await echoed(w, 'fri what is two plus two', user=30)
             assert len(checks) == 1 and not sent(w, TURN, since=before)

@@ -51,6 +51,7 @@ from .fri_reports import ReportButton, report_component
 from .fri_requests import request_dm_component
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
+from .fri_turn_withdrawal import exchange, held
 from .fri_usage import describe_usage, usage_query, usage_requested, window_applied
 from .panels import defer_panel
 from .privacy import clean
@@ -467,10 +468,23 @@ class Fri(discord.Client):
                 if fence.get('gate'):
                     await fence['gate']()
                 # With the summaries Fri's replies in view (and one it answers) drew on, as they stand now: refused
-                # if one went. They count for the save only once the request still carries them (see depend).
-                await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
-                    context, fence['turn']['user_id'], fence['actions']), **self.summary_generation(
-                        context, also=self.dependencies(context))})
+                # if one went. They count for the save only once the request still carries them (see depend). Only
+                # what the request could still carry: a row taken back by now goes before it (fri #217).
+                prospective = self.dependencies(self.standing(context))
+                try:
+                    await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
+                        context, fence['turn']['user_id'], fence['actions']), **self.summary_generation(
+                            context, also=prospective)})
+                except ControllerRejected:
+                    # Taken back while the check waited, a row's summary may have gone with it, which the request
+                    # won't carry now. Asked once more without those alone; what the turn already depends on stays,
+                    # and any other refusal comes back the same.
+                    again = self.dependencies(self.standing(context))
+                    if not prospective-again:
+                        raise
+                    await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
+                        context, fence['turn']['user_id'], fence['actions']), **self.summary_generation(
+                            context, also=again)})
             # A message its author edited or deleted since the live view was copied: its old words stay out.
             # A row read again after that, as an edited message answered again is, holds what it says now.
             # So does one the live view no longer holds as copied: pushed out by newer lines while the turn
@@ -1062,7 +1076,8 @@ class Fri(discord.Client):
 
     def dependencies(self, context):
         """The summaries Fri's earlier replies in this context drew on: an echo in the channel's view (as Gene answered
-        its recheck) or a reply of Fri's the member answered (see resolve_references), as (user, generation) pairs.
+        its recheck), a reply of Fri's the member answered (see resolve_references), or one of the member's own saved
+        exchanges, as a controller offering saved-dependencies names them (fri #216), as (user, generation) pairs.
         Nothing from a controller without summary dependencies, or for an ordinary turn."""
         fence = context.get('fence')
         if fence is None or DEPENDENCIES not in self.capabilities:
@@ -1070,7 +1085,21 @@ class Fri(discord.Client):
         known = getattr(fence.get('rechecks'), 'summaries', {})
         carried = [item for row in context.get('recent', []) for item in known.get(row.get('id'), ())]
         carried += context.get('reference_summaries', [])
+        carried += [item for turn in context.get('turns', []) for item in turn.get('summaries') or ()]
         return {(str(item['user_id']), int(item['generation'])) for item in carried}
+
+    def standing(self, context):
+        """A copy of the context holding only what the next request could still carry of the live view and the member's
+        saved history, as chat_once leaves them before it: rows not taken back and as the view holds them now, and
+        exchanges not withheld. What a check counts dependencies on before its request (fri #217)."""
+        if not self.agent:
+            return context
+        where = (((context.get('fence') or {}).get('turn') or {}).get('conversation_id', ''))
+        live = self.agent.versions(int(where[7:]) if where.startswith('public:') and where[7:].isdigit() else None)
+        rows = [row for row in context.get('recent', []) if self.agent.current(row, live) and (row.get(
+            'gene_error') or not str(row.get('id', '')).isdigit() or int(row['id']) not in self.agent.unsent)]
+        gone = self.agent.saved_turns.withheld(held(context))
+        return {**context, 'recent': rows, 'turns': [turn for turn in context.get('turns', []) if not exchange(turn) & gone]}
 
     def depend(self, context):
         """Last thing before a request, once nothing more leaves its context: the turn depends on the summaries what it
