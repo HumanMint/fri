@@ -87,6 +87,21 @@ def test_cut_off_requester_notice_sends_are_settled_whatever_fri_or_the_controll
     assert settled == [agent, agent]
 
 
+def test_a_day_old_notice_note_is_dropped_while_the_controller_is_out(heartbeat):
+    """fri #238: the notices stage runs only once /agent/state answers, so a stale note kept its channel and message
+    IDs for the whole outage. They're dropped before the controller read; a fresh note stays to be settled."""
+    old, now = time.time()-2*86400, time.time()
+    private_json(heartbeat.fri.data/'requester-notices.json', {
+        'a'*12: {'lease': 'f'*32, 'actor': '10', 'channel_id': '456', 'message_id': '789', 'take_back': True,
+                 'since': old, 'at': old},
+        'b'*12: {'lease': 'e'*32, 'actor': '10', 'channel_id': '456', 'since': now, 'at': now}})
+    heartbeat.fri.api.side_effect = ControllerUnavailable(UNREACHABLE)
+    agent = heartbeat.agent
+    asyncio.run(agent.heartbeat.coro(agent))
+    assert agent.heartbeat_status == 'deferred' and 'notices' not in agent.stages
+    assert list(json.loads((heartbeat.fri.data/'requester-notices.json').read_text())) == ['b'*12]
+
+
 def test_disabled_stages_do_not_run_or_report(heartbeat, monkeypatch):
     agent = heartbeat.agent
     asyncio.run(agent.heartbeat.coro(agent))

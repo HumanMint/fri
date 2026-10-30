@@ -20,6 +20,9 @@ GENERATION_WRITES = 'summary-generation-writes'
 DEPENDENCIES = 'summary-dependencies'
 # It drops notes and retires replies a withdrawn message reached, and names where notes came from when asked (gene #141).
 SOURCES = 'withdrawal-sources'
+# It names the summaries each saved exchange drew on when asked, and takes a turn's dependencies on writes of the model's
+# words (saved work, reminders), refusing and retiring them once one goes (fri #216).
+SAVED = 'saved-dependencies'
 PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_thread)
 
 
@@ -173,12 +176,14 @@ def clip(text, limit):
 
 def profiled(fri, scope, context=False):
     """Ask for the member's profile (and summary) when the controller keeps them; otherwise the request is unchanged.
-    context: chat context, which also names where each note came from, from a controller that can (fri #215)."""
+    context: chat context, which also names where each note came from, and the summaries each saved exchange drew on,
+    from a controller that can (fri #215, fri #216)."""
     if not getattr(fri, 'profiles', False):
         return scope
-    sources = context and SOURCES in getattr(fri, 'capabilities', ())
+    offered = getattr(fri, 'capabilities', ())
     return {**scope, 'profiles': True, **({'summaries': True} if getattr(fri, 'summaries', False) else {}),
-            **({'sources': True} if sources else {})}
+            **({'sources': True} if context and SOURCES in offered else {}),
+            **({'dependencies': True} if context and SAVED in offered else {})}
 
 
 def note_place(get_channel, scope, conversation, *, public=False):

@@ -250,8 +250,7 @@ class SavedTurns:
         said, history = ([] if said is None else said), []
         for turn in context.get('turns', []):
             rows = turn.get('burst') or ()
-            ids = {str((item or {}).get('id', '')) for item in [turn.get('source'), *(row.get('source') for row in rows)]}
-            if not ids & gone:
+            if not exchange(turn) & gone:
                 history.append(turn)
                 continue
             said += [row.get('text', '') for row in rows if str((row.get('source') or {}).get('id')) in gone]
@@ -401,6 +400,12 @@ def sent_at(message_id):
 def saved_lately(message_id):
     """Sent recently enough that the controller may keep an exchange holding it, from the time in its Discord ID."""
     return sent_at(message_id) > time.time()-KEPT_SECONDS
+
+
+def exchange(turn):
+    """The messages a saved exchange answered: its own and its burst's, as strings."""
+    rows = turn.get('burst') or ()
+    return {str((item or {}).get('id', '')) for item in [turn.get('source'), *(row.get('source') for row in rows)]}
 
 
 def held(context):

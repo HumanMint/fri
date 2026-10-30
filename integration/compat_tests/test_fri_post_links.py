@@ -191,11 +191,11 @@ def test_a_split_scheme_never_passes_for_the_shown_link_or_hides_another(reply, 
     # a masked link's target is read as a bare one would be, since Discord can refuse the masked link; and a "\\" can
     # escape a masked link's ">" or ")", making what follows its own.
     ('https://discord.com/x/../'+PATH+'/..', '..'), ('[clip](https://discord.com/x/../'+PATH+'/%2e%2e)', 'clip'),
-    ('[clip](<https://discord.com/x/../'+PATH+'/..\\>)', 'clip'), ('[clip](https://discord.com/x/../'+PATH+'/..\\))', 'clip)'),
+    ('[clip](<https://discord.com/x/../'+PATH+'/..\\>)', 'clip'), ('[clip](https://discord.com/x/../'+PATH+'/..\\))', 'clip'),
     # In <…> but maybe a masked link's target, where "\\." is an escape and a ")" can end it: its starts count too. An
     # empty label is a masked link's (fri #220), and one this pattern doesn't take (after a "\ufeff") still counts.
     ('[](<https://discord.com/x/../'+PATH+'/\\..>)', 'can’t link that one.'),
-    ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', '[](\ufeff )'),
+    ('[](\ufeff <https://discord.com/x/../'+PATH+')/..>)', '/..>)'),  # That masked link ends at its first ")".
     ('<https://discord.com/x/../'+PATH+'\\..>', 'can’t link that one.'),
 ])
 def test_a_link_in_brackets_names_a_post_only_once_its_whole_path_is_read(reply, sent):
@@ -213,6 +213,158 @@ def test_a_link_in_brackets_names_a_post_only_once_its_whole_path_is_read(reply,
 def test_a_link_after_an_escaped_bracket_is_read_as_a_bare_one(reply, sent):
     from fri.fri_links import link_posts
     assert link_posts(reply, read()) == sent
+
+
+# fri #231: markdown undoes a masked link's escapes ("\\" before punctuation) before a browser reads its target, and
+# an escaped bracket, ">" or space doesn't end it. As written, "\\" splits a path as "/" does, so "x\\(y/.." resolves
+# to "x"; undone, "x(y/.." resolves away.
+ESCAPED = ['https://discord.com/x\\(y/../'+PATH, 'https://discord.com/x\\)y/../'+PATH, 'https://discord.com/x\\<y/../'+PATH,
+           'https://discord.com/x\\>y/../'+PATH, 'https://discord.com/a\\ b/../../'+PATH, 'https://discord.com/a\\\tb/../../'+PATH,
+           'https://discord.com/x/\\%2e\\%2e/'+PATH, 'https://discord\\.com/'+PATH, 'https\\://discord.com/'+PATH]
+
+
+@pytest.mark.parametrize('url', ESCAPED)
+@pytest.mark.parametrize('form, sent', [('[clip]({})', 'clip'), ('[clip](<{}>)', 'clip'), ('see [clip]( {} ) ok', 'see clip ok'),
+                                        # One the pattern doesn't take (its label holds a newline): read to a space,
+                                        # and all of its target goes with the link (review of fri #236, round 2).
+                                        ('[kev\n]({})', 'kev\n')])
+def test_an_escape_in_a_masked_links_target_hides_no_post_link(url, form, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(form.format(url), read()) == sent
+
+
+@pytest.mark.parametrize('reply, sent', [
+    # Only the exact link shown stays: undone, these are the shown one, but as written they aren't.
+    ('[clip](https://discord.com\\/channels/123/2/1300000000000000005)', 'clip'),
+    ('[clip](https\\://discord.com/channels/123/2/1300000000000000005)', 'clip'),
+    ('[kev\n](https\\://discord.com/channels/123/2/1300000000000000005)', 'kev\n'),
+    (f'[kev’s clip](<{FOUND}>)', f'[kev’s clip](<{FOUND}>)'),
+    # The escaped ")" is the target's own, so the one after it closes the link.
+    (f'[clip]({MADE_UP}\\))', 'clip'),
+    # Out of a masked link, markdown reads a link as written: "\\" is a "/" to a browser, and "https\\:" is no link.
+    ('see https://discord.com/x\\(y/../'+PATH, 'see https://discord.com/x\\(y/../'+PATH),
+    ('see https\\://discord.com/'+PATH+' ok', 'see https\\://discord.com/'+PATH+' ok'),
+    ('see <https\\://discord.com/'+PATH+'> ok', 'see <https\\://discord.com/'+PATH+'> ok'),
+    # A "\\" before a letter or a digit escapes nothing, in a target too: "x\\y/.." resolves to "x" either way.
+    ('[clip](https://discord.com/x\\y/../'+PATH+')', '[clip](https://discord.com/x\\y/../'+PATH+')'),
+    ('[clip](https://example.com/a\\(b)', '[clip](https://example.com/a\\(b)'),  # Not a post link: left as it is.
+])
+def test_a_masked_target_is_read_with_its_escapes_undone_and_kept_only_as_shown(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+# Review of fri #236: right after a "](", a kept link may be a masked link's target, which runs on to its ")". What comes
+# after the link there is its target's too ("<A>(x)/../../3/…" resolves to another post), so it stays only when a space
+# or ")" ends it. Dropping an escaped link can join the text around it into one, and an <…> one can be the target too.
+# A dropped one takes all of its masked link with it but the label (round 2), its title too.
+SUFFIX = '(x)/../../3/1300000000000000009'
+ESCAPED_SPLICE = '[clip](h[](https\\://discord.com/channels/123/2/1300000000000000009)'+FOUND[1:]+SUFFIX+')'
+
+
+@pytest.mark.parametrize('reply, sent', [
+    (ESCAPED_SPLICE, 'clip'), (f'[clip]({FOUND}{SUFFIX})', 'clip'), (f'[kev\n](<{FOUND}>{SUFFIX})', 'kev\n'),
+    (f'[kev\n]({FOUND}<x/../../3/{ID})', 'kev\n'), (f'[kev\n]({FOUND}>x/../../3/{ID})', 'kev\n'),
+    (f'[clip]({FOUND}\\(x/../../3/{ID})', 'clip'), (f'[clip](\n{FOUND}{SUFFIX})', 'clip'), (f'[kev\n]({FOUND}<x)', 'kev\n'),
+    # A space or ")" ends the target there, and the end of the text leaves no masked link.
+    (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'), (f'[clip]({FOUND} "the clip")', f'[clip](<{FOUND}> "the clip")'),
+    (f'[kev\n](<{FOUND}> )', f'[kev\n](<{FOUND}> )'), (f'[clip]({FOUND}', f'[clip](<{FOUND}>'),
+    # Past a space, the target ends unless a ")" or a title closes it, or a "(" before the space runs on through it.
+    (f'[kev\n](\n{FOUND}? ok', f'[kev\n](\n<{FOUND}>? ok'), (f'[kev\n]({FOUND}? ok)', f'[kev\n](<{FOUND}>? ok)'),
+    (f'[kev\n]({FOUND}? )', 'kev\n'), (f'[kev\n]({FOUND}? "t")', 'kev\n'), (f'[kev\n]({FOUND}?(a b)/../../3/{ID})', 'kev\n'),
+    # Not after a "](": no masked link's target, so what follows is only text.
+    (f'see ({FOUND}{SUFFIX})', f'see (<{FOUND}>{SUFFIX})'), (f'see ({FOUND}.) ok', f'see (<{FOUND}>.) ok'),
+])
+def test_a_shown_link_a_masked_target_runs_on_past_stays_only_once_its_target_ends(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+def test_a_reply_built_from_receipts_never_keeps_a_shown_link_a_masked_target_runs_on_past():
+    from fri.fri_outcomes import fallback, receipt
+    sent = fallback([receipt('web_search', {'answer': f'[clip]({FOUND}{SUFFIX})', 'sources': [FOUND]})])
+    assert sent == 'clip'
+
+
+# Review of fri #236, round 2: dropping a link inside a masked link's target used to leave the rest of that target,
+# joined ("h" and "ttps") into a link whose "(a b)" group the filter couldn't read past. Now the whole target goes,
+# its label kept, and a target's "(…)" group is read through, its space too (fri #235).
+GROUP = 'ttps://discord.com/(a b)/../channels/123/3/'+ID
+INNER = ['[](https\\://discord.com/channels/123/2/1300000000000000009)', '<'+MADE_UP+'>', MADE_UP]
+
+
+@pytest.mark.parametrize('inner', INNER, ids=['escaped', 'angled', 'bare'])
+@pytest.mark.parametrize('form, sent', [('[clip](h{}'+GROUP+')', 'clip'), ('[kev\n](h{}'+GROUP+')', 'kev\n'),
+                                        # The outer one ends at its first ")", so what follows that stays.
+                                        ('[a](x[b](h{}'+GROUP+')y)', 'ay)'), ('see [clip]( h{}'+GROUP+' ) ok', 'see clip ok')])
+def test_a_link_dropped_inside_a_masked_target_takes_the_whole_target(inner, form, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(form.format(inner), read()) == sent
+
+
+def test_a_reply_built_from_receipts_drops_a_masked_target_a_dropped_link_was_inside():
+    from fri.fri_outcomes import fallback, receipt
+    answer = '[clip](h'+INNER[0]+GROUP+')'
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': [FOUND]})]) == 'clip'
+
+
+@pytest.mark.parametrize('reply, sent', [
+    ('[clip](https://discord.com/x(a b)/../../'+PATH+')', 'clip'),
+    ('[kev\n](<https://discord.com/x(a b)/../../'+PATH+'>)', 'kev\n'),
+    ('[clip](https://discord.com/x(a\nb)/../../'+PATH+')', 'clip'),
+    ('[clip](https://discord.com/x(a b) /../../'+PATH+')', '[clip](https://discord.com/x(a b) /../../'+PATH+')'),
+    ('[clip](https://example.com/x(a b)/../../'+PATH+')', '[clip](https://example.com/x(a b)/../../'+PATH+')'),
+])
+def test_a_masked_targets_group_is_read_through_its_space(reply, sent):
+    """fri #235: Discord's target takes a "(…)" group whole, spaces included. One followed by a space ends there."""
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+@pytest.mark.parametrize('filler', ['](', '[a]('])
+def test_shown_links_a_masked_target_may_run_on_past_read_their_runs_once(monkeypatch, filler):
+    """Review of fri #236, round 2: each kept link checks what follows it, in one run read once, not once each."""
+    import fri.fri_links as links
+
+    class Counted:
+        def __init__(self, pattern):
+            self.pattern, self.calls = pattern, 0
+
+        def match(self, *args):
+            self.calls += 1
+            return self.pattern.match(*args)
+    counted = Counted(links.TARGET)
+    monkeypatch.setattr(links, 'TARGET', counted)
+    for size in (2000, 4000):
+        counted.calls = 0
+        reply = ((filler+FOUND+'<')*(size//60+1))[:size-1]+')'
+        links.link_posts(reply, read())
+        assert counted.calls <= 8
+
+
+# Review of fri #236, round 3: a "\\" right before a kept <link> escapes its "<", so Discord links the bare run after it
+# instead, through the ">" ("<A>/../../3/…" resolves to another post). Dropping an escaped link could leave one there,
+# and one the model wrote already did. A kept link's "<" is never escaped: an odd run of "\\" before it gets one more.
+RUN_ON = '/../../3/'+ID
+
+
+@pytest.mark.parametrize('reply, sent', [
+    ('\\[](https\\://discord.com/channels/123/2/1300000000000000009)<'+FOUND+'>'+RUN_ON, '\\\\<'+FOUND+'>'+RUN_ON),
+    ('\\'+FOUND+'>'+RUN_ON, '\\\\<'+FOUND+'>'+RUN_ON), ('\\<'+FOUND+'>'+RUN_ON, '\\\\<'+FOUND+'>'+RUN_ON),
+    ('\\\\\\'+FOUND+'>'+RUN_ON, '\\'*4+'<'+FOUND+'>'+RUN_ON), ('[x\\]('+MADE_UP+')<'+FOUND+'>'+RUN_ON, 'x\\\\<'+FOUND+'>'+RUN_ON),
+    ('see \\<'+FOUND+'>', 'see \\\\<'+FOUND+'>'),
+    # An even run escapes nothing, and with none the <link> is Discord's whole link already.
+    ('\\\\'+FOUND+'>'+RUN_ON, '\\\\<'+FOUND+'>'+RUN_ON), (FOUND+'>'+RUN_ON, '<'+FOUND+'>'+RUN_ON),
+])
+def test_a_kept_links_bracket_is_never_escaped(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+def test_a_reply_built_from_receipts_never_escapes_a_kept_links_bracket():
+    from fri.fri_outcomes import fallback, receipt
+    answer = '\\[](https\\://discord.com/channels/123/2/1300000000000000009)<'+FOUND+'>'+RUN_ON
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': [FOUND]})]) == '\\\\<'+FOUND+'>'+RUN_ON
 
 
 # Spaces as Discord's markdown reads them (JavaScript's): <…> ends only at a plain space, while a bare link or a masked
@@ -453,9 +605,9 @@ def test_a_reply_built_from_receipts_keeps_only_post_links_they_showed(kind, val
     ('[kev](<htt\tps://discord.com/'+PATH+'/..>)', 'kev'),
     # A masked link this pattern doesn't take (its label holds a newline, or a "]" Discord allows): right after the "(",
     # its target is read to a space, through a "<" or ">".
-    ('[kev\n](https://discord.com/x<y/../'+PATH+')', '[kev\n]()'), ('[a]b](https://discord.com/x<y/../'+PATH+')', '[a]b]()'),
-    ('[kev\n](<https://discord.com/a>b<c/../'+PATH+'>)', '[kev\n](<)'),
-    (f'[kev\n]({FOUND}<x)', f'[kev\n](<{FOUND}><x)'), (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'),
+    ('[kev\n](https://discord.com/x<y/../'+PATH+')', 'kev\n'), ('[a]b](https://discord.com/x<y/../'+PATH+')', '[a]b]'),
+    ('[kev\n](<https://discord.com/a>b<c/../'+PATH+'>)', 'kev\n'),
+    (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'),
 ])
 def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
     from fri.fri_links import link_posts
@@ -467,6 +619,16 @@ def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
     '<https://discord.com/'+'x/'*1990, '[a](<https://discord.com/x/../'*130, '<https://discord.com/a/'*180,
     'https://discord.com/x/../'*160, 'https://discord.com/a/'*180, '<h\ttps:'*500, '<https://discord.com\\x/..'*150,
     '(https://discord.com/x/../'*160, '[a\n](<https://discord.com/x/..'*130, '( <\x01https:'*500,
+    # fri #231: escapes in masked targets, read as written and undone, and escaped spaces that don't end one.
+    '[a](https://discord.com/x\\(y/..'*130, '(https://discord.com/a\\ '*160, '[a\n](https\\://discord.com/x\\(/'*120,
+    '[a](<https://discord.com/x\\>/..'*130, '(https\\:'*500,
+    # Review of fri #236: shown links a masked target may run on past, dropped or kept.
+    ('[a]('+FOUND+'(x)/../')*60, ('](\n'+FOUND+'? ')*60, ('[a]('+FOUND+' ')*60,
+    # Round 2: targets a dropped link was inside, groups with spaces, unclosed groups and titles.
+    ('[a](h'+MADE_UP+'ttps://discord.com/(a b)/../')*40, '[a](https://discord.com/x(a b)'*130, '[a](x('*600,
+    ('[a]('+MADE_UP+' "t" ')*60, '[a](x'*700, ('](('+MADE_UP+' ')*60,
+    # Round 3: kept links after a backslash, written so or left by a drop.
+    ('\\'+FOUND+'> ')*60, ('\\[](https\\://discord.com/channels/123/3/9)<'+FOUND+'>')*30,
 ])
 @pytest.mark.parametrize('end', ['', '>'])
 def test_a_4000_character_reply_full_of_links_in_brackets_is_filtered_well_under_100_ms(filler, end):
@@ -589,8 +751,9 @@ def test_a_reply_built_from_receipts_fits_discord_in_utf_16_units(value):
     assert units(sent) <= 1800 and sent.startswith('gene returned:\n')
 
 
-@pytest.mark.parametrize('before', ['🙂'*880+' ', '🙂'*890+' ', '🙂'*870+' ', '🙂'*860+'\n'],
-                         ids=['link-at-the-cut', 'link-past-the-cut', 'cut-after-the-link', 'fits'])
+@pytest.mark.parametrize('before', ['🙂'*880+' ', '🙂'*890+' ', '🙂'*870+' ', '🙂'*860+'\n', '🙂'*885, '🙂'*870],
+                         ids=['link-at-the-cut', 'link-past-the-cut', 'cut-after-the-link', 'fits', 'first-word-cut',
+                              'first-word-fits'])
 @pytest.mark.parametrize('source', [FOUND, {'url': FOUND}], ids=['string', 'record'])
 def test_a_reply_cut_to_fit_keeps_a_shown_link_whole_or_leaves_it_out(before, source):
     """The cut falls between links, never through one (a cut post link names another post), and the filter runs again
@@ -600,3 +763,32 @@ def test_a_reply_cut_to_fit_keeps_a_shown_link_whole_or_leaves_it_out(before, so
     assert units(sent) <= 1800
     assert f'<{FOUND}>' in sent or 'discord' not in sent
     assert 'discord' not in sent.replace(f'<{FOUND}>', '')
+
+
+@pytest.mark.parametrize('answer', ['🙂'*885+f'[clip]({FOUND})', '🙂'*885+FOUND, FOUND+'🙂'*900, f'[clip]({FOUND})'+'🙂'*900],
+                         ids=['masked', 'bare', 'link-first', 'masked-first'])
+def test_a_first_word_holding_a_link_goes_whole_and_the_reply_says_so_if_nothing_is_left(answer):
+    """fri #231: the word holding the link starts the reply, so the cut can't fall after it. It goes whole too, and
+    with nothing left the reply says it can't link it, as with a reply that was only a dropped link."""
+    from fri.fri_links import EMPTY
+    from fri.fri_outcomes import fallback, receipt
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': [{'url': FOUND}]})]) == EMPTY
+
+
+@pytest.mark.parametrize('answer, sent', [
+    ('🙂'*905+'https:', '🙂'*900), ('🙂'*905+'https://', '🙂'*900), ('a '+'🙂'*905+'https:', 'a '+'🙂'*899),
+    ('🙂'*905+'https://example.com', 'can’t link that one.'),
+], ids=['scheme', 'scheme-and-slashes', 'scheme-later', 'link'])
+def test_a_scheme_alone_is_cut_as_text(answer, sent):
+    """Review of fri #236: only a scheme with an address after it is a link the cut keeps whole."""
+    from fri.fri_outcomes import fallback, receipt
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': []})]) == sent
+
+
+@pytest.mark.parametrize('answer, sent', [
+    ('🙂'*905+'https\\://example.com', '🙂'*900), ('🙂'*905+'[x](https\\://example.com)', 'can’t link that one.'),
+], ids=['escaped-out-of-a-target', 'escaped-in-a-target'])
+def test_an_escaped_scheme_is_a_link_to_the_cut_only_in_a_masked_target(answer, sent):
+    """Review of fri #236, round 2: out of a masked link's target, "https\\://" is text, as the filter reads it."""
+    from fri.fri_outcomes import fallback, receipt
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': []})]) == sent
