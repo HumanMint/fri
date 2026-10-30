@@ -113,13 +113,12 @@ class Ledger:
         if entry := self.pending.get(i):
             entry.update(reason=None, composed=False, notice=None)
 
-    def abandon(self, i, entry, reason, told=False):
-        """A rerun ended without handling its message again: quiet, or `told` a notice, for `reason`. `entry` is what
-        was parked for that rerun; once its handling took it, or parked it again for the next rerun, there's nothing
-        left to settle."""
+    def abandon(self, i, entry, reason):
+        """A rerun ended without handling its message again: quiet, for `reason`. `entry` is what was parked for that
+        rerun; once its handling took it, or parked it again for the next rerun, there's nothing left to settle."""
         if entry is not None and self.again.get(i) is entry:
             del self.again[i]
-            self.close(entry, reason, told=told)
+            self.close(entry, reason, told=False)
 
     def miss(self, i, reason):
         """Why it may go unanswered, the first reason kept, as Agent.miss keeps a ping's."""

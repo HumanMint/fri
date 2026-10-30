@@ -2,7 +2,6 @@
 
 import asyncio
 import time
-from collections import deque
 from types import SimpleNamespace
 
 import discord
@@ -23,7 +22,7 @@ from compat_tests.test_fri_continuations import (
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_timing import no_debounce
 from fri import fri_agent
-from fri.fri_agent import REFETCH_BACKOFF, UNREAD, Agent
+from fri.fri_agent import REFETCH_BACKOFF, Agent
 
 EDITED = 'fri whats a good starter modpack'
 
@@ -505,19 +504,12 @@ def failing_rerun_fetch(channel, failures, error=server_error, during=None):
     return made
 
 
-def talked_before(agent, user=20, revision=0):
-    """Gene gave Fri this member's privacy revision a minute ago, as a turn of theirs then did: the baseline an
-    unreadable rerun's notice needs (see Agent.unread)."""
-    vars(agent).setdefault('revisions_read', {})[str(user)] = deque([(time.time()-60, revision)], maxlen=16)
-
-
-def test_an_edited_questions_rerun_whose_fetch_keeps_failing_tells_them_so(monkeypatch, tmp_path):
+def test_an_edited_questions_rerun_whose_fetch_keeps_failing_is_tried_again_then_settles_quietly(monkeypatch, tmp_path):
     """fri #243, the issue's ordering: the edited question's rerun can't fetch it, a server error each time. That's
-    no sign it was deleted: it's tried again, a few times, then the question hears Fri couldn't read it, a fixed
-    notice, instead of being settled as deleted with nothing said."""
+    no sign it was deleted: it's tried again, a few times. Still unread, it's settled quietly as a failed fetch,
+    not as deleted: Fri can't tell it still stands, or that its author hasn't erased since, so it says nothing."""
     async def scenario():
         fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
-        talked_before(agent)
         message = members(message)
         model = Model(fri, tmp_path, waits={1: 'before'})
         gathering = gathered(monkeypatch)
@@ -530,46 +522,12 @@ def test_an_edited_questions_rerun_whose_fetch_keeps_failing_tells_them_so(monke
             await until(lambda: not agent.reruns, 10)
             assert len(made) == 1+len(REFETCH_BACKOFF)  # Tried again after each backoff, not taken as deleted.
             assert not model.requests  # Nothing it can't read reaches the model...
-            question.reply.assert_awaited_once()  # ...but they're told, once.
-            assert question.reply.await_args.args[0] == UNREAD
-            assert question.reply.await_args.kwargs['allowed_mentions'] is fri_agent.NO_MENTIONS
+            question.reply.assert_not_awaited()  # ...and nothing goes out.
             outcomes = agent.ledger.snapshot()
-            assert outcomes['told_why'].get('fetch failed: HTTPException') == 1
+            assert outcomes['quiet'].get('fetch failed: HTTPException') == 1
             assert 'message deleted' not in outcomes['quiet'] and outcomes['in_flight'] == 0
             agent.last_spoke.clear()
             assert agent.ambient_ready(channel.id, 20)
-        finally:
-            model.hold[1].set()
-            for event in (release, fetched, *gathering):
-                if event:
-                    event.set()
-            await finish(fri, tasks)
-    asyncio.run(scenario())
-
-
-def test_an_unreadable_reruns_notice_counts_as_told_even_if_cleaning_up_after_it_fails(monkeypatch, tmp_path):
-    """The notice is recorded once it's out, before the waiting notices it replaces are cleared, so a cleanup that
-    fails or is cancelled can't leave the ledger calling a question that heard why quiet."""
-    async def scenario():
-        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
-        talked_before(agent)
-        message = members(message)
-        model = Model(fri, tmp_path, waits={1: 'before'})
-        gathering = gathered(monkeypatch)
-        tasks, release, fetched = [], None, None
-        try:
-            question, tasks, fetching, fetched, release = await edited_while_recovering(
-                agent, model, message, gathering, channel, rows)
-            fetched.set()
-            async def stuck(user):
-                raise TimeoutError
-            monkeypatch.setattr(fri.waiting_notices, 'clear', stuck)
-            failing_rerun_fetch(channel, 99)
-            await until(lambda: not agent.reruns, 10)
-            question.reply.assert_awaited_once()
-            outcomes = agent.ledger.snapshot()
-            assert outcomes['told_why'].get('fetch failed: HTTPException') == 1
-            assert not outcomes['quiet'].get('fetch failed: HTTPException') and outcomes['in_flight'] == 0
         finally:
             model.hold[1].set()
             for event in (release, fetched, *gathering):
@@ -602,97 +560,6 @@ def test_an_edited_questions_rerun_reads_it_once_a_failed_fetch_goes_through(mon
             assert [text for text, _ in model.requests] == [EDITED]
             question.reply.assert_awaited_once()
             assert question.reply.await_args.args[0] == ANSWER
-        finally:
-            model.hold[1].set()
-            for event in (release, fetched, *gathering):
-                if event:
-                    event.set()
-            await finish(fri, tasks)
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize('change', ['erased', 'erased through gene', 'erased through gene as the rerun began',
-                                    'deleted', 'fri disabled', 'left the server'])
-def test_an_unreadable_rerun_stays_quiet_once_its_question_no_longer_stands(monkeypatch, tmp_path, change):
-    """fri #243's notice is fenced: past the rerun's tries, it goes only while the question stands as far as Fri
-    knows. An erasure ("forget me" here, or through Gene during the very first fetch, or landing while the rerun's
-    first read of Gene is out: the revision compared last is the one the question came in under), a deletion
-    event, Fri going off or its author leaving, during those tries, leaves it quiet."""
-    async def scenario():
-        fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
-        talked_before(agent)
-        message = members(message)
-        model = Model(fri, tmp_path, waits={1: 'before'})
-        gathering = gathered(monkeypatch)
-        tasks, release, fetched = [], None, None
-        member = agent.member
-        async def left(user, *args, **kwargs):
-            return None if change == 'left the server' and user == 20 and kwargs.get('fresh') else await member(
-                user, *args, **kwargs)
-        try:
-            question, tasks, fetching, fetched, release = await edited_while_recovering(
-                agent, model, message, gathering, channel, rows)
-            fetched.set()
-            revisions = [0]
-            async def revision(user):
-                if change == 'erased through gene as the rerun began' and (
-                        asyncio.current_task().get_coro().__name__ == 'rerun'):
-                    revisions[0] = 1  # Gene erased while this read was out: it answers with the new revision.
-                return revisions[0]
-            agent.revision = revision
-            def meanwhile(n):
-                if change == 'erased through gene':
-                    revisions[0] += n == 1  # Erased through Gene while the first fetch is out.
-                if n != 2:
-                    return
-                if change == 'erased':
-                    agent.forget(20, erased=True)
-                elif change == 'deleted':
-                    agent.unsend(1, [question.id])
-                elif change == 'fri disabled':
-                    agent.config['enabled'] = False
-                else:
-                    agent.member = left
-            made = failing_rerun_fetch(channel, 99, during=meanwhile)
-            await until(lambda: not agent.reruns, 10)
-            assert len(made) == 1+len(REFETCH_BACKOFF)
-            assert not model.requests
-            question.reply.assert_not_awaited()
-            outcomes = agent.ledger.snapshot()
-            assert not outcomes['told_why'].get('fetch failed: HTTPException') and outcomes['in_flight'] == 0
-        finally:
-            model.hold[1].set()
-            for event in (release, fetched, *gathering):
-                if event:
-                    event.set()
-            await finish(fri, tasks)
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize('before', [None, 0], ids=['first read after it', 'read before it'])
-def test_an_unreadable_rerun_stays_quiet_when_gene_erased_before_its_question_was_first_read(
-        monkeypatch, tmp_path, before):
-    """Review of fri #246 (round 3): Gene erased them (cleared chats) just as they sent the question, so its first
-    read already says revision 1, and every check since agrees. With no read from before it was sent, nothing
-    shows the erasure came first, so no notice; with one (revision 0), the revision moved since, so none either."""
-    async def scenario():
-        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
-        if before is not None:
-            talked_before(agent, revision=before)
-        store.clear_chats('20')
-        message = members(message)
-        model = Model(fri, tmp_path, waits={1: 'before'})
-        gathering = gathered(monkeypatch)
-        tasks, release, fetched = [], None, None
-        try:
-            question, tasks, fetching, fetched, release = await edited_while_recovering(
-                agent, model, message, gathering, channel, rows)
-            fetched.set()
-            made = failing_rerun_fetch(channel, 99)
-            await until(lambda: not agent.reruns, 10)
-            assert len(made) == 1+len(REFETCH_BACKOFF)
-            question.reply.assert_not_awaited()
-            assert not agent.ledger.snapshot()['told_why'].get('fetch failed: HTTPException')
         finally:
             model.hold[1].set()
             for event in (release, fetched, *gathering):
