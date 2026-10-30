@@ -438,3 +438,90 @@ def test_a_restored_entry_rebuilt_goes_with_its_revision_where_the_guard_is(monk
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+# Sol round 3 of fri #250: what an earlier process left is the earlier process's, whatever the file says.
+
+BAD_TIMES = {'NaN': 'NaN', 'inf': 'Infinity', '-inf': '-Infinity', 'huge int': '1'+'0'*400,
+             'more digits than ints parse': '1'+'0'*5000, 'string': '"yesterday"', 'negative': '-5',
+             'future': '99999999999', 'missing': None}
+
+
+def left_on_disk(tmp_path, entries):
+    """withdrawals.json as text, values written as given (JSON's NaN and Infinity included)."""
+    rows = []
+    for mid, (user, queued) in entries.items():
+        fields = [f'"scope": {{"guild_id": "123", "channel_id": "1", "conversation_id": "public:1", "user_id": "{user}"}}',
+                  '"revision": 0', '"deleted": true', '"tries": 1', '"due": 0']
+        if queued is not None:
+            fields.append(f'"queued_at": {queued}')
+        rows.append(f'"{mid}": {{{", ".join(fields)}}}')
+    (tmp_path/'withdrawals.json').write_text('{"pending": {'+', '.join(rows)+'}}')
+
+
+@pytest.mark.parametrize('bad', list(BAD_TIMES))
+def test_whatever_a_left_entry_says_of_its_time_it_stays_an_earlier_processs(monkeypatch, tmp_path, bad):
+    """Its time read as NaN, an infinity, a huge integer, a string, a negative, a future one or nothing: Fri still
+    starts, loads it and the entry beside it, holds both back, and never sends either without its revision to a
+    controller without the guard. Against the live release, that writes nothing for the member erased since."""
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            started = w.fri.capabilities | NEWER
+            earlier, other = await earlier_exchange(w), w.said('fri and lunch?')
+            await w.agent.handle(other)
+            w.store.personal_control('20', 'disable')  # Their "forget me" through an older Fri: the file stays.
+            left_on_disk(tmp_path, {str(earlier.id): ('20', BAD_TIMES[bad]), str(other.id): ('20', '0')})
+            w.agent.saved_turns = SavedTurns(w.agent)  # Started again remembering the newer controller...
+            w.fri.capabilities = started
+            older_controller(w)  # ...which has rolled back.
+            w.fri.capabilities = started
+            w.agent.saved_turns.retry()  # As a start does; it mustn't fail.
+            await settled(w)
+            assert erased_ids(w) == 0
+            assert all('revision' in payload for payload in attempts(w, WITHDRAW))
+            assert {str(earlier.id), str(other.id)} <= set(w.agent.saved_turns.pending)
+            assert w.agent.saved_turns.withheld([earlier.id, other.id]) == {str(earlier.id), str(other.id)}
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_malformed_entry_never_stops_the_others_loading(monkeypatch, tmp_path):
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            good = w.said('one')
+            scope = '{"guild_id": "123", "channel_id": "1", "conversation_id": "public:1", "user_id": "20"}'
+            (tmp_path/'withdrawals.json').write_text(
+                '{"pending": {"'+'9'*400+f'": {{"scope": {scope}, "revision": 0}}, '
+                f'"12": {{"scope": "nope"}}, "13": {{"scope": {scope}, "revision": NaN}}, '
+                f'"14": {{"scope": {scope}, "revision": 1{"0"*400}}}, "15": 7, '
+                f'"{good.id}": {{"scope": {scope}, "revision": 0, "deleted": true}}}}}}')
+            turns = w.agent.saved_turns = SavedTurns(w.agent)
+            assert set(turns.pending) >= {str(good.id)} and '9'*400 not in turns.pending and '12' not in turns.pending
+            assert all(entry.get('revision') in (0, None) for entry in turns.pending.values())
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_fresh_withdrawal_by_id_goes_whatever_the_clock_did(monkeypatch, tmp_path):
+    """The wall clock set back past Fri's start: a withdrawal by ID queued now is this process's, so it goes."""
+    async def scenario():
+        import time
+        w = await world(monkeypatch, tmp_path)
+        if 'saved-turn-withdrawal' not in w.fri.capabilities:
+            pytest.skip('needs a controller offering saved-turn-withdrawal')
+        try:
+            w.agent.saved_turns.pending  # Started, with nothing left on disk.
+            real = time.time
+            monkeypatch.setattr(time, 'time', lambda: real()-3600)
+            nearby = w.said('just chatting')
+            await delete(w, nearby, guild=123)
+            assert [payload['message_ids'] for payload in calls(w, SAVED)] == [[str(nearby.id)]]
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
