@@ -541,6 +541,8 @@ def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
     # fri #231: escapes in masked targets, read as written and undone, and escaped spaces that don't end one.
     '[a](https://discord.com/x\\(y/..'*130, '(https://discord.com/a\\ '*160, '[a\n](https\\://discord.com/x\\(/'*120,
     '[a](<https://discord.com/x\\>/..'*130, '(https\\:'*500,
+    # Review of fri #236: shown links a masked target may run on past, dropped or kept.
+    ('[a]('+FOUND+'(x)/../')*60, ('](\n'+FOUND+'? ')*60, ('[a]('+FOUND+' ')*60,
 ])
 @pytest.mark.parametrize('end', ['', '>'])
 def test_a_4000_character_reply_full_of_links_in_brackets_is_filtered_well_under_100_ms(filler, end):
