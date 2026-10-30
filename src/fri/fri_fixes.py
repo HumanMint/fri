@@ -13,7 +13,8 @@ noted first, and a heartbeat pass settles one a lost answer or a shutdown left, 
 offers by then: it records what happened and takes back a reply that no longer holds. A send whose answer
 was lost is known only by Discord's own copy of it, which Fri's gateway delivers with its claim's nonce
 (fri #221): seen, it's recorded as sent and so checked again, and unseen it stays unconfirmed, since nothing
-in Discord tells the notice from another reply of Fri's to the report.
+in Discord tells the notice from another reply of Fri's to the report. Seen only once a pass was recording it as
+unconfirmed, which the controller never checks again, it's taken back (fri #232).
 """
 
 import asyncio
@@ -651,7 +652,8 @@ async def settle_one(fri, job_id, entry):
 
     A send cut off before Fri heard its outcome is recorded as unconfirmed once it was cleared (it may be up),
     and as failed before then: Fri never sends without the controller's go. One whose copy Fri saw is recorded
-    as sent (see seen), so the controller checks it again."""
+    as sent (see seen), so the controller checks it again. One whose copy came only once it was being recorded as
+    unconfirmed is taken back: that record is final, so nothing checks it now (fri #232)."""
     message_id = str(entry.get('message_id') or '')
     if not message_id and time.time()-float(entry['since']) < GAVE_UP:
         return False  # A send from a tap that just stopped may still land.
@@ -663,7 +665,13 @@ async def settle_one(fri, job_id, entry):
                                       'lease': entry['lease'], 'state': state, 'message_id': message_id})
         except ControllerRejected:
             return True  # No claim of this lease (another tap's, or recorded), or no such route: an older controller.
-        if not (state == 'sent' and isinstance(recorded, dict) and recorded.get('state') == 'invalidated'):
+        current = noted(fri).get(job_id)  # Read again: its copy may have come while the finish was out (see seen).
+        if (not message_id and isinstance(current, dict) and current.get('lease') == entry['lease'] and
+                current.get('message_id')):
+            entry, message_id = current, str(current['message_id'])
+        held = recorded.get('state') if isinstance(recorded, dict) else None
+        # Up, and either no longer holding or recorded unconfirmed, which the controller never checks again.
+        if not (message_id and (held == 'uncertain' or state == 'sent' and held == 'invalidated')):
             return True
         keep(fri, job_id, {**entry, 'take_back': True})
     outcome = await retract(await reach(fri, entry), message_id)
