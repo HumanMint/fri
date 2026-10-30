@@ -524,7 +524,7 @@ def test_an_edited_questions_rerun_whose_fetch_keeps_failing_tells_them_so(monke
             assert not model.requests  # Nothing it can't read reaches the model...
             question.reply.assert_awaited_once()  # ...but they're told, once.
             assert question.reply.await_args.args[0] == UNREAD
-            assert question.reply.await_args.kwargs['allowed_mentions'] == discord.AllowedMentions.none()
+            assert question.reply.await_args.kwargs['allowed_mentions'] is fri_agent.NO_MENTIONS
             outcomes = agent.ledger.snapshot()
             assert outcomes['told_why'].get('fetch failed: HTTPException') == 1
             assert 'message deleted' not in outcomes['quiet'] and outcomes['in_flight'] == 0
@@ -556,7 +556,7 @@ def test_an_edited_questions_rerun_reads_it_once_a_failed_fetch_goes_through(mon
             await until(lambda: len(gathering) == 3)  # Taken in again as it reads now: its own burst, just it.
             gathering[2].set()
             await until(lambda: not agent.reruns, 10)
-            assert len(made) == 2
+            assert len(made) >= 2  # The one that failed, the one that read it, then any its turn's checks make.
             assert [text for text, _ in model.requests] == [EDITED]
             question.reply.assert_awaited_once()
             assert question.reply.await_args.args[0] == ANSWER

@@ -51,6 +51,8 @@ NO_MENTIONS = discord.AllowedMentions.none()
 GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
 REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long, and how many, delivered IDs are remembered.
 MAX_REANSWERS = 1  # Times one message is answered again after its edit; a further edit gets the notice.
+REFETCH_BACKOFF = (1, 2, 4)  # Seconds before each try again to read a message to be answered again (see rerun).
+UNREAD = 'couldn’t read your edit, discord flaked on me. try again.'
 
 
 def gene_command(text):
@@ -197,7 +199,7 @@ class Agent:
         self.acted = {}  # Discord message ID -> when a turn for it ran a tool that may change something.
         self.reruns = set()  # Those answers again still going (see answer_edits).
         self.rerunning = {}  # Message ID -> the newest edited_at seen while it waits to be answered again.
-        self.requeued = {}  # Message ID -> its author, from being queued to be answered again until that ends.
+        self.requeued = {}  # Message ID -> the message as it came in, from being queued to be answered again until that ends.
         self.edit_seen = {}  # Message ID -> the newest edited_at seen while it was handled (see saw_edit).
         self.last_attention = {}
         self.last_spoke = {}
@@ -1167,7 +1169,7 @@ class Agent:
         while len(self.reanswered) > MAX_DELIVERED:
             del self.reanswered[next(iter(self.reanswered))]
         self.reanswer[message.id] = message.channel.id
-        self.requeued[message.id] = message.author.id  # Attention waits for it meanwhile (see ambient_ready).
+        self.requeued[message.id] = message  # Attention waits for its author meanwhile (see ambient_ready).
         return True
 
     async def answer_alone(self, token):
@@ -1286,25 +1288,48 @@ class Agent:
         """A message edited while Fri answered it, fetched again and handled as if it just came in, so every
         gate runs on what it says now: an edit that drops Fri's name or takes it back gets nothing. The fetch
         counts only if no edit came during it and it shows the newest edit seen (Discord's copy can lag the
-        edit event); it's tried a few times, then dropped. It's then taken in as of when that fetch began, so
-        an edit after is withdrawn like any other, and alone, so it never joins a burst sent after it. If it ends
-        before handling it again, its count from the first handling settles here, for why (see Ledger.park)."""
-        parked, reason = self.ledger.parked(message_id), 'no reply'
+        edit event); it's tried a few times, then dropped. Only Discord saying the message isn't there counts as
+        deleted. A fetch that fails otherwise, a server error say, is tried again after a short backoff while
+        its turn's deadline allows, then they're told Fri couldn't read it (see unread), not dropped (fri #243).
+        It's then taken in as of when that fetch began, so an edit after is withdrawn like any other, and alone,
+        so it never joins a burst sent after it. If it ends before handling it again, its count from the first
+        handling settles here, for why (see Ledger.park)."""
+        parked, reason, told = self.ledger.parked(message_id), 'no reply', False
+        first = self.requeued.get(message_id)  # As it came in: all a notice can go on if it can't be read now.
+        forgotten = self.forgotten.get(first.author.id, 0) if first is not None else 0
+        until = discord.utils.snowflake_time(message_id).timestamp()+QUEUE_SECONDS
         try:
-            for _ in range(3):
+            changing = failed = 0
+            while True:
                 began = time.time()
                 try:
                     message = await self.fri.get_channel(channel_id).fetch_message(message_id)
-                except (AttributeError, discord.HTTPException):
-                    reason = 'message deleted'
-                    return  # Deleted meanwhile, or the channel's gone: nothing left to answer.
+                except AttributeError:
+                    reason = 'channel gone'
+                    return  # Nowhere left to answer it.
+                except (discord.HTTPException, aiohttp.ClientError, TimeoutError) as exc:
+                    status = getattr(exc, 'status', None)
+                    if isinstance(exc, discord.NotFound) or status == 404:
+                        reason = 'message deleted'
+                        return  # Deleted meanwhile: nothing left to answer.
+                    if isinstance(exc, discord.Forbidden) or status == 403:
+                        reason = 'missing permissions'
+                        return  # Fri can't read it there now: a closed gate, which stays quiet.
+                    reason = 'fetch failed: '+type(exc).__name__
+                    if failed < len(REFETCH_BACKOFF) and time.time()+REFETCH_BACKOFF[failed] < until:
+                        await asyncio.sleep(REFETCH_BACKOFF[failed])
+                        failed += 1
+                        continue
+                    told = await self.unread(first, forgotten)
+                    return
                 newest = self.rerunning.get(message_id)
                 if not self.taken_back(message_id, began) and (
                         newest is None or (message.edited_at is not None and message.edited_at >= newest)):
                     break
-            else:
-                reason = 'message changed'
-                return  # Still changing, or Discord's copy lags: they can ask again.
+                changing += 1
+                if changing == 3:
+                    reason = 'message changed'
+                    return  # Still changing, or Discord's copy lags: they can ask again.
             if self.memory_control(message):
                 reason = 'edited into a privacy control'
                 return  # Not a privacy control: it was refused for the edit (see Fri.chat_once), and they send it again.
@@ -1321,7 +1346,31 @@ class Agent:
             self.rerunning.pop(message_id, None)
             self.edit_seen.pop(message_id, None)
             self.requeued.pop(message_id, None)
-            self.ledger.abandon(message_id, parked, reason)
+            self.ledger.abandon(message_id, parked, reason, told=told)
+
+    async def unread(self, message, forgotten):
+        """An edited message to be answered again that Discord wouldn't show Fri, past its rerun's tries: it hears
+        so, a fixed notice carrying nothing it said or anything else, rather than nothing (fri #243). Only while
+        it still stands as far as Fri can tell without reading it: no deletion of it came in, it would still be
+        answered where it was sent by the gates it passed coming in (see excluded: outside Fri's channels, where
+        only reading a ping shows it still stands, that's never), and its author hasn't erased since the rerun
+        began: `forgotten` local erasures then, and Gene's revision, read first and compared last, as a ping's
+        notice is (see Invitation.notice). True once it's out."""
+        if message is None or message.id in self.unsent:
+            return False
+        user = message.author.id
+        try:
+            revision = await self.revision(user)
+            if await self.excluded(message, message.guild is None) or message.id in self.unsent:
+                return False
+            if await self.erasure(user, forgotten, revision):  # Last, so an erasure during the reads above counts.
+                return False
+            await message.reply(UNREAD, mention_author=False, allowed_mentions=NO_MENTIONS)
+        except (discord.HTTPException, aiohttp.ClientError, TimeoutError, commands.UserFeedbackCheckFailure,
+                KeyError, TypeError):
+            return False
+        await self.fri.waiting_notices.clear(user)
+        return True
 
     def saw_edit(self, i, edited):
         """The newest edit seen, by its event or a check's fetch, of a message being handled or answered again:
@@ -1959,7 +2008,8 @@ class Agent:
         it's in no queue (fri #228). And Fri hasn't spoken here for a while."""
         return (user not in self.fri.busy and (channel, user) not in self.pending and
                 not any(str(i) in self.direct for i in self.turns.arrived.get(user, ())) and
-                user not in self.requeued.values() and time.time()-self.last_spoke.get(channel, 0) >= 600)
+                all(queued.author.id != user for queued in self.requeued.values()) and
+                time.time()-self.last_spoke.get(channel, 0) >= 600)
 
     async def respond(self, message, text, dm=False, **options):
         # The turn, and an invitation's grant, are consumed only by the save after delivery, so a
