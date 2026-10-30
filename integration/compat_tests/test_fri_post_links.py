@@ -286,6 +286,61 @@ def test_a_reply_built_from_receipts_never_keeps_a_shown_link_a_masked_target_ru
     assert sent == '[clip]('+SUFFIX+')'
 
 
+# Review of fri #236, round 2: dropping a link inside a masked link's target used to leave the rest of that target,
+# joined ("h" and "ttps") into a link whose "(a b)" group the filter couldn't read past. Now the whole target goes,
+# its label kept, and a target's "(…)" group is read through, its space too (fri #235).
+GROUP = 'ttps://discord.com/(a b)/../channels/123/3/'+ID
+INNER = ['[](https\\://discord.com/channels/123/2/1300000000000000009)', '<'+MADE_UP+'>', MADE_UP]
+
+
+@pytest.mark.parametrize('inner', INNER, ids=['escaped', 'angled', 'bare'])
+@pytest.mark.parametrize('form, sent', [('[clip](h{}'+GROUP+')', 'clip'), ('[kev\n](h{}'+GROUP+')', 'kev\n'),
+                                        ('[a](x[b](h{}'+GROUP+')y)', 'a'), ('see [clip]( h{}'+GROUP+' ) ok', 'see clip ok')])
+def test_a_link_dropped_inside_a_masked_target_takes_the_whole_target(inner, form, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(form.format(inner), read()) == sent
+
+
+def test_a_reply_built_from_receipts_drops_a_masked_target_a_dropped_link_was_inside():
+    from fri.fri_outcomes import fallback, receipt
+    answer = '[clip](h'+INNER[0]+GROUP+')'
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': [FOUND]})]) == 'clip'
+
+
+@pytest.mark.parametrize('reply, sent', [
+    ('[clip](https://discord.com/x(a b)/../../'+PATH+')', 'clip'),
+    ('[kev\n](<https://discord.com/x(a b)/../../'+PATH+'>)', 'kev\n'),
+    ('[clip](https://discord.com/x(a\nb)/../../'+PATH+')', 'clip'),
+    ('[clip](https://discord.com/x(a b) /../../'+PATH+')', '[clip](https://discord.com/x(a b) /../../'+PATH+')'),
+    ('[clip](https://example.com/x(a b)/../../'+PATH+')', '[clip](https://example.com/x(a b)/../../'+PATH+')'),
+])
+def test_a_masked_targets_group_is_read_through_its_space(reply, sent):
+    """fri #235: Discord's target takes a "(…)" group whole, spaces included. One followed by a space ends there."""
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+@pytest.mark.parametrize('filler', ['](', '[a]('])
+def test_shown_links_a_masked_target_may_run_on_past_read_their_runs_once(monkeypatch, filler):
+    """Review of fri #236, round 2: each kept link checks what follows it, in one run read once, not once each."""
+    import fri.fri_links as links
+
+    class Counted:
+        def __init__(self, pattern):
+            self.pattern, self.calls = pattern, 0
+
+        def match(self, *args):
+            self.calls += 1
+            return self.pattern.match(*args)
+    counted = Counted(links.TARGET)
+    monkeypatch.setattr(links, 'TARGET', counted)
+    for size in (2000, 4000):
+        counted.calls = 0
+        reply = ((filler+FOUND+'<')*(size//60+1))[:size-1]+')'
+        links.link_posts(reply, read())
+        assert counted.calls <= 8
+
+
 # Spaces as Discord's markdown reads them (JavaScript's): <…> ends only at a plain space, while a bare link or a masked
 # link's target ends at any of these, but not at a control character Python also calls a space (review of fri #219).
 @pytest.mark.parametrize('space, ends', [('\u2003', True), ('\xa0', True), ('\v', True), ('\x1c', False), ('\x85', False)])
@@ -695,5 +750,14 @@ def test_a_first_word_holding_a_link_goes_whole_and_the_reply_says_so_if_nothing
 ], ids=['scheme', 'scheme-and-slashes', 'scheme-later', 'link'])
 def test_a_scheme_alone_is_cut_as_text(answer, sent):
     """Review of fri #236: only a scheme with an address after it is a link the cut keeps whole."""
+    from fri.fri_outcomes import fallback, receipt
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': []})]) == sent
+
+
+@pytest.mark.parametrize('answer, sent', [
+    ('🙂'*905+'https\\://example.com', '🙂'*900), ('🙂'*905+'[x](https\\://example.com)', 'can’t link that one.'),
+], ids=['escaped-out-of-a-target', 'escaped-in-a-target'])
+def test_an_escaped_scheme_is_a_link_to_the_cut_only_in_a_masked_target(answer, sent):
+    """Review of fri #236, round 2: out of a masked link's target, "https\\://" is text, as the filter reads it."""
     from fri.fri_outcomes import fallback, receipt
     assert fallback([receipt('web_search', {'answer': answer, 'sources': []})]) == sent
