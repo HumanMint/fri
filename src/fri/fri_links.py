@@ -370,7 +370,10 @@ def assemble(runs, edits):
     dropped inside a masked link's target that may close takes all of that target, the outermost one's, with the label
     kept as a dropped masked link's is (review of fri #236). What's left of a target can never be joined into
     another link. An edit across a target's edge is left undone, its text outside the target as it was: link_posts
-    reads again until nothing changes. `edits` are in order and apart, and so are the targets, so each is read once."""
+    reads again until nothing changes. `edits` are in order and apart, and so are the targets, so each is read once.
+
+    A kept <link>'s "<" is never escaped: Discord would link the bare run after it instead, through its ">"
+    ("<A>/../../3/…" is another post). An odd run of "\\" before it, left by a drop or written so, gets one more."""
     text, regions = runs.text, []
     if dropped := [edit[0] for edit in edits if edit[3]]:
         frames, index = [(found.start(1), found.end()) for found in FRAME.finditer(text)], 0
@@ -408,11 +411,21 @@ def assemble(runs, edits):
             index += 1
         if not (index < len(merged) and merged[index][0] < end):
             pieces.append((begin, end, kept))
-    parts, done = [], 0
+    parts, done, slashes = [], 0, 0
     for start, end, kept in sorted(pieces):
-        parts += [text[done:start], kept]
-        done = end
+        between = text[done:start]
+        slashes = trailing(between, slashes)
+        if kept.startswith('<') and slashes % 2:
+            kept = '\\'+kept
+        parts += [between, kept]
+        slashes, done = trailing(kept, slashes), end
     return ''.join(parts)+text[done:]
+
+
+def trailing(part, before):
+    """How many "\\" end the text so far, `before` of them before `part`."""
+    count = len(part)-len(part.rstrip('\\'))
+    return before+count if count == len(part) else count
 
 
 def once(text, allowed, found):

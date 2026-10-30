@@ -627,6 +627,8 @@ def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
     # Round 2: targets a dropped link was inside, groups with spaces, unclosed groups and titles.
     ('[a](h'+MADE_UP+'ttps://discord.com/(a b)/../')*40, '[a](https://discord.com/x(a b)'*130, '[a](x('*600,
     ('[a]('+MADE_UP+' "t" ')*60, '[a](x'*700, ('](('+MADE_UP+' ')*60,
+    # Round 3: kept links after a backslash, written so or left by a drop.
+    ('\\'+FOUND+'> ')*60, ('\\[](https\\://discord.com/channels/123/3/9)<'+FOUND+'>')*30,
 ])
 @pytest.mark.parametrize('end', ['', '>'])
 def test_a_4000_character_reply_full_of_links_in_brackets_is_filtered_well_under_100_ms(filler, end):
