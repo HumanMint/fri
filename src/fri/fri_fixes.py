@@ -14,7 +14,9 @@ offers by then: it records what happened and takes back a reply that no longer h
 was lost is known only by Discord's own copy of it, which Fri's gateway delivers with its claim's nonce
 (fri #221): seen, it's recorded as sent and so checked again, and unseen it stays unconfirmed, since nothing
 in Discord tells the notice from another reply of Fri's to the report. Seen only once a pass was recording it as
-unconfirmed, which the controller never checks again, it's taken back (fri #232).
+unconfirmed, which the controller never checks again, it's taken back (fri #232), and so it is once that's recorded:
+the claim's nonce and the channel are kept for a day, so a copy that comes later still is (fri #238). A take-back
+Discord refuses with a 403 is tried again until then, since Fri may be let again, and the owner hears of it once.
 """
 
 import asyncio
@@ -51,6 +53,7 @@ AUTHORIZE = 'requester-notice-authorize'  # Fri asks for the send right before i
 PENDING = 'requester-notices.json'
 GAVE_UP = 60  # Fri gives a send 25 s: noted this long ago with no tap running, it has posted or never will.
 KEEP = 86400  # A noted send still unsettled after this (a channel gone, say) is dropped, and logged.
+ECHOES = 20  # Sends settled unconfirmed whose copy a later take-back can still match (see bury): the newest only.
 TELLING = collections.Counter()  # Taps replying for each job in this process, which a pass leaves alone.
 TAKE_BACK = 10  # How long a take-back waits on Discord's answer. It never cancels the delete (see retract).
 DELETING = {}  # Each delete still on its way after its take-back moved on, by message, so none is doubled.
@@ -471,7 +474,9 @@ async def tell_once(fri, job_id, actor):
         if entry:
             entry = keep(fri, job_id, {**entry, 'take_back': True})
         outcome = await retract(channel, message_id)
-        if entry and outcome != 'unconfirmed':
+        if entry and outcome == 'forbidden':  # This answer tells the owner, so the passes trying again stay quiet.
+            keep(fri, job_id, {**entry, 'told': True})
+        elif entry and outcome != 'unconfirmed':
             forget(fri, job_id, lease)
         return taken_back(outcome, recorded.get('reason'), message, retried=entry is not None), False
     if entry and answered:  # Otherwise the next pass hears the answer again (see settle).
@@ -497,23 +502,29 @@ def seen(fri, message):
     """Fri's own message as the gateway delivered it: the notice of a cleared send whose answer was lost, if it
     carries that claim's nonce in that channel (fri #221). Noted as sent, so the tap or the next pass records it,
     the controller checks it again and Fri takes it back if it no longer holds. Nothing else of Fri's matches:
-    each claim's nonce is its own. Never raises."""
+    each claim's nonce is its own. One settled unconfirmed by then is taken back (see bury). Never raises."""
     nonce = getattr(message, 'nonce', None)
     if nonce is None or getattr(getattr(message, 'author', None), 'id', None) != getattr(fri.user, 'id', None):
         return
     try:
         for job_id, entry in noted(fri).items():
-            if (isinstance(entry, dict) and entry.get('cleared') and not entry.get('message_id') and
-                    (notice := notice_id(job_id, entry.get('lease'))) != job_id and
-                    str(nonce) == str(int(notice[:20], 16)) and str(message.channel.id) == entry.get('channel_id')):
+            if (not isinstance(entry, dict) or entry.get('message_id') or
+                    str(message.channel.id) != entry.get('channel_id')):
+                continue
+            if 'nonce' in entry:
+                if str(nonce) == entry['nonce']:
+                    keep(fri, job_id, {**entry, 'message_id': str(int(message.id)), 'take_back': True})
+            elif (entry.get('cleared') and (notice := notice_id(job_id, entry.get('lease'))) != job_id and
+                    str(nonce) == str(int(notice[:20], 16))):
                 keep(fri, job_id, {**entry, 'message_id': str(int(message.id))})
     except (*MALFORMED, AttributeError):
         LOG.info('A requester notice copy could not be matched')
 
 
 async def retract(channel, message_id):
-    """Fri's own reply down: 'gone' once it is (or already was), 'refused' when Discord won't, 'unconfirmed'
-    when Discord didn't answer, which a later try may settle.
+    """Fri's own reply down: 'gone' once it is (or already was), 'refused' when Discord won't, 'forbidden' when
+    it won't for now (a 403: Fri's permissions may come back), 'unconfirmed' when Discord didn't answer. A later
+    try may settle the last two.
 
     Waits up to TAKE_BACK and never cancels the delete: discord.py can't recover from a cancel inside its global
     rate-limit wait, and every later Discord call would stall (fri #226). One still going is left to finish, and
@@ -529,6 +540,8 @@ async def retract(channel, message_id):
         task.result()
     except discord.NotFound:
         return 'gone'
+    except discord.Forbidden:
+        return 'forbidden'
     except discord.HTTPException as exc:
         return 'unconfirmed' if exc.status >= 500 else 'refused'
     except (TimeoutError, OSError, discord.DiscordException):
@@ -564,9 +577,9 @@ def taken_back(outcome, reason, report, retried=False):
     if outcome == 'gone':
         return notice_text(f'took the reply back: {why}.')
     LOG.warning('A reply whose claim stopped holding was not taken back yet')
-    if outcome == 'unconfirmed' and retried:
-        return notice_text(f'it posted, but {why}, and discord didn’t confirm taking it back. '
-                           f'i’ll keep trying: {report.jump_url}')
+    if outcome in ('unconfirmed', 'forbidden') and retried:
+        refusal = 'didn’t confirm taking it back' if outcome == 'unconfirmed' else 'wouldn’t let me take it back'
+        return notice_text(f'it posted, but {why}, and discord {refusal}. i’ll keep trying: {report.jump_url}')
     return notice_text(f'it posted, but {why}, and discord wouldn’t let me take it back: {report.jump_url}')
 
 
@@ -595,6 +608,53 @@ def keep(fri, job_id, entry):
     except OSError as exc:
         LOG.warning('Requester notice send not noted: %s', type(exc).__name__)
     return entry
+
+
+def bury(fri, job_id, entry):
+    """A cleared send settled unconfirmed, its copy still unseen: what's kept is what a copy that comes later needs
+    to be taken back (see seen), the claim's nonce, its lease's first digits and the channel, until KEEP from the tap.
+    Nothing of the owner's or the reporter's, and only the newest ECHOES (fri #238). Raises if it can't be written."""
+    entries = noted(fri)
+    current = entries.get(job_id)
+    if not (isinstance(current, dict) and current.get('lease') == entry['lease']):
+        return  # Gone already, or another claim's now.
+    notice = notice_id(job_id, entry['lease'])
+    if notice == job_id:  # No nonce of its own, so no copy could be told apart.
+        del entries[job_id]
+    else:
+        entries[job_id] = {'nonce': str(int(notice[:20], 16)), 'lease': entry['lease'][:8],
+                           'channel_id': str(entry['channel_id']), 'at': entry['at']}
+        buried = sorted((key for key, kept in entries.items()
+                         if isinstance(kept, dict) and 'nonce' in kept and not kept.get('message_id')),
+                        key=lambda key: when(entries[key]))
+        for key in buried[:max(len(buried)-ECHOES, 0)]:
+            del entries[key]
+    private_json(fri.data/PENDING, entries)
+
+
+def when(entry):
+    try:
+        return float(entry['at'])
+    except MALFORMED:
+        return 0.0
+
+
+def stale(job_id, entry):
+    """A note past KEEP, or one this Fri can't read: nothing's left to settle, so it goes."""
+    try:
+        return not JOB.fullmatch(job_id) or not isinstance(entry, dict) or time.time()-float(entry['at']) > KEEP
+    except MALFORMED:
+        return True
+
+
+def expire(fri):
+    """Stale notes dropped before the heartbeat waits on the controller, whose outage would otherwise keep their
+    channel and message IDs for as long as it lasts (fri #238). A tap's own is left to it. Raises if the write fails."""
+    entries = noted(fri)
+    kept = {job_id: entry for job_id, entry in entries.items() if TELLING.get(job_id) or not stale(job_id, entry)}
+    if len(kept) < len(entries):
+        LOG.warning('Gave up settling %d requester notice send(s)', len(entries)-len(kept))
+        private_json(fri.data/PENDING, kept)
 
 
 def forget(fri, job_id, lease):
@@ -631,9 +691,7 @@ async def settle_all(fri):
         if TELLING.get(job_id):
             continue
         try:
-            if not JOB.fullmatch(job_id) or not isinstance(entry, dict):
-                done = True
-            elif time.time()-float(entry['at']) > KEEP:
+            if stale(job_id, entry):
                 LOG.warning('Gave up settling a requester notice send')
                 done = True
             else:
@@ -653,8 +711,11 @@ async def settle_one(fri, job_id, entry):
     A send cut off before Fri heard its outcome is recorded as unconfirmed once it was cleared (it may be up),
     and as failed before then: Fri never sends without the controller's go. One whose copy Fri saw is recorded
     as sent (see seen), so the controller checks it again. One whose copy came only once it was being recorded as
-    unconfirmed is taken back: that record is final, so nothing checks it now (fri #232)."""
+    unconfirmed is taken back: that record is final, so nothing checks it now (fri #232). Unseen by then, what its
+    copy needs is kept (see bury). A take-back Discord refuses for now is tried again, and the owner told once."""
     message_id = str(entry.get('message_id') or '')
+    if 'nonce' in entry and not message_id:
+        return False  # Settled unconfirmed: only its copy, if it comes, leaves anything to do.
     if not message_id and time.time()-float(entry['since']) < GAVE_UP:
         return False  # A send from a tap that just stopped may still land.
     if not entry.get('take_back'):
@@ -672,12 +733,39 @@ async def settle_one(fri, job_id, entry):
         held = recorded.get('state') if isinstance(recorded, dict) else None
         # Up, and either no longer holding or recorded unconfirmed, which the controller never checks again.
         if not (message_id and (held == 'uncertain' or state == 'sent' and held == 'invalidated')):
-            return True
-        keep(fri, job_id, {**entry, 'take_back': True})
-    outcome = await retract(await reach(fri, entry), message_id)
+            if state != 'uncertain' or message_id:
+                return True
+            bury(fri, job_id, entry)
+            return False
+        entry = keep(fri, job_id, {**entry, 'take_back': True})
+    channel = await reach(fri, entry)
+    outcome = await retract(channel, message_id)
+    if outcome == 'forbidden':
+        if not entry.get('told'):
+            LOG.warning('Discord refused to take back a reply whose claim stopped holding; trying again later')
+            await warn_owner(fri, job_id, entry, channel, message_id)
+        return False
     if outcome == 'refused':
         LOG.warning('A reply whose claim stopped holding could not be taken back')
     return outcome != 'unconfirmed'
+
+
+async def warn_owner(fri, job_id, entry, channel, message_id):
+    """The owner hears once where the reply Discord won't let Fri take back is, and the passes keep trying."""
+    try:
+        owner = fri.get_user(fri.owner_id) or await fri.fetch_user(fri.owner_id)
+        dm = owner.dm_channel or await owner.create_dm()
+    except TAP_FAILURES as exc:  # Not told yet, so the next pass, trying again, tells them then.
+        LOG.info('Owner DM not reached for a refused take-back: %s', type(exc).__name__)
+        return
+    keep(fri, job_id, {**entry, 'told': True})  # At most once: a DM whose answer was lost isn't repeated.
+    guild = getattr(getattr(channel, 'guild', None), 'id', None) or '@me'
+    try:
+        await dm.send(notice_text('my reply to a reporter has to come down, and discord won’t let me delete it. '
+                                  f'i’ll keep trying: https://discord.com/channels/{guild}/{channel.id}/{message_id}'),
+                      allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+    except (discord.DiscordException, TimeoutError, OSError) as exc:
+        LOG.warning('Owner not told of a refused take-back: %s', type(exc).__name__)
 
 
 async def reach(fri, entry):
