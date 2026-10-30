@@ -40,10 +40,13 @@ def statuses(monkeypatch):
 
 def older_controller(w):
     """Answer as the live release does, unless the controller is one already. True if it's emulated here."""
+    w.attempts = None
     if SOURCES not in w.fri.capabilities:
         return False
-    api = w.fri.api
+    api, w.attempts = w.fri.api, []
     async def older(method, path, payload=None):
+        if method == 'POST':
+            w.attempts.append((path, payload))
         if path == '/fri/contract':
             contract = await api(method, path, payload)
             return {**contract, 'capabilities': [c for c in contract['capabilities'] if c not in NEWER]}
@@ -54,6 +57,12 @@ def older_controller(w):
         return await api(method, path, payload)
     w.fri.api = older
     return True
+
+
+def attempts(w, path):
+    """Every request Fri made to `path`, refused ones too (the emulation refuses before the harness records)."""
+    made = w.attempts if getattr(w, 'attempts', None) is not None else w.calls
+    return [payload for p, payload in made if p == path]
 
 
 def calls(w, path):
@@ -126,10 +135,10 @@ def test_by_id_ones_a_rolled_back_controller_cant_take_wait_held_back(monkeypatc
     asyncio.run(scenario())
 
 
-def test_a_withdrawal_left_on_disk_is_not_replayed_to_an_older_controller(monkeypatch, tmp_path, caplog):
-    """B2's repro: saved and timed out here, then Fri rolled back and the member erased ("forget me"), then this Fri
-    started against a rolled-back Gene. Replaying it would write their IDs back; it's dropped instead."""
-    caplog.set_level(logging.DEBUG)
+def test_a_withdrawal_left_on_disk_is_not_replayed_to_an_older_controller(monkeypatch, tmp_path):
+    """B2 of the pre-release review: saved and timed out here, then Fri rolled back and the member erased ("forget me"),
+    then this Fri started against a rolled-back Gene. Replaying it unguarded would write their IDs back. Sol round 1 of
+    fri #250 (B1): it's neither sent nor dropped there, but kept, held back, until a Gene with the guard is known."""
     async def scenario():
         from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
@@ -148,9 +157,9 @@ def test_a_withdrawal_left_on_disk_is_not_replayed_to_an_older_controller(monkey
             await settled(w)
             with w.store.connection() as db:  # A controller without the revision guard writes the erased IDs back.
                 assert db.execute("SELECT count(*) FROM chat_turn_withdrawals WHERE user_id='20'").fetchone()[0] == 0
-            assert not calls(w, WITHDRAW)
-            assert str(earlier.id) not in on_disk(tmp_path) and not w.agent.saved_turns.pending
-            assert any('earlier process' in line and str(earlier.id) in line for line in caplog.messages)
+            assert not attempts(w, WITHDRAW)
+            assert str(earlier.id) in w.agent.saved_turns.pending  # Kept, and so held back.
+            assert str(earlier.id) in w.agent.saved_turns.withheld([earlier.id])
         finally:
             await w.fri.close()
     asyncio.run(scenario())
@@ -192,3 +201,151 @@ def test_an_ordinary_withdrawal_sends_as_before(monkeypatch, tmp_path):
             await w.fri.close()
     asyncio.run(scenario())
 
+
+# Sol round 1 of fri #250.
+
+def older_from_the_start(w):
+    """A Gene rolled back before Fri started: Fri reads its contract, so it knows no withdrawal-sources."""
+    emulated = older_controller(w)
+    w.fri.capabilities = w.fri.capabilities-NEWER
+    return emulated
+
+
+def test_a_restart_against_an_older_controller_keeps_a_valid_withdrawal_held_back(monkeypatch, tmp_path):
+    """B1: saved against the older Gene, its withdrawal timed out, Fri restarted with the queue: it's neither sent
+    unguarded nor dropped, so it stays held back past the hour. Once a Gene with the guard is known, it goes, with its
+    revision. It's dropped only once it can no longer matter: older than an exchange lives."""
+    async def scenario():
+        import fri.fri_turn_withdrawal as withdrawal
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            api = w.fri.api
+            emulated = older_from_the_start(w)
+            earlier = await earlier_exchange(w)
+            state = failing(w, WITHDRAW)
+            await delete(w, earlier)
+            state['down'] = False
+            w.agent.saved_turns = SavedTurns(w.agent)  # Started again, the queue intact.
+            w.calls.clear()
+            w.agent.saved_turns.retry()
+            await settled(w)
+            assert not attempts(w, WITHDRAW) and str(earlier.id) in w.agent.saved_turns.pending
+            monkeypatch.setattr(withdrawal, 'MARKED_SECONDS', 0)
+            w.requests.clear()
+            await w.agent.handle(w.said('fri hi'))
+            assert w.requests and MARKER not in str(w.requests)  # Still held back.
+            if emulated:  # Gene rolled forward again: read on the retry schedule, then replayed with its revision.
+                w.fri.api = api
+                monkeypatch.setattr(withdrawal, 'REREAD_SECONDS', 0)
+                w.agent.saved_turns.retry()
+                await settled(w)
+                assert [payload.get('revision') for payload in calls(w, WITHDRAW)] == [0]
+                assert MARKER not in saved(w) and not w.agent.saved_turns.pending
+            else:
+                monkeypatch.setattr(withdrawal, 'KEPT_SECONDS', 0)  # Past the week an exchange lives: it can't matter.
+                w.agent.saved_turns.retry()
+                await settled(w)
+                assert not w.agent.saved_turns.pending
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def erased_ids(w, user='20'):
+    with w.store.connection() as db:
+        return db.execute('SELECT count(*) FROM chat_turn_withdrawals WHERE user_id=?', (user,)).fetchone()[0]
+
+
+def test_a_replay_refused_by_a_rolled_back_gene_is_never_resent_unguarded(monkeypatch, tmp_path):
+    """B2: on disk, its member erased by an older Fri, loaded while Fri knows the guard; Gene rolls back first, its 422
+    makes Fri read the contract again, and the guard is gone: the entry waits, never resent without its revision."""
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            started = w.fri.capabilities | NEWER
+            earlier = await earlier_exchange(w)
+            state = failing(w, WITHDRAW)
+            await delete(w, earlier)
+            w.store.personal_control('20', 'disable')  # An older Fri's "forget me": the file stays.
+            state['down'] = False
+            older_controller(w)
+            w.fri.capabilities = started  # Read at start, before Gene rolled back.
+            w.calls.clear()
+            w.agent.saved_turns = SavedTurns(w.agent)
+            w.agent.saved_turns.retry()
+            await settled(w)
+            assert all('revision' in payload for payload in attempts(w, WITHDRAW))  # Never sent without it.
+            assert erased_ids(w) == 0
+            assert str(earlier.id) in w.agent.saved_turns.pending
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_forget_me_while_fri_reads_the_contract_stops_the_resend(monkeypatch, tmp_path):
+    """B3: this process's withdrawal is refused (Gene rolled back), and while Fri reads the contract again the member
+    says "forget me": the resend is abandoned, so nothing of theirs is written after their erasure."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            started = w.fri.capabilities | NEWER
+            earlier = await earlier_exchange(w)
+            older_controller(w)
+            w.fri.capabilities = started
+            api = w.fri.api
+            async def erasing(method, path, payload=None):
+                if path == '/fri/contract':
+                    w.store.personal_control('20', 'disable')
+                    w.agent.forget(20, erased=True)
+                return await api(method, path, payload)
+            w.fri.api = erasing
+            w.calls.clear()
+            await delete(w, earlier)
+            assert len(attempts(w, WITHDRAW)) == 1  # The refused one only.
+            assert erased_ids(w) == 0 and not w.agent.saved_turns.pending
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_erasure_during_the_contract_read_never_stops_the_others(monkeypatch, tmp_path):
+    """B4: a by-ID withdrawal waiting (Gene has no such request since a rollback) is taken by its member's erasure
+    while Fri reads the contract; the worker carries on, and another member's withdrawal still goes."""
+    async def scenario():
+        import fri.fri_turn_withdrawal as withdrawal
+        w = await world(monkeypatch, tmp_path)
+        try:
+            monkeypatch.setattr(withdrawal, 'REREAD_SECONDS', 0)
+            started = w.fri.capabilities | NEWER
+            theirs = w.said('fri explain '+MARKER, user=40)
+            await w.agent.handle(theirs)
+            assert MARKER in saved(w, '40')
+            nearby = w.said('just chatting', user=30)
+            w.agent.recent[1].append({'id': str(nearby.id), 'user_id': '30', 'name': 'member', 'text': nearby.content,
+                                      'at': 0, 'revision': 0, 'gene_error': False})
+            older_controller(w)
+            w.fri.capabilities = started
+            await delete(w, nearby, guild=123)  # By ID: its 404 makes Fri read the contract; it waits.
+            assert str(nearby.id) in w.agent.saved_turns.pending
+            state = failing(w, WITHDRAW)
+            w.agent.looked.clear()
+            w.agent.recent.clear()
+            await delete(w, theirs)  # Member 40's: times out, so it waits too.
+            state['down'] = False
+            api, erased = w.fri.api, []
+            async def erasing(method, path, payload=None):
+                if path == '/fri/contract' and not erased:
+                    erased.append(True)
+                    w.store.personal_control('30', 'disable')
+                    w.agent.forget(30, erased=True)
+                return await api(method, path, payload)
+            w.fri.api = erasing
+            w.agent.saved_turns.retry()
+            await settled(w)
+            assert MARKER not in saved(w, '40')
+            assert str(nearby.id) not in w.agent.saved_turns.pending
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
