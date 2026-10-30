@@ -458,7 +458,9 @@ SHAPES = [("'", "a' ", ''), ("'", "rockin' ", ''), ('', "''a ", ''), ('', "' ", 
           ('love story', ', no more of those songs', ''), ('love story', ' is what x, y and', ' i never asked'),
           ('love story', " isn't what i and", ' x chose'), ('no more', ', no more', ' x'),
           ('love story', ' by she wants revenge', ''), ('love', ' by "she wants revenge"', ''), ('love', ' by a b c d', ''),
-          ('love', " by 'a", ''), ('love story', ', i said no, not now', ' x'), ('love', " by 'a'", '')]
+          ('love', " by 'a", ''), ('love story', ', i said no, not now', ' x'), ('love', " by 'a'", ''),
+          ('love', ' by "a"', ', not now'), ('love', ' by \u2018me\u2019', ', not now'), ('love', ' by a told b', ''),
+          ('"love', ' by \u2018me\u2019', '", not now')]
 
 
 def message(shape, length=4000):
