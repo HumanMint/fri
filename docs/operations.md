@@ -280,8 +280,17 @@ advertises it, so the controller must be released first.
   queued entry has its own generation, and an answer settles only the entries it was sent for, so one
   queued for the same message meanwhile (its save landed and named it, say) stands and goes next. A
   timeout or an outage is logged with the message IDs and error type only, and sent again after 2, 15
-  and 60 seconds, then every five minutes; a start sends everything still pending. A refusal (a 4xx) can
-  never succeed, so it's logged and dropped. The queue keeps an entry only as long as what it names can
+  and 60 seconds, then every five minutes; a start sends everything still pending. So is a refusal (a
+  4xx): none is dropped for one, so it stays held back until the controller takes it. A refusal may come
+  from a Gene rolled back alone while Fri runs, which doesn't know a field (`deleted`, `revision`) or the
+  by-ID request Fri learned at its start. Fri reads the controller's contract again then, at most once a
+  minute, and its capabilities follow it everywhere; if the request it would make now differs, it's sent
+  once more right away. One the controller can't take at all now waits, held back, until it can again.
+  One left in `withdrawals.json` by an earlier process is sent only to a controller offering
+  `withdrawal-sources`, which checks the revision it was saved under. Against any other it's dropped
+  with a log line, as a failed withdrawal was before this queue: a rolled-back Fri may have carried out
+  that member's "forget me" meanwhile, and replaying it would write their IDs back. The queue keeps an
+  entry only as long as what it names can
   be kept (a week, or a note's 90 days, below), and at most 20,000, the oldest messages' going first.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the

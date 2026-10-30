@@ -172,7 +172,10 @@ def test_a_pending_withdrawal_survives_a_restart(monkeypatch, tmp_path):
             assert w.requests and MARKER not in str(w.requests)
             w.agent.saved_turns.retry()  # As a start does.
             await settled(w)
-            assert MARKER not in saved(w) and not json.loads((tmp_path/'withdrawals.json').read_text())['pending']
+            assert not json.loads((tmp_path/'withdrawals.json').read_text())['pending']
+            # Sent again only to a controller checking the revision it was saved under: an older one may have seen
+            # their "forget me" through a rolled-back Fri, so it's dropped there, as before this queue.
+            assert (MARKER in saved(w)) is (SOURCES not in w.fri.capabilities)
         finally:
             await w.fri.close()
     asyncio.run(scenario())

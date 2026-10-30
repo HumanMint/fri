@@ -24,6 +24,7 @@ import logging
 import time
 
 from .fri_errors import ControllerRejected
+from .fri_protocol import compatible
 from .private_files import private_json
 
 CAPABILITY = 'turn-withdrawal'
@@ -37,6 +38,7 @@ MOST = 20000  # Bounds memory only: the controller keeps six exchanges per membe
 MARKED_SECONDS = 3600  # As Agent.withdrawn: longer than any turn that could still hold a copy runs.
 BATCH = 10  # As many IDs as /chat/turn/withdraw/saved takes at once.
 RETRY_SECONDS = (2, 15, 60, 300)  # After each failure, then every five minutes while it stays pending.
+REREAD_SECONDS = 60  # At most this often, the controller's contract read again for a refusal (see reread).
 RECORD = 'withdrawals.json'
 
 LOG = logging.getLogger('fri.agent')
@@ -53,6 +55,7 @@ class SavedTurns:
         self.timer = None
         self.generation = 0  # Each queued entry's own number: a reply to an older one never settles a newer one.
         self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
+        self.reread_at = 0.0  # time.monotonic() as the contract was last read again (see reread).
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -80,9 +83,10 @@ class SavedTurns:
                     deleted = entry.get('deleted') is True
                     if isinstance(entry.get('scope'), dict):
                         revision = entry.get('revision')
+                        # From an earlier process: replayed only where its revision is checked (see drain).
                         self._pending[str(i)] = self.entry(scope={key: str(entry['scope'].get(key, '')) for key in (
                             'guild_id', 'channel_id', 'conversation_id', 'user_id')}, deleted=deleted,
-                            revision=revision if type(revision) is int and revision >= 0 else None)
+                            revision=revision if type(revision) is int and revision >= 0 else None, replayed=True)
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 LOG.warning('Pending withdrawals could not be read, so none are resent: %s', type(exc).__name__)
             self.prune(time.time())
@@ -105,7 +109,8 @@ class SavedTurns:
     def persist(self):
         if path := self.record():
             try:
-                private_json(path, {'pending': {i: {key: value for key, value in entry.items() if key != 'gen'}
+                private_json(path, {'pending': {i: {key: value for key, value in entry.items()
+                                                    if key not in ('gen', 'replayed')}
                                                 for i, entry in self.pending.items() if self.lasting(entry)}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
                 LOG.warning('Pending withdrawals could not be saved: %s', type(exc).__name__)
@@ -309,15 +314,36 @@ class SavedTurns:
 
     async def drain(self):
         """One call at a time: each withdrawal Fri saved an exchange for on its own, those by ID ten a call (edits and
-        deletions apart). A failure waits (RETRY_SECONDS) and is sent again; a refusal can never succeed, so it's logged
-        and dropped. Each answer settles only the entries it was sent for: one queued for the same message meanwhile
-        (its save landed and named it, say, or it was deleted after an edit) is newer, so it stands and goes next."""
+        deletions apart). A failure or a refusal waits (RETRY_SECONDS) and is sent again; none is dropped for one, so it
+        stays held back until the controller takes it (a Gene rolled back alone refuses fields it doesn't know: see
+        send). One the controller can't take now (no such request since a rollback) waits too. Each answer settles only
+        the entries it was sent for: one queued for the same message meanwhile (its save landed and named it, say, or it
+        was deleted after an edit) is newer, so it stands and goes next. One left on disk by an earlier process goes
+        only to a controller that checks its revision (SOURCES): any other may have outlived the member's "forget me"
+        through a rolled-back Fri, which left the record, so it's dropped, as a failed withdrawal was before this queue."""
         tried = set()
         while True:
             now = time.time()
             self.prune(now)
+            dropped = [i for i, entry in self.pending.items() if entry.get('replayed') and not self.capable(SOURCES)]
+            for i in dropped:
+                del self.pending[i]
+                LOG.warning('Withdrawn message %s from an earlier process was dropped: this controller can\'t check it '
+                            'against a privacy change since', i)
+            if dropped:
+                self.persist()
             due = sorted(i for i, entry in self.pending.items() if entry['due'] <= now and entry['gen'] not in tried)
+            waiting = [i for i in due if not self.takes(self.pending[i])]
+            if waiting and await self.reread():  # A controller rolled back may have come forward again.
+                waiting = [i for i in waiting if not self.takes(self.pending[i])]
+            for i in waiting:
+                self.wait(self.pending[i])
+                tried.add(self.pending[i]['gen'])
+            due = [i for i in due if i not in waiting]
             if not due:
+                if waiting:
+                    self.persist()
+                    continue
                 break
             placed = [i for i in due if 'scope' in self.pending[i]]
             if placed:
@@ -333,13 +359,40 @@ class SavedTurns:
             for i, entry in batch:
                 if self.pending.get(i) is not entry:
                     continue  # Replaced or forgotten while it was sent: the newer one stands.
-                if outcome in ('sent', 'refused'):
+                if outcome == 'sent':
                     del self.pending[i]
                 else:
-                    entry['tries'] += 1
-                    entry['due'] = time.time()+RETRY_SECONDS[min(entry['tries'], len(RETRY_SECONDS))-1]
+                    self.wait(entry)
             self.persist()
         self.schedule()
+
+    @staticmethod
+    def wait(entry):
+        entry['tries'] += 1
+        entry['due'] = time.time()+RETRY_SECONDS[min(entry['tries'], len(RETRY_SECONDS))-1]
+
+    def takes(self, entry):
+        """Whether the controller offers the request this withdrawal needs, as it last said."""
+        return self.offered() and ('scope' in entry or self.capable(SAVED_CAPABILITY))
+
+    async def reread(self):
+        """The controller's contract again, at most every REREAD_SECONDS: one rolled back (or forward) while Fri runs
+        offers what it offers now, and Fri asks in that shape (see send). Fri's capabilities follow it everywhere. True
+        if it was read."""
+        now = time.monotonic()
+        if now-self.reread_at < REREAD_SECONDS:
+            return False
+        self.reread_at = now
+        try:
+            contract = await self.agent.fri.api('GET', '/fri/contract')
+        except Exception as exc:
+            LOG.warning('The controller\'s contract could not be read again: %s', type(exc).__name__)
+            return False
+        if not compatible(contract):
+            LOG.warning('The controller\'s contract read again is not one Fri runs with; keeping what it read before')
+            return False
+        self.agent.fri.capabilities = frozenset(contract['capabilities'])
+        return True
 
     def schedule(self):
         if self.timer is not None:
@@ -361,20 +414,39 @@ class SavedTurns:
                 **({'revision': entry['revision']} if entry.get('revision') is not None else {})}
 
     async def send(self, message_id, entry):
-        try:
-            await self.agent.fri.api('POST', '/chat/turn/withdraw', {**entry['scope'], 'message_id': str(message_id),
-                                                                      **self.extra(entry)})
-        except Exception as exc:  # Logged without the words; whatever withdrew it goes on.
-            return failed('Withdrawn message %s was not dropped from saved turns: %s', str(message_id), exc)
-        return 'sent'
+        return await self.asking(lambda: ('/chat/turn/withdraw', {**entry['scope'], 'message_id': str(message_id),
+                                                                  **self.extra(entry)}), entry,
+                                 'Withdrawn message %s was not dropped from saved turns: %s', str(message_id))
 
     async def send_unplaced(self, server, message_ids, deleted=False):
+        return await self.asking(lambda: ('/chat/turn/withdraw/saved', {
+            'guild_id': server, 'message_ids': message_ids, **self.extra({'deleted': deleted})}), {'deleted': deleted},
+            'Withdrawn messages %s were not dropped from saved turns: %s', ', '.join(message_ids))
+
+    async def asking(self, request, entry, text, ids):
+        """Sent as the controller takes it. A refusal may be a controller rolled back alone, which doesn't know a field
+        or a request Fri learned at its start: Fri reads its contract again and, if the request it would make now
+        differs, sends that once more right away. Otherwise, and on any failure, it waits (see drain). Logged without
+        the words."""
+        path, payload = request()
         try:
-            await self.agent.fri.api('POST', '/chat/turn/withdraw/saved', {
-                'guild_id': server, 'message_ids': message_ids, **self.extra({'deleted': deleted})})
-        except Exception as exc:  # As above.
-            return failed('Withdrawn messages %s were not dropped from saved turns: %s', ', '.join(message_ids), exc)
-        return 'sent'
+            await self.agent.fri.api('POST', path, payload)
+            return 'sent'
+        except ControllerRejected as exc:
+            if exc.status is None or not await self.reread():
+                return failed(text, ids, exc)
+            if not self.takes({'scope': None} if path == '/chat/turn/withdraw' else {}):
+                return failed(text, ids, exc)
+            again = request()
+            if again == (path, payload):
+                return failed(text, ids, exc)
+            try:
+                await self.agent.fri.api('POST', *again)
+                return 'sent'
+            except Exception as retried:
+                return failed(text, ids, retried)
+        except Exception as exc:
+            return failed(text, ids, exc)
 
 
 def stays(sources, evidence, gone, said):
@@ -387,9 +459,11 @@ def stays(sources, evidence, gone, said):
 
 
 def failed(text, ids, exc):
+    """Kept and sent again later, refused or not: a refusal can come from a controller rolled back alone."""
     refused = isinstance(exc, ControllerRejected) and exc.status is not None
-    LOG.warning(text+(' (refused, not sent again)' if refused else ' (sent again later)'), ids, type(exc).__name__)
-    return 'refused' if refused else 'failed'
+    LOG.warning(text+(f' (refused, HTTP {exc.status}; sent again later)' if refused else ' (sent again later)'), ids,
+                type(exc).__name__)
+    return 'failed'
 
 
 def sent_at(message_id):
