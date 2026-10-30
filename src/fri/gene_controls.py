@@ -167,6 +167,8 @@ TITLE_QUOTE = re.compile(rf'(?P<double>["“])|(?P<link>https://\S+)|{OPENER}')
 CLOSER = re.compile(rf"(?P<loose>{OPENER}|(?<!\S)['‘](?!\w))|(?P<dropped>(?:(?<=in)|(?<=\bol)|(?<=\blil)|(?<=\bn)|(?<=\bo)|(?<=\ban))'"
                     r"(?=\s+\w))|(?<=\S)'(?!\w)")
 WORD = re.compile(r"[\w']+")
+ANOTHER = re.compile(r"\s*(?:\w|'\w)")  # A word next, past spaces: not a closing mark or a pause.
+SPACES = re.compile(r'\s*')
 CLAUSE = r"(?:^|[,;:.!?—–\-\"'‘“”]\s*|\b(?:and|but|or|so|then|also|plus|like|actually|wait|lol|nah|no|oh|please|pls|just)\s+)"
 # Outside a quoted title, any of these means the message is not asking for that song now.
 REFUSED = re.compile(
@@ -323,18 +325,19 @@ def masked(text, spans):
 
 def artist_first(text, artist):
     """The first word of the artist named at this ARTIST match. If they quoted it, the word inside the quote when it's
-    all they quoted ("by ‘Me’"), else none: a name of several words they quoted is a name, whatever its first word
-    ("by ‘My Chemical Romance’"). A closing ’ reads as ' here (see correction), so it ends the word it closes."""
+    all they quoted ("by ‘Me’", "by "Me "", an unclosed "by "Me, no more"), else none: a name of several words they
+    quoted is a name, whatever its first word ("by ‘My Chemical Romance’"). A closing ’ reads as ' here (see
+    correction), so it ends the word it closes."""
     at = artist.end(1)
     opened = text[at] in '"“‘'
-    word = WORD.match(text, at+opened)
+    word = WORD.match(text, SPACES.match(text, at+1).end() if opened else at)  # "“ Me ”" too.
     if not word:
         return ''
     said = word[0]
     if said.startswith("'"):  # A straight quote opened it.
         opened, said = True, said[1:]
-    if opened and not (said.endswith("'") or text[word.end():word.end()+1] in '"”'):
-        return ''  # They quoted more than this word.
+    if opened and not said.endswith("'") and ANOTHER.match(text, word.end()):
+        return ''  # Another word follows inside the quote.
     return said.strip("'")
 
 
