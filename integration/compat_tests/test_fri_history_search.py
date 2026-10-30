@@ -78,7 +78,12 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'which was the meme you posted in this chat last night', 'what was the new song posted in #music',
                  'what was the song posted in #music', 'what was the link <@123> sent the other day again',
                  'what’s the recipe lulu shared in the cooking thread', 'what was the game sam recommended tonight',
-                 'what was the link ollie dropped like an hour ago'):
+                 'what was the link ollie dropped like an hour ago',
+                 # Names that end like a noun are still names; "are" takes a plural thing before the name.
+                 'what was the song Felicity mentioned?', 'what were those songs Charity mentioned?',
+                 'what was the song Clement mentioned?', 'what was the clip trinity sent',
+                 'what are the songs kev mentioned', 'what are the tracks mo recommended?',
+                 'what was the song posted here?', 'what was the song kev posted here?'):
         assert requested(text)
     for text in ('hey fri', 'play Sad Machine', 'do not search chat', '> find old messages',
                  'what do you recommend?', 'what should I say to a friend who is upset?',
@@ -103,7 +108,9 @@ def test_archive_intent_and_date_limits_are_bounded():
                  "what's the best laptop recommended?", 'what is the daily dose recommended?',
                  'what is the max file size shared in this server?', 'what was the price posted here?',
                  'what are the side effects mentioned?', 'what is the html tag recommended?',
-                 'what’s the max player count recommended in the minecraft server?'):
+                 'what’s the max player count recommended in the minecraft server?',
+                 'what are the personal details shared in a server?', 'what are the design patterns recommended?',
+                 'what is the screen resolution recommended here?', 'what’s the song posted here?'):
         assert not requested(text)
     assert valid_action(query())
     assert not valid_action(query(cursor='invented'))
