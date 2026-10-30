@@ -602,12 +602,13 @@ def test_an_edited_questions_rerun_reads_it_once_a_failed_fetch_goes_through(mon
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('change', ['erased', 'erased through gene', 'deleted', 'fri disabled', 'left the server'])
+@pytest.mark.parametrize('change', ['erased', 'erased through gene', 'erased through gene as the rerun began',
+                                    'deleted', 'fri disabled', 'left the server'])
 def test_an_unreadable_rerun_stays_quiet_once_its_question_no_longer_stands(monkeypatch, tmp_path, change):
     """fri #243's notice is fenced: past the rerun's tries, it goes only while the question stands as far as Fri
-    knows. An erasure ("forget me" here, or through Gene during the very first fetch: its revision is read before
-    that fetch and compared last), a deletion event, Fri going off or its author leaving, during those tries, leaves
-    it quiet."""
+    knows. An erasure ("forget me" here, or through Gene during the very first fetch, or landing while the rerun's
+    first read of Gene is out: the revision compared last is the one the question came in under), a deletion
+    event, Fri going off or its author leaving, during those tries, leaves it quiet."""
     async def scenario():
         fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
         message = members(message)
@@ -624,6 +625,9 @@ def test_an_unreadable_rerun_stays_quiet_once_its_question_no_longer_stands(monk
             fetched.set()
             revisions = [0]
             async def revision(user):
+                if change == 'erased through gene as the rerun began' and (
+                        asyncio.current_task().get_coro().__name__ == 'rerun'):
+                    revisions[0] = 1  # Gene erased while this read was out: it answers with the new revision.
                 return revisions[0]
             agent.revision = revision
             def meanwhile(n):
