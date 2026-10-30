@@ -280,8 +280,25 @@ advertises it, so the controller must be released first.
   queued entry has its own generation, and an answer settles only the entries it was sent for, so one
   queued for the same message meanwhile (its save landed and named it, say) stands and goes next. A
   timeout or an outage is logged with the message IDs and error type only, and sent again after 2, 15
-  and 60 seconds, then every five minutes; a start sends everything still pending. A refusal (a 4xx) can
-  never succeed, so it's logged and dropped. The queue keeps an entry only as long as what it names can
+  and 60 seconds, then every five minutes; a start sends everything still pending. So is a refusal (a
+  4xx): none is dropped for one, so it stays held back until the controller takes it. A refusal may come
+  from a Gene rolled back alone while Fri runs, which doesn't know a field (`deleted`, `revision`) or the
+  by-ID request Fri learned at its start. Fri reads the controller's contract again then, at most once a
+  minute, and its capabilities follow it everywhere; if the request it would make now differs, it's sent
+  once more right away. One the controller can't take at all now waits, held back, until it can again.
+  One left in `withdrawals.json` by an earlier process (anything read from that file, which every entry
+  rebuilt for that message stays: an edit's turned into a deletion, say; nothing in the file decides it,
+  and one queued in this process never counts, whatever the clock does) is sent only, with its revision,
+  to a controller offering `withdrawal-sources`, which checks the revision it was saved under: a rolled-back Fri may
+  have carried out that member's "forget me" meanwhile, and an unguarded replay would write their IDs
+  back. Against any other it's neither sent nor dropped but kept, held back, and the contract is read
+  again on the retry schedule, so a Gene rolled forward takes it. Right before every request (the first,
+  a resend after a refusal, each retry) Fri checks again that the entry is still queued as it was, that
+  its member hasn't said "forget me" since, and that the controller can safely take it as it now stands;
+  if not, the request isn't made. The file is read so that no value can fail the whole read (NaN,
+  infinities and over-long numbers read as nothing), and each entry is checked on its own, so a malformed
+  one is left out and never stops the rest or Fri's start. The queue keeps an entry only as long as what
+  it names can
   be kept (a week, or a note's 90 days, below), and at most 20,000, the oldest messages' going first.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the
