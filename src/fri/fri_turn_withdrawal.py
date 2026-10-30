@@ -64,8 +64,11 @@ class SavedTurns:
         return name in getattr(self.agent.fri, 'capabilities', ())
 
     def entry(self, **what):
+        """A queued withdrawal, with its own number and its member's erasure count now (see current)."""
         self.generation += 1
-        return {**what, 'tries': 0, 'due': 0, 'gen': self.generation}
+        user = (what.get('scope') or {}).get('user_id') or what.get('user_id')
+        return {**what, 'tries': 0, 'due': 0, 'gen': self.generation,
+                **({'erasure': self.erasure(user)} if user else {})}
 
     @property
     def pending(self):
@@ -110,7 +113,7 @@ class SavedTurns:
         if path := self.record():
             try:
                 private_json(path, {'pending': {i: {key: value for key, value in entry.items()
-                                                    if key not in ('gen', 'replayed')}
+                                                    if key not in ('gen', 'replayed', 'erasure')}
                                                 for i, entry in self.pending.items() if self.lasting(entry)}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
                 LOG.warning('Pending withdrawals could not be saved: %s', type(exc).__name__)
@@ -316,64 +319,73 @@ class SavedTurns:
         """One call at a time: each withdrawal Fri saved an exchange for on its own, those by ID ten a call (edits and
         deletions apart). A failure or a refusal waits (RETRY_SECONDS) and is sent again; none is dropped for one, so it
         stays held back until the controller takes it (a Gene rolled back alone refuses fields it doesn't know: see
-        send). One the controller can't take now (no such request since a rollback) waits too. Each answer settles only
-        the entries it was sent for: one queued for the same message meanwhile (its save landed and named it, say, or it
-        was deleted after an edit) is newer, so it stands and goes next. One left on disk by an earlier process goes
-        only to a controller that checks its revision (SOURCES): any other may have outlived the member's "forget me"
-        through a rolled-back Fri, which left the record, so it's dropped, as a failed withdrawal was before this queue."""
+        post). One the controller can't safely take now waits too, held back: a request it no longer offers since a
+        rollback, or one left on disk by an earlier process, for a controller without the revision guard (SOURCES),
+        which a rolled-back Fri's "forget me" may have outlived. The contract is read again on the retry schedule, so
+        one rolled forward is used. Such an entry goes only once it can no longer matter: older than the controller
+        keeps what it names (prune), or its member erased here (forget). Each answer settles only the entries it was
+        sent for: one queued for the same message meanwhile is newer, so it stands and goes next. Everything is worked
+        out again after each wait, and whatever stays is scheduled however the worker ends."""
         tried = set()
-        while True:
-            now = time.time()
-            self.prune(now)
-            dropped = [i for i, entry in self.pending.items() if entry.get('replayed') and not self.capable(SOURCES)]
-            for i in dropped:
-                del self.pending[i]
-                LOG.warning('Withdrawn message %s from an earlier process was dropped: this controller can\'t check it '
-                            'against a privacy change since', i)
-            if dropped:
-                self.persist()
-            due = sorted(i for i, entry in self.pending.items() if entry['due'] <= now and entry['gen'] not in tried)
-            waiting = [i for i in due if not self.takes(self.pending[i])]
-            if waiting and await self.reread():  # A controller rolled back may have come forward again.
-                waiting = [i for i in waiting if not self.takes(self.pending[i])]
-            for i in waiting:
-                self.wait(self.pending[i])
-                tried.add(self.pending[i]['gen'])
-            due = [i for i in due if i not in waiting]
-            if not due:
-                if waiting:
+        try:
+            while True:
+                if not self.due(tried):
+                    break
+                if [i for i in self.due(tried) if not self.sendable(self.pending[i])]:
+                    await self.reread()  # A controller rolled back may have come forward again.
+                due = self.due(tried)  # Again: anything may have changed while it read.
+                for i in [i for i in due if not self.sendable(self.pending[i])]:
+                    self.wait(self.pending[i])
+                    tried.add(self.pending[i]['gen'])
+                due = [i for i in due if self.sendable(self.pending[i])]
+                if not due:
                     self.persist()
                     continue
-                break
-            placed = [i for i in due if 'scope' in self.pending[i]]
-            if placed:
-                batch = [(placed[0], self.pending[placed[0]])]
-                call = self.send(int(placed[0]), batch[0][1])
-            else:
-                first = self.pending[due[0]]
-                batch = [(i, self.pending[i]) for i in due if self.pending[i].get('server') == first['server']
-                         and self.pending[i].get('deleted') is first.get('deleted')][:BATCH]
-                call = self.send_unplaced(first['server'], [i for i, _ in batch], first.get('deleted') is True)
-            tried.update(entry['gen'] for _, entry in batch)
-            outcome = await call
-            for i, entry in batch:
-                if self.pending.get(i) is not entry:
-                    continue  # Replaced or forgotten while it was sent: the newer one stands.
-                if outcome == 'sent':
-                    del self.pending[i]
+                placed = [i for i in due if 'scope' in self.pending[i]]
+                if placed:
+                    batch = [(placed[0], self.pending[placed[0]])]
                 else:
-                    self.wait(entry)
-            self.persist()
-        self.schedule()
+                    first = self.pending[due[0]]
+                    batch = [(i, self.pending[i]) for i in due if self.pending[i].get('server') == first['server']
+                             and self.pending[i].get('deleted') is first.get('deleted')][:BATCH]
+                tried.update(entry['gen'] for _, entry in batch)
+                sent = await self.post(batch)
+                for i, entry in batch:
+                    if self.pending.get(i) is not entry:
+                        continue  # Replaced or forgotten while it was sent: the newer one stands, or none.
+                    if (i, entry['gen']) in sent:
+                        del self.pending[i]
+                    else:
+                        self.wait(entry)
+                self.persist()
+        finally:
+            self.schedule()
+
+    def due(self, tried):
+        now = time.time()
+        self.prune(now)
+        return sorted(i for i, entry in self.pending.items() if entry['due'] <= now and entry['gen'] not in tried)
+
+    def current(self, i, entry):
+        """Right before any request for it: still this entry, queued, for a member who hasn't said "forget me" since
+        it was, and one the controller can safely take as it last said (see sendable)."""
+        if self.pending.get(i) is not entry:
+            return False
+        user = (entry.get('scope') or {}).get('user_id') or entry.get('user_id')
+        return (not user or self.erasure(user) == entry.get('erasure', 0)) and self.sendable(entry)
+
+    def sendable(self, entry):
+        """Whether the controller, as it last said, offers the request this withdrawal needs, and can take it safely:
+        one from an earlier process only with the revision guard (SOURCES), and only with the revision it was saved
+        under, so a member erased since through another Fri gets nothing written."""
+        if not self.offered() or ('scope' not in entry and not self.capable(SAVED_CAPABILITY)):
+            return False
+        return not entry.get('replayed') or (self.capable(SOURCES) and entry.get('revision') is not None)
 
     @staticmethod
     def wait(entry):
         entry['tries'] += 1
         entry['due'] = time.time()+RETRY_SECONDS[min(entry['tries'], len(RETRY_SECONDS))-1]
-
-    def takes(self, entry):
-        """Whether the controller offers the request this withdrawal needs, as it last said."""
-        return self.offered() and ('scope' in entry or self.capable(SAVED_CAPABILITY))
 
     async def reread(self):
         """The controller's contract again, at most every REREAD_SECONDS: one rolled back (or forward) while Fri runs
@@ -413,40 +425,43 @@ class SavedTurns:
         return {**({'deleted': True} if entry.get('deleted') else {}),
                 **({'revision': entry['revision']} if entry.get('revision') is not None else {})}
 
-    async def send(self, message_id, entry):
-        return await self.asking(lambda: ('/chat/turn/withdraw', {**entry['scope'], 'message_id': str(message_id),
-                                                                  **self.extra(entry)}), entry,
-                                 'Withdrawn message %s was not dropped from saved turns: %s', str(message_id))
+    def request(self, batch):
+        """The request for these, in the shape the controller takes as it last said (see extra)."""
+        (first, entry), ids = batch[0], [i for i, _ in batch]
+        if 'scope' in entry:
+            return '/chat/turn/withdraw', {**entry['scope'], 'message_id': str(first), **self.extra(entry)}
+        return '/chat/turn/withdraw/saved', {'guild_id': entry['server'], 'message_ids': ids,
+                                             **self.extra({'deleted': entry.get('deleted')})}
 
-    async def send_unplaced(self, server, message_ids, deleted=False):
-        return await self.asking(lambda: ('/chat/turn/withdraw/saved', {
-            'guild_id': server, 'message_ids': message_ids, **self.extra({'deleted': deleted})}), {'deleted': deleted},
-            'Withdrawn messages %s were not dropped from saved turns: %s', ', '.join(message_ids))
-
-    async def asking(self, request, entry, text, ids):
-        """Sent as the controller takes it. A refusal may be a controller rolled back alone, which doesn't know a field
-        or a request Fri learned at its start: Fri reads its contract again and, if the request it would make now
-        differs, sends that once more right away. Otherwise, and on any failure, it waits (see drain). Logged without
-        the words."""
-        path, payload = request()
-        try:
-            await self.agent.fri.api('POST', path, payload)
-            return 'sent'
-        except ControllerRejected as exc:
-            if exc.status is None or not await self.reread():
-                return failed(text, ids, exc)
-            if not self.takes({'scope': None} if path == '/chat/turn/withdraw' else {}):
-                return failed(text, ids, exc)
-            again = request()
-            if again == (path, payload):
-                return failed(text, ids, exc)
+    async def post(self, batch):
+        """Sent as the controller takes it. A refusal may come from a controller rolled back alone, which doesn't know a
+        field or a request Fri learned at its start: Fri reads its contract again and, if the request it would make now
+        differs, sends that once more right away. Before each request (the first and that one), only the entries still
+        queued as they were, for members who haven't erased since, and safe to send as the controller now stands, go
+        (see current): any other waits, or was dropped meanwhile. Returns (message ID, generation) of those taken.
+        Logged without the words."""
+        made = None
+        for attempt in (1, 2):
+            live = [(i, entry) for i, entry in batch if self.current(i, entry)]
+            if not live:
+                return set()
+            path, payload = self.request(live)
+            if (path, payload) == made:
+                return set()  # The same request again: nothing changed, so it waits.
+            made, ids = (path, payload), ', '.join(i for i, _ in live)
+            text = (f'Withdrawn message{"s" if len(live) > 1 else ""} %s {"were" if len(live) > 1 else "was"} not '
+                    'dropped from saved turns: %s')
             try:
-                await self.agent.fri.api('POST', *again)
-                return 'sent'
-            except Exception as retried:
-                return failed(text, ids, retried)
-        except Exception as exc:
-            return failed(text, ids, exc)
+                await self.agent.fri.api('POST', path, payload)
+                return {(i, entry['gen']) for i, entry in live}
+            except ControllerRejected as exc:
+                failed(text, ids, exc)
+                if attempt == 2 or exc.status is None or not await self.reread():
+                    return set()
+            except Exception as exc:
+                failed(text, ids, exc)
+                return set()
+        return set()
 
 
 def stays(sources, evidence, gone, said):
@@ -463,7 +478,6 @@ def failed(text, ids, exc):
     refused = isinstance(exc, ControllerRejected) and exc.status is not None
     LOG.warning(text+(f' (refused, HTTP {exc.status}; sent again later)' if refused else ' (sent again later)'), ids,
                 type(exc).__name__)
-    return 'failed'
 
 
 def sent_at(message_id):

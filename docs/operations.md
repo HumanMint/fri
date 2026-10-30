@@ -286,11 +286,14 @@ advertises it, so the controller must be released first.
   by-ID request Fri learned at its start. Fri reads the controller's contract again then, at most once a
   minute, and its capabilities follow it everywhere; if the request it would make now differs, it's sent
   once more right away. One the controller can't take at all now waits, held back, until it can again.
-  One left in `withdrawals.json` by an earlier process is sent only to a controller offering
-  `withdrawal-sources`, which checks the revision it was saved under. Against any other it's dropped
-  with a log line, as a failed withdrawal was before this queue: a rolled-back Fri may have carried out
-  that member's "forget me" meanwhile, and replaying it would write their IDs back. The queue keeps an
-  entry only as long as what it names can
+  One left in `withdrawals.json` by an earlier process is sent only, with its revision, to a controller
+  offering `withdrawal-sources`, which checks the revision it was saved under: a rolled-back Fri may
+  have carried out that member's "forget me" meanwhile, and an unguarded replay would write their IDs
+  back. Against any other it's neither sent nor dropped but kept, held back, and the contract is read
+  again on the retry schedule, so a Gene rolled forward takes it. Right before every request (the first,
+  a resend after a refusal, each retry) Fri checks again that the entry is still queued as it was, that
+  its member hasn't said "forget me" since, and that the controller can safely take it as it now stands;
+  if not, the request isn't made. The queue keeps an entry only as long as what it names can
   be kept (a week, or a note's 90 days, below), and at most 20,000, the oldest messages' going first.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the
