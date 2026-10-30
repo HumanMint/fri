@@ -269,11 +269,42 @@ advertises it, so the controller must be released first.
   chat channels, their threads and DMs), sent within the week a saved exchange lasts, is asked about
   by ID through `/chat/turn/withdraw/saved`, ten at a time, when the controller also offers
   `saved-turn-withdrawal`: that covers a message saved before a restart. The controller drops only an
-  exchange that holds it, so an unrelated edit changes nothing. A failed call is logged with the
-  message IDs and error type only, and the turn goes on. An older controller is never asked, and one
-  with `turn-withdrawal` only is asked about the messages Fri saved since it started. Not covered yet (fri #101): Fri's own saved replies and echo rows,
-  and other members' exchanges, that drew on the message record authors and revisions, not message
-  IDs, so they stay.
+  exchange that holds it, so an unrelated edit changes nothing. An older controller is never asked, and one
+  with `turn-withdrawal` only is asked about the messages Fri saved since it started.
+- **Until the controller takes a withdrawal (fri #215).** Each withdrawal waits in one queue until the
+  controller answers it. One for an exchange this process saved is kept in `withdrawals.json` in Fri's
+  data directory (message ID, where it was saved, the member's privacy revision then and whether the
+  message was deleted; never words), so a restart sends it again; one by ID is kept in memory only.
+  One worker sends them, one call at a time: each on its own through `/chat/turn/withdraw`, and those by
+  ID ten a call (edits and deletions apart), each ID once however many edits and deletes name it. Each
+  queued entry has its own generation, and an answer settles only the entries it was sent for, so one
+  queued for the same message meanwhile (its save landed and named it, say) stands and goes next. A
+  timeout or an outage is logged with the message IDs and error type only, and sent again after 2, 15
+  and 60 seconds, then every five minutes; a start sends everything still pending. A refusal (a 4xx) can
+  never succeed, so it's logged and dropped. The queue keeps an entry only as long as what it names can
+  be kept (a week, or a note's 90 days, below), and at most 20,000, the oldest messages' going first.
+  A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
+  already on its way carries the revision it was saved under, which the erasure moved, so the
+  controller writes nothing for it, and a save whose answer comes after it records nothing. A withdrawal
+  by ID, whoever's it is, is retried in memory only: a restart loses it, as before this queue, and can't
+  write back a message of someone who said "forget me" before the restart. Meanwhile, and for an hour after (past any turn still holding a
+  copy), what a turn read that holds a taken-back message stays out of its request, checked right before
+  each one: an exchange of its history, a pending question, an exchange elsewhere, a note learned from
+  it, and the member's summary, which may have read it. What's left counts as carried, so if one of those
+  is taken back after the request, the answer is withheld and nothing is saved, as for a post the model
+  was shown. "What do you remember about me" and My memory hold back the same notes, and the summary.
+  A turn with nothing taken back reads exactly what it did before.
+- **What else a withdrawn message reached (gene #141).** A controller offering `withdrawal-sources` drops
+  the notes learned from a withdrawn message, edited or deleted, and names, in chat context and My memory,
+  where each note and exchange elsewhere came from (which Fri keeps beside them, never in what the model
+  reads). Each turn's check and save then carry `drew_on`: every message its requests carried besides
+  its own (the live view, what it answers or quotes, what it looked at or read, saved history), up to
+  1000, or the turn is refused rather than drop one. Once one is deleted, the controller keeps only a
+  breadcrumb of the saved reply, and of one that carried Fri's reply to it; Fri's own echo of such a reply
+  leaves the channel's live view at once, in memory, and so does the echo of its reply to the message
+  itself. An edit leaves those replies and echoes, as before (gene #150). Since a note lasts 90 days,
+  such a controller is asked by ID about messages up to 90 days old. An older controller gets neither
+  field and is asked about a week back, as before.
 - **What a turn drawing on the member summary writes or keeps.** A turn whose model request had Fri's
   summary of the member carries its generation (gene #91). Before every tool step, Fri checks that
   generation with `/chat/turn/check`, whether or not typing had already started, so a step the model
