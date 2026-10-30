@@ -265,6 +265,8 @@ meme memes screenshot file post'''.split())
 POINTERS = frozenset('this that these those above attached'.split()) | FORMATS
 VAGUE = frozenset('it its them here there one ones thing'.split())  # Pointers only with no word of the ask's own.
 DETERMINERS = frozenset('this that these those the my our ur your his her their its'.split())
+ASKS = frozenset('what whats how hows why which who whos where when'.split())
+AUXILIARIES = frozenset('is are was were do does did can could would will should'.split())
 FILLER = frozenset('''fri yo hey hi ok okay oh ah uh um hm hmm so just really actually lowkey kinda now too also
 pls plz please rn what whats who whos which how hows why is are was does do did can could would will you u ur
 your yours i im me my mine of about on at in out the a an and or to for any tell say describe explain'''.split())
@@ -288,20 +290,33 @@ def declined(source):
 
 def about_media(text):
     """An ask that needs the media itself to answer: only reactions and pointers at it, or a pointer at it and
-    one word of its own. Emoji alone count; greetings and questions with nothing pointing at it don't.
-
-    A format named in general is the question's own word, not a pointer: after "a" or "an" ("what is a video
-    codec?"), or bare and plural or before a noun when the ask has a word of its own besides ("how do gifs
-    loop?"). "funny clips" and "what song is in the video" still point at the post."""
-    words = re.findall(r"[^\W_]+", re.sub(r"<[^>]*>|['’]", '', text.casefold()))
+    one word of its own. Emoji alone count; greetings and questions with nothing pointing at it don't."""
+    words = re.findall(r"[^\W_]+", re.sub(r"<[^<>]*>|['’]", '', text.casefold()))  # One pass, even with no ">".
     own = {i for i, word in enumerate(words) if word not in REACTIONS | POINTERS | VAGUE | FILLER}
-    before = ['', *words]
-    own |= {i for i, word in enumerate(words) if word in FORMATS and (before[i] in ('a', 'an') or before[i] not in
-            DETERMINERS and (word.endswith('s') and own or i+1 in own))}
+    own |= in_general(words, own)
     if any(word in POINTERS for i, word in enumerate(words) if i not in own):
         return len(own) <= 1
     return not own and (not words or any(word in REACTIONS or word in VAGUE for word in words))
 
+
+def in_general(words, own):
+    """Formats a question names in general, which are its own words rather than pointers at the post: after "a"
+    ("what is a video codec?", "whats a good screenshot tool"), or bare and plural with a word of the question's
+    own ("how do gifs loop?") or defined ("what are gifs?"). Only in a question, so a short take ("gif broken?")
+    or an exclamation ("what a gif") is still about the post."""
+    if not words or not (words[0] in AUXILIARIES or ASKS & set(words)):
+        return set()
+    found = set()
+    for i, word in enumerate(words):
+        before = ['', '', '', *words[:i]][-3:]
+        if word not in FORMATS or before[-1] in DETERMINERS:
+            continue
+        if (before[-1] in ('a', 'an') and before[-2] not in ('what', 'such') or
+                before[-2] in ('a', 'an') and before[-1] not in DETERMINERS and before[-3] not in ('what', 'such')):
+            found.add(i)
+        elif word.endswith('s') and before[-1] not in ('a', 'an') and (own or before[-2:] == ['what', 'are']):
+            found.add(i)
+    return found
 
 def decline(context, event, source, reason, text, invitation):
     """Own media Fri didn't see. An ask about the media itself gets a short local line and no model call; a
