@@ -349,3 +349,92 @@ def test_an_erasure_during_the_contract_read_never_stops_the_others(monkeypatch,
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+# Sol round 2 of fri #250: an entry rebuilt from one an earlier process left keeps where it came from.
+
+async def restored_edit(w, monkeypatch):
+    """An edit's withdrawal timed out and was left on disk; the member erased through an older Fri (the file stays);
+    Fri started again remembering the newer controller, which then rolled back."""
+    from compat_tests.test_fri_saved_withdrawal import edit, edited
+    from fri.fri_turn_withdrawal import SavedTurns
+    started = w.fri.capabilities | NEWER
+    earlier = await earlier_exchange(w)
+    state = failing(w, WITHDRAW)
+    await edit(w, edited(earlier))
+    assert str(earlier.id) in on_disk(tmp_path_of(w))
+    w.store.personal_control('20', 'disable')
+    state['down'] = False
+    w.agent.saved_turns = SavedTurns(w.agent)
+    w.fri.capabilities = started
+    older_controller(w)
+    w.fri.capabilities = started  # Remembered from its start.
+    w.calls.clear()
+    if w.attempts is not None:
+        w.attempts.clear()
+    return earlier
+
+
+def tmp_path_of(w):
+    return w.fri.data
+
+
+def test_a_deletion_after_a_restored_edit_is_never_sent_unguarded(monkeypatch, tmp_path):
+    """The repro: the message's raw delete rebuilds its entry as a deletion. Gene refuses the newer fields (422), Fri
+    reads the contract again, and the rebuilt entry is still the earlier process's: it waits, never resent without its
+    revision, so nothing of the erased member is written."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = await restored_edit(w, monkeypatch)
+            await delete(w, earlier, guild=123)
+            assert erased_ids(w) == 0  # The live release writes the erased member's row for an unguarded one.
+            assert all('revision' in payload for payload in attempts(w, WITHDRAW))
+            assert str(earlier.id) in w.agent.saved_turns.pending
+            assert str(earlier.id) in w.agent.saved_turns.withheld([earlier.id])
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_save_here_naming_a_restored_entrys_message_keeps_it_an_earlier_ones(monkeypatch, tmp_path):
+    """Another path that rebuilds it: this process saves an exchange with the same message (an edit answered again,
+    say), then the message is deleted. The entry built from that save still came first from the earlier process."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            import time
+            earlier = await restored_edit(w, monkeypatch)
+            scope = {'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20'}
+            w.agent.saved_turns.kept({**scope, 'revision': 1, 'source': {'kind': 'discord_message', 'id': str(earlier.id)}},
+                                     {'ok': True}, (time.time(), time.monotonic()))
+            await delete(w, earlier, guild=123)
+            assert erased_ids(w) == 0  # The live release writes the erased member's row for an unguarded one.
+            assert all('revision' in payload for payload in attempts(w, WITHDRAW))
+            assert str(earlier.id) in w.agent.saved_turns.pending
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_restored_entry_rebuilt_goes_with_its_revision_where_the_guard_is(monkeypatch, tmp_path):
+    """Guard: against a controller with the guard, the rebuilt deletion is sent, with the revision first saved."""
+    async def scenario():
+        from compat_tests.test_fri_saved_withdrawal import edit, edited
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        if SOURCES not in w.fri.capabilities:
+            pytest.skip('needs a controller offering '+SOURCES)
+        try:
+            earlier = await earlier_exchange(w)
+            state = failing(w, WITHDRAW)
+            await edit(w, edited(earlier))
+            state['down'] = False
+            w.agent.saved_turns = SavedTurns(w.agent)
+            w.calls.clear()
+            await delete(w, earlier, guild=123)
+            assert [(payload.get('deleted'), payload.get('revision')) for payload in calls(w, WITHDRAW)] == [(True, 0)]
+            assert MARKER not in saved(w) and not w.agent.saved_turns.pending
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
