@@ -253,6 +253,35 @@ def test_a_masked_target_is_read_with_its_escapes_undone_and_kept_only_as_shown(
     assert link_posts(reply, read()) == sent
 
 
+# Review of fri #236: right after a "](", a kept link may be a masked link's target, which runs on to its ")". What comes
+# after the link there is its target's too ("<A>(x)/../../3/…" resolves to another post), so it stays only when a space
+# or ")" ends it. Dropping an escaped link can join the text around it into one, and an <…> one can be the target too.
+SUFFIX = '(x)/../../3/1300000000000000009'
+ESCAPED_SPLICE = '[clip](h[](https\\://discord.com/channels/123/2/1300000000000000009)'+FOUND[1:]+SUFFIX+')'
+
+
+@pytest.mark.parametrize('reply, sent', [
+    (ESCAPED_SPLICE, '[clip]('+SUFFIX+')'), (f'[clip]({FOUND}{SUFFIX})', '[clip]('+SUFFIX+')'),
+    (f'[kev\n](<{FOUND}>{SUFFIX})', '[kev\n]('+SUFFIX+')'), (f'[kev\n]({FOUND}<x/../../3/{ID})', f'[kev\n](<x/../../3/{ID})'),
+    (f'[kev\n]({FOUND}>x/../../3/{ID})', f'[kev\n](x/../../3/{ID})'), (f'[clip]({FOUND}\\(x/../../3/{ID})', 'clip'),
+    (f'[clip](\n{FOUND}{SUFFIX})', '[clip](\n'+SUFFIX+')'), (f'[kev\n]({FOUND}<x)', '[kev\n](<x)'),
+    # A space or ")" ends the target there, and the end of the text leaves no masked link.
+    (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'), (f'[clip]({FOUND} "the clip")', f'[clip](<{FOUND}> "the clip")'),
+    (f'[kev\n](<{FOUND}> )', f'[kev\n](<{FOUND}> )'), (f'[clip]({FOUND}', f'[clip](<{FOUND}>'),
+    # Not after a "](": no masked link's target, so what follows is only text.
+    (f'see ({FOUND}{SUFFIX})', f'see (<{FOUND}>{SUFFIX})'), (f'see ({FOUND}.) ok', f'see (<{FOUND}>.) ok'),
+])
+def test_a_shown_link_a_masked_target_runs_on_past_stays_only_once_its_target_ends(reply, sent):
+    from fri.fri_links import link_posts
+    assert link_posts(reply, read()) == sent
+
+
+def test_a_reply_built_from_receipts_never_keeps_a_shown_link_a_masked_target_runs_on_past():
+    from fri.fri_outcomes import fallback, receipt
+    sent = fallback([receipt('web_search', {'answer': f'[clip]({FOUND}{SUFFIX})', 'sources': [FOUND]})])
+    assert sent == '[clip]('+SUFFIX+')'
+
+
 # Spaces as Discord's markdown reads them (JavaScript's): <…> ends only at a plain space, while a bare link or a masked
 # link's target ends at any of these, but not at a control character Python also calls a space (review of fri #219).
 @pytest.mark.parametrize('space, ends', [('\u2003', True), ('\xa0', True), ('\v', True), ('\x1c', False), ('\x85', False)])
@@ -493,7 +522,7 @@ def test_a_reply_built_from_receipts_keeps_only_post_links_they_showed(kind, val
     # its target is read to a space, through a "<" or ">".
     ('[kev\n](https://discord.com/x<y/../'+PATH+')', '[kev\n]()'), ('[a]b](https://discord.com/x<y/../'+PATH+')', '[a]b]()'),
     ('[kev\n](<https://discord.com/a>b<c/../'+PATH+'>)', '[kev\n](<)'),
-    (f'[kev\n]({FOUND}<x)', f'[kev\n](<{FOUND}><x)'), (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'),
+    (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'),
 ])
 def test_a_bracket_inside_a_link_in_brackets_is_part_of_it(reply, sent):
     from fri.fri_links import link_posts
@@ -652,3 +681,13 @@ def test_a_first_word_holding_a_link_goes_whole_and_the_reply_says_so_if_nothing
     from fri.fri_links import EMPTY
     from fri.fri_outcomes import fallback, receipt
     assert fallback([receipt('web_search', {'answer': answer, 'sources': [{'url': FOUND}]})]) == EMPTY
+
+
+@pytest.mark.parametrize('answer, sent', [
+    ('🙂'*905+'https:', '🙂'*900), ('🙂'*905+'https://', '🙂'*900), ('a '+'🙂'*905+'https:', 'a '+'🙂'*899),
+    ('🙂'*905+'https://example.com', 'can’t link that one.'),
+], ids=['scheme', 'scheme-and-slashes', 'scheme-later', 'link'])
+def test_a_scheme_alone_is_cut_as_text(answer, sent):
+    """Review of fri #236: only a scheme with an address after it is a link the cut keeps whole."""
+    from fri.fri_outcomes import fallback, receipt
+    assert fallback([receipt('web_search', {'answer': answer, 'sources': []})]) == sent
