@@ -409,6 +409,11 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, "Not Now by ‘Me’", i said not now', 'Not Now by Me', False),
     ('wrong song, "Not Now by \'Me\'", not now', 'Not Now by Me', False),
     ('wrong song, "Not Now by ‘Blink-182’", i said "Not Now"', 'Not Now by Blink-182', True),
+    # A name of several words they quoted is a name, even one starting with a pronoun (round 1 of #165's review).
+    ('wrong song, "Not Now by ‘My Chemical Romance’", i said "Not Now"', 'Not Now by My Chemical Romance', True),
+    ('wrong song, "Not Now by “My Chemical Romance”", i said "Not Now"', 'Not Now by My Chemical Romance', True),
+    ('wrong song, "Not Now by \'Our Lady Peace\'", i said "Not Now"', 'Not Now by Our Lady Peace', True),
+    ('wrong song, Glad You Came by "My Chemical Romance", not now', 'Glad You Came My Chemical Romance not now', False),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
