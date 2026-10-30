@@ -286,8 +286,9 @@ advertises it, so the controller must be released first.
   by-ID request Fri learned at its start. Fri reads the controller's contract again then, at most once a
   minute, and its capabilities follow it everywhere; if the request it would make now differs, it's sent
   once more right away. One the controller can't take at all now waits, held back, until it can again.
-  One left in `withdrawals.json` by an earlier process is sent only, with its revision, to a controller
-  offering `withdrawal-sources`, which checks the revision it was saved under: a rolled-back Fri may
+  One left in `withdrawals.json` by an earlier process (first queued before this process started, which
+  the file records and every entry rebuilt for that message keeps: an edit's turned into a deletion, say)
+  is sent only, with its revision, to a controller offering `withdrawal-sources`, which checks the revision it was saved under: a rolled-back Fri may
   have carried out that member's "forget me" meanwhile, and an unguarded replay would write their IDs
   back. Against any other it's neither sent nor dropped but kept, held back, and the contract is read
   again on the retry schedule, so a Gene rolled forward takes it. Right before every request (the first,

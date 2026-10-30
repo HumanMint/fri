@@ -56,6 +56,8 @@ class SavedTurns:
         self.generation = 0  # Each queued entry's own number: a reply to an older one never settles a newer one.
         self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
         self.reread_at = 0.0  # time.monotonic() as the contract was last read again (see reread).
+        # This process's start, for withdrawals: one first queued before it came from an earlier process (see sendable).
+        self.started = time.time()
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -63,11 +65,14 @@ class SavedTurns:
     def capable(self, name):
         return name in getattr(self.agent.fri, 'capabilities', ())
 
-    def entry(self, **what):
-        """A queued withdrawal, with its own number and its member's erasure count now (see current)."""
+    def entry(self, queued_at=None, **what):
+        """A queued withdrawal, with its own number and its member's erasure count now (see current). queued_at: when a
+        withdrawal of its message was first queued, which every entry rebuilt for that message keeps, so one an earlier
+        process left can't pass as this one's (see sendable)."""
         self.generation += 1
         user = (what.get('scope') or {}).get('user_id') or what.get('user_id')
         return {**what, 'tries': 0, 'due': 0, 'gen': self.generation,
+                'queued_at': time.time() if queued_at is None else queued_at,
                 **({'erasure': self.erasure(user)} if user else {})}
 
     @property
@@ -85,11 +90,12 @@ class SavedTurns:
                         continue
                     deleted = entry.get('deleted') is True
                     if isinstance(entry.get('scope'), dict):
-                        revision = entry.get('revision')
-                        # From an earlier process: replayed only where its revision is checked (see drain).
+                        revision, queued = entry.get('revision'), entry.get('queued_at')
+                        # From an earlier process, whatever it says: replayed only where its revision is checked.
+                        queued = min(float(queued), self.started-1) if type(queued) in (int, float) else 0.0
                         self._pending[str(i)] = self.entry(scope={key: str(entry['scope'].get(key, '')) for key in (
                             'guild_id', 'channel_id', 'conversation_id', 'user_id')}, deleted=deleted,
-                            revision=revision if type(revision) is int and revision >= 0 else None, replayed=True)
+                            revision=revision if type(revision) is int and revision >= 0 else None, queued_at=queued)
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 LOG.warning('Pending withdrawals could not be read, so none are resent: %s', type(exc).__name__)
             self.prune(time.time())
@@ -113,7 +119,7 @@ class SavedTurns:
         if path := self.record():
             try:
                 private_json(path, {'pending': {i: {key: value for key, value in entry.items()
-                                                    if key not in ('gen', 'replayed', 'erasure')}
+                                                    if key not in ('gen', 'erasure')}
                                                 for i, entry in self.pending.items() if self.lasting(entry)}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
                 LOG.warning('Pending withdrawals could not be saved: %s', type(exc).__name__)
@@ -169,7 +175,7 @@ class SavedTurns:
             entry = self.saved.pop(i, None)
             if entry is not None:
                 if self.offered():
-                    self.pending[str(i)] = self.entry(scope=entry[1], revision=entry[2],
+                    self.pending[str(i)] = self.entry(scope=entry[1], revision=entry[2], queued_at=known.get('queued_at'),
                                                       deleted=deleted or known.get('deleted') is True)
                     queued = True
             elif server is not None and sent_at(i) > now-horizon:
@@ -177,12 +183,13 @@ class SavedTurns:
                     if 'scope' in known:  # Fri knows where it was saved: that one stands, deleted or not.
                         if deleted and not known.get('deleted'):
                             self.pending[str(i)] = self.entry(**{key: known[key] for key in ('scope', 'revision')},
-                                                              deleted=True)
+                                                              deleted=True, queued_at=known.get('queued_at'))
                             queued = True
                     elif not known or (deleted and not known.get('deleted')) or (i in authors and 'user_id' not in known):
                         author = authors.get(i, known.get('user_id'))
                         self.pending[str(i)] = self.entry(server=str(server), deleted=deleted or known.get('deleted')
-                                                          is True, **({'user_id': author} if author else {}))
+                                                          is True, queued_at=known.get('queued_at'),
+                                                          **({'user_id': author} if author else {}))
                         queued = True
             else:
                 continue  # Nothing Fri saves could hold it.
@@ -376,11 +383,13 @@ class SavedTurns:
 
     def sendable(self, entry):
         """Whether the controller, as it last said, offers the request this withdrawal needs, and can take it safely:
-        one from an earlier process only with the revision guard (SOURCES), and only with the revision it was saved
-        under, so a member erased since through another Fri gets nothing written."""
+        one from an earlier process (first queued before this one started, however it was rebuilt since: see entry)
+        only with the revision guard (SOURCES), and only with the revision it was saved under, so a member erased since
+        through another Fri gets nothing written."""
         if not self.offered() or ('scope' not in entry and not self.capable(SAVED_CAPABILITY)):
             return False
-        return not entry.get('replayed') or (self.capable(SOURCES) and entry.get('revision') is not None)
+        earlier = entry.get('queued_at', 0.0) < self.started
+        return not earlier or (self.capable(SOURCES) and entry.get('revision') is not None)
 
     @staticmethod
     def wait(entry):
