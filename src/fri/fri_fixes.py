@@ -17,7 +17,10 @@ in Discord tells the notice from another reply of Fri's to the report. Seen only
 unconfirmed, which the controller never checks again, it's taken back (fri #232), and so it is once that's recorded,
 or refused (fri #245): the claim's nonce and the channel are kept for a day, so a copy that comes later still is
 (fri #238). A take-back Discord refuses with a 403 is tried again until then, since Fri may be let again, and the
-owner hears of it once.
+owner hears of it once. A pass notes that it asked for an unconfirmed record before it asks, so the reply is still
+taken back when the controller later refuses that send reported as sent, which it may do for that record (fri #257).
+A copy Fri can't note while its notes can't be read or saved is kept in memory, bounded, until a write saves it
+(fri #258).
 """
 
 import asyncio
@@ -58,7 +61,8 @@ ECHOES = 20  # Sends settled unconfirmed whose copy a later take-back can still 
 TELLING = collections.Counter()  # Taps replying for each job in this process, which a pass leaves alone.
 TAKE_BACK = 10  # How long a take-back waits on Discord's answer. It never cancels the delete (see retract).
 DELETING = {}  # Each delete still on its way after its take-back moved on, by message, so none is doubled.
-TOLD = collections.deque(maxlen=ECHOES)  # Claims whose tap told the owner of a refused take-back, unsaved (fri #245).
+TOLD = {}  # Claims whose tap told the owner of a refused take-back, unsaved, by their note's time (fri #245, #258).
+SEEN = collections.deque(maxlen=ECHOES)  # Copies of notices Fri couldn't note yet, applied to each read (fri #258).
 SETTLING = weakref.WeakKeyDictionary()  # Each agent's settling pass, waited on like check's.
 JOB = re.compile(r'[a-f0-9]{12}')
 TELL_ID = re.compile(r'^fri:tell:(?P<job_id>[a-f0-9]{12})$')
@@ -481,7 +485,9 @@ async def tell_once(fri, job_id, actor):
                 note(fri, job_id, {**entry, 'told': True})
             except OSError as exc:  # Remembered here instead, and a pass saves it (see warn_owner).
                 LOG.warning('Requester notice send not noted: %s', type(exc).__name__)
-                TOLD.append(lease)
+                TOLD[lease] = when(entry)
+                while len(TOLD) > ECHOES:
+                    del TOLD[next(iter(TOLD))]
         elif entry and outcome != 'unconfirmed':
             forget(fri, job_id, lease)
         return taken_back(outcome, recorded.get('reason'), message, retried=entry is not None), False
@@ -508,23 +514,50 @@ def seen(fri, message):
     """Fri's own message as the gateway delivered it: the notice of a cleared send whose answer was lost, if it
     carries that claim's nonce in that channel (fri #221). Noted as sent, so the tap or the next pass records it,
     the controller checks it again and Fri takes it back if it no longer holds. Nothing else of Fri's matches:
-    each claim's nonce is its own. One settled unconfirmed by then is taken back (see bury). Never raises."""
+    each claim's nonce is its own. One settled unconfirmed by then is taken back (see bury). Never raises.
+
+    A copy Fri can't note, its notes unreadable or unwritable for now, is kept in memory instead: the newest ECHOES,
+    until KEEP. Each read of the notes applies it, so the tap and the passes still know where the reply went, and
+    the next write saves it (fri #258)."""
     nonce = getattr(message, 'nonce', None)
     if nonce is None or getattr(getattr(message, 'author', None), 'id', None) != getattr(fri.user, 'id', None):
         return
     try:
-        for job_id, entry in noted(fri).items():
-            if (not isinstance(entry, dict) or entry.get('message_id') or
-                    str(message.channel.id) != entry.get('channel_id')):
-                continue
-            if 'nonce' in entry:
-                if str(nonce) == entry['nonce']:
-                    keep(fri, job_id, {**entry, 'message_id': str(int(message.id)), 'take_back': True})
-            elif (entry.get('cleared') and (notice := notice_id(job_id, entry.get('lease'))) != job_id and
-                    str(nonce) == str(int(notice[:20], 16))):
-                keep(fri, job_id, {**entry, 'message_id': str(int(message.id))})
-    except (*MALFORMED, AttributeError):
+        copy = (str(message.channel.id), str(nonce), str(int(message.id)), time.time())
+        try:
+            entries = read(fri)
+        except OSError as exc:
+            LOG.warning('Requester notice copy not matched yet: %s', type(exc).__name__)
+            remember(copy)
+            return
+        for job_id, entry in entries.items():
+            if (update := matched(job_id, entry, copy)) is not None:
+                try:
+                    note(fri, job_id, update)
+                except OSError as exc:
+                    LOG.warning('Requester notice copy not noted yet: %s', type(exc).__name__)
+                    remember(copy)
+    except (*MALFORMED, AttributeError, RecursionError):
         LOG.info('A requester notice copy could not be matched')
+
+
+def matched(job_id, entry, copy):
+    """The note once its send's copy came (see seen), or None if copy isn't that: its claim's nonce in its channel."""
+    channel_id, nonce, message_id, _ = copy
+    if not isinstance(entry, dict) or entry.get('message_id') or channel_id != entry.get('channel_id'):
+        return None
+    if 'nonce' in entry:
+        return {**entry, 'message_id': message_id, 'take_back': True} if nonce == entry['nonce'] else None
+    if (entry.get('cleared') and (notice := notice_id(job_id, entry.get('lease'))) != job_id and
+            nonce == str(int(notice[:20], 16))):
+        return {**entry, 'message_id': message_id}
+    return None
+
+
+def remember(copy):
+    """Kept once per message, and only the newest ECHOES (see read)."""
+    if all(kept[2] != copy[2] for kept in SEEN):
+        SEEN.append(copy)
 
 
 async def retract(channel, message_id):
@@ -591,18 +624,45 @@ def taken_back(outcome, reason, report, retried=False):
 
 def noted(fri):
     try:
-        entries = json.loads((fri.data/PENDING).read_text())
-    except FileNotFoundError:
-        return {}
+        return read(fri)
     except (ValueError, RecursionError, OSError) as exc:
         LOG.warning('Requester notice sends unreadable (%s)', type(exc).__name__)
         return {}
-    return entries if isinstance(entries, dict) else {}
+
+
+def read(fri):
+    """The notes, with each copy Fri saw but couldn't note yet applied as seen would have (fri #258). A copy none of
+    them needs any more, saved or settled, is forgotten. Raises if they can't be read."""
+    try:
+        entries = json.loads((fri.data/PENDING).read_text())
+    except FileNotFoundError:
+        entries = {}
+    if not isinstance(entries, dict):
+        return {}
+    needed = []
+    for copy in SEEN:
+        for job_id, entry in entries.items():
+            try:
+                update = matched(job_id, entry, copy)
+            except MALFORMED:
+                continue
+            if update is not None:
+                entries[job_id] = update
+                if copy not in needed:
+                    needed.append(copy)
+    SEEN.clear()
+    SEEN.extend(needed)
+    return entries
 
 
 def note(fri, job_id, entry):
-    """Read again just before each write, like save. Raises if it can't be written: a send isn't cleared then."""
-    entries = noted(fri)
+    """Read again just before each write, like save. Raises if it can't be written, or if the others can't be read,
+    since writing over them would lose them: a send isn't cleared then. A file that isn't notes is replaced."""
+    try:
+        entries = read(fri)
+    except (ValueError, RecursionError) as exc:
+        LOG.warning('Requester notice sends unreadable (%s)', type(exc).__name__)
+        entries = {}
     entries[job_id] = entry
     private_json(fri.data/PENDING, entries)
 
@@ -655,11 +715,23 @@ def stale(job_id, entry):
 
 def expire(fri):
     """Stale notes dropped before the heartbeat waits on the controller, whose outage would otherwise keep their
-    channel and message IDs for as long as it lasts (fri #238). A tap's own is left to it. Raises if the write fails."""
-    entries = noted(fri)
+    channel and message IDs for as long as it lasts (fri #238). A tap's own is left to it. What the process remembers
+    goes at KEEP too, and copies it couldn't note yet are saved now, if they can be (fri #258). Raises if the write
+    fails."""
+    now = time.time()
+    for lease in [lease for lease, at in TOLD.items() if now-at > KEEP]:
+        del TOLD[lease]
+    while SEEN and now-SEEN[0][3] > KEEP:
+        SEEN.popleft()
+    try:
+        entries = read(fri)
+    except (ValueError, RecursionError, OSError) as exc:  # Nothing written over notes it can't read.
+        LOG.warning('Requester notice sends unreadable (%s)', type(exc).__name__)
+        return
     kept = {job_id: entry for job_id, entry in entries.items() if TELLING.get(job_id) or not stale(job_id, entry)}
     if len(kept) < len(entries):
         LOG.warning('Gave up settling %d requester notice send(s)', len(entries)-len(kept))
+    if len(kept) < len(entries) or SEEN:  # Read applied what's left of SEEN, which is what this saves.
         private_json(fri.data/PENDING, kept)
 
 
@@ -693,9 +765,11 @@ async def settle(agent):
 
 async def settle_all(fri):
     """Each cleared send whose tap never saw it through: a lost answer, a shutdown, a take-back cut off."""
-    for job_id, entry in noted(fri).items():
-        if TELLING.get(job_id):
+    for job_id in list(noted(fri)):
+        entries = noted(fri)  # As they are now: a copy may have come while one before it settled (see seen).
+        if job_id not in entries or TELLING.get(job_id):
             continue
+        entry = entries[job_id]
         try:
             if stale(job_id, entry):
                 LOG.warning('Gave up settling a requester notice send')
@@ -719,7 +793,11 @@ async def settle_one(fri, job_id, entry):
     as sent (see seen), so the controller checks it again. One whose copy came only once it was being recorded as
     unconfirmed is taken back: that record is final, so nothing checks it now (fri #232), and so is one the
     controller refuses to record (fri #245). Unseen by then, what its copy needs is kept (see bury). A take-back
-    Discord refuses for now is tried again, and the owner told once."""
+    Discord refuses for now is tried again, and the owner told once.
+
+    Fri notes that it asked for the unconfirmed record before it does. Its answer lost and the copy seen, a later
+    pass reports the send as sent, and a refusal then may be for that record: a controller before gene #143 refuses a
+    finish heard again, and a later one can't match the lease that one cleared. So that's taken back too (fri #257)."""
     message_id = str(entry.get('message_id') or '')
     if 'nonce' in entry and not message_id:
         return False  # Settled unconfirmed: only its copy, if it comes, leaves anything to do.
@@ -727,14 +805,21 @@ async def settle_one(fri, job_id, entry):
         return False  # A send from a tap that just stopped may still land.
     if not entry.get('take_back'):
         state = 'sent' if message_id else 'uncertain' if entry.get('cleared') else 'failed'
+        if state == 'uncertain' and not entry.get('unsure'):
+            entry = {**entry, 'unsure': True}
+            note(fri, job_id, entry)  # Raises if it can't be noted, and then nothing is asked: a later pass tries.
+        refused = False
         try:
             recorded = await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
                                      {'guild_id': str(fri.guild_id), 'user_id': str(entry['actor']),
                                       'lease': entry['lease'], 'state': state, 'message_id': message_id})
         except ControllerRejected:
-            if state != 'uncertain':
-                return True  # No claim of this lease (another tap's, or recorded), or no such route: an older controller.
-            recorded = None  # Refused (a rollback, say), it may still be up, and nothing will check it (fri #245).
+            # No claim of this lease (another tap's, or recorded), or no such route (an older controller): a send
+            # Discord confirmed, or never cleared, is settled. One that may be recorded unconfirmed, by this pass or
+            # one whose answer was lost, may still be up, and nothing will check it (fri #245, #257).
+            if not (state == 'uncertain' or entry.get('unsure')):
+                return True
+            recorded, refused = None, True
         current = noted(fri).get(job_id)  # Read again: its copy may have come while the finish was out (see seen).
         if (not message_id and isinstance(current, dict) and current.get('lease') == entry['lease'] and
                 current.get('message_id')):
@@ -742,7 +827,8 @@ async def settle_one(fri, job_id, entry):
         held = recorded.get('state') if isinstance(recorded, dict) else None
         # Up, and either no longer holding or unconfirmed, recorded so or refused, which nothing checks again. A sent
         # one the controller says nothing of was recorded as sent: an older controller.
-        if not (message_id and (held in ('uncertain', 'invalidated') or state == 'uncertain' and held != 'sent')):
+        if not (message_id and (held in ('uncertain', 'invalidated') or refused or
+                                state == 'uncertain' and held != 'sent')):
             if state != 'uncertain' or message_id:
                 return True
             bury(fri, job_id, entry)
@@ -781,6 +867,7 @@ async def warn_owner(fri, job_id, entry, channel, message_id):
     except OSError as exc:
         LOG.warning('Owner not told of a refused take-back yet: %s', type(exc).__name__)
         return
+    TOLD.pop(entry['lease'], None)  # Saved, so the process needn't remember it (fri #258).
     if told:
         return
     guild = getattr(getattr(channel, 'guild', None), 'id', None) or '@me'

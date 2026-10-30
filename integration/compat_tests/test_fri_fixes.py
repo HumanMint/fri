@@ -2028,3 +2028,31 @@ def test_a_note_written_while_the_others_cant_be_read_writes_over_none_of_them(w
         fri_fixes.note(world.fri, 'f'*12, {'lease': 'e'*32, 'actor': str(OWNER), 'channel_id': '456',
                                            'since': time.time(), 'at': time.time()})
     assert pending(world) == before
+
+
+def test_a_copy_noted_while_an_earlier_send_settles_is_kept_by_the_pass(world, monkeypatch):
+    """A pass settles each note in turn, and a copy can be noted while one before it is out. Noting that it asks for
+    the next one's unconfirmed record (fri #257) mustn't write over that copy: each is settled as it is by then, so
+    it's reported as sent, and the controller checks it again."""
+    from fri.private_files import private_json
+    job_id, lease, copy = cut_off_once_cleared(world)
+    first, then = 'a'*12, time.time()-120  # Another claim's send, settled before it.
+    private_json(world.fri.data/'requester-notices.json', {
+        first: {'lease': 'e'*32, 'actor': str(OWNER), 'channel_id': '456', 'since': then, 'at': then, 'cleared': True},
+        **pending(world)})
+    api = world.fri.api.side_effect
+
+    async def meanwhile(method, path, body=None):
+        if path == f'/requests/{first}/requester-notice/finish':
+            fri_fixes.seen(world.fri, copy)
+            raise ControllerRejected('Not Found', 404)
+        return await api(method, path, body)
+
+    world.fri.api.side_effect = meanwhile
+    deleted = reply_deletions(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    state, message_id = notice_row(world, job_id)
+    if state == 'invalidated':  # A controller that checks it again (gene #47): the reporter erased.
+        assert [str(id) for id in deleted] == [str(copy.id)] and job_id not in pending(world)
+    else:  # One that doesn't records it as it was sent.
+        assert (state, message_id) == ('sent', str(copy.id)) and not deleted and job_id not in pending(world)
