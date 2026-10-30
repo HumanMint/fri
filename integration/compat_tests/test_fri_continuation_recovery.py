@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from collections import deque
 from types import SimpleNamespace
 
 import discord
@@ -504,12 +505,19 @@ def failing_rerun_fetch(channel, failures, error=server_error, during=None):
     return made
 
 
+def talked_before(agent, user=20, revision=0):
+    """Gene gave Fri this member's privacy revision a minute ago, as a turn of theirs then did: the baseline an
+    unreadable rerun's notice needs (see Agent.unread)."""
+    vars(agent).setdefault('revisions_read', {})[str(user)] = deque([(time.time()-60, revision)], maxlen=16)
+
+
 def test_an_edited_questions_rerun_whose_fetch_keeps_failing_tells_them_so(monkeypatch, tmp_path):
     """fri #243, the issue's ordering: the edited question's rerun can't fetch it, a server error each time. That's
     no sign it was deleted: it's tried again, a few times, then the question hears Fri couldn't read it, a fixed
     notice, instead of being settled as deleted with nothing said."""
     async def scenario():
         fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        talked_before(agent)
         message = members(message)
         model = Model(fri, tmp_path, waits={1: 'before'})
         gathering = gathered(monkeypatch)
@@ -544,6 +552,7 @@ def test_an_unreadable_reruns_notice_counts_as_told_even_if_cleaning_up_after_it
     fails or is cancelled can't leave the ledger calling a question that heard why quiet."""
     async def scenario():
         fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        talked_before(agent)
         message = members(message)
         model = Model(fri, tmp_path, waits={1: 'before'})
         gathering = gathered(monkeypatch)
@@ -611,6 +620,7 @@ def test_an_unreadable_rerun_stays_quiet_once_its_question_no_longer_stands(monk
     event, Fri going off or its author leaving, during those tries, leaves it quiet."""
     async def scenario():
         fri, agent, _, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        talked_before(agent)
         message = members(message)
         model = Model(fri, tmp_path, waits={1: 'before'})
         gathering = gathered(monkeypatch)
@@ -650,6 +660,39 @@ def test_an_unreadable_rerun_stays_quiet_once_its_question_no_longer_stands(monk
             question.reply.assert_not_awaited()
             outcomes = agent.ledger.snapshot()
             assert not outcomes['told_why'].get('fetch failed: HTTPException') and outcomes['in_flight'] == 0
+        finally:
+            model.hold[1].set()
+            for event in (release, fetched, *gathering):
+                if event:
+                    event.set()
+            await finish(fri, tasks)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('before', [None, 0], ids=['first read after it', 'read before it'])
+def test_an_unreadable_rerun_stays_quiet_when_gene_erased_before_its_question_was_first_read(
+        monkeypatch, tmp_path, before):
+    """Review of fri #246 (round 3): Gene erased them (cleared chats) just as they sent the question, so its first
+    read already says revision 1, and every check since agrees. With no read from before it was sent, nothing
+    shows the erasure came first, so no notice; with one (revision 0), the revision moved since, so none either."""
+    async def scenario():
+        fri, agent, store, _, channel, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        if before is not None:
+            talked_before(agent, revision=before)
+        store.clear_chats('20')
+        message = members(message)
+        model = Model(fri, tmp_path, waits={1: 'before'})
+        gathering = gathered(monkeypatch)
+        tasks, release, fetched = [], None, None
+        try:
+            question, tasks, fetching, fetched, release = await edited_while_recovering(
+                agent, model, message, gathering, channel, rows)
+            fetched.set()
+            made = failing_rerun_fetch(channel, 99)
+            await until(lambda: not agent.reruns, 10)
+            assert len(made) == 1+len(REFETCH_BACKOFF)
+            question.reply.assert_not_awaited()
+            assert not agent.ledger.snapshot()['told_why'].get('fetch failed: HTTPException')
         finally:
             model.hold[1].set()
             for event in (release, fetched, *gathering):
