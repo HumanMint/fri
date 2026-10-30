@@ -268,6 +268,10 @@ ESCAPED_SPLICE = '[clip](h[](https\\://discord.com/channels/123/2/13000000000000
     # A space or ")" ends the target there, and the end of the text leaves no masked link.
     (f'[kev\n]({FOUND})', f'[kev\n](<{FOUND}>)'), (f'[clip]({FOUND} "the clip")', f'[clip](<{FOUND}> "the clip")'),
     (f'[kev\n](<{FOUND}> )', f'[kev\n](<{FOUND}> )'), (f'[clip]({FOUND}', f'[clip](<{FOUND}>'),
+    # Past a space, the target ends unless a ")" or a title closes it, or a "(" before the space runs on through it.
+    (f'[kev\n](\n{FOUND}? ok', f'[kev\n](\n<{FOUND}>? ok'), (f'[kev\n]({FOUND}? ok)', f'[kev\n](<{FOUND}>? ok)'),
+    (f'[kev\n]({FOUND}? )', '[kev\n](? )'), (f'[kev\n]({FOUND}? "t")', '[kev\n](? "t")'),
+    (f'[kev\n]({FOUND}?(a b)/../../3/{ID})', f'[kev\n](?(a b)/../../3/{ID})'),
     # Not after a "](": no masked link's target, so what follows is only text.
     (f'see ({FOUND}{SUFFIX})', f'see (<{FOUND}>{SUFFIX})'), (f'see ({FOUND}.) ok', f'see (<{FOUND}>.) ok'),
 ])

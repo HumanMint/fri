@@ -3,13 +3,16 @@
 import re
 from enum import Enum
 
-from .fri_links import EMPTY, LINKED, SPACE, link_posts
+from .fri_links import EMPTY, ESCAPED, SPACE, link_posts
 from .fri_memory import clip, units
 from .fri_notices import notice_text
 from .privacy import clean
 
 LIMIT = 1800  # UTF-16 units, as Discord counts a message's length.
 GAP, WORD = re.compile(f'[{SPACE}]'), re.compile(f'[^{SPACE}]*')
+# A link the cut keeps whole: a scheme with an address after it, escaped too as in a masked link's target. A scheme
+# alone is only text.
+ADDRESS = re.compile(ESCAPED+r'[/\\]+[^'+SPACE+r'/\\]', re.I)
 
 
 class Outcome(str, Enum):
@@ -60,7 +63,7 @@ def fit(text, evidence, limit=LIMIT):
         cut = start = len(clip(text, budget))
         while start and not GAP.match(text, start-1):
             start -= 1
-        if LINKED.search(text, start, WORD.match(text, cut).end()):
+        if ADDRESS.search(text, start, WORD.match(text, cut).end()):
             if not text[:start].strip():
                 return EMPTY
             cut = start  # A word holding a link goes whole.

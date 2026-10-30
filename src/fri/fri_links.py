@@ -49,6 +49,10 @@ RUN = re.compile(r'[^'+SPACE+r'<]*')
 # Right after a "(", one may be the target of a masked link LINK doesn't take (a label holding a newline, or a "]"
 # Discord allows), which a "<" doesn't end either: it's read to a space instead (see aimed), or past an escaped one.
 TARGET = re.compile(r'(?:'+PAIR+r'|[^'+SPACE+r'])*')
+# What ends a masked link's target right after a link kept in it (see past): a space or its ")". Past a space, only a
+# ")" or a title's quote closes it.
+CLOSED = re.compile(r'[)'+SPACE+r']')
+CLOSES = re.compile(r'['+SPACE+r']*[)\'"]')
 # The rest of a bare one: a trailing slash, query or fragment is part of it. Sentence punctuation or markdown at its
 # end isn't, nor an emoji or other non-URL text right after it, nor a word after closing markdown ("**…**this"):
 # inside it, "_" and "~" are its own (?utm_source=…), but it never ends on them, "*" or "|". Markdown opened before
@@ -240,10 +244,31 @@ def aimed(text, at):
     return targeted(text, at-(text[at-1:at] == '<'))
 
 
+def framed(text, at):
+    """aimed, after a "](": the link at `at` may be a masked link's target, which runs on to its ")"."""
+    while at and text[at-1] <= ' ':
+        at -= 1
+    at -= text[at-1:at] == '<'
+    while at and (text[at-1].isspace() or text[at-1] == '\ufeff'):
+        at -= 1
+    return at >= 2 and text[at-2:at] == ']('
+
+
+def past(text, end, closing):
+    """Whether a masked link's target holding a link that ends at `end` may run on past it (fri #236): over what follows
+    up to a space, or through one from a "(" in that, to a ")" or a title that closes it. Not past the last ")"
+    (`closing`), where nothing closes one."""
+    if end > closing or CLOSED.match(text, end):
+        return False
+    run = TARGET.match(text, end).end()
+    return '(' in text[end:run] or ')' in text[end:run] or bool(CLOSES.match(text, run))
+
+
 def once(text, allowed, found):
     """`text` with each post link in it kept, as <link>, or dropped (see link_posts), once. `found`: what ends found for
     each run of text read so far."""
     parts, done, at, marks, channels, runs = [], 0, 0, frozenset(), set(), {}
+    closing = text.rfind(')')  # Past the last ")", no masked link closes.
     bare, angled, target = (1, 0), (1, 0), (1, 0)
 
     def length(scheme, start, stop, whole, plain=True):
@@ -311,7 +336,8 @@ def once(text, allowed, found):
             if name == 'bare':
                 tail = TAILS[marks].match(text, start+size).end()
                 url, end = text[start:tail], tail+text.startswith('>', tail)
-            kept = f'<{url}>' if url in allowed else ''
+            # Exactly a shown link, and a masked link's whole target if it may be one ("<A>(x)/../.." isn't A).
+            kept = f'<{url}>' if url in allowed and not (framed(text, start) and past(text, end, closing)) else ''
         parts += [text[done:begin], kept]
         done = at = end
     return ''.join(parts)+text[done:]
