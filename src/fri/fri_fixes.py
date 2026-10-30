@@ -14,9 +14,10 @@ offers by then: it records what happened and takes back a reply that no longer h
 was lost is known only by Discord's own copy of it, which Fri's gateway delivers with its claim's nonce
 (fri #221): seen, it's recorded as sent and so checked again, and unseen it stays unconfirmed, since nothing
 in Discord tells the notice from another reply of Fri's to the report. Seen only once a pass was recording it as
-unconfirmed, which the controller never checks again, it's taken back (fri #232), and so it is once that's recorded:
-the claim's nonce and the channel are kept for a day, so a copy that comes later still is (fri #238). A take-back
-Discord refuses with a 403 is tried again until then, since Fri may be let again, and the owner hears of it once.
+unconfirmed, which the controller never checks again, it's taken back (fri #232), and so it is once that's recorded,
+or refused (fri #245): the claim's nonce and the channel are kept for a day, so a copy that comes later still is
+(fri #238). A take-back Discord refuses with a 403 is tried again until then, since Fri may be let again, and the
+owner hears of it once.
 """
 
 import asyncio
@@ -57,6 +58,7 @@ ECHOES = 20  # Sends settled unconfirmed whose copy a later take-back can still 
 TELLING = collections.Counter()  # Taps replying for each job in this process, which a pass leaves alone.
 TAKE_BACK = 10  # How long a take-back waits on Discord's answer. It never cancels the delete (see retract).
 DELETING = {}  # Each delete still on its way after its take-back moved on, by message, so none is doubled.
+TOLD = collections.deque(maxlen=ECHOES)  # Claims whose tap told the owner of a refused take-back, unsaved (fri #245).
 SETTLING = weakref.WeakKeyDictionary()  # Each agent's settling pass, waited on like check's.
 JOB = re.compile(r'[a-f0-9]{12}')
 TELL_ID = re.compile(r'^fri:tell:(?P<job_id>[a-f0-9]{12})$')
@@ -475,7 +477,11 @@ async def tell_once(fri, job_id, actor):
             entry = keep(fri, job_id, {**entry, 'take_back': True})
         outcome = await retract(channel, message_id)
         if entry and outcome == 'forbidden':  # This answer tells the owner, so the passes trying again stay quiet.
-            keep(fri, job_id, {**entry, 'told': True})
+            try:
+                note(fri, job_id, {**entry, 'told': True})
+            except OSError as exc:  # Remembered here instead, and a pass saves it (see warn_owner).
+                LOG.warning('Requester notice send not noted: %s', type(exc).__name__)
+                TOLD.append(lease)
         elif entry and outcome != 'unconfirmed':
             forget(fri, job_id, lease)
         return taken_back(outcome, recorded.get('reason'), message, retried=entry is not None), False
@@ -711,8 +717,9 @@ async def settle_one(fri, job_id, entry):
     A send cut off before Fri heard its outcome is recorded as unconfirmed once it was cleared (it may be up),
     and as failed before then: Fri never sends without the controller's go. One whose copy Fri saw is recorded
     as sent (see seen), so the controller checks it again. One whose copy came only once it was being recorded as
-    unconfirmed is taken back: that record is final, so nothing checks it now (fri #232). Unseen by then, what its
-    copy needs is kept (see bury). A take-back Discord refuses for now is tried again, and the owner told once."""
+    unconfirmed is taken back: that record is final, so nothing checks it now (fri #232), and so is one the
+    controller refuses to record (fri #245). Unseen by then, what its copy needs is kept (see bury). A take-back
+    Discord refuses for now is tried again, and the owner told once."""
     message_id = str(entry.get('message_id') or '')
     if 'nonce' in entry and not message_id:
         return False  # Settled unconfirmed: only its copy, if it comes, leaves anything to do.
@@ -725,14 +732,17 @@ async def settle_one(fri, job_id, entry):
                                      {'guild_id': str(fri.guild_id), 'user_id': str(entry['actor']),
                                       'lease': entry['lease'], 'state': state, 'message_id': message_id})
         except ControllerRejected:
-            return True  # No claim of this lease (another tap's, or recorded), or no such route: an older controller.
+            if state != 'uncertain':
+                return True  # No claim of this lease (another tap's, or recorded), or no such route: an older controller.
+            recorded = None  # Refused (a rollback, say), it may still be up, and nothing will check it (fri #245).
         current = noted(fri).get(job_id)  # Read again: its copy may have come while the finish was out (see seen).
         if (not message_id and isinstance(current, dict) and current.get('lease') == entry['lease'] and
                 current.get('message_id')):
             entry, message_id = current, str(current['message_id'])
         held = recorded.get('state') if isinstance(recorded, dict) else None
-        # Up, and either no longer holding or recorded unconfirmed, which the controller never checks again.
-        if not (message_id and (held == 'uncertain' or state == 'sent' and held == 'invalidated')):
+        # Up, and either no longer holding or unconfirmed, recorded so or refused, which nothing checks again. A sent
+        # one the controller says nothing of was recorded as sent: an older controller.
+        if not (message_id and (held in ('uncertain', 'invalidated') or state == 'uncertain' and held != 'sent')):
             if state != 'uncertain' or message_id:
                 return True
             bury(fri, job_id, entry)
@@ -751,14 +761,28 @@ async def settle_one(fri, job_id, entry):
 
 
 async def warn_owner(fri, job_id, entry, channel, message_id):
-    """The owner hears once where the reply Discord won't let Fri take back is, and the passes keep trying."""
-    try:
-        owner = fri.get_user(fri.owner_id) or await fri.fetch_user(fri.owner_id)
-        dm = owner.dm_channel or await owner.create_dm()
-    except TAP_FAILURES as exc:  # Not told yet, so the next pass, trying again, tells them then.
-        LOG.info('Owner DM not reached for a refused take-back: %s', type(exc).__name__)
+    """The owner hears once where the reply Discord won't let Fri take back is, and the passes keep trying. Told
+    only once that's saved, from the note as it is then: one the heartbeat dropped meanwhile stays gone, and a pass
+    that can't save it says nothing and tries again (fri #245). One a tap already told is saved, and nothing said."""
+    told = entry['lease'] in TOLD
+    if not told:
+        try:
+            owner = fri.get_user(fri.owner_id) or await fri.fetch_user(fri.owner_id)
+            dm = owner.dm_channel or await owner.create_dm()
+        except TAP_FAILURES as exc:  # Not told yet, so the next pass, trying again, tells them then.
+            LOG.info('Owner DM not reached for a refused take-back: %s', type(exc).__name__)
+            return
+    current = noted(fri).get(job_id)  # Read again: past KEEP while Discord answered, it's gone (see expire).
+    if not (isinstance(current, dict) and current.get('lease') == entry['lease'] and not current.get('told') and
+            not stale(job_id, current)):
         return
-    keep(fri, job_id, {**entry, 'told': True})  # At most once: a DM whose answer was lost isn't repeated.
+    try:
+        note(fri, job_id, {**current, 'told': True})  # At most once: a DM whose answer was lost isn't repeated.
+    except OSError as exc:
+        LOG.warning('Owner not told of a refused take-back yet: %s', type(exc).__name__)
+        return
+    if told:
+        return
     guild = getattr(getattr(channel, 'guild', None), 'id', None) or '@me'
     try:
         await dm.send(notice_text('my reply to a reporter has to come down, and discord won’t let me delete it. '
