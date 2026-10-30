@@ -167,6 +167,7 @@ TITLE_QUOTE = re.compile(rf'(?P<double>["“])|(?P<link>https://\S+)|{OPENER}')
 CLOSER = re.compile(rf"(?P<loose>{OPENER}|(?<!\S)['‘](?!\w))|(?P<dropped>(?:(?<=in)|(?<=\bol)|(?<=\blil)|(?<=\bn)|(?<=\bo)|(?<=\ban))'"
                     r"(?=\s+\w))|(?<=\S)'(?!\w)")
 WORD = re.compile(r"[\w']+")
+UNCLOSED = re.compile(r"[\s\"“”‘']*(?P<words>[\w']+(?:\s+[\w']+)*)")  # Marks, then words up to a pause.
 CLAUSE = r"(?:^|[,;:.!?—–\-\"'‘“”]\s*|\b(?:and|but|or|so|then|also|plus|like|actually|wait|lol|nah|no|oh|please|pls|just)\s+)"
 # Outside a quoted title, any of these means the message is not asking for that song now.
 REFUSED = re.compile(
@@ -201,9 +202,9 @@ WITHDRAWN = re.compile(r"\b(?:actually,?\s+(?:no(?:pe|t that)?|nah)|no,?\s+wait|
                        rf"|{SAID}(?:(?:not|never)(?:\s+to(?:\s+do\s+(?:that|this|it))?)?"
                        rf"|(?:no(?:pe)?|nah)(?:\s+to\s+(?:that|this|it)(?:\s+(?:one|song|track))?)?)\b{CLOSING}")
 # So does a closing "not now" or "no more" after a pause, a "no" or their own "i said" ("..., no, not right now", "we
-# said no more"), though only after the song they named: in it, those words are its title ("No More, No More"), as
-# they are when they say the song again ("Not Now, i said not now"). LATER stays out of CLOSING, so a run of ", not
-# now" can't make every pause read on to the end.
+# said no more"), though only after the song they named, or an artist named in it: in its title, those words are the
+# title's ("No More, No More"), as they are when they say the song again ("Not Now, i said not now"). LATER stays out
+# of CLOSING, so a run of ", not now" can't make every pause read on to the end.
 LATER = (r"(?:not\s+(?:(?:right|just)\s+)?(?:now|rn)|not\s+(?:for\s+now|any\s*more|today|tonight)|no\s+more"
          r"(?:\s+(?:of\s+)?(?:(?:that|this|these|those|it|them)(?:\s+(?:ones?|songs?|tracks?))?|music|songs?|tracks?))?)\b")
 STOPPED = re.compile(rf"(?:[,;:.!?…—–\-'\"]|\bn(?:o|ah)\b[,.!]?|{SAID})\s*(?P<later>{LATER}){CLOSING}")
@@ -252,8 +253,9 @@ ARTIST = re.compile(r"\b((?:by|from|featuring|ft\.?|feat\.?)\s+)(?P<first>[\w']+
 # A hand-off or denial is read past an artist's whole name: what they quoted, or its words up to a clause break, another
 # artist, their own "i" or "we", or the end, at most four and none after the first a pronoun ("by She Wants Revenge",
 # not "by Taylor wants they chose"). In it, a verb handing the song to someone is the name's only as its second word,
-# with a name after it ("by Taylor wants" and "by Alex asked for" aren't), and never one introducing someone's words,
-# which stay theirs ("by Alex said Taylor").
+# with a name after it ("by Taylor wants" and "by Taylor wants to" aren't), and never one introducing, reporting or
+# hearing someone's words, which stay theirs ("by Alex said Taylor", "by Taylor told Alex", "by Taylor heard Alex").
+HANDS = r"(?:wants?|wanted|picked|meant)"
 OBJECTLESS = {'to', 'for', 'of', 'about'}
 SPEAKER = re.compile(r"(?:i|we)(?:'\w+)?")  # Their own subject: "i", "we", "i'm", "we've".
 CORRECTION_SECONDS = 600  # How long after Gene played a song for someone they can put it right.
@@ -320,6 +322,25 @@ def masked(text, spans):
     return ''.join(parts)+text[at:]
 
 
+def artist_first(text, artist):
+    """The first word of the artist named at this ARTIST match. One they quoted names a pronoun only when the quote
+    holds that word alone, however it's spaced or nested ("by ‘Me’", "by ' Me '", "by “‘Me’”"): any more words make it
+    a name, whatever comes between them ("by ‘My Chemical Romance’", "by ‘Me & My’"). It's the quote artist_spans
+    reads; one that doesn't close counts its words up to a pause ("by "Me, no more")."""
+    at = artist.end(1)
+    if text[at:at+1] not in ('"', '“', "'", '‘'):
+        word = WORD.match(text, at)
+        return word[0].strip("'") if word else ''
+    close = quoted_title(text, at)
+    if close and close > 0:
+        said = WORD.findall(text, at+1, close-1)
+    else:
+        run = UNCLOSED.match(text, at)
+        said = run['words'].split() if run else []
+    said = [word.strip("'") for word in said if word.strip("'")]
+    return said[0] if len(said) == 1 else ''
+
+
 def artist_spans(text, artist):
     """The spans to mask for the artist named at this ARTIST match, and where an artist they quoted ends: where a
     withdrawal or someone else's words are read, its first word, or each word they quoted, its opening mark with the
@@ -346,7 +367,7 @@ def artist_spans(text, artist):
             return first, (at, artist.end()), None
         name.append(said)
         end = word.end()
-    if any(TRAILING.fullmatch(said) and not (i == 1 and name[0] != 'the' and not re.fullmatch(SAYS, said)
+    if any(TRAILING.fullmatch(said) and not (i == 1 and name[0] != 'the' and re.fullmatch(HANDS, said)
                                              and name[2:] and name[2] not in OBJECTLESS)
            for i, said in enumerate(name[1:], 1)):
         end = artist.end()
@@ -382,8 +403,8 @@ def replacement(text, song, start, named):
     title = said[0][2]  # An artist follows the title's first word, never starts it.
     if quoted:  # Only this title is protected, never another quote in the message, and it ends where they closed it.
         # Its own title is what they quoted, up to an artist they quoted with it ("Not Now by Blink-182"), though not
-        # a connector before a pronoun ("Stand By Me").
-        own = next((m.start() for m in ARTIST.finditer(text, title, end) if m['first'].strip("'") not in NOT_ARTISTS),
+        # a connector before a pronoun, quoted or not ("Stand By Me", "Not Now by ‘Me’").
+        own = next((m.start() for m in ARTIST.finditer(text, title, end) if artist_first(text, m) not in NOT_ARTISTS),
                    end)
         text = text[:start]+'"'+' '*(end-start-2)+'"'+text[end:]
         song_end = clause = end
@@ -408,9 +429,13 @@ def replacement(text, song, start, named):
     denials = (clause, song_end, after) if after else (clause, song_end)
     if not quoted:  # Its own title is the words before an artist they named in it ("Not Now by Blink-182").
         own = min((m.start() for m, *_ in artists if m.start() < song_end), default=song_end)
-    # Past the song they named, or their own "i said not now" it took in, and not that song said again: the named
-    # song, or its own title before that, grounded as the named song is ("the Not Now" may be "Not Now").
-    stopped = STOPPED.search(plain, song_end) or SAID_STOPPED.search(plain, title)
+    # Past the song they named, or past an artist named in it, where its title is over ('Glad You Came by "The
+    # Wanted", not now'), though not a connector naming no one ("Stand By Me, No More"); or their own "i said not now"
+    # it took in. Not that song said again: the named song, or its own title before that, grounded as the named song
+    # is ("the Not Now" may be "Not Now").
+    past = next((name[1] for m, _, name, _ in artists if m.start() < song_end
+                 and (first := artist_first(text, m)) not in NOT_ARTISTS and not SPEAKER.fullmatch(first)), song_end)
+    stopped = STOPPED.search(plain, min(past, song_end)) or SAID_STOPPED.search(plain, title)
     if stopped:
         title_words = [word for word, at, _ in said if at < min(own, stopped.start())]
         later = song_words(stopped['later'])
