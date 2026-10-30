@@ -1299,6 +1299,12 @@ class Agent:
         forgotten = self.forgotten.get(first.author.id, 0) if first is not None else 0
         until = discord.utils.snowflake_time(message_id).timestamp()+QUEUE_SECONDS
         try:
+            revision = None  # Gene's privacy revision for its author before the first fetch; unknown, no notice.
+            if first is not None:
+                try:
+                    revision = await self.revision(first.author.id)
+                except (commands.UserFeedbackCheckFailure, aiohttp.ClientError, OSError, KeyError, TypeError):
+                    pass
             changing = failed = 0
             while True:
                 began = time.time()
@@ -1307,7 +1313,7 @@ class Agent:
                 except AttributeError:
                     reason = 'channel gone'
                     return  # Nowhere left to answer it.
-                except (discord.HTTPException, aiohttp.ClientError, TimeoutError) as exc:
+                except (discord.HTTPException, aiohttp.ClientError, OSError) as exc:  # OSError: timeouts, resets.
                     status = getattr(exc, 'status', None)
                     if isinstance(exc, discord.NotFound) or status == 404:
                         reason = 'message deleted'
@@ -1319,8 +1325,11 @@ class Agent:
                     if failed < len(REFETCH_BACKOFF) and time.time()+REFETCH_BACKOFF[failed] < until:
                         await asyncio.sleep(REFETCH_BACKOFF[failed])
                         failed += 1
-                        continue
-                    told = await self.unread(first, forgotten)
+                        if time.time() < until:  # Again after it, since a backoff can wake late.
+                            continue
+                    told = await self.unread(first, forgotten, revision)
+                    if told:  # Recorded first (see finally), so a failed or cancelled cleanup can't undo it.
+                        await self.fri.waiting_notices.clear(first.author.id)
                     return
                 newest = self.rerunning.get(message_id)
                 if not self.taken_back(message_id, began) and (
@@ -1337,10 +1346,10 @@ class Agent:
             self.watched.pop(message.id, None)
             await self.handle(message, read=began)
         except asyncio.CancelledError:
-            reason = 'CancelledError'
+            reason = reason if told else 'CancelledError'  # Once told, why it was told stands.
             raise
         except Exception as exc:
-            reason = type(exc).__name__
+            reason = reason if told else type(exc).__name__
             LOG.exception('Answering an edited message again failed')
         finally:
             self.rerunning.pop(message_id, None)
@@ -1348,28 +1357,27 @@ class Agent:
             self.requeued.pop(message_id, None)
             self.ledger.abandon(message_id, parked, reason, told=told)
 
-    async def unread(self, message, forgotten):
+    async def unread(self, message, forgotten, revision):
         """An edited message to be answered again that Discord wouldn't show Fri, past its rerun's tries: it hears
         so, a fixed notice carrying nothing it said or anything else, rather than nothing (fri #243). Only while
         it still stands as far as Fri can tell without reading it: no deletion of it came in, it would still be
         answered where it was sent by the gates it passed coming in (see excluded: outside Fri's channels, where
         only reading a ping shows it still stands, that's never), and its author hasn't erased since the rerun
-        began: `forgotten` local erasures then, and Gene's revision, read first and compared last, as a ping's
-        notice is (see Invitation.notice). True once it's out."""
-        if message is None or message.id in self.unsent:
+        began: `forgotten` local erasures then, and Gene's `revision`, read before its first fetch (None if that
+        failed: then nothing goes) and compared last, as a ping's notice is (see Invitation.notice). True once
+        it's out; the caller clears the waiting notices it replaces."""
+        if message is None or revision is None or message.id in self.unsent:
             return False
         user = message.author.id
         try:
-            revision = await self.revision(user)
             if await self.excluded(message, message.guild is None) or message.id in self.unsent:
                 return False
             if await self.erasure(user, forgotten, revision):  # Last, so an erasure during the reads above counts.
                 return False
             await message.reply(UNREAD, mention_author=False, allowed_mentions=NO_MENTIONS)
-        except (discord.HTTPException, aiohttp.ClientError, TimeoutError, commands.UserFeedbackCheckFailure,
+        except (discord.HTTPException, aiohttp.ClientError, OSError, commands.UserFeedbackCheckFailure,
                 KeyError, TypeError):
             return False
-        await self.fri.waiting_notices.clear(user)
         return True
 
     def saw_edit(self, i, edited):
