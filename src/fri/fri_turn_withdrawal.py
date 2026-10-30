@@ -21,6 +21,7 @@ again; one by ID is retried in memory only, so a restart loses it, as before thi
 import asyncio
 import json
 import logging
+import re
 import time
 
 from .fri_errors import ControllerRejected
@@ -56,8 +57,6 @@ class SavedTurns:
         self.generation = 0  # Each queued entry's own number: a reply to an older one never settles a newer one.
         self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
         self.reread_at = 0.0  # time.monotonic() as the contract was last read again (see reread).
-        # This process's start, for withdrawals: one first queued before it came from an earlier process (see sendable).
-        self.started = time.time()
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -65,14 +64,14 @@ class SavedTurns:
     def capable(self, name):
         return name in getattr(self.agent.fri, 'capabilities', ())
 
-    def entry(self, queued_at=None, **what):
-        """A queued withdrawal, with its own number and its member's erasure count now (see current). queued_at: when a
-        withdrawal of its message was first queued, which every entry rebuilt for that message keeps, so one an earlier
-        process left can't pass as this one's (see sendable)."""
+    def entry(self, restored=False, **what):
+        """A queued withdrawal, with its own number and its member's erasure count now (see current). restored: loaded
+        from what an earlier process left on disk, or rebuilt from one that was, which every entry rebuilt for that
+        message keeps (see withdraw). Set only as it's read, never from what the file says, so one an earlier process
+        left can't pass as this one's, and one queued here never as an earlier one's, whatever the clock does."""
         self.generation += 1
         user = (what.get('scope') or {}).get('user_id') or what.get('user_id')
-        return {**what, 'tries': 0, 'due': 0, 'gen': self.generation,
-                'queued_at': time.time() if queued_at is None else queued_at,
+        return {**what, 'tries': 0, 'due': 0, 'gen': self.generation, **({'restored': True} if restored else {}),
                 **({'erasure': self.erasure(user)} if user else {})}
 
     @property
@@ -84,20 +83,20 @@ class SavedTurns:
             self._pending = {}
             path = self.record()
             try:
-                stored = json.loads(path.read_text())['pending'] if path and path.exists() else {}
-                for i, entry in stored.items():
-                    if not (str(i).isdigit() and isinstance(entry, dict)):
-                        continue
-                    deleted = entry.get('deleted') is True
-                    if isinstance(entry.get('scope'), dict):
-                        revision, queued = entry.get('revision'), entry.get('queued_at')
-                        # From an earlier process, whatever it says: replayed only where its revision is checked.
-                        queued = min(float(queued), self.started-1) if type(queued) in (int, float) else 0.0
-                        self._pending[str(i)] = self.entry(scope={key: str(entry['scope'].get(key, '')) for key in (
-                            'guild_id', 'channel_id', 'conversation_id', 'user_id')}, deleted=deleted,
-                            revision=revision if type(revision) is int and revision >= 0 else None, queued_at=queued)
-            except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                stored = loaded(path.read_text())['pending'] if path and path.exists() else {}
+                if not isinstance(stored, dict):
+                    raise TypeError('not a record of pending withdrawals')
+            except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
                 LOG.warning('Pending withdrawals could not be read, so none are resent: %s', type(exc).__name__)
+                stored = {}
+            for i, entry in stored.items():  # Each on its own: one malformed never stops the rest.
+                if (scope := restorable(i, entry)) is None:
+                    LOG.warning('A pending withdrawal on disk was malformed, so it was left out')
+                    continue
+                revision = entry.get('revision')
+                # From an earlier process, whatever it says: replayed only where its revision is checked (sendable).
+                self._pending[i] = self.entry(scope=scope, deleted=entry.get('deleted') is True, restored=True,
+                                              revision=revision if type(revision) is int and 0 <= revision < 2**63 else None)
             self.prune(time.time())
             now = time.time()
             for i in self._pending:  # Taken back before the restart: still held back until they land.
@@ -119,7 +118,7 @@ class SavedTurns:
         if path := self.record():
             try:
                 private_json(path, {'pending': {i: {key: value for key, value in entry.items()
-                                                    if key not in ('gen', 'erasure')}
+                                                    if key not in ('gen', 'erasure', 'restored')}
                                                 for i, entry in self.pending.items() if self.lasting(entry)}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
                 LOG.warning('Pending withdrawals could not be saved: %s', type(exc).__name__)
@@ -175,7 +174,7 @@ class SavedTurns:
             entry = self.saved.pop(i, None)
             if entry is not None:
                 if self.offered():
-                    self.pending[str(i)] = self.entry(scope=entry[1], revision=entry[2], queued_at=known.get('queued_at'),
+                    self.pending[str(i)] = self.entry(scope=entry[1], revision=entry[2], restored=known.get('restored'),
                                                       deleted=deleted or known.get('deleted') is True)
                     queued = True
             elif server is not None and sent_at(i) > now-horizon:
@@ -183,12 +182,12 @@ class SavedTurns:
                     if 'scope' in known:  # Fri knows where it was saved: that one stands, deleted or not.
                         if deleted and not known.get('deleted'):
                             self.pending[str(i)] = self.entry(**{key: known[key] for key in ('scope', 'revision')},
-                                                              deleted=True, queued_at=known.get('queued_at'))
+                                                              deleted=True, restored=known.get('restored'))
                             queued = True
                     elif not known or (deleted and not known.get('deleted')) or (i in authors and 'user_id' not in known):
                         author = authors.get(i, known.get('user_id'))
                         self.pending[str(i)] = self.entry(server=str(server), deleted=deleted or known.get('deleted')
-                                                          is True, queued_at=known.get('queued_at'),
+                                                          is True, restored=known.get('restored'),
                                                           **({'user_id': author} if author else {}))
                         queued = True
             else:
@@ -383,13 +382,12 @@ class SavedTurns:
 
     def sendable(self, entry):
         """Whether the controller, as it last said, offers the request this withdrawal needs, and can take it safely:
-        one from an earlier process (first queued before this one started, however it was rebuilt since: see entry)
-        only with the revision guard (SOURCES), and only with the revision it was saved under, so a member erased since
-        through another Fri gets nothing written."""
+        one from an earlier process (read from disk, however it was rebuilt since: see entry) only with the revision
+        guard (SOURCES), and only with the revision it was saved under, so a member erased since through another Fri
+        gets nothing written."""
         if not self.offered() or ('scope' not in entry and not self.capable(SAVED_CAPABILITY)):
             return False
-        earlier = entry.get('queued_at', 0.0) < self.started
-        return not earlier or (self.capable(SOURCES) and entry.get('revision') is not None)
+        return not entry.get('restored') or (self.capable(SOURCES) and entry.get('revision') is not None)
 
     @staticmethod
     def wait(entry):
@@ -471,6 +469,30 @@ class SavedTurns:
                 failed(text, ids, exc)
                 return set()
         return set()
+
+
+def loaded(text):
+    """The record as JSON, where no value can fail the whole read: NaN and the infinities read as nothing, and so does
+    an integer longer than any this record holds (Python refuses to read past 4,300 digits, and a float of one past
+    about 309 overflows)."""
+    return json.loads(text, parse_constant=lambda name: None, parse_int=lambda digits: int(digits) if len(digits) <= 25
+                      else None)
+
+
+SCOPE = {'guild_id': r'[0-9]{1,25}', 'channel_id': r'[0-9]{1,25}', 'conversation_id': r'(private|public):[0-9]{1,25}',
+         'user_id': r'[0-9]{1,25}'}
+
+
+def restorable(i, entry):
+    """The scope of a pending withdrawal read from disk, or None if it isn't one Fri could have written: a Discord
+    message ID, and where it was saved, as /chat/turn/withdraw takes it. Nothing else of it decides anything."""
+    if not (isinstance(i, str) and re.fullmatch(r'[0-9]{1,25}', i) and isinstance(entry, dict)):
+        return None
+    scope = entry.get('scope')
+    if not isinstance(scope, dict) or not all(isinstance(scope.get(key), str) and re.fullmatch(pattern, scope[key])
+                                              for key, pattern in SCOPE.items()):
+        return None
+    return {key: scope[key] for key in SCOPE}
 
 
 def stays(sources, evidence, gone, said):
