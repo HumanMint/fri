@@ -51,6 +51,7 @@ NO_MENTIONS = discord.AllowedMentions.none()
 GENE_ERROR = '[gene posted an error. its text is withheld here because it can quote members]'
 REDELIVERY_SECONDS, MAX_DELIVERED = 3600, 10000  # How long, and how many, delivered IDs are remembered.
 MAX_REANSWERS = 1  # Times one message is answered again after its edit; a further edit gets the notice.
+REFETCH_BACKOFF = (1, 2, 4)  # Seconds before each try again to read a message to be answered again (see rerun).
 
 
 def gene_command(text):
@@ -1286,25 +1287,47 @@ class Agent:
         """A message edited while Fri answered it, fetched again and handled as if it just came in, so every
         gate runs on what it says now: an edit that drops Fri's name or takes it back gets nothing. The fetch
         counts only if no edit came during it and it shows the newest edit seen (Discord's copy can lag the
-        edit event); it's tried a few times, then dropped. It's then taken in as of when that fetch began, so
-        an edit after is withdrawn like any other, and alone, so it never joins a burst sent after it. If it ends
-        before handling it again, its count from the first handling settles here, for why (see Ledger.park)."""
+        edit event); it's tried a few times, then dropped. Only Discord saying the message isn't there counts as
+        deleted, and only its saying Fri can't read it there as a closed gate. A fetch that fails otherwise, a
+        server error, a timeout or a dropped connection, is tried again after a short backoff while its turn's
+        deadline allows (fri #243, #249), then dropped quietly: unread, Fri can't tell the message still stands, or
+        that its author hasn't erased since. It's then taken in as of when that fetch began, so an edit after is
+        withdrawn like any other, and alone, so it never joins a burst sent after it. If it ends before handling it
+        again, its count from the first handling settles here, for why (see Ledger.park)."""
         parked, reason = self.ledger.parked(message_id), 'no reply'
+        until = discord.utils.snowflake_time(message_id).timestamp()+QUEUE_SECONDS
         try:
-            for _ in range(3):
+            changing = failed = 0
+            while True:
                 began = time.time()
                 try:
                     message = await self.fri.get_channel(channel_id).fetch_message(message_id)
-                except (AttributeError, discord.HTTPException):
-                    reason = 'message deleted'
-                    return  # Deleted meanwhile, or the channel's gone: nothing left to answer.
+                except AttributeError:
+                    reason = 'channel gone'
+                    return  # Nowhere left to answer it.
+                except (discord.HTTPException, aiohttp.ClientError, OSError) as exc:  # OSError: timeouts, resets.
+                    status = getattr(exc, 'status', None)
+                    if isinstance(exc, discord.NotFound) or status == 404:
+                        reason = 'message deleted'
+                        return  # Deleted meanwhile: nothing left to answer.
+                    if isinstance(exc, discord.Forbidden) or status == 403:
+                        reason = 'missing permissions'
+                        return  # Fri can't read it there now: a closed gate.
+                    reason = 'fetch failed: '+type(exc).__name__
+                    if failed < len(REFETCH_BACKOFF) and time.time()+REFETCH_BACKOFF[failed] < until:
+                        await asyncio.sleep(REFETCH_BACKOFF[failed])
+                        failed += 1
+                        if time.time() < until:  # Again after it, since a backoff can wake late.
+                            continue
+                    return  # Still unreadable past its tries.
                 newest = self.rerunning.get(message_id)
                 if not self.taken_back(message_id, began) and (
                         newest is None or (message.edited_at is not None and message.edited_at >= newest)):
                     break
-            else:
-                reason = 'message changed'
-                return  # Still changing, or Discord's copy lags: they can ask again.
+                changing += 1
+                if changing == 3:
+                    reason = 'message changed'
+                    return  # Still changing, or Discord's copy lags: they can ask again.
             if self.memory_control(message):
                 reason = 'edited into a privacy control'
                 return  # Not a privacy control: it was refused for the edit (see Fri.chat_once), and they send it again.
