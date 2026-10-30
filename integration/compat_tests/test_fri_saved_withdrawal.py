@@ -23,8 +23,12 @@ SAVED_CAPABILITY = 'saved-turn-withdrawal'
 
 
 async def world(monkeypatch, tmp_path, capable=True):
+    """capable=False: a controller without saved-turn-withdrawal, a genuinely older one (offline-checks with GENE_SHA
+    set to one) or the paired one with the capability taken away. A case that needs it skips on an older one."""
     w = await turn_world(monkeypatch, tmp_path)
-    assert SAVED_CAPABILITY in w.fri.capabilities
+    if capable and SAVED_CAPABILITY not in w.fri.capabilities:
+        await w.fri.close()
+        pytest.skip('needs a controller offering '+SAVED_CAPABILITY)
     if not capable:
         w.fri.capabilities = w.fri.capabilities-{SAVED_CAPABILITY}
     return w
@@ -140,9 +144,12 @@ def test_what_fri_couldnt_have_saved_asks_nothing(monkeypatch, tmp_path):
             await delete(w, unrelated.id, channel=2)
             await edit(w, edited(unrelated), guild=456, channel=3)  # Another server.
             await edit(w, edited(unrelated), guild=456, channel=4)  # One whose channel Fri hasn't cached.
-            old = SimpleNamespace(id=discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=8)),
+            # Older than any exchange the controller keeps, or any note, which one offering withdrawal-sources drops
+            # with its message too (gene #141).
+            days = 91 if 'withdrawal-sources' in w.fri.capabilities else 8
+            old = SimpleNamespace(id=discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=days)),
                                   content='x', edited_at=discord.utils.utcnow(), author=SimpleNamespace(id=20, bot=False))
-            await edit(w, old)  # Older than any exchange the controller keeps.
+            await edit(w, old)
             await delete(w, old.id)
             card = copy.copy(unrelated)  # A link card or embed update: no edit of theirs.
             await edit(w, card)

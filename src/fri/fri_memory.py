@@ -18,6 +18,8 @@ GENERATION_WRITES = 'summary-generation-writes'
 # It reports the summaries a reply of Fri's drew on, and takes a turn's dependencies on them through Fri's earlier replies
 # it carried, refusing and retiring it once one goes (fri #193).
 DEPENDENCIES = 'summary-dependencies'
+# It drops notes and retires replies a withdrawn message reached, and names where notes came from when asked (gene #141).
+SOURCES = 'withdrawal-sources'
 PUBLIC_THREADS = (discord.ChannelType.public_thread, discord.ChannelType.news_thread)
 
 
@@ -63,6 +65,14 @@ def place_notes(get_channel, context, conversation):
 
     A private conversation is the member's own: all their notes show there, so nothing is dropped.
     """
+    learned = context.pop('note_sources', None)
+    if learned is not None:  # Beside the notes too: note key -> the messages it came from (fri #215), None among them
+        notes = (context.get('personal_memory') or {}).get('notes', [])  # for a copy whose source is unknown.
+        aligned = isinstance(learned, list) and len(learned) == len(notes)
+        context['note_sources'] = {}
+        for note, ids in zip(notes, learned if aligned else [None]*len(notes)):
+            context['note_sources'][note_key(note)] = [*context['note_sources'].get(note_key(note), []),
+                                                       *(ids if isinstance(ids, list) else [None])]
     origins = context.pop('profile_origins', None)
     if origins is None or not conversation.startswith('public:'):
         return context  # An older controller says nothing, as before.
@@ -84,6 +94,8 @@ def drop_unheard(get_channel, context):
                            said_to_everyone(get_channel, origins.get(note_key(note), 'unknown'))]
         kept = {note_key(note) for note in memory['notes']}  # Nothing of a dropped note stays behind.
         context['profile_origins'] = {key: origin for key, origin in origins.items() if key in kept}
+        if context.get('note_sources') is not None:
+            context['note_sources'] = {key: ids for key, ids in context['note_sources'].items() if key in kept}
     return context
 
 
@@ -159,11 +171,14 @@ def clip(text, limit):
     return ''.join(kept)
 
 
-def profiled(fri, scope):
-    """Ask for the member's profile (and summary) when the controller keeps them; otherwise the request is unchanged."""
+def profiled(fri, scope, context=False):
+    """Ask for the member's profile (and summary) when the controller keeps them; otherwise the request is unchanged.
+    context: chat context, which also names where each note came from, from a controller that can (fri #215)."""
     if not getattr(fri, 'profiles', False):
         return scope
-    return {**scope, 'profiles': True, **({'summaries': True} if getattr(fri, 'summaries', False) else {})}
+    sources = context and SOURCES in getattr(fri, 'capabilities', ())
+    return {**scope, 'profiles': True, **({'summaries': True} if getattr(fri, 'summaries', False) else {}),
+            **({'sources': True} if sources else {})}
 
 
 def note_place(get_channel, scope, conversation, *, public=False):
