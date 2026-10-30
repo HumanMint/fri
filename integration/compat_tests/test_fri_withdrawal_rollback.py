@@ -525,3 +525,18 @@ def test_a_fresh_withdrawal_by_id_goes_whatever_the_clock_did(monkeypatch, tmp_p
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+def test_a_record_too_deep_to_read_never_stops_fri_starting(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            (tmp_path/'withdrawals.json').write_text('{"pending": '+'['*100000+']'*100000+'}')
+            turns = w.agent.saved_turns = SavedTurns(w.agent)
+            assert turns.pending == {}
+            assert any('could not be read' in line for line in caplog.messages)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
