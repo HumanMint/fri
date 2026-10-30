@@ -7,7 +7,7 @@ import discord
 
 from . import feedback as commands
 from .fri_context import discord_source
-from .fri_memory import MOVES, clip, note_place, profiled, units
+from .fri_memory import MOVES, SOURCES, clip, note_place, profiled, units
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
@@ -70,6 +70,7 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
     if not await allowed(cog, interaction, scope, message=False, tell=True):
         return
     state = state or await cog.api('POST', '/chat/memory/notes', scope)
+    state = await screened(cog, scope, state)
     profiles = getattr(cog, 'profiles', False)
     lines = [notice] if notice else []
     lines += ['Memory is '+('on.' if state['enabled'] else 'off.'),
@@ -102,6 +103,21 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
     from .fri_panel import card, reply
     await reply(cog, interaction, embed=card('My memory', '\n\n'.join(lines)),
                 view=MemoryView(cog, scope, state, selected, confirm=confirm))
+
+
+async def screened(cog, scope, state):
+    """What My memory may list now: not a note a withdrawal still on its way holds, nor the summary then, as a request
+    couldn't read them (fri #215). Asked again with where each note came from, and with the member's chat context, only
+    while something is held back."""
+    turns = getattr(getattr(cog, 'agent', None), 'saved_turns', None)
+    if turns is None or not turns.withholding() or SOURCES not in getattr(cog, 'capabilities', ()):
+        return state
+    asked = {**scope, 'sources': True}
+    if any('sources' not in entry for entry in state['entries']):
+        state = await cog.api('POST', '/chat/memory/notes', asked)
+    context = await cog.api('POST', '/chat/context', asked)
+    from .fri_memory import place_notes
+    return turns.screen(place_notes(cog.get_channel, context, scope['conversation_id']), state)
 
 
 def movable(cog, scope):
