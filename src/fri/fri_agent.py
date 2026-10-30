@@ -2609,6 +2609,11 @@ class Agent:
     async def heartbeat(self):
         self.heartbeat_started, self.heartbeat_ticking = time.time(), time.monotonic()
         self.ensure_memes().expire()  # In memory, so before anything that waits on the controller.
+        try:  # Local too: a controller outage must not keep a stale requester notice note (fri #238).
+            from .fri_fixes import expire as expire_notices
+            expire_notices(self.fri)
+        except Exception as exc:  # Never at the cost of the tick.
+            LOG.warning('Requester notice notes not expired this tick: %s', type(exc).__name__)
         self.running('state')
         from .fri_agent_model import PROGRESS
         # Set in the tick's own context, so a member's message, say, handled meanwhile has no mark to make.
