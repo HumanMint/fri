@@ -377,6 +377,38 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, the Not Now by Blink-182, not now', 'Not Now Blink-182', True),
     ('wrong song, the Not Now by Blink-182, i said "Not Now"', 'The Not Now Blink-182', True),
     ('wrong song, the No More by Blink-182, not now', 'No More Blink-182', False),
+    # gene #156 (1): past an artist they named, the title is over, so a closing "not now" or "no more" after a pause
+    # takes the song back even when the song they proposed took it in, quoted artist or plain...
+    ('wrong song, Glad You Came by "The Wanted", not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Glad You Came by "The Wanted" not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Tear You Apart by "She Wants Revenge", not now', 'Tear You Apart She Wants Revenge not now', False),
+    ("wrong song, Glad You Came by 'The Wanted', no more", 'Glad You Came The Wanted no more', False),
+    ('wrong song, Love Story by Taylor Swift, not now', 'Love Story Taylor Swift not now', False),
+    ('wrong song, Love Story by Taylor Swift nah not now lol', 'Love Story Taylor Swift nah not now lol', False),
+    # ...though not the song said again, a title they quoted, or after a connector that names no one ("By Me").
+    ('wrong song, Not Now by "Blink-182", not now', 'Not Now Blink-182 not now', True),
+    ('wrong song, the Not Now by "Blink-182", not now', 'Not Now Blink-182 not now', True),
+    ('wrong song, "Love Story by Taylor Swift, not now"', 'Love Story by Taylor Swift not now', True),
+    ('wrong song, Stand By Me, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By "Me", No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By ‘Me’, No More', 'Stand By Me No More', True),
+    # gene #156 (2): a verb reporting someone's words, or hearing them, is never an artist's name, as one introducing
+    # them isn't ("by Alex said Taylor"); a verb handing the song to someone may still be its second word.
+    ("wrong song, 'Love Story' by Taylor told Alex", 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor asked Alex", 'Love Story', False),
+    ('wrong song, Love Story by Taylor tells Alex', 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor asks Alex", 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor say Alex", 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor mentions Alex", 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor heard Alex", 'Love Story', False),
+    ("wrong song, 'Love' by Alex Picked Taylor", 'Love', True),
+    ('wrong song, "Love" by "Taylor Told Alex"', 'Love', True),  # What they quoted is the artist's, every word.
+    # gene #156 (3): a pronoun they quoted after a connector names no one either, whichever quote they used.
+    ('wrong song, "Not Now by ‘Me’", not now', 'Not Now by Me', False),
+    ('wrong song, “Not Now by ‘Me’”, not now', 'Not Now by Me', False),
+    ('wrong song, "Not Now by ‘Me’", i said not now', 'Not Now by Me', False),
+    ('wrong song, "Not Now by \'Me\'", not now', 'Not Now by Me', False),
+    ('wrong song, "Not Now by ‘Blink-182’", i said "Not Now"', 'Not Now by Blink-182', True),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
