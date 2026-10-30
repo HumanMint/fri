@@ -306,9 +306,9 @@ def in_general(words, own):
     or an exclamation ("what a gif") is still about the post."""
     if not words or not (words[0] in AUXILIARIES or ASKS & set(words)):
         return set()
-    found = set()
+    found, padded = set(), ['', '', '', *words]
     for i, word in enumerate(words):
-        before = ['', '', '', *words[:i]][-3:]
+        before = padded[i:i+3]  # The three words before this one.
         if word not in FORMATS or before[-1] in DETERMINERS:
             continue
         if (before[-1] in ('a', 'an') and before[-2] not in ('what', 'such') or
