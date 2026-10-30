@@ -83,7 +83,7 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'what was the song Felicity mentioned?', 'what were those songs Charity mentioned?',
                  'what was the song Clement mentioned?', 'what was the clip trinity sent',
                  'what are the songs kev mentioned', 'what are the tracks mo recommended?',
-                 'what was the song posted here?', 'what was the song kev posted here?'):
+                 'what was the song posted here?', 'what was the price posted here?', 'what was the song kev posted here?'):
         assert requested(text)
     for text in ('hey fri', 'play Sad Machine', 'do not search chat', '> find old messages',
                  'what do you recommend?', 'what should I say to a friend who is upset?',
@@ -106,7 +106,7 @@ def test_archive_intent_and_date_limits_are_bounded():
                  'what is the maximum file size shared in a server?', 'what’s the file size limit shared here?',
                  'what is the max bitrate sent today?', 'what is the default setting recommended here?',
                  "what's the best laptop recommended?", 'what is the daily dose recommended?',
-                 'what is the max file size shared in this server?', 'what was the price posted here?',
+                 'what is the max file size shared in this server?',
                  'what are the side effects mentioned?', 'what is the html tag recommended?',
                  'what’s the max player count recommended in the minecraft server?',
                  'what are the personal details shared in a server?', 'what are the design patterns recommended?',
