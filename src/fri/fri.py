@@ -85,7 +85,9 @@ CHANGED = 'someone in that context changed their privacy settings while i was re
 CONVERSATION_CHANGED = 'the conversation changed while i was typing. ask again and i’ll catch up.'
 READ_CHANGED = 'that chat changed while i was reading it. ask again.'
 WITHDRAWN = 'the message i was answering got edited or deleted while i was on it. ask again if you still want it.'
-CLOSED = 'a channel i was pulling from just went private while i was replying, so that stays unsaid. ask again.'
+# A /fri panel turn that stopped, as a DM's goes quiet: the panel says so rather than keep thinking (fri #288).
+PANEL_SKIPPED = 'skipped that one, something changed while i was on it. ask again if you still want it.'
+CLOSED ='a channel i was pulling from just went private while i was replying, so that stays unsaid. ask again.'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
 
@@ -1343,11 +1345,24 @@ class Fri(discord.Client):
             from .fri_memory_panel import show
             await show(self, interaction)
             return
+        # The author's baseline as it comes in, as a DM's (see Agent.receive): their erasures here before anything
+        # waits, then their privacy revision once the panel is answered. Their turn is held to both, its research and
+        # image looks too (fri #288). A memory control isn't: it always hears how it went.
+        user = interaction.user.id
+        held = self.agent is not None and memory_intent(text) not in ('disable', 'enable')
+        forgotten = self.agent.forgotten.get(user, 0) if held else None
         await defer_panel(interaction)
-        await reply(self, interaction, 'Thinking…', view=HomeView(self, interaction.user.id))
+        await reply(self, interaction, 'Thinking…', view=HomeView(self, user))
         try:
-            result = await self.talk(interaction.guild_id, interaction.channel_id, interaction.user.id, text, 'private',
-                                     interaction.user.display_name, event=interaction)
+            revision = await self.agent.revision(user) if held else None
+            result = await self.talk(interaction.guild_id, interaction.channel_id, user, text, 'private',
+                                     interaction.user.display_name, event=interaction, revision=revision,
+                                     forgotten=forgotten)
+            # Last before it's shown, with nothing to wait on: their erasures here since it came in. talk() ends on
+            # Gene's check of the whole turn, everyone it drew on and their own revision (held to the one above), so
+            # a read here would reopen that fence for them alone (fri #290's round 1).
+            if held and self.agent.forgotten.get(user, 0) != forgotten:
+                raise AuthorErased()
             view = (DraftView(self, interaction.user.id, result.draft, fence=result.turn) if result.draft
                     else HomeView(self, interaction.user.id))
             if result.settings_preview:
@@ -1360,6 +1375,8 @@ class Fri(discord.Client):
             saved = await self.record_turn(result) if sessions(self).displayed(interaction) else None
             if saved and saved.get('first_memory') and not result.settings_preview:
                 await reply(self, interaction, embed=card('Fri', result.reply+self.first_memory(saved)), view=view)
+        except (AuthorErased, GateClosed):  # Nothing of it shown or saved, and nothing said why.
+            await reply(self, interaction, PANEL_SKIPPED, view=HomeView(self, user))
         except commands.UserFeedbackCheckFailure as exc:
             await reply(self, interaction, str(exc), view=HomeView(self, interaction.user.id))
         await self.waiting_notices.clear(interaction.user.id)
