@@ -896,7 +896,16 @@ async def settle_one(fri, job_id, entry):
     elif entry.get('take_back') is not True:
         state = 'sent' if message_id else 'uncertain' if 'cleared' in entry else 'failed'
         if state != 'failed':
-            entry = asking(fri, job_id, entry, state)  # Raises if it can't be saved, and then nothing is asked.
+            try:
+                entry = asking(fri, job_id, entry, state)  # Nothing is asked that can't be noted first.
+            except OSError:
+                # One that knows where its reply went is read instead, asking nothing: a report gone takes the reply
+                # back, as main's finish would have. Otherwise a later pass tries again.
+                if not message_id or await withdrawn(fri, job_id) is not True:
+                    raise
+                if (entry := current(fri, job_id, entry)) is None:
+                    return True  # Gone meanwhile (see expire).
+                return await retracted(fri, job_id, keep(fri, job_id, {**entry, 'take_back': True}))
         refused = False
         try:
             recorded = await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
@@ -922,11 +931,13 @@ async def settle_one(fri, job_id, entry):
         if held not in ('uncertain', 'invalidated'):
             if state == 'failed' or state == 'sent' and held == 'sent':
                 return True
+            # What main does, from the note as it is now: a copy that comes during the read only says what to take back.
+            keeps = main_keeps(state, refused, said, message_id)
             gone, entry = await by_report(fri, job_id, entry)
             if entry is None:
                 return True  # Gone meanwhile (see expire).
             message_id = str(entry.get('message_id') or '')
-            if gone is None and main_keeps(state, refused, said, message_id):
+            if gone is None and keeps:
                 return False  # Unread, and main leaves it up: asked again until KEEP, which can only take more down.
             if gone is False:  # Still on record: it stays up, and one whose copy hasn't come asks again then.
                 if message_id:
@@ -938,6 +949,13 @@ async def settle_one(fri, job_id, entry):
             bury(fri, job_id, entry)
             return False
         entry = keep(fri, job_id, {**entry, 'take_back': True})
+    return await retracted(fri, job_id, entry)
+
+
+async def retracted(fri, job_id, entry):
+    """The reply taken back, its decision noted (take_back): True once nothing's left to do. One Discord refuses for
+    now is tried again, and the owner told once."""
+    message_id = str(entry['message_id'])
     channel = await reach(fri, entry)
     outcome = await retract(channel, message_id)
     if outcome == 'forbidden':
