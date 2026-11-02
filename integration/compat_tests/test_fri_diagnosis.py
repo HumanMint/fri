@@ -31,7 +31,9 @@ def test_failure_triage_uses_luna_then_sol_xhigh_without_commands_or_coding(monk
         assert agent.config['attention_model'] == 'gpt-6-luna'
         assert agent.run.await_args_list[0].args[0] == 'attention'
         if gate == 'investigate':
-            assert agent.run.await_args.kwargs == {'model': 'gpt-6.1-sol', 'effort': 'xhigh'}
+            kwargs = agent.run.await_args.kwargs
+            assert callable(kwargs.pop('erased'))  # Fenced like a tool's own request (fri #283).
+            assert kwargs == {'model': 'gpt-6.1-sol', 'effort': 'xhigh'}
             assert result['proposed_request'] == 'Investigate lost command acknowledgements'
         assert result['receipts'] == receipts[:1]
         assert [call.args[1] for call in fri.api.await_args_list] == ['/chat/context', '/controls/health', '/controls/recent']
