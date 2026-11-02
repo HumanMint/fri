@@ -141,7 +141,7 @@ def test_outcomes_reach_the_health_file_and_fri_health_without_ids_names_or_word
             for private in (answered.id, refused.id, '"20"', '"21"', 'member 2', 'zebra'):
                 assert str(private) not in text
             assert set(outcomes) == {'since', 'addressed', 'in_flight', 'answered', 'told_why', 'quiet', 'withheld',
-                                     'outage', 'cooldown', 'latency'}
+                                     'outage', 'cooldown', 'latency', 'forwards'}
             line = next(line for line in (await fri.watcher.report()).splitlines() if line.startswith('- addressed'))
             assert line.startswith('- addressed to me since <t:') and ':R>: 2 (1 ping, 1 by name), 1 answered (p50 ' in line
             assert line.endswith(', 1 quiet (fri disabled)')

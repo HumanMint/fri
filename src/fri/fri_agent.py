@@ -795,6 +795,7 @@ class Agent:
         if not message.author.bot and forwarded(message):
             LOG.info('Forward %s/%s not read: %s', 'dm' if message.guild is None else message.channel.id,
                      message.id, reason)
+            self.ledger.forward(reason)  # And by the gate alone, for fri health and its file.
 
     def answered(self, events, told=None):
         """Something went out for these: their answer or, `told`, a notice saying why not (see fri_ledger)."""
