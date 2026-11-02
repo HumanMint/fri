@@ -140,7 +140,10 @@ def test_dropped_forwards_are_counted_by_gate_in_fri_health_and_its_file(monkeyp
             assert outcomes['forwards'] == {'no text': 2}
             lines = [line for line in (await fri.watcher.report()).splitlines() if 'forwards' in line]
             assert lines == [f"- forwards not read since <t:{int(outcomes['since'])}:R>: 2 (no text ×2)"]
-            shown = json.dumps(outcomes) + lines[0]
+            # The times aren't member data, and digits in them can match a short ID by chance ("…755574" has
+            # 555), so they're left out of what's searched.
+            shown = json.dumps({key: value for key, value in outcomes.items() if key != 'since'})
+            shown += lines[0].replace(f"<t:{int(outcomes['since'])}:R>", '')
             for private in (*[event.id for event in events], TEXT, 'member 30', '"30"', '4242', '9999', '555'):
                 assert str(private) not in shown
         finally:
