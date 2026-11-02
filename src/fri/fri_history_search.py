@@ -88,13 +88,21 @@ PROPERTY = (r'(?:size|limit|rate|bitrate|speed|price|cost|fee|amount|number|coun
             r'security|compatibility|detail|pattern)(?:e?s)?\b')
 WHO = r'(?:<@!?\d{1,25}>|'+PERSON+')'
 NAME = r'(?!'+GRAMMAR+'|'+PROPERTY+r')\w+'
+# Two-word properties whose first word isn't one itself: "the screen Resolution recommended" names no one.
+COMPOUND = (r'(?:screen\s+(?:resolution|size)|(?:frame|sample|refresh|bit|heart|error|exchange|interest|tax)\s+rate|'
+            r'font\s+size|word\s+count|(?:upload|download)\s+(?:limit|speed)|age\s+rating|response\s+time|'
+            r'battery\s+life|shutter\s+speed|aspect\s+ratio|(?:video|audio)\s+(?:codec|bitrate|format|quality))\b')
 # A name spelled as one, capitalized after a lowercase word, is a name even when it's also a listed property word,
-# as a mention or a pronoun is ("the song Price mentioned"); a title-cased question ("the Max File Size") isn't one
-# (fri #239, item 2).
-SPELLED = r'(?-i:[a-z]\w*)\s+(?!'+GRAMMAR+r')(?-i:[A-Z][a-z]+)\b'
-# A plural thing before a name, after "are": not an adjective that only ends in "s" ("wireless", "glass", "various"),
-# which an adjective-and-noun phrase starts with ("the wireless routers recommended") (fri #239, item 1).
-PLURAL = r'\w+(?<![su])s'
+# as a mention or a pronoun is ("the song Price mentioned"). Not after a property word, nor in a known compound
+# ("the file Size shared", "the screen Resolution recommended"), nor in a title-cased question ("the Max File Size")
+# (fri #239, item 2; Sol round 1 of #294).
+SPELLED = r'(?!'+PROPERTY+r'\s|'+COMPOUND+r')(?-i:[a-z]\w*)\s+(?!'+GRAMMAR+r')(?-i:[A-Z][a-z]+)\b'
+# A plural thing before a name, after "are", isn't an adjective or modifier that only ends in "s", which an
+# adjective-and-noun phrase starts with ("the wireless routers recommended", "the chess openings recommended") (fri
+# #239, item 1). Real plurals ending in "us" or "ss" stay: menus, emus, haikus, bass (Sol round 1 of #294).
+ADJECTIVE = (r'(?:\w+(?:less|ous|ness)|glass|cross|gross|swiss|plus|chess|class|brass|boss|bus|status|bonus|campus|'
+             r'virus|focus|gas)\b')
+PLURAL = r'(?!'+ADJECTIVE+r')\w+s'
 WHAT = r"\b(?:what(?:'s|’s|s)?|which)\s+"
 THING = r'(?:that|the|those)\s+(?:\w+\s+){0,3}?'  # A few words, then the speaker, then the verb.
 NAMED_VERB = r'\s+(?:said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
@@ -106,7 +114,7 @@ NAMED = re.compile('(?is)'+'|'.join((
     +NAMED_VERB+AFTER,
     # After "are" the thing is plural before a name ("the tracks mo recommended"), so "the design patterns
     # recommended" names no one.
-    WHAT+r'are\s+'+THING+r'(?:\w+\s+'+WHO+r'|(?=\w+(?<![su])s\s)(?:'+PLURAL+r'\s+'+NAME+'|'+SPELLED+'))'+NAMED_VERB+AFTER,
+    WHAT+r'are\s+'+THING+r'(?:\w+\s+'+WHO+r'|(?='+PLURAL+r'\s)(?:'+PLURAL+r'\s+'+NAME+'|'+SPELLED+'))'+NAMED_VERB+AFTER,
     # With no one named ("what was the new song posted in #music"), only a place here or a past time makes it
     # recall, and not after "is": "what is the max file size shared in this server?" asks about the server.
     WHAT+r'(?:(?:was|were)\s+)?'+THING+r'(?!'+GRAMMAR+r')\w+'+NAMED_VERB+SAID_HERE,
