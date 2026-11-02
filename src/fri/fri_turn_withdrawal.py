@@ -20,9 +20,11 @@ again; one by ID is retried in memory only, so a restart loses it, as before thi
 
 import asyncio
 import json
+import json.decoder
 import logging
 import re
 import time
+from json.scanner import NUMBER_RE
 
 from .fri_errors import ControllerRejected
 from .fri_protocol import compatible
@@ -41,6 +43,11 @@ BATCH = 10  # As many IDs as /chat/turn/withdraw/saved takes at once.
 RETRY_SECONDS = (2, 15, 60, 300)  # After each failure, then every five minutes while it stays pending.
 REREAD_SECONDS = 60  # At most this often, the controller's contract read again for a refusal (see reread).
 RECORD = 'withdrawals.json'
+RECORD_BYTES = 16*2**20  # Far past MOST entries; a record larger than this isn't one Fri wrote.
+MAX_DEPTH = 16  # The record is four deep; a value nested deeper is skipped where it stands (see read_record).
+CLOSED_SECONDS = KEPT_SECONDS  # How long saved context stays held back after a record that couldn't be read.
+SET_ASIDE = 3  # At most this many unreadable records kept aside, the newest.
+UNREADABLE = re.compile(r'withdrawals\.unreadable-([0-9]{1,12})(?:-[0-9]{1,3})?\.json')
 
 LOG = logging.getLogger('fri.agent')
 
@@ -57,6 +64,7 @@ class SavedTurns:
         self.generation = 0  # Each queued entry's own number: a reply to an older one never settles a newer one.
         self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
         self.reread_at = 0.0  # time.monotonic() as the contract was last read again (see reread).
+        self.closed_until = 0.0  # time.time() until which every saved context is held back (see fail_closed).
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -78,30 +86,94 @@ class SavedTurns:
     def pending(self):
         """Withdrawals the controller hasn't taken yet: message ID -> {'scope', 'revision'} for one Fri saved an exchange
         with, {'server'} for one asked about by ID, each with 'deleted' (not an edit), 'tries', 'due' (time.time())
-        and 'gen' (see drain)."""
+        and 'gen' (see drain); or {'hold'} for one read from disk that can't be sent but whose message stays held back.
+
+        The record is read without recursion and with a bound on its size, so no value in it can fail the read: one
+        nested too deep is skipped where it stands (see read_record), and each entry is checked on its own. A record
+        that still can't be trusted at all is never read as empty: it's set aside unread and every saved context is held
+        back (see fail_closed). Nothing here stops Fri starting."""
         if self._pending is None:
             self._pending = {}
+            self.closed_until = self.set_aside_until()
             path = self.record()
+            stored = {}
             try:
-                stored = loaded(path.read_text())['pending'] if path and path.exists() else {}
-                if not isinstance(stored, dict):
-                    raise TypeError('not a record of pending withdrawals')
-            except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
-                LOG.warning('Pending withdrawals could not be read, so none are resent: %s', type(exc).__name__)
+                if path and path.exists():
+                    if path.stat().st_size > RECORD_BYTES:
+                        raise Unreadable('larger than any record Fri writes')
+                    record = read_record(path.read_text())
+                    stored = record.get('pending') if isinstance(record, dict) else None
+                    if not isinstance(stored, dict):
+                        raise Unreadable('no record of pending withdrawals in it')
+            except (OSError, ValueError) as exc:  # Unreadable and UnicodeDecodeError are ValueErrors.
+                self.fail_closed(path, exc)
                 stored = {}
             for i, entry in stored.items():  # Each on its own: one malformed never stops the rest.
-                if (scope := restorable(i, entry)) is None:
-                    LOG.warning('A pending withdrawal on disk was malformed, so it was left out')
-                    continue
-                revision = entry.get('revision')
-                # From an earlier process, whatever it says: replayed only where its revision is checked (sendable).
-                self._pending[i] = self.entry(scope=scope, deleted=entry.get('deleted') is True, restored=True,
-                                              revision=revision if type(revision) is int and 0 <= revision < 2**63 else None)
+                if (scope := restorable(i, entry)) is not None:
+                    revision = entry.get('revision')
+                    # From an earlier process, whatever it says: replayed only where its revision is checked (sendable).
+                    self._pending[i] = self.entry(scope=scope, deleted=entry.get('deleted') is True, restored=True,
+                                                  revision=revision if type(revision) is int and 0 <= revision < 2**63
+                                                  else None)
+                elif isinstance(i, str) and re.fullmatch(r'[0-9]{1,25}', i):
+                    # Its message is known, the rest isn't one Fri could send: held back, never released (round 4).
+                    LOG.warning('A pending withdrawal on disk was malformed, so its message is held back unsent')
+                    self._pending[i] = self.entry(hold=True, restored=True)
+                else:
+                    LOG.warning('A pending withdrawal on disk named no message, so it was left out')
             self.prune(time.time())
             now = time.time()
             for i in self._pending:  # Taken back before the restart: still held back until they land.
                 self.marked.setdefault(i, now)
         return self._pending
+
+    def fail_closed(self, path, exc):
+        """A record that can't be trusted at all is never read as empty: what it held back would come back. It's set
+        aside unread (renamed, so nothing overwrites it before someone recovers it), and every saved context is held
+        back for a week (CLOSED_SECONDS), across restarts while it lies there (see set_aside_until). Fri still starts
+        and answers, without saved context. Logged without its contents."""
+        now = time.time()
+        self.closed_until = max(self.closed_until, now+CLOSED_SECONDS)
+        moved = None
+        if path is not None and not isinstance(exc, FileNotFoundError):
+            for n in range(100):
+                aside = path.with_name(f'withdrawals.unreadable-{int(now)}{"" if n == 0 else f"-{n}"}.json')
+                if aside.exists():
+                    continue
+                try:
+                    path.rename(aside)
+                    moved = aside.name
+                except OSError as failed:
+                    LOG.warning('The unreadable withdrawals record could not be set aside: %s', type(failed).__name__)
+                break
+        LOG.warning('Pending withdrawals could not be read (%s), so every saved context is held back for a week%s',
+                    type(exc).__name__, f'; the record was set aside as {moved}' if moved else '')
+        self.set_aside_until()  # Keeps the newest few.
+
+    def set_aside_until(self):
+        """Until when the unreadable records set aside keep every saved context held back: a week from the newest.
+        Only the newest SET_ASIDE are kept, and none past a week, when nothing they held can matter."""
+        path = self.record()
+        if path is None:
+            return 0.0
+        now, found = time.time(), []
+        try:
+            found = [(min(int(m.group(1)), now), entry) for entry in path.parent.iterdir()
+                     if (m := UNREADABLE.fullmatch(entry.name))]
+        except OSError as exc:
+            LOG.warning('Unreadable withdrawals records could not be looked for: %s', type(exc).__name__)
+        found.sort(key=lambda pair: pair[0], reverse=True)
+        for at, entry in found[SET_ASIDE:]+[pair for pair in found[:SET_ASIDE] if pair[0] <= now-CLOSED_SECONDS]:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+        return max([at+CLOSED_SECONDS for at, _ in found if at > now-CLOSED_SECONDS], default=0.0)
+
+    def closed(self):
+        """Whether every saved context is held back now: a record that couldn't be read lies set aside (fail_closed)."""
+        self.pending  # Read first: that's what can close it.
+        return time.time() < self.closed_until
 
     def record(self):
         data = getattr(self.agent.fri, 'data', None)
@@ -112,7 +184,7 @@ class SavedTurns:
         """Whether a queued withdrawal goes to disk: only one for an exchange this process saved, which names its member
         so their "forget me" finds it, and which a save answered after one never records (see kept). Never one by ID:
         Fri may not know whose it is, and a restart forgets any "forget me" before it (fri #224 round 3)."""
-        return 'scope' in entry
+        return 'scope' in entry or entry.get('hold') is True
 
     def persist(self):
         if path := self.record():
@@ -242,11 +314,13 @@ class SavedTurns:
     def withholding(self):
         """Whether anything is held back now, so a memory view should be screened (see screen)."""
         now = time.time()
-        return bool(self.pending) or any(at >= now-MARKED_SECONDS for at in self.marked.values())
+        return self.closed() or bool(self.pending) or any(at >= now-MARKED_SECONDS for at in self.marked.values())
 
     def withheld(self, ids):
         """Of these message IDs, those taken back while a turn may still hold a copy, or whose withdrawal the
-        controller hasn't taken yet."""
+        controller hasn't taken yet; all of them while a record couldn't be read (see fail_closed)."""
+        if self.closed():
+            return {str(i) for i in ids}
         now = time.time()
         return {str(i) for i in ids if str(i) in self.pending or self.marked.get(str(i), 0) >= now-MARKED_SECONDS}
 
@@ -256,7 +330,17 @@ class SavedTurns:
         source the controller doesn't know but whose words a withheld message of its history holds; and the member's
         summary, which may have read it (the controller drops it once it may have). Returns the IDs of what's left,
         which delivery and the save then check again (see Agent.reply_once). said: gets the withheld messages' words,
-        for a memory view to judge notes by (see screen); kept nowhere else."""
+        for a memory view to judge notes by (see screen); kept nowhere else. While a record couldn't be read, every
+        saved context goes, notes of unknown source too (see fail_closed)."""
+        if self.closed():
+            context['turns'], context['pending'], context['elsewhere'] = [], None, []
+            if context.get('personal_memory'):
+                context['personal_memory']['notes'] = []
+            for key in ('note_sources', 'profile_origins'):
+                if context.get(key) is not None:
+                    context[key] = {}
+            context['member_summary'] = None
+            return set()
         found = held(context)
         gone = self.withheld(found)
         if not gone:
@@ -298,6 +382,8 @@ class SavedTurns:
             self.withhold(context, said)
         if state is None:
             return None
+        if self.closed():
+            return {**state, 'entries': [], **({'summary': None} if 'summary' in state else {})}
         withheld = self.withheld(i for entry in state.get('entries', []) for i in entry.get('sources') or ()
                                  if i is not None)
         entries = [entry for entry in state.get('entries', [])
@@ -370,7 +456,8 @@ class SavedTurns:
     def due(self, tried):
         now = time.time()
         self.prune(now)
-        return sorted(i for i, entry in self.pending.items() if entry['due'] <= now and entry['gen'] not in tried)
+        return sorted(i for i, entry in self.pending.items()
+                      if not entry.get('hold') and entry['due'] <= now and entry['gen'] not in tried)
 
     def current(self, i, entry):
         """Right before any request for it: still this entry, queued, for a member who hasn't said "forget me" since
@@ -385,7 +472,7 @@ class SavedTurns:
         one from an earlier process (read from disk, however it was rebuilt since: see entry) only with the revision
         guard (SOURCES), and only with the revision it was saved under, so a member erased since through another Fri
         gets nothing written."""
-        if not self.offered() or ('scope' not in entry and not self.capable(SAVED_CAPABILITY)):
+        if entry.get('hold') or not self.offered() or ('scope' not in entry and not self.capable(SAVED_CAPABILITY)):
             return False
         return not entry.get('restored') or (self.capable(SOURCES) and entry.get('revision') is not None)
 
@@ -417,9 +504,10 @@ class SavedTurns:
         if self.timer is not None:
             self.timer.cancel()
             self.timer = None
-        if not self.pending:
+        due = [entry['due'] for entry in self.pending.values() if not entry.get('hold')]  # A hold is never sent.
+        if not due:
             return
-        wait = max(0.0, min(entry['due'] for entry in self.pending.values())-time.time())
+        wait = max(0.0, min(due)-time.time())
         try:
             self.timer = asyncio.get_running_loop().call_later(wait, self.kick)
         except RuntimeError:
@@ -471,12 +559,110 @@ class SavedTurns:
         return set()
 
 
-def loaded(text):
-    """The record as JSON, where no value can fail the whole read: NaN and the infinities read as nothing, and so does
-    an integer longer than any this record holds (Python refuses to read past 4,300 digits, and a float of one past
-    about 309 overflows)."""
-    return json.loads(text, parse_constant=lambda name: None, parse_int=lambda digits: int(digits) if len(digits) <= 25
-                      else None)
+WHITESPACE = re.compile(r'[ \t\n\r]*')
+
+
+class Unreadable(ValueError):
+    """The record isn't JSON Fri could have written; nothing in it can be trusted."""
+
+
+SKIPPED = type('Skipped', (), {'__repr__': lambda self: 'SKIPPED', '__slots__': ()})()
+LITERALS = (('true', True), ('false', False), ('null', None), ('NaN', None), ('Infinity', None), ('-Infinity', None))
+
+
+def read_record(text, depth=MAX_DEPTH):
+    """JSON without recursion, so no nesting can fail the read. A container deeper than `depth` is skipped where it
+    stands (it reads as SKIPPED), so one deep value costs only itself. NaN, the infinities and an integer longer than 25
+    digits read as None. Anything that isn't JSON raises Unreadable."""
+    n = len(text)
+
+    def space(at):
+        return WHITESPACE.match(text, at).end()
+
+    def string(at):
+        if text[at:at+1] != '"':
+            raise Unreadable('expected a string')
+        try:
+            return json.decoder.scanstring(text, at+1)
+        except json.JSONDecodeError:
+            raise Unreadable('a string never ends or holds something JSON doesn\'t') from None
+
+    def skipped(at):  # Past a container too deep to keep, bracket by bracket, strings stepped over whole.
+        level = 0
+        while at < n:
+            c = text[at]
+            if c == '"':
+                at = string(at)[1]
+                continue
+            if c in '[{':
+                level += 1
+            elif c in ']}':
+                level -= 1
+                if level == 0:
+                    return at+1
+            at += 1
+        raise Unreadable('a container never ends')
+
+    def scalar(at):
+        if text[at:at+1] == '"':
+            return string(at)
+        if (number := NUMBER_RE.match(text, at)) is not None:
+            whole, fraction, exponent = number.groups()
+            if fraction or exponent:
+                return float(whole+(fraction or '')+(exponent or '')), number.end()
+            return (int(whole) if len(whole.lstrip('-')) <= 25 else None), number.end()
+        for word, value in LITERALS:
+            if text.startswith(word, at):
+                return value, at+len(word)
+        raise Unreadable('expected a value')
+
+    def key(at):  # A key and its colon, in an object.
+        name, at = string(space(at))
+        at = space(at)
+        if text[at:at+1] != ':':
+            raise Unreadable('expected a colon')
+        return name, space(at+1)
+
+    stack, at = [], space(0)  # Each open container: [it, the key its next value goes under].
+    while True:
+        if at >= n:
+            raise Unreadable('cut off')
+        c = text[at]
+        if c in '[{':  # A container opens: a value is read once it closes.
+            if len(stack) >= depth:
+                value, at = SKIPPED, skipped(at)
+            else:
+                stack.append([{} if c == '{' else [], None])
+                at = space(at+1)
+                if text[at:at+1] == ('}' if c == '{' else ']'):
+                    value, at = stack.pop()[0], at+1
+                else:
+                    if c == '{':
+                        stack[-1][1], at = key(at)
+                    continue
+        else:
+            value, at = scalar(at)
+        while True:  # Hand the value to its container; close every container that ends here.
+            if not stack:
+                if space(at) != n:
+                    raise Unreadable('more after the record')
+                return value
+            container, name = stack[-1]
+            if isinstance(container, dict):
+                container[name] = value
+            else:
+                container.append(value)
+            at = space(at)
+            mark = text[at:at+1]
+            if mark == ',':
+                at = space(at+1)
+                if isinstance(container, dict):
+                    stack[-1][1], at = key(at)
+                break
+            if mark == ('}' if isinstance(container, dict) else ']'):
+                value, at = stack.pop()[0], at+1
+                continue
+            raise Unreadable('expected a comma or a close')
 
 
 SCOPE = {'guild_id': r'[0-9]{1,25}', 'channel_id': r'[0-9]{1,25}', 'conversation_id': r'(private|public):[0-9]{1,25}',
