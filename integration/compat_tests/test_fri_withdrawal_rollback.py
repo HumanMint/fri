@@ -681,3 +681,24 @@ def test_memory_views_show_nothing_saved_while_closed(monkeypatch, tmp_path):
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+def test_a_hold_outlives_a_later_event_for_its_message_and_another_start(monkeypatch, tmp_path):
+    """A by-ID event for a held message (its raw delete, say) never turns the hold into a request kept only in memory:
+    after another start it's still held back."""
+    async def scenario():
+        import json
+
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            held_back = w.said('said and taken back')
+            (tmp_path/'withdrawals.json').write_text(json.dumps({'pending': {str(held_back.id): {'scope': 'lost'}}}))
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert w.agent.saved_turns.pending[str(held_back.id)].get('hold')
+            await delete(w, held_back, guild=123)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert w.agent.saved_turns.withheld([held_back.id]) == {str(held_back.id)}
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
