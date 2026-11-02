@@ -45,7 +45,7 @@ def test_each_message_takes_the_route_fri_gives_it():
     chat = responder()
     rows = run(chat)
     assert all(row['passed'] for row in rows.values()), {name: row['evidence'] for name, row in rows.items()}
-    assert len(RECALL) == 5 and len(GENERAL) == 2
+    assert len(RECALL) == 6 and len(GENERAL) == 3
     assert all(rows[name]['evidence'] == {'offered': True, 'local_notice': False, 'chosen': 'history_search'}
                for name in RECALL)
     assert all(rows[name]['evidence'] == {'offered': False, 'local_notice': False, 'chosen': None} for name in GENERAL)

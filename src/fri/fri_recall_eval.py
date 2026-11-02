@@ -42,8 +42,10 @@ def cases():
         recall('named_thread', 'what was the snack lee recommended in the cooking thread?', True),
         recall('plural_after_are', 'what are the tracks mo recommended?', True),
         recall('name_ending_like_a_noun', 'what was the song Felicity mentioned?', True),
+        recall('name_that_is_a_property_word', 'what was the song Price mentioned?', True),  # fri #239, item 2.
         recall('general_place_alone', 'what is the maximum file size shared in a server?', False),
         recall('general_plural_phrase', 'what are the personal details shared in a server?', False),
+        recall('general_adjective_compound', 'what are the wireless routers recommended?', False),  # Item 1.
         {'name': 'unseen_gif_short_take', 'text': 'gif broken?', 'gif': 'local',
          'expect': 'The local notice, with no model call.'},
         {'name': 'unseen_gif_general_question', 'text': 'what is a video codec?', 'gif': 'model',
