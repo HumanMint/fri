@@ -88,6 +88,13 @@ PROPERTY = (r'(?:size|limit|rate|bitrate|speed|price|cost|fee|amount|number|coun
             r'security|compatibility|detail|pattern)(?:e?s)?\b')
 WHO = r'(?:<@!?\d{1,25}>|'+PERSON+')'
 NAME = r'(?!'+GRAMMAR+'|'+PROPERTY+r')\w+'
+# A name spelled as one, capitalized after a lowercase word, is a name even when it's also a listed property word,
+# as a mention or a pronoun is ("the song Price mentioned"); a title-cased question ("the Max File Size") isn't one
+# (fri #239, item 2).
+SPELLED = r'(?-i:[a-z]\w*)\s+(?!'+GRAMMAR+r')(?-i:[A-Z][a-z]+)\b'
+# A plural thing before a name, after "are": not an adjective that only ends in "s" ("wireless", "glass", "various"),
+# which an adjective-and-noun phrase starts with ("the wireless routers recommended") (fri #239, item 1).
+PLURAL = r'\w+(?<![su])s'
 WHAT = r"\b(?:what(?:'s|’s|s)?|which)\s+"
 THING = r'(?:that|the|those)\s+(?:\w+\s+){0,3}?'  # A few words, then the speaker, then the verb.
 NAMED_VERB = r'\s+(?:said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
@@ -95,10 +102,11 @@ NAMED = re.compile('(?is)'+'|'.join((
     r'\bwho\s+(?:said|recommended|mentioned|posted|talked|discussed|linked)\b',
     # "what was that song kev mentioned": a thing someone said, named before the verb. The verb ends the clause,
     # as in recall: "doctor recommended dose" uses it as an adjective.
-    WHAT+r'(?:(?:was|were|is)\s+)?'+THING+r'(?:\w+\s+'+WHO+r'|(?!'+NEEDS_NOUN+r')\w+\s+'+NAME+')'+NAMED_VERB+AFTER,
+    WHAT+r'(?:(?:was|were|is)\s+)?'+THING+r'(?:\w+\s+'+WHO+r'|(?!'+NEEDS_NOUN+r')(?:\w+\s+'+NAME+'|'+SPELLED+'))'
+    +NAMED_VERB+AFTER,
     # After "are" the thing is plural before a name ("the tracks mo recommended"), so "the design patterns
     # recommended" names no one.
-    WHAT+r'are\s+'+THING+r'(?:\w+\s+'+WHO+r'|\w+s\s+'+NAME+')'+NAMED_VERB+AFTER,
+    WHAT+r'are\s+'+THING+r'(?:\w+\s+'+WHO+r'|(?=\w+(?<![su])s\s)(?:'+PLURAL+r'\s+'+NAME+'|'+SPELLED+'))'+NAMED_VERB+AFTER,
     # With no one named ("what was the new song posted in #music"), only a place here or a past time makes it
     # recall, and not after "is": "what is the max file size shared in this server?" asks about the server.
     WHAT+r'(?:(?:was|were)\s+)?'+THING+r'(?!'+GRAMMAR+r')\w+'+NAMED_VERB+SAID_HERE,
