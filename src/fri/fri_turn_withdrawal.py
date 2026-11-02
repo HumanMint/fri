@@ -19,12 +19,13 @@ again; one by ID is retried in memory only, so a restart loses it, as before thi
 """
 
 import asyncio
+import io
 import json
 import json.decoder
 import logging
+import math
 import re
 import time
-from json.scanner import NUMBER_RE
 
 from .fri_errors import ControllerRejected
 from .fri_protocol import compatible
@@ -43,11 +44,15 @@ BATCH = 10  # As many IDs as /chat/turn/withdraw/saved takes at once.
 RETRY_SECONDS = (2, 15, 60, 300)  # After each failure, then every five minutes while it stays pending.
 REREAD_SECONDS = 60  # At most this often, the controller's contract read again for a refusal (see reread).
 RECORD = 'withdrawals.json'
-RECORD_BYTES = 16*2**20  # Far past MOST entries; a record larger than this isn't one Fri wrote.
-MAX_DEPTH = 16  # The record is four deep; a value nested deeper is skipped where it stands (see read_record).
-CLOSED_SECONDS = KEPT_SECONDS  # How long saved context stays held back after a record that couldn't be read.
-SET_ASIDE = 3  # At most this many unreadable records kept aside, the newest.
+CLOSED_RECORD = 'withdrawals.closed.json'  # Until when every saved context is held back (see fail_closed).
+# How long saved context stays held back after a record that couldn't be read: as long as anything a withdrawal
+# protects can be kept, by any controller (an exchange, or a note).
+CLOSED_SECONDS = max(KEPT_SECONDS, NOTED_SECONDS)
+SET_ASIDE = 3  # At most this many unreadable records kept aside, the newest, none past CLOSED_SECONDS.
 UNREADABLE = re.compile(r'withdrawals\.unreadable-([0-9]{1,12})(?:-[0-9]{1,3})?\.json')
+CHUNK = 2**20  # Characters read at a time: a record of any size costs time to read, not memory (see read_record).
+LONGEST = 64  # Characters of a string kept, past any message ID, scope value or key a record uses.
+DEEPEST = 2**20  # Containers open at once in a value passed over; json.loads gives up near a thousand.
 
 LOG = logging.getLogger('fri.agent')
 
@@ -65,6 +70,7 @@ class SavedTurns:
         self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
         self.reread_at = 0.0  # time.monotonic() as the contract was last read again (see reread).
         self.closed_until = 0.0  # time.time() until which every saved context is held back (see fail_closed).
+        self.blocked = False  # An unreadable record not yet set aside: no queue write replaces it (see persist).
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -88,39 +94,33 @@ class SavedTurns:
         with, {'server'} for one asked about by ID, each with 'deleted' (not an edit), 'tries', 'due' (time.time())
         and 'gen' (see drain); or {'hold'} for one read from disk that can't be sent but whose message stays held back.
 
-        The record is read without recursion and with a bound on its size, so no value in it can fail the read: one
-        nested too deep is skipped where it stands (see read_record), and each entry is checked on its own. A record
-        that still can't be trusted at all is never read as empty: it's set aside unread and every saved context is held
-        back (see fail_closed). Nothing here stops Fri starting."""
+        The record is read in pieces, without recursion: any size main reads, in bounded memory, building only what an
+        entry uses and checking the rest as JSON (see read_record). Each entry is checked on its own. A record that still
+        can't be trusted at all is never read as empty: every saved context is held back (see fail_closed). Nothing
+        here stops Fri starting."""
         if self._pending is None:
             self._pending = {}
-            self.closed_until = self.set_aside_until()
-            path = self.record()
-            stored = {}
-            try:
-                if path and path.exists():
-                    if path.stat().st_size > RECORD_BYTES:
-                        raise Unreadable('larger than any record Fri writes')
-                    record = read_record(path.read_text())
-                    stored = record.get('pending') if isinstance(record, dict) else None
-                    if not isinstance(stored, dict):
-                        raise Unreadable('no record of pending withdrawals in it')
-            except (OSError, ValueError) as exc:  # Unreadable and UnicodeDecodeError are ValueErrors.
-                self.fail_closed(path, exc)
-                stored = {}
-            for i, entry in stored.items():  # Each on its own: one malformed never stops the rest.
-                if (scope := restorable(i, entry)) is not None:
-                    revision = entry.get('revision')
+            self.closed_until = self.read_closed()
+            path, found = self.record(), {}
+            if path is not None:
+                try:
+                    with path.open() as stream:
+                        found = read_record(stream)
+                except FileNotFoundError:
+                    pass  # Nothing pending.
+                except (OSError, ValueError) as exc:  # Unreadable and UnicodeDecodeError are ValueErrors.
+                    self.fail_closed(path, exc)
+            held = 0
+            for i, facts in found.items():
+                if facts is not None:
                     # From an earlier process, whatever it says: replayed only where its revision is checked (sendable).
-                    self._pending[i] = self.entry(scope=scope, deleted=entry.get('deleted') is True, restored=True,
-                                                  revision=revision if type(revision) is int and 0 <= revision < 2**63
-                                                  else None)
-                elif isinstance(i, str) and re.fullmatch(r'[0-9]{1,25}', i):
-                    # Its message is known, the rest isn't one Fri could send: held back, never released (round 4).
-                    LOG.warning('A pending withdrawal on disk was malformed, so its message is held back unsent')
+                    self._pending[i] = self.entry(**facts, restored=True)
+                else:  # Its message is known, the rest isn't one Fri could send: held back, never released (round 4).
+                    held += 1
                     self._pending[i] = self.entry(hold=True, restored=True)
-                else:
-                    LOG.warning('A pending withdrawal on disk named no message, so it was left out')
+            if held:
+                LOG.warning('%s pending withdrawals on disk were malformed, so their messages are held back unsent', held)
+            self.tidy()
             self.prune(time.time())
             now = time.time()
             for i in self._pending:  # Taken back before the restart: still held back until they land.
@@ -128,52 +128,117 @@ class SavedTurns:
         return self._pending
 
     def fail_closed(self, path, exc):
-        """A record that can't be trusted at all is never read as empty: what it held back would come back. It's set
-        aside unread (renamed, so nothing overwrites it before someone recovers it), and every saved context is held
-        back for a week (CLOSED_SECONDS), across restarts while it lies there (see set_aside_until). Fri still starts
-        and answers, without saved context. Logged without its contents."""
+        """A record that can't be trusted at all is never read as empty: what it held back would come back. Every saved
+        context is held back instead, for as long as anything a withdrawal protects can be kept (CLOSED_SECONDS), across
+        restarts. That is written down first, beside the record (CLOSED_RECORD); only then is the record set aside
+        unread (renamed, for someone to recover). Until both are done it stays where it is and no queue write replaces it
+        (see persist), so the next start finds it unreadable again. Fri still starts and answers, without saved context.
+        Logged without its contents."""
+        LOG.warning('Pending withdrawals could not be read (%s), so every saved context is held back for %s days',
+                    type(exc).__name__, CLOSED_SECONDS//86400)
+        self.blocked = True
+        self.set_aside(path)
+
+    def set_aside(self, path):
+        """Closed until the longest horizon from now, on disk first, and then the unreadable record renamed out of the
+        way. True once no queue write can replace it."""
         now = time.time()
         self.closed_until = max(self.closed_until, now+CLOSED_SECONDS)
-        moved = None
-        if path is not None and not isinstance(exc, FileNotFoundError):
-            for n in range(100):
-                aside = path.with_name(f'withdrawals.unreadable-{int(now)}{"" if n == 0 else f"-{n}"}.json')
-                if aside.exists():
-                    continue
-                try:
-                    path.rename(aside)
-                    moved = aside.name
-                except OSError as failed:
-                    LOG.warning('The unreadable withdrawals record could not be set aside: %s', type(failed).__name__)
-                break
-        LOG.warning('Pending withdrawals could not be read (%s), so every saved context is held back for a week%s',
-                    type(exc).__name__, f'; the record was set aside as {moved}' if moved else '')
-        self.set_aside_until()  # Keeps the newest few.
+        if not self.mark_closed(self.closed_until):
+            return False
+        for n in range(100):
+            aside = path.with_name(f'withdrawals.unreadable-{int(now)}{"" if n == 0 else f"-{n}"}.json')
+            if aside.exists():
+                continue
+            try:
+                path.rename(aside)
+            except FileNotFoundError:  # Gone already: nothing left to replace.
+                pass
+            except OSError as exc:
+                LOG.warning('The unreadable withdrawals record could not be set aside: %s', type(exc).__name__)
+                return False
+            else:
+                LOG.warning('The unreadable withdrawals record was set aside as %s', aside.name)
+            self.blocked = False
+            self.tidy()
+            return True
+        return False
 
-    def set_aside_until(self):
-        """Until when the unreadable records set aside keep every saved context held back: a week from the newest.
-        Only the newest SET_ASIDE are kept, and none past a week, when nothing they held can matter."""
-        path = self.record()
+    def marker(self):
+        data = getattr(self.agent.fri, 'data', None)
+        return None if data is None else data/CLOSED_RECORD
+
+    def mark_closed(self, until):
+        """Writes until when every saved context is held back. True if it's on disk."""
+        path = self.marker()
+        if path is None:
+            return False
+        try:
+            private_json(path, {'closed_until': until})
+            return True
+        except OSError as exc:
+            LOG.warning('Until when saved context is held back could not be saved: %s', type(exc).__name__)
+            return False
+
+    def read_closed(self):
+        """Until when every saved context is held back, as written down (see fail_closed): never past the longest
+        horizon from now, so a clock set back since can't stretch it, and a deadline cut to that is written back, so
+        later starts keep it. One that can't be read closes for the whole horizon from now, written back too. One that's
+        over is removed. Removing it by hand ends it early (see docs/operations.md)."""
+        path = self.marker()
         if path is None:
             return 0.0
-        now, found = time.time(), []
+        now = time.time()
         try:
-            found = [(min(int(m.group(1)), now), entry) for entry in path.parent.iterdir()
-                     if (m := UNREADABLE.fullmatch(entry.name))]
+            with path.open() as stream:
+                until = deadline(stream.read(256))
+        except FileNotFoundError:
+            return 0.0
+        except (OSError, ValueError):  # UnicodeDecodeError too.
+            until = None
+        if until is not None and until <= now:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return 0.0
+        if until is None or until > now+CLOSED_SECONDS:
+            LOG.warning('Until when saved context is held back was unreadable or past %s days, so it is %s days from now',
+                        CLOSED_SECONDS//86400, CLOSED_SECONDS//86400)
+            until = now+CLOSED_SECONDS
+            self.mark_closed(until)
+        return until
+
+    def tidy(self):
+        """Unreadable records set aside, kept for someone to recover: the newest SET_ASIDE, none past CLOSED_SECONDS,
+        when nothing they held can matter. One dated in the future counts as set aside now."""
+        path = self.record()
+        if path is None:
+            return
+        now = time.time()
+        try:
+            found = sorted(((min(int(m.group(1)), now), entry) for entry in path.parent.iterdir()
+                            if (m := UNREADABLE.fullmatch(entry.name))), key=lambda pair: pair[0], reverse=True)
         except OSError as exc:
             LOG.warning('Unreadable withdrawals records could not be looked for: %s', type(exc).__name__)
-        found.sort(key=lambda pair: pair[0], reverse=True)
-        for at, entry in found[SET_ASIDE:]+[pair for pair in found[:SET_ASIDE] if pair[0] <= now-CLOSED_SECONDS]:
+            return
+        for _, entry in found[SET_ASIDE:]+[pair for pair in found[:SET_ASIDE] if pair[0] <= now-CLOSED_SECONDS]:
             try:
                 entry.unlink()
             except OSError:
                 pass
-        return max([at+CLOSED_SECONDS for at, _ in found if at > now-CLOSED_SECONDS], default=0.0)
 
     def closed(self):
-        """Whether every saved context is held back now: a record that couldn't be read lies set aside (fail_closed)."""
+        """Whether every saved context is held back now: a record couldn't be read (see fail_closed)."""
         self.pending  # Read first: that's what can close it.
         return time.time() < self.closed_until
+
+    def status(self):
+        """For fri health and its file: until when every saved context is held back (None if it isn't), whether queued
+        withdrawals are saved to disk meanwhile, and how many wait. No IDs, nothing of the record."""
+        closed = self.closed()
+        return {'closed_until': self.closed_until if closed else None, 'saved_to_disk': not self.blocked,
+                'pending': len(self.pending)}
 
     def record(self):
         data = getattr(self.agent.fri, 'data', None)
@@ -187,11 +252,19 @@ class SavedTurns:
         return 'scope' in entry or entry.get('hold') is True
 
     def persist(self):
+        """The lasting withdrawals to disk (see lasting). Never over an unreadable record not yet set aside: it's set
+        aside first, or nothing is written and every saved context stays held back for the longest horizon from now, so
+        what's queued only in memory is covered too (see fail_closed)."""
         if path := self.record():
+            pending = self.pending  # Read first: reading is what finds a record unreadable.
+            if self.blocked and not self.set_aside(path):
+                LOG.warning('Pending withdrawals were not saved: the unreadable record could not be set aside, so it '
+                            'stays as it was and every saved context stays held back')
+                return
             try:
                 private_json(path, {'pending': {i: {key: value for key, value in entry.items()
                                                     if key not in ('gen', 'erasure', 'restored')}
-                                                for i, entry in self.pending.items() if self.lasting(entry)}})
+                                                for i, entry in pending.items() if self.lasting(entry)}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
                 LOG.warning('Pending withdrawals could not be saved: %s', type(exc).__name__)
 
@@ -561,126 +634,271 @@ class SavedTurns:
         return set()
 
 
-WHITESPACE = re.compile(r'[ \t\n\r]*')
-
-
 class Unreadable(ValueError):
     """The record isn't JSON Fri could have written; nothing in it can be trusted."""
 
 
-SKIPPED = type('Skipped', (), {'__repr__': lambda self: 'SKIPPED', '__slots__': ()})()
-LITERALS = (('true', True), ('false', False), ('null', None), ('NaN', None), ('Infinity', None), ('-Infinity', None))
-
-
-def read_record(text, depth=MAX_DEPTH):
-    """JSON without recursion, so no nesting can fail the read. A container deeper than `depth` is skipped where it
-    stands (it reads as SKIPPED), so one deep value costs only itself. NaN, the infinities and an integer longer than 25
-    digits read as None. Anything that isn't JSON raises Unreadable."""
-    n = len(text)
-
-    def space(at):
-        return WHITESPACE.match(text, at).end()
-
-    def string(at):
-        if text[at:at+1] != '"':
-            raise Unreadable('expected a string')
-        try:
-            return json.decoder.scanstring(text, at+1)
-        except json.JSONDecodeError:
-            raise Unreadable('a string never ends or holds something JSON doesn\'t') from None
-
-    def skipped(at):  # Past a container too deep to keep, bracket by bracket, strings stepped over whole.
-        level = 0
-        while at < n:
-            c = text[at]
-            if c == '"':
-                at = string(at)[1]
-                continue
-            if c in '[{':
-                level += 1
-            elif c in ']}':
-                level -= 1
-                if level == 0:
-                    return at+1
-            at += 1
-        raise Unreadable('a container never ends')
-
-    def scalar(at):
-        if text[at:at+1] == '"':
-            return string(at)
-        if (number := NUMBER_RE.match(text, at)) is not None:
-            whole, fraction, exponent = number.groups()
-            if fraction or exponent:
-                return float(whole+(fraction or '')+(exponent or '')), number.end()
-            return (int(whole) if len(whole.lstrip('-')) <= 25 else None), number.end()
-        for word, value in LITERALS:
-            if text.startswith(word, at):
-                return value, at+len(word)
-        raise Unreadable('expected a value')
-
-    def key(at):  # A key and its colon, in an object.
-        name, at = string(space(at))
-        at = space(at)
-        if text[at:at+1] != ':':
-            raise Unreadable('expected a colon')
-        return name, space(at+1)
-
-    stack, at = [], space(0)  # Each open container: [it, the key its next value goes under].
-    while True:
-        if at >= n:
-            raise Unreadable('cut off')
-        c = text[at]
-        if c in '[{':  # A container opens: a value is read once it closes.
-            if len(stack) >= depth:
-                value, at = SKIPPED, skipped(at)
-            else:
-                stack.append([{} if c == '{' else [], None])
-                at = space(at+1)
-                if text[at:at+1] == ('}' if c == '{' else ']'):
-                    value, at = stack.pop()[0], at+1
-                else:
-                    if c == '{':
-                        stack[-1][1], at = key(at)
-                    continue
-        else:
-            value, at = scalar(at)
-        while True:  # Hand the value to its container; close every container that ends here.
-            if not stack:
-                if space(at) != n:
-                    raise Unreadable('more after the record')
-                return value
-            container, name = stack[-1]
-            if isinstance(container, dict):
-                container[name] = value
-            else:
-                container.append(value)
-            at = space(at)
-            mark = text[at:at+1]
-            if mark == ',':
-                at = space(at+1)
-                if isinstance(container, dict):
-                    stack[-1][1], at = key(at)
-                break
-            if mark == ('}' if isinstance(container, dict) else ']'):
-                value, at = stack.pop()[0], at+1
-                continue
-            raise Unreadable('expected a comma or a close')
-
-
+LONG = type('Long', (), {'__repr__': lambda self: 'LONG', '__slots__': ()})()  # A string past LONGEST: checked, not kept.
+OTHER = type('Other', (), {'__repr__': lambda self: 'OTHER', '__slots__': ()})()  # Any other value, checked, not kept.
+WHITESPACE = re.compile(r'[ \t\n\r]*')
+PLAIN = re.compile(r'[^"\\\x00-\x1f]*')  # What a JSON string holds as itself.
+DIGITS = re.compile(r'[0-9]*')
+HEX = re.compile(r'[0-9a-fA-F]{4}')
+LITERALS = (('true', True), ('false', False), ('null', None), ('NaN', OTHER), ('Infinity', OTHER))
+ID = re.compile(r'[0-9]{1,25}')
 SCOPE = {'guild_id': r'[0-9]{1,25}', 'channel_id': r'[0-9]{1,25}', 'conversation_id': r'(private|public):[0-9]{1,25}',
          'user_id': r'[0-9]{1,25}'}
 
 
-def restorable(i, entry):
-    """The scope of a pending withdrawal read from disk, or None if it isn't one Fri could have written: a Discord
-    message ID, and where it was saved, as /chat/turn/withdraw takes it. Nothing else of it decides anything."""
-    if not (isinstance(i, str) and re.fullmatch(r'[0-9]{1,25}', i) and isinstance(entry, dict)):
+class Reader:
+    """JSON from a stream, a piece at a time, accepted where json.loads accepts it (short of its own nesting and digit
+    limits, which it doesn't share). Only what's asked for is built, and at most LONGEST characters of a string; the
+    rest is checked and passed over. So a record of any size or nesting costs bounded memory, and no recursion."""
+
+    def __init__(self, stream):
+        self.stream, self.text, self.at, self.ended = stream, '', 0, False
+
+    def ahead(self, n=1):
+        """The next n characters (fewer only where the record ends), read in as needed."""
+        while len(self.text)-self.at < n and not self.ended:
+            more = self.stream.read(CHUNK)
+            self.ended = not more
+            self.text, self.at = self.text[self.at:]+more, 0
+        return self.text[self.at:self.at+n]
+
+    def run(self, pattern, keep=0):
+        """Past a run of what `pattern` matches, across pieces: how long it was, and its first `keep` characters."""
+        count, kept = 0, ''
+        while True:
+            self.ahead()
+            end = pattern.match(self.text, self.at).end()
+            if len(kept) < keep:
+                kept += self.text[self.at:min(end, self.at+keep-len(kept))]
+            count, self.at = count+end-self.at, end
+            if end < len(self.text) or self.ended:
+                return count, kept
+
+    def space(self):
+        self.run(WHITESPACE)
+
+    def expect(self, mark):
+        if self.ahead() != mark:
+            raise Unreadable(f'expected {mark!r}')
+        self.at += 1
+
+    def string(self):
+        """A string, past its closing quote: itself, or LONG past LONGEST characters."""
+        self.expect('"')
+        raw, room, long = '', 12*LONGEST, False  # A character takes at most twelve in JSON (a surrogate pair).
+        while True:
+            count, part = self.run(PLAIN, keep=0 if long else room+1-len(raw))
+            raw += part
+            long = long or count > len(part) or len(raw) > room
+            mark = self.ahead()
+            if mark == '"':
+                self.at += 1
+                return LONG if long else json.decoder.scanstring(raw+'"', 0)[0]
+            if mark != '\\':
+                raise Unreadable('a string never ends or holds something JSON doesn\'t')
+            escape = self.ahead(6)
+            size = (6 if escape[1:2] == 'u' and HEX.fullmatch(escape, 2) else
+                    2 if escape[1:2] and escape[1] in '"\\/bfnrt' else 0)
+            if not size:
+                raise Unreadable('an escape JSON doesn\'t have')
+            if not long:
+                raw += escape[:size]
+            self.at += size
+
+    def number(self):
+        """A number, past it: an integer of at most 25 digits as itself, any other as OTHER."""
+        sign = ''
+        if self.ahead() == '-':
+            sign, self.at = '-', self.at+1
+        first = self.ahead()
+        if first == '0':
+            count, digits, self.at = 1, '0', self.at+1
+        elif '1' <= first <= '9':
+            count, digits = self.run(DIGITS, keep=26)
+        else:
+            raise Unreadable('expected a value')
+        whole = True
+        if self.ahead() == '.':
+            self.at += 1
+            if not self.run(DIGITS)[0]:
+                raise Unreadable('expected a digit')
+            whole = False
+        if self.ahead() in ('e', 'E'):
+            self.at += 1
+            if self.ahead() in ('+', '-'):
+                self.at += 1
+            if not self.run(DIGITS)[0]:
+                raise Unreadable('expected a digit')
+            whole = False
+        return int(sign+digits) if whole and count <= 25 else OTHER
+
+    def value(self):
+        """A value, past it: a string, an integer, true, false or null as itself; anything else checked, as OTHER."""
+        mark = self.ahead()
+        if mark == '"':
+            return self.string()
+        if mark in ('{', '['):
+            self.skip()
+            return OTHER
+        if mark == '-' and self.ahead(9) == '-Infinity':
+            self.at += 9
+            return OTHER
+        if mark == '-' or '0' <= mark <= '9':
+            return self.number()
+        for word, value in LITERALS:
+            if self.ahead(len(word)) == word:
+                self.at += len(word)
+                return value
+        raise Unreadable('expected a value')
+
+    def key(self):
+        """An object's key and its colon."""
+        name = self.string()
+        self.space()
+        self.expect(':')
+        self.space()
+        return name
+
+    def skip(self):
+        """Past one value, checked as json.loads checks it, none of it built. Returns None."""
+        closes = bytearray()  # What each container open ends with.
+        while True:
+            self.space()
+            mark = self.ahead()
+            if mark in ('{', '['):
+                if len(closes) >= DEEPEST:
+                    raise Unreadable('nested deeper than any record')
+                end = '}' if mark == '{' else ']'
+                self.at += 1
+                self.space()
+                if self.ahead() != end:
+                    closes.append(ord(end))
+                    if mark == '{':
+                        self.key()
+                    continue
+                self.at += 1
+            else:
+                self.value()
+            while closes:  # The value is read: past each container that ends here.
+                self.space()
+                mark = self.ahead()
+                if mark == ',':
+                    self.at += 1
+                    if closes[-1] == ord('}'):
+                        self.space()
+                        self.key()
+                    break
+                if mark != chr(closes[-1]):
+                    raise Unreadable('expected a comma or a close')
+                self.at += 1
+                closes.pop()
+            else:
+                return None
+
+    def members(self):
+        """Each key of the object here, with the reader at its value, which the caller reads before asking for more."""
+        self.expect('{')
+        self.space()
+        if self.ahead() == '}':
+            self.at += 1
+            return
+        while True:
+            yield self.key()
+            self.space()
+            mark = self.ahead()
+            if mark == '}':
+                self.at += 1
+                return
+            if mark != ',':
+                raise Unreadable('expected a comma or a close')
+            self.at += 1
+            self.space()
+
+
+def read_record(record):
+    """The pending withdrawals a record holds (a stream, or its text): message ID -> its 'scope', 'revision' and
+    'deleted', or None for one whose message ID is readable but whose rest isn't an entry Fri could send. Accepted
+    where json.loads accepts it, and read as it reads (a key given twice counts as given last). Only those fields are
+    built; anything else is checked as JSON and passed over, so neither size nor nesting can fail the read or exhaust
+    memory. At most MOST*2 entries are held while it reads, the newest messages', as the queue keeps MOST (see prune).
+    Raises Unreadable if it isn't JSON, or isn't a record of pending withdrawals."""
+    reader = Reader(io.StringIO(record) if isinstance(record, str) else record)
+    reader.space()
+    if reader.ahead() != '{':
+        raise Unreadable('not a record of pending withdrawals')
+    pending, nameless = None, 0
+    for name in reader.members():
+        if name == 'pending' and reader.ahead() == '{':
+            pending, nameless = entries(reader)
+        else:
+            reader.skip()
+            if name == 'pending':
+                pending = None
+    reader.space()
+    if reader.ahead():
+        raise Unreadable('more after the record')
+    if pending is None:
+        raise Unreadable('no record of pending withdrawals in it')
+    if nameless:
+        LOG.warning('%s pending withdrawals on disk named no message, so they were left out', nameless)
+    return pending
+
+
+def entries(reader):
+    found, nameless = {}, 0
+    for i in reader.members():
+        facts = entry(reader) if reader.ahead() == '{' else reader.skip()
+        if not (isinstance(i, str) and ID.fullmatch(i)):
+            nameless += 1
+            continue
+        found[i] = facts
+        if len(found) > 2*MOST:
+            for old in sorted(found, key=int)[:len(found)-MOST]:
+                del found[old]
+    return found, nameless
+
+
+def entry(reader):
+    """An entry's scope, revision and whether it was a deletion; None if its scope isn't one /chat/turn/withdraw takes.
+    Nothing else of it decides anything."""
+    scope, revision, deleted = None, None, False
+    for name in reader.members():
+        if name == 'scope':
+            scope = place(reader) if reader.ahead() == '{' else reader.skip()
+        elif name == 'revision':
+            value = reader.value()
+            revision = value if type(value) is int and 0 <= value < 2**63 else None
+        elif name == 'deleted':
+            deleted = reader.value() is True
+        else:
+            reader.skip()
+    return None if scope is None else {'scope': scope, 'revision': revision, 'deleted': deleted}
+
+
+def place(reader):
+    """Where an entry's exchange was saved, as /chat/turn/withdraw takes it, or None."""
+    found = {}
+    for name in reader.members():
+        value = reader.value()
+        if name in SCOPE:
+            found[name] = value
+    if all(isinstance(found.get(key), str) and re.fullmatch(pattern, found[key]) for key, pattern in SCOPE.items()):
+        return {key: found[key] for key in SCOPE}
+    return None
+
+
+def deadline(text):
+    """The time a closed marker holds (see SavedTurns.read_closed), or None if it holds none Fri could have written."""
+    try:
+        value = json.loads(text)
+    except ValueError:
         return None
-    scope = entry.get('scope')
-    if not isinstance(scope, dict) or not all(isinstance(scope.get(key), str) and re.fullmatch(pattern, scope[key])
-                                              for key, pattern in SCOPE.items()):
-        return None
-    return {key: scope[key] for key in SCOPE}
+    value = value.get('closed_until') if isinstance(value, dict) else None
+    return float(value) if type(value) in (int, float) and math.isfinite(value) else None
 
 
 def stays(sources, evidence, gone, said):

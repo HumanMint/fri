@@ -1473,6 +1473,7 @@ class Fri(discord.Client):
                 'status': self.agent.heartbeat_status, 'stages': self.agent.stages,
                 'current': self.agent.heartbeat_current} if self.agent else None,
             'outcomes': self.agent.ledger.snapshot() if self.agent else None,
+            'withdrawals': self.agent.saved_turns.status() if self.agent else None,
             'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,

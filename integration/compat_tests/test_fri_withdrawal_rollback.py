@@ -808,6 +808,7 @@ def test_a_record_main_reads_is_read_whole_however_large(monkeypatch, tmp_path):
         w = await world(monkeypatch, tmp_path)
         try:
             earlier = await kept_pending(w, tmp_path, monkeypatch)
+            await w.agent.handle(w.said('fri and lunch?'))  # Another saved exchange, nothing withdrawn.
             padded(tmp_path)
             turns = w.agent.saved_turns = SavedTurns(w.agent)
             assert str(earlier.id) in turns.pending and not turns.closed()
@@ -849,22 +850,23 @@ def test_an_unreadable_record_that_cant_be_set_aside_is_never_overwritten(monkey
 
 def test_the_closed_state_outlasts_a_transient_read_failure(monkeypatch, tmp_path):
     """The record couldn't be read once and couldn't be set aside: closed is on disk before anything else is written,
-    so a start that reads the record fine afterwards is still closed, and its entries are all there."""
+    so a later start is still closed, and the record is kept as it was (set aside once a later write could move it)."""
     async def scenario():
         from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
         try:
-            earlier = await kept_pending(w, tmp_path, monkeypatch)
+            await kept_pending(w, tmp_path, monkeypatch)
             text = (tmp_path/'withdrawals.json').read_text()
             reads(monkeypatch, tmp_path/'withdrawals.json')
             renames(monkeypatch, times=1)
             w.agent.saved_turns = SavedTurns(w.agent)
             assert MARKER not in await next_request(w) and history(w) == 0
             w.agent.saved_turns.forget('30')
-            assert (tmp_path/'withdrawals.json').read_text() == text
+            assert text in [path.read_text() for path in tmp_path.glob('withdrawals*.json')]
             turns = w.agent.saved_turns = SavedTurns(w.agent)
-            assert turns.closed() and str(earlier.id) in turns.pending
+            assert turns.closed() and (tmp_path/CLOSED).exists()
             assert MARKER not in await next_request(w) and history(w) == 0
+            assert text in [path.read_text() for path in tmp_path.glob('withdrawals*.json')]
         finally:
             await w.fri.close()
     asyncio.run(scenario())
