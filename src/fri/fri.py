@@ -567,6 +567,9 @@ class Fri(discord.Client):
             # wait on Discord and Gene, and the owner can turn DMs off meanwhile.
             if fence and fence.get('dms') and not fence['dms']():
                 raise GateClosed('dms off')
+            # Their own erasures here, after every wait above, Gene's turn check included (fri #265). It reads nothing.
+            if fence and fence.get('erased') and await fence['erased']():
+                raise AuthorErased()
             # Last, with nothing to wait on before the request: a short line from the member that joined the turn
             # by now is answered with it instead, and one after this is answered on its own (see Continuation).
             if fence and fence.get('commit') and not fence['commit']():
@@ -590,9 +593,10 @@ class Fri(discord.Client):
             agent.ledger.composed(context)
         return result
 
-    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, typing=None, last_look=None):
+    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, forgotten=None, typing=None, last_look=None):
         # `revision`: the author's privacy revision as their message came in, if known. Gene fences the
-        # reply against the one read below, so an erasure before that read must stop it here.
+        # reply against the one read below, so an erasure before that read must stop it here. `forgotten`: their
+        # local erasures then (see Agent.erasure), which the turn's fence carries beside it (fri #265).
         # `typing(stage)`: told once a model turn is 'admitted' (no closing, control or cooldown) and
         # before an 'action' runs, so the caller shows typing only when words are coming. `last_look(result)`:
         # the caller's own last Discord read, run before the turn's last privacy checks so they cover it.
@@ -830,6 +834,10 @@ class Fri(discord.Client):
                                     'actions': actions, 'shown': set(), 'began': began}
                 if self.agent and source.kind == 'discord_message':
                     context['fence']['commit'] = lambda: self.agent.commit(event)
+                if self.agent and forgotten is not None:
+                    # Why it can't go on, from their own erasures here: a "forget me" Fri took in counts at once,
+                    # before Gene has it, so Gene's turn check can't see it. Asked after every wait (see chat_once).
+                    context['fence']['erased'] = lambda: self.agent.erasure(user_id, forgotten)
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
                     async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
                         if closed := await self.agent.dm_closed(user_id):
