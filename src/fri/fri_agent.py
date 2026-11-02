@@ -199,7 +199,7 @@ class Agent:
         self.reruns = set()  # Those answers again still going (see answer_edits).
         self.rerunning = {}  # Message ID -> the newest edited_at seen while it waits to be answered again.
         self.requeued = {}  # Message ID -> its author, from being queued to be answered again until that ends.
-        self.fences = {}  # Message ID -> its first handling's privacy baseline, for that too (see rerun).
+        self.fences = {}  # Message ID -> its author's privacy baseline from its first handling, as long (see rerun).
         self.edit_seen = {}  # Message ID -> the newest edited_at seen while it was handled (see saw_edit).
         self.last_attention = {}
         self.last_spoke = {}
@@ -875,7 +875,8 @@ class Agent:
     def erased_since(self, message, revision=None):
         """Whether the author of a message being answered again as edited (see rerun) erased since its first
         handling took their baseline as it came in: here, or through the panel, Gene or Red by `revision`, theirs
-        as read just now (revisions only go up). Only a known baseline counts. Never for another message."""
+        as read just now (revisions only go up). Without a known baseline, as if they had. Never for another
+        message."""
         if message.id not in self.rerunning:
             return False
         since = self.fences.get(message.id)
@@ -1319,7 +1320,8 @@ class Agent:
             while True:
                 began = time.time()
                 try:
-                    async with asyncio.timeout(until-time.time() if failed else None):  # Discord can hold one open.
+                    # A try again ends at the turn's deadline: Discord can hold a fetch open (fri #259).
+                    async with asyncio.timeout(until-time.time() if failed else None):
                         message = await self.fri.get_channel(channel_id).fetch_message(message_id)
                 except AttributeError:
                     reason = 'channel gone'
@@ -1710,8 +1712,10 @@ class Agent:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})
             return
-        elif not privacy or message.id in self.rerunning:  # A DM's too, as it comes in, so an erasure during any
-            try:  # wait below counts. A rerun's always: it's compared with its first handling's (see rerun).
+        elif not privacy or message.id in self.rerunning:
+            # A DM's too, as it comes in, so an erasure during any wait below counts. A rerun's always, a privacy
+            # control's too: it's compared with its first handling's (see rerun).
+            try:
                 observed = await self.revision(message.author.id)
             except ControllerUnavailable:
                 if self.forgotten.get(message.author.id, 0) != forgotten:
