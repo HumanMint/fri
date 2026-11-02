@@ -646,6 +646,18 @@ DIGITS = re.compile(r'[0-9]*')
 HEX = re.compile(r'[0-9a-fA-F]{4}')
 LITERALS = (('true', True), ('false', False), ('null', None), ('NaN', OTHER), ('Infinity', OTHER))
 ID = re.compile(r'[0-9]{1,25}')
+# A run of plain values each followed by a comma: numbers, literals, strings without escapes, and arrays and objects of
+# only those. Passed over a window at a time, as the value-by-value reading would, so long arrays and objects cost C
+# time, not a Python step per value.
+SPACES = r'[ \t\n\r]*'
+TEXT = r'"[^"\\\x00-\x1f]*"'
+PLAIN_VALUE = rf'(?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|true|false|null|NaN|-?Infinity|{TEXT})'
+PAIR = rf'{TEXT}{SPACES}:{SPACES}{PLAIN_VALUE}'
+FLAT = (rf'(?:{PLAIN_VALUE}|\[{SPACES}(?:{PLAIN_VALUE}(?:{SPACES},{SPACES}{PLAIN_VALUE})*+)?{SPACES}\]|'
+        rf'\{{{SPACES}(?:{PAIR}(?:{SPACES},{SPACES}{PAIR})*+)?{SPACES}\}})')
+ITEMS = re.compile(rf'(?:{SPACES}{FLAT}{SPACES},)*+')
+MEMBERS = re.compile(rf'(?:{SPACES}{TEXT}{SPACES}:{SPACES}{FLAT}{SPACES},)*+')
+WINDOW = 2**16
 SCOPE = {'guild_id': r'[0-9]{1,25}', 'channel_id': r'[0-9]{1,25}', 'conversation_id': r'(private|public):[0-9]{1,25}',
          'user_id': r'[0-9]{1,25}'}
 
@@ -755,6 +767,12 @@ class Reader:
                 return value
         raise Unreadable('expected a value')
 
+    def plain(self, pattern):
+        """Past a run of plain values each followed by a comma (ITEMS or MEMBERS), a window at a time. One cut off where
+        the text read so far ends is left for the value-by-value reading."""
+        while (end := pattern.match(self.text, self.at, min(len(self.text), self.at+WINDOW)).end()) > self.at:
+            self.at = end
+
     def key(self):
         """An object's key and its colon."""
         name = self.string()
@@ -789,8 +807,11 @@ class Reader:
                 if mark == ',':
                     self.at += 1
                     if closes[-1] == ord('}'):
+                        self.plain(MEMBERS)
                         self.space()
                         self.key()
+                    else:
+                        self.plain(ITEMS)
                     break
                 if mark != chr(closes[-1]):
                     raise Unreadable('expected a comma or a close')

@@ -61,6 +61,15 @@ def tree(rng, depth=0):
     if r < 0.63:
         n = rng.randint(17, 400)
         return ('raw', '['*n+']'*n)
+    if r < 0.7:  # Wide and flat: what's passed over a window at a time.
+        def flat():
+            if rng.random() < 0.7:
+                return ('s', rng.choice(SCALARS))
+            if rng.random() < 0.5:
+                return ('a', [('s', rng.choice(SCALARS)) for _ in range(rng.randint(0, 4))])
+            return ('o', [(rng.choice(KEYS), ('s', rng.choice(SCALARS))) for _ in range(rng.randint(0, 4))])
+        items = [flat() for _ in range(rng.randint(5, 30))]
+        return ('a', items) if rng.random() < 0.5 else ('o', [(rng.choice(KEYS), item) for item in items])
     return ('o', [(rng.choice(KEYS), tree(rng, depth+1)) for _ in range(rng.randint(0, 3))])
 
 
@@ -149,7 +158,7 @@ def test_whatever_json_loads_refuses_is_refused(monkeypatch, chunk):
         if not text:
             continue
         at = rng.randrange(len(text))
-        change = rng.choice(['', '{', '}', '[', ']', ',', ':', '"', '\\', 'x', ' ', '1', '-', '.', 'e', '\x01', 'n'])
+        change = rng.choice(['', '{', '}', '[', ']', ',', ':', '"', '\\', 'x', ' ', '0', '1', '-', '.', 'e', '\x01', 'n'])
         changed = text[:at]+change+text[at+rng.choice([0, 1]):]
         want, got = expected(changed), read(changed)
         assert got == want, changed
@@ -160,7 +169,11 @@ def test_whatever_json_loads_refuses_is_refused(monkeypatch, chunk):
 SKIPPED_BUT_NOT_JSON = ['['*16+'1 2'+']'*16, '['*17+'1,]'+']'*16, '['*17+']'*16+'}', '{"a" 1}', '{"a":1,}', '[1,]',
                         '[}', '{]', '{1: 2}', "{'a': 1}", '"\\x"', '"\\u12G4"', '"a\x01"', '01', '1.', '1e', '-',
                         '-Infinityx', 'tru', 'nul', 'NaNa', '[1]]', '"abc', '﻿[]', '[1 , ]', '{"a":}',
-                        '[' * 100000]
+                        '[' * 100000,
+                        # Mid-list, where runs of plain values are passed over a window at a time.
+                        '[1,01,2]', '[1,"a\x01",2]', '[1,"\\x",2]', '{"a":1,"b":01,"c":2}', '[1,[1,01],2]',
+                        '[1,{"a":01},2]', '[1,[1,],2]', '[1,{"a":1,},2]', '[1,2 3,4]', '{"a":1,"b" 2,"c":3}',
+                        '[1,-,2]', '[1,1.,2]', '[1,tru,2]', '[1,[1 2],3]', '[1,{"a" 1},2]', '[1,[1}],2]']
 
 
 @pytest.mark.parametrize('junk', SKIPPED_BUT_NOT_JSON)
