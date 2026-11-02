@@ -501,7 +501,10 @@ def test_a_malformed_entry_never_stops_the_others_loading(monkeypatch, tmp_path)
                 f'"14": {{"scope": {scope}, "revision": 1{"0"*400}}}, "15": 7, '
                 f'"{good.id}": {{"scope": {scope}, "revision": 0, "deleted": true}}}}}}')
             turns = w.agent.saved_turns = SavedTurns(w.agent)
-            assert set(turns.pending) >= {str(good.id)} and '9'*400 not in turns.pending and '12' not in turns.pending
+            assert str(good.id) in turns.pending and '9'*400 not in turns.pending  # No message ID: nothing to hold.
+            # A readable message ID whose entry isn't one Fri could send is still held back, never released (round 4).
+            assert turns.pending['12'].get('hold') and turns.pending['15'].get('hold')
+            assert turns.withheld(['12', '15']) == {'12', '15'}
             assert all(entry.get('revision') in (0, None) for entry in turns.pending.values())
         finally:
             await w.fri.close()
@@ -527,7 +530,9 @@ def test_a_fresh_withdrawal_by_id_goes_whatever_the_clock_did(monkeypatch, tmp_p
     asyncio.run(scenario())
 
 
-def test_a_record_too_deep_to_read_never_stops_fri_starting(monkeypatch, tmp_path, caplog):
+def test_a_record_whose_pending_list_is_too_deep_fails_closed(monkeypatch, tmp_path, caplog):
+    """Its whole pending list too deep to read: nothing in it can be trusted, so Fri starts, sets it aside unread, and
+    holds back every saved context until a week has passed (round 4: never "empty")."""
     caplog.set_level(logging.DEBUG)
     async def scenario():
         from fri.fri_turn_withdrawal import SavedTurns
@@ -535,8 +540,139 @@ def test_a_record_too_deep_to_read_never_stops_fri_starting(monkeypatch, tmp_pat
         try:
             (tmp_path/'withdrawals.json').write_text('{"pending": '+'['*100000+']'*100000+'}')
             turns = w.agent.saved_turns = SavedTurns(w.agent)
-            assert turns.pending == {}
+            assert turns.pending == {} and turns.closed()
             assert any('could not be read' in line for line in caplog.messages)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+
+# Sol round 4 of fri #250: an unreadable record is never empty.
+
+DEEP = '['*100000+']'*100000
+
+
+async def pending_on_disk(w, tmp_path):
+    """A genuine withdrawal left on disk: an exchange holding the marker, its message deleted while the controller
+    timed out."""
+    earlier = await earlier_exchange(w)
+    state = failing(w, WITHDRAW)
+    await delete(w, earlier)
+    state['down'] = False
+    assert str(earlier.id) in on_disk(tmp_path)
+    return earlier
+
+
+async def next_request(w):
+    w.requests.clear()
+    await w.agent.handle(w.said('fri hi'))
+    assert w.requests
+    return str(w.requests)
+
+
+@pytest.mark.parametrize('where', ['beside the record', 'beside the entry', 'in an unused part of the entry'])
+def test_a_deep_unused_field_never_releases_a_valid_withdrawal(monkeypatch, tmp_path, where):
+    """The reviewer's repro: a valid withdrawal on disk beside a field of 100,000 nested arrays. The entry still loads,
+    so its exchange stays out of the next request."""
+    async def scenario():
+        import json
+
+        import fri.fri_turn_withdrawal as withdrawal
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = await pending_on_disk(w, tmp_path)
+            record = json.loads((tmp_path/'withdrawals.json').read_text())
+            text = json.dumps(record)
+            if where == 'beside the record':
+                text = text[:-1]+', "junk": '+DEEP+'}'
+            else:
+                entry = json.dumps(record['pending'][str(earlier.id)])
+                extra = (', "junk": '+DEEP+'}') if where == 'in an unused part of the entry' else None
+                if extra:
+                    text = text.replace(entry, entry[:-1]+extra)
+                else:
+                    text = text.replace('"pending": {', '"pending": {"junk": '+DEEP+', ')
+            (tmp_path/'withdrawals.json').write_text(text)
+            monkeypatch.setattr(withdrawal, 'MARKED_SECONDS', 0)  # Only the record holds it back now.
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert MARKER not in await next_request(w)
+            assert str(earlier.id) in w.agent.saved_turns.pending
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_entry_too_deep_to_read_is_still_held_back(monkeypatch, tmp_path):
+    """Its scope itself nested past reading: the entry can't be sent, but its message ID is held, never released."""
+    async def scenario():
+        import json
+
+        import fri.fri_turn_withdrawal as withdrawal
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = await pending_on_disk(w, tmp_path)
+            record = json.loads((tmp_path/'withdrawals.json').read_text())
+            record['pending'][str(earlier.id)]['scope'] = 'DEEP'
+            (tmp_path/'withdrawals.json').write_text(json.dumps(record).replace('"DEEP"', DEEP))
+            monkeypatch.setattr(withdrawal, 'MARKED_SECONDS', 0)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert MARKER not in await next_request(w)
+            w.agent.saved_turns = SavedTurns(w.agent)  # And again after another start: it was kept.
+            assert MARKER not in await next_request(w)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('broken', ['cut off', 'not json', 'too large', 'pending not a list of entries'])
+def test_an_unreadable_record_fails_closed_until_a_week_has_passed(monkeypatch, tmp_path, broken):
+    """Nothing in it can be trusted: Fri still starts and answers, but with no saved context at all, across restarts,
+    until a week has passed. The record is set aside unread, so nothing overwrites it."""
+    async def scenario():
+        import fri.fri_turn_withdrawal as withdrawal
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            await pending_on_disk(w, tmp_path)
+            await w.agent.handle(w.said('fri and lunch?'))  # Another saved exchange, nothing withdrawn.
+            kept = (tmp_path/'withdrawals.json').read_text()
+            text = {'cut off': kept[:len(kept)//2], 'not json': '{"pending": {'+'x'*50+'}}', 'too large': kept,
+                    'pending not a list of entries': '{"pending": [1, 2, 3]}'}[broken]
+            (tmp_path/'withdrawals.json').write_text(text)
+            if broken == 'too large':
+                monkeypatch.setattr(withdrawal, 'RECORD_BYTES', len(kept)-1)
+            monkeypatch.setattr(withdrawal, 'MARKED_SECONDS', 0)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            sent = await next_request(w)
+            assert MARKER not in sent and 'fri and lunch?' not in sent  # No saved history at all.
+            aside = sorted(tmp_path.glob('withdrawals.unreadable-*.json'))
+            assert len(aside) == 1 and aside[0].read_text() == text  # Set aside as it was, unread.
+            w.agent.saved_turns = SavedTurns(w.agent)  # Another start: still closed.
+            sent = await next_request(w)
+            assert MARKER not in sent and 'fri and lunch?' not in sent
+            monkeypatch.setattr(withdrawal, 'CLOSED_SECONDS', 0)  # A week on.
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert 'fri and lunch?' in await next_request(w)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_memory_views_show_nothing_saved_while_closed(monkeypatch, tmp_path):
+    async def scenario():
+        from compat_tests.test_fri_member_profiles import DM, GENERAL, note
+        from compat_tests.test_fri_member_profiles import world as profiles
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = profiles(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri i like lavender bicycles', 'noted', note('i like lavender bicycles', 'hobbies'))
+            (tmp_path/'withdrawals.json').write_text('{"pending": {')
+            w.fri.agent.saved_turns = SavedTurns(w.fri.agent)
+            dm, _, _ = await w.say(DM, 'what do you remember about me')
+            assert 'lavender' not in dm.reply
         finally:
             await w.fri.close()
     asyncio.run(scenario())
