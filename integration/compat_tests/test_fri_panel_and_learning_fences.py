@@ -162,9 +162,70 @@ def test_a_panel_reply_is_held_to_its_authors_erasures_like_a_dms(monkeypatch, t
     asyncio.run(scenario())
 
 
+SAID = 'member thirty swears by the synthetic-quartz-banjo'
+
+
+def drawn_turn(monkeypatch, tmp_path, erase_at=None):
+    """Member 20's panel turn, its reply drawing on a saved reply attributed to member 30 (fri #290's round 1). Returns
+    the controller calls in order, how many came before the reply was shown (None if it wasn't), and what the panel
+    showed. erase_at: the call during which member 30 erases, through Gene."""
+    async def scenario():
+        fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+        interaction = panel(fri)
+        store.save_chat('123', 'private:456', '20', 0, 'what did they say', SAID, 'model', 'high',
+                        provenance=[{'user_id': '30', 'revision': 0}])
+
+        async def respond(text, context, ready):
+            await ready()
+            return ChatResult(status='completed', reply='they said '+SAID)
+
+        model(fri, tmp_path, respond)
+        api, calls, display = fri.api, [], []
+
+        async def watching(method, path, payload=None):
+            calls.append(path)
+            if len(calls)-1 == erase_at:
+                store.personal_control('30', 'disable')
+            return await api(method, path, payload)
+
+        fri.api = watching
+        edit = interaction.edit_original_response.side_effect
+
+        async def showing(**kwargs):
+            if any('synthetic-quartz-banjo' in (embed.description or '') for embed in kwargs.get('embeds') or []):
+                display.append(len(calls))
+            return SimpleNamespace(id=1234) if edit is None else await edit(**kwargs)
+
+        interaction.edit_original_response.side_effect = showing
+        try:
+            await fri.chat_interaction(interaction, 'remind me what they said')
+            return calls, display[0] if display else None, shown(interaction)
+        finally:
+            await fri.close()
+    return asyncio.run(scenario())
+
+
+def test_nothing_waits_between_a_panel_turns_last_check_and_what_it_shows(monkeypatch, tmp_path):
+    """fri #290's round 1: the panel's own last read of the author's revision came after talk()'s check of the whole
+    turn, so it reopened that fence while checking only the requester: member 30 erasing during that read still saw
+    their words a reply drew on shown (Gene refused the save only afterwards). Gene's check of the whole turn, which
+    holds the requester's revision too, is the panel's last wait now: what follows it before the reply is shown reads
+    nothing. Member 30 erasing at any call after it would show their words, so there must be none."""
+    (tmp_path/'first').mkdir()
+    calls, shown_after, _ = drawn_turn(monkeypatch, tmp_path/'first')
+    assert shown_after is not None and '/chat/turn/check' in calls[:shown_after]
+    last = max(n for n, path in enumerate(calls[:shown_after]) if path == '/chat/turn/check')
+    late = calls[last+1:shown_after]
+    if late:  # Erasing then shows what main's turn would have stopped.
+        (tmp_path/'second').mkdir()
+        _, shown_again, text = drawn_turn(monkeypatch, tmp_path/'second', erase_at=last+1)
+        assert 'synthetic-quartz-banjo' not in text, late
+    assert late == []
+
+
 def test_a_panel_reply_whose_last_check_cant_reach_the_controller_gets_the_outage_text(monkeypatch, tmp_path):
-    """fri #288: the panel's last check reads Gene's revision. The controller unreachable there isn't an erasure: the
-    reply isn't shown or recorded, and the panel says the controller is down, as for any of its reads."""
+    """fri #288: the controller unreachable at the turn's last check, Gene's check of the whole turn, isn't an erasure:
+    the reply isn't shown or recorded, and the panel says the controller is down, as for any of its reads."""
     async def scenario():
         fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
         interaction = panel(fri)
@@ -179,7 +240,7 @@ def test_a_panel_reply_whose_last_check_cant_reach_the_controller_gets_the_outag
         api, saved = fri.api, []
 
         async def down(method, path, payload=None):
-            if answered and path == '/agent/context':
+            if answered and path == '/chat/turn/check':
                 raise ControllerUnavailable(UNREACHABLE)
             if path == '/chat/turn':
                 saved.append(payload)
@@ -289,8 +350,14 @@ def test_a_learning_passs_summary_request_carries_no_record_whose_author_erased(
             assert ids == [[first, second]] and set(asked[0]) == {'messages'}
             assert set(asked[0]['messages'][0]) == {'id', 'user_id', 'role_id', 'revision', 'text', 'at'}
             assert not finishes[-1]['error']
-        elif moved in ('both', 'controller down'):
+        elif moved == 'controller down':
             assert asked == [] and finishes[-1]['error']
+        elif moved == 'both':
+            # Nothing left to send is an empty batch, not a failed summary: no usage, and its scans count as read
+            # (fri #290's round 1).
+            assert asked == [] and not finishes[-1]['error'] and finishes[-1]['records'] == []
+            assert finishes[-1]['counters'] == {'input_tokens': 0, 'output_tokens': 0, 'reasoning_output_tokens': 0}
+            assert finishes[-1]['scanned'] == 2
         else:
             assert ids == [[second]]  # Their text never reached the model; the other member's did.
             assert [record['id'] for record in finishes[-1]['records']] == [second]
@@ -298,11 +365,43 @@ def test_a_learning_passs_summary_request_carries_no_record_whose_author_erased(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('moved', ['local', 'gene', 'nothing'])
+@pytest.mark.parametrize('moved', ['during the history read', 'between two of their records'])
+def test_a_learning_pass_holds_every_record_to_one_baseline_taken_before_it_reads(learning, monkeypatch, moved):  # noqa: F811
+    """fri #290's round 1: each record took its author's erasures here as it was read, after the history was. A "forget
+    me" during the history read was every record's baseline then, and one between two of a member's records dropped
+    the first and sent the second. One snapshot, taken before the history is read, holds the whole batch."""
+    async def scenario():
+        agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch)
+        channel = agent.fri.get_channel(1)
+        third = str(channel.add(learning[0][0]-80, user=11, text='i play chess on weekends'))
+        if moved == 'during the history read':
+            logs = channel._state.http.logs_from
+
+            async def reading(*args, **kwargs):
+                agent.forget(11, erased=True)
+                return await logs(*args, **kwargs)
+            channel._state.http.logs_from = reading
+        else:
+            profile = agent.profile.side_effect
+
+            def between(channel_id, user):
+                if user == 14 and not agent.forgotten.get(11):
+                    agent.forget(11, erased=True)  # After member 11's first record, before their second.
+                return profile(channel_id, user)
+            agent.profile.side_effect = between
+        await agent.learn()
+        assert [[record['id'] for record in data['messages']] for data in asked] == [[second]], (first, third)
+        assert [record['id'] for record in finishes[-1]['records']] == [second]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('moved', ['local', 'gene', 'local, during the search', 'nothing'])
 def test_an_exploration_passs_summary_request_carries_no_record_whose_author_erased(learning, monkeypatch, moved):  # noqa: F811
     """fri #289, the learning pass's other mode: an exploration of a member's archived messages sends them to the summary
     model the same way, and was checked the same way, not at all. It's held to the same fence (see Agent.unmoved): the
-    member erasing during its sign-in, here or through Gene, leaves nothing to send, so nothing is."""
+    member erasing during its sign-in, here or through Gene, or during the archive search (one baseline, taken before
+    it, fri #290's round 1), leaves nothing to send, so nothing is: an empty batch, not a failed one."""
     from compat_tests.test_fri_exploration import archive, row
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
@@ -321,6 +420,8 @@ def test_an_exploration_passs_summary_request_carries_no_record_whose_author_era
     async def http(route, params):
         if route.url.endswith('/members'):
             return [{'user': {'id': '11', 'username': 'friend', 'bot': False}, 'roles': ['90']}]
+        if moved == 'local, during the search' and not agents[0].forgotten.get(11):
+            agents[0].forget(11, erased=True)
         return {'messages': [[found] for found in next(pages, [])], 'doing_deep_historical_index': False}
 
     async def sign_in():
@@ -353,4 +454,5 @@ def test_an_exploration_passs_summary_request_carries_no_record_whose_author_era
     if moved == 'nothing':
         assert [[record['id'] for record in data['messages']] for data in asked] == [[old['id']]]
     else:
-        assert asked == [] and finishes[-1]['records'] == [] and finishes[-1]['error']
+        assert asked == [] and finishes[-1]['records'] == [] and not finishes[-1]['error']
+        assert finishes[-1]['scanned_ids'] == [old['id']] and not any(finishes[-1]['counters'].values())
