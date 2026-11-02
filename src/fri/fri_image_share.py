@@ -163,7 +163,11 @@ class ImageShare:
                     current.edited_at != self.source_edited):
                 return False
             context = await a.fri.api('POST', '/chat/context', a.scope)
-            return context['revision'] == a.revision and await a.valid()
+            if context['revision'] != a.revision or not await a.valid():
+                return False
+            # Its switches again, after every read above: one may have gone off meanwhile (fri #275).
+            return bool(a.agent.config['enabled'] and a.agent.state.get('web_search_enabled') and
+                        (a.public or a.agent.config['support_dms']))
         except (commands.UserFeedbackCheckFailure, discord.HTTPException, TimeoutError, KeyError):
             return False
 
@@ -184,9 +188,15 @@ class ImageShare:
             return {'error': 'I couldn’t finish checking an image. Nothing was uploaded.'}
 
     async def inspect(self, instruction, data, schema, **kwargs):
+        """A model request of the search's own, with the member's request: signed in first, then the turn's last
+        checks (see Actions.fenced), which stop the turn if it moved."""
         agent = self.actions.agent
+
+        async def moved():
+            await self.actions.fenced()
+            return False
         return await agent.run('image_lookup', instruction, data, schema,
-            model=agent.config['meme_model'], effort=agent.config['meme_effort'], **kwargs)
+            model=agent.config['meme_model'], effort=agent.config['meme_effort'], erased=moved, **kwargs)
 
     async def find(self, query, *, transport=None):
         label = receipt_query(query)  # Validate persistence before external work.

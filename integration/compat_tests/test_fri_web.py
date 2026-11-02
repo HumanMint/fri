@@ -102,7 +102,9 @@ def test_search_action_keeps_context_out_and_records_separate_usage(monkeypatch,
             search.assert_not_awaited()
             result = await actions.execute({'kind': 'web_search', 'query': 'current Python release'})
             assert result['kind'] == 'web_search'
-            search.assert_awaited_once_with(fri.chat, 'current Python release', 'gpt-6.1-sol', 'high')
+            # Signed in, the turn's last checks run before the request (fri #273).
+            search.assert_awaited_once_with(fri.chat, 'current Python release', 'gpt-6.1-sol', 'high',
+                                            ready=actions.fenced)
             agent.record.assert_awaited_with('web_search', 'gpt-6.1-sol', 'high', {'input_tokens': 100}, 'completed')
             agent.member.return_value = None
             assert not await actions.valid()

@@ -837,7 +837,9 @@ class Fri(discord.Client):
                 if self.agent and forgotten is not None:
                     # Why it can't go on, from their own erasures here: a "forget me" Fri took in counts at once,
                     # before Gene has it, so Gene's turn check can't see it. Asked after every wait (see chat_once).
-                    context['fence']['erased'] = lambda: self.agent.erasure(user_id, forgotten)
+                    # `read`: Gene's revision too, for a model request a tool makes of its own (see Actions.fenced).
+                    context['fence']['erased'] = lambda read=False: self.agent.erasure(
+                        user_id, forgotten, context['revision'] if read else None)
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
                     async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
                         if closed := await self.agent.dm_closed(user_id):

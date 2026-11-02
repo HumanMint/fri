@@ -21,6 +21,11 @@ class ControllerUnavailable(commands.UserFeedbackCheckFailure):
         self.answered = answered  # Something answered as the controller never would: a proxy's page, a wrong URL.
 
 
+class TurnUnreachable(ControllerUnavailable):
+    """The controller couldn't say whether a turn's fence still holds, asked by a step of the turn (before a tool's
+    model request of its own): the turn's outage, which the tool runner leaves to it (see fri_runner)."""
+
+
 class AuthorErased(Exception):
     """The author erased after their message came in, so nothing more answers it."""
 
