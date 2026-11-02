@@ -17,10 +17,10 @@ in Discord tells the notice from another reply of Fri's to the report. Seen only
 unconfirmed, which the controller never checks again, it's taken back (fri #232), and so it is once that's recorded,
 or refused (fri #245): the claim's nonce and the channel are kept for a day, so a copy that comes later still is
 (fri #238). A take-back Discord refuses with a 403 is tried again until then, since Fri may be let again, and the
-owner hears of it once. A pass notes that it asked for an unconfirmed record before it asks, so the reply is still
-taken back when the controller later refuses that send reported as sent, which it may do for that record (fri #257).
-A copy Fri can't note while its notes can't be read or saved is kept in memory, bounded, until a write saves it
-(fri #258).
+owner hears of it once. When the controller's answer doesn't say whether a reply holds (a refusal, or an older
+controller that records a sent one without checking), Fri asks whether its report is still on record, and takes the
+reply back only once it isn't (fri #257, #262). A copy Fri can't note while its notes can't be read or saved is kept
+in memory, bounded, until a write saves it (fri #258).
 """
 
 import asyncio
@@ -795,9 +795,11 @@ async def settle_one(fri, job_id, entry):
     controller refuses to record (fri #245). Unseen by then, what its copy needs is kept (see bury). A take-back
     Discord refuses for now is tried again, and the owner told once.
 
-    Fri notes that it asked for the unconfirmed record before it does. Its answer lost and the copy seen, a later
-    pass reports the send as sent, and a refusal then may be for that record: a controller before gene #143 refuses a
-    finish heard again, and a later one can't match the lease that one cleared. So that's taken back too (fri #257)."""
+    An answer that doesn't say whether the reply holds leaves it to the report: a refusal (a controller before gene
+    #143 hearing a finish again, a later one reading the lease-less record it left, or no such route), a sent one an
+    older controller records without checking, or the sent record a controller answers an unconfirmed one with. The
+    reply comes down only once the controller says the report is no longer on record, and it stays up while it is: a
+    refusal alone can't tell an unconfirmed record from a sent one (fri #257, #262). Until it can say, the note waits."""
     message_id = str(entry.get('message_id') or '')
     if 'nonce' in entry and not message_id:
         return False  # Settled unconfirmed: only its copy, if it comes, leaves anything to do.
@@ -805,32 +807,32 @@ async def settle_one(fri, job_id, entry):
         return False  # A send from a tap that just stopped may still land.
     if not entry.get('take_back'):
         state = 'sent' if message_id else 'uncertain' if entry.get('cleared') else 'failed'
-        if state == 'uncertain' and not entry.get('unsure'):
-            entry = {**entry, 'unsure': True}
-            note(fri, job_id, entry)  # Raises if it can't be noted, and then nothing is asked: a later pass tries.
-        refused = False
         try:
             recorded = await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
                                      {'guild_id': str(fri.guild_id), 'user_id': str(entry['actor']),
                                       'lease': entry['lease'], 'state': state, 'message_id': message_id})
-        except ControllerRejected:
-            # No claim of this lease (another tap's, or recorded), or no such route (an older controller): a send
-            # Discord confirmed, or never cleared, is settled. One that may be recorded unconfirmed, by this pass or
-            # one whose answer was lost, may still be up, and nothing will check it (fri #245, #257).
-            if not (state == 'uncertain' or entry.get('unsure')):
-                return True
-            recorded, refused = None, True
+        except ControllerRejected:  # No claim of this lease (another tap's, or recorded), or no such route.
+            if state == 'failed':
+                return True  # Never cleared, so nothing posted.
+            recorded = None
         current = noted(fri).get(job_id)  # Read again: its copy may have come while the finish was out (see seen).
         if (not message_id and isinstance(current, dict) and current.get('lease') == entry['lease'] and
                 current.get('message_id')):
             entry, message_id = current, str(current['message_id'])
         held = recorded.get('state') if isinstance(recorded, dict) else None
-        # Up, and either no longer holding or unconfirmed, recorded so or refused, which nothing checks again. A sent
-        # one the controller says nothing of was recorded as sent: an older controller.
-        if not (message_id and (held in ('uncertain', 'invalidated') or refused or
-                                state == 'uncertain' and held != 'sent')):
-            if state != 'uncertain' or message_id:
+        if recorded is not None and held is None and state == 'uncertain':
+            held = 'uncertain'  # Recorded so by an older controller, which says nothing more.
+        # Unconfirmed, which nothing checks again, or no longer holding: it comes down. Otherwise it's up to the report,
+        # unless the controller checked it when it recorded it as sent (gene #47).
+        if held not in ('uncertain', 'invalidated'):
+            if state == 'failed' or state == 'sent' and held == 'sent':
                 return True
+            gone = await withdrawn(fri, job_id)
+            if gone is None:
+                return False  # The controller can't say now: the next pass asks again, until KEEP.
+            if not gone:
+                return True  # Its report is on record, so it stays up.
+        if not message_id:
             bury(fri, job_id, entry)
             return False
         entry = keep(fri, job_id, {**entry, 'take_back': True})
@@ -844,6 +846,19 @@ async def settle_one(fri, job_id, entry):
     if outcome == 'refused':
         LOG.warning('A reply whose claim stopped holding could not be taken back')
     return outcome != 'unconfirmed'
+
+
+async def withdrawn(fri, job_id):
+    """Whether the controller says this notice's report is no longer on record: its request withdrawn because the
+    reporter erased, or someone it drew on did. Every controller's request shows that, and it's the erasure Gene's own
+    check of a sent reply looks for (gene #47). None when it can't say now."""
+    try:
+        job = await fri.api('GET', '/requests/'+job_id)
+    except (commands.UserFeedbackCheckFailure, *TAP_FAILURES) as exc:
+        LOG.info('Requester notice report not read: %s', type(exc).__name__)
+        return None
+    source = job.get('source_url') if isinstance(job, dict) else None
+    return source == '' if isinstance(source, str) else None
 
 
 async def warn_owner(fri, job_id, entry, channel, message_id):

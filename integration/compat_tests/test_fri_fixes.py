@@ -1909,24 +1909,6 @@ def unreadable(monkeypatch):
     return failing
 
 
-def test_a_send_is_recorded_unconfirmed_only_once_fri_noted_it_asked(world, monkeypatch):
-    """fri #257: a later pass has to know the unconfirmed record was asked for, so that's noted first. If it can't be
-    noted, nothing is asked: the claim stays open, and a later pass tries again."""
-    job_id, lease, copy = cut_off_once_cleared(world)
-    deleted = reply_deletions(world)
-    unwritable(monkeypatch)[0] = 1
-    asyncio.run(fri_fixes.settle(world.agent))
-    assert notice_row(world, job_id)[0] == 'sending' and pending(world)[job_id]['lease'] == lease
-    lost_finish(world)
-    asyncio.run(fri_fixes.settle(world.agent))
-    assert notice_row(world, job_id)[0] == 'uncertain'
-    with world.store.connection() as db:  # Refused from here on, whatever the controller.
-        db.execute('UPDATE requester_notices SET lease=NULL WHERE job_id=?', (job_id,))
-    fri_fixes.seen(world.fri, copy)
-    asyncio.run(fri_fixes.settle(world.agent))
-    assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
-
-
 @pytest.mark.parametrize('then', ['pass', 'tick_then_restart'])
 def test_a_copy_seen_while_its_note_cant_be_saved_is_still_taken_back(world, monkeypatch, then):
     """fri #258: the send was settled unconfirmed (fri #238), and its copy came while the notes couldn't be saved.
