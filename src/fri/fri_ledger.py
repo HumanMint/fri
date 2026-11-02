@@ -72,6 +72,7 @@ class Ledger:
         self.answers = 0
         self.outage = self.cooldown = 0
         self.told, self.quiet, self.withheld = Counter(), Counter(), Counter()
+        self.forwards = Counter()  # Members' forwards Fri dropped unread, by the gate (see Agent.forward_dropped).
         self.latency = deque(maxlen=SAMPLES)
 
     def track(self, message, kind):
@@ -175,6 +176,10 @@ class Ledger:
         reason = str(reason)[:80]
         counts[reason if reason in counts or len(counts) < REASONS else 'other'] += 1
 
+    def forward(self, reason):
+        """A member's forward dropped unread at this gate: counted until N3 reads them (see Agent.forward_dropped)."""
+        self.add(self.forwards, reason)
+
     def snapshot(self):
         latency = sorted(self.latency)
         def rank(q):  # Nearest rank.
@@ -183,7 +188,8 @@ class Ledger:
         return {'since': self.since, 'addressed': dict(self.kinds), 'in_flight': handling,
                 'answered': self.answers, 'told_why': dict(self.told), 'quiet': dict(self.quiet),
                 'withheld': dict(self.withheld), 'outage': self.outage, 'cooldown': self.cooldown,
-                'latency': {'p50': rank(0.5), 'p90': rank(0.9), 'samples': len(latency)}}
+                'latency': {'p50': rank(0.5), 'p90': rank(0.9), 'samples': len(latency)},
+                'forwards': dict(self.forwards)}
 
 
 def describe(outcomes):
@@ -208,3 +214,13 @@ def describe(outcomes):
         if outcomes[key]:
             parts.append(f'{outcomes[key]} {key}')
     return f"- addressed to me since <t:{int(outcomes['since'])}:R>: " + ', '.join(parts)
+
+
+def describe_forwards(outcomes):
+    """The owner's line for forwards Fri dropped unread, by gate, e.g. "3 (no text ×2, dms off)"; None for none."""
+    counts = outcomes.get('forwards') or {}
+    if not counts:
+        return None
+    top = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    reasons = ', '.join(reason + (f' ×{n}' if n > 1 else '') for reason, n in top[:3]) + (', …' if len(top) > 3 else '')
+    return f"- forwards not read since <t:{int(outcomes['since'])}:R>: {sum(counts.values())} ({reasons})"
