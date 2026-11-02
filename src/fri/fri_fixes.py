@@ -872,9 +872,10 @@ async def settle_one(fri, job_id, entry):
     the reply comes down as above; one for a sent record, when Fri never asked for an unconfirmed one, means it holds
     that. Anything else leaves it to the report: a refusal after both were asked, a sent one an older controller
     records without checking, or the sent record a controller answers an unconfirmed one with (fri #257, #262). The
-    reply comes down only once the controller says the report is no longer on record. While it is, it stays up, and
-    one whose copy hasn't come keeps a tombstone that asks again when it does. Until the controller can say, the
-    note waits. Every decision reads the note again after its waits, so a copy noted meanwhile is never lost."""
+    reply comes down once the controller says the report is no longer on record. While it is, it stays up, and one
+    whose copy hasn't come keeps a tombstone that asks again when it does. While the controller can't say, it does
+    what main does with that answer (see main_keeps): waiting, and asking again, only where main leaves it up. Every
+    decision reads the note again after its waits, so a copy noted meanwhile is never lost."""
     message_id = str(entry.get('message_id') or '')
     if 'nonce' in entry and not message_id:
         return False  # Settled unconfirmed: only its copy, if it comes, leaves anything to do.
@@ -883,9 +884,13 @@ async def settle_one(fri, job_id, entry):
     # Each optional field as Fri writes it, and otherwise read so the reply isn't lost: cleared and a read owed once
     # present at all, and a take-back decided only as True, else decided again.
     if 'nonce' in entry and entry.get('take_back') is not True:  # Kept while its report stood, its copy come (see bury).
-        decided, entry = await by_report(fri, job_id, entry)
-        if decided is not None:
-            return decided
+        gone, entry = await by_report(fri, job_id, entry)
+        if entry is None:
+            return True  # Gone meanwhile (see expire).
+        if gone is False:
+            return True  # Still on record: it stays up.
+        # Gone, or the controller can't say: main's tombstone takes its copy back unasked, and an unread report never
+        # keeps more up than main does.
         message_id = str(entry['message_id'])
         entry = keep(fri, job_id, {**entry, 'take_back': True})
     elif entry.get('take_back') is not True:
@@ -904,7 +909,7 @@ async def settle_one(fri, job_id, entry):
         if (entry := current(fri, job_id, entry)) is None:
             return True  # Gone meanwhile (see expire).
         message_id = str(entry.get('message_id') or '')
-        held = recorded.get('state') if isinstance(recorded, dict) else None
+        held = said = recorded.get('state') if isinstance(recorded, dict) else None
         asked, owed = asked_for(entry), 'check' in entry
         if not refused and held is None and state == 'uncertain':
             held = 'uncertain'  # Recorded so by an older controller, which says nothing more.
@@ -917,10 +922,18 @@ async def settle_one(fri, job_id, entry):
         if held not in ('uncertain', 'invalidated'):
             if state == 'failed' or state == 'sent' and held == 'sent':
                 return True
-            decided, entry = await by_report(fri, job_id, entry)
-            if decided is not None:
-                return decided
+            gone, entry = await by_report(fri, job_id, entry)
+            if entry is None:
+                return True  # Gone meanwhile (see expire).
             message_id = str(entry.get('message_id') or '')
+            if gone is None and main_keeps(state, refused, said, message_id):
+                return False  # Unread, and main leaves it up: asked again until KEEP, which can only take more down.
+            if gone is False:  # Still on record: it stays up, and one whose copy hasn't come asks again then.
+                if message_id:
+                    return True
+                bury(fri, job_id, entry, check=True)
+                return False
+            # Gone, or unread where main takes it back or buries it: so does this.
         if not message_id:
             bury(fri, job_id, entry)
             return False
@@ -938,23 +951,27 @@ async def settle_one(fri, job_id, entry):
 
 
 async def by_report(fri, job_id, entry):
-    """Whether a reply whose record leaves it open has to come down, from whether its report is still on record (see
-    settle_one): (None, the note as it is now) once it does, else (whether nothing's left to do, the note). Noted
-    first that this is owed, so a later pass asks again whatever the controller answers then."""
+    """Whether this notice's report is no longer on record (True), still is (False), or can't be read now (None), with
+    the note as it is after that read: None once it's gone or another claim's (see settle_one). Noted first that the
+    read is owed, so a later pass asks again whatever the controller answers then. Raises if the note can't be saved,
+    and then nothing is asked, or read (see current)."""
     if 'check' not in entry:
         entry = {**entry, 'check': True}
-        note(fri, job_id, entry)  # Raises if it can't be saved, and then nothing is asked.
+        note(fri, job_id, entry)
     gone = await withdrawn(fri, job_id)
-    if (entry := current(fri, job_id, entry)) is None:
-        return True, entry  # Gone meanwhile (see expire).
-    if gone is None:
-        return False, entry  # The controller can't say now: the next pass asks again, until KEEP.
-    if gone:
-        return None, entry
-    if not entry.get('message_id') and 'nonce' not in entry:
-        bury(fri, job_id, entry, check=True)  # Its copy, once it comes, asks again (see seen).
-        return False, entry
-    return True, entry  # Its report is on record, so it stays up.
+    return gone, current(fri, job_id, entry)
+
+
+def main_keeps(state, refused, said, message_id):
+    """Whether main, before this note kept what it asked, would have settled this answer with the reply left up: a
+    refused sent record, one a controller answers without a state or as sent, and an unconfirmed one it says was sent.
+    Otherwise it took the reply back, or buried a tombstone whose copy it takes back. A report that can't be read keeps
+    up no more than that, so the read only ever spares what main would have taken down (#260's round 4)."""
+    if refused and state != 'uncertain':
+        return True
+    if message_id:
+        return not (said in ('uncertain', 'invalidated') or state == 'uncertain' and said != 'sent')
+    return state != 'uncertain'
 
 
 async def withdrawn(fri, job_id):
