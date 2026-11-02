@@ -633,10 +633,26 @@ def test_an_entry_too_deep_to_read_is_still_held_back(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('broken', ['cut off', 'not json', 'too large', 'pending not a list of entries'])
-def test_an_unreadable_record_fails_closed_until_a_week_has_passed(monkeypatch, tmp_path, broken):
+BROKEN = {'cut off': lambda kept: kept[:len(kept)//2], 'not json': lambda kept: '{"pending": {'+'x'*50+'}}',
+          'pending not a list of entries': lambda kept: '{"pending": [1, 2, 3]}',
+          'a skipped value not json': lambda kept: kept[:-1]+', "junk": '+'['*16+'1 2'+']'*16+'}'}
+
+
+def module_clock(monkeypatch, seconds):
+    """The withdrawal queue's own clock `seconds` on, and nothing else's: only how long it holds back changes."""
+    import time
+
+    import fri.fri_turn_withdrawal as withdrawal
+    now = withdrawal.time.time
+    monkeypatch.setattr(withdrawal, 'time', type('Clock', (), {'time': staticmethod(lambda: now()+seconds),
+                                                               'monotonic': staticmethod(time.monotonic)}))
+
+
+@pytest.mark.parametrize('broken', list(BROKEN))
+def test_an_unreadable_record_fails_closed_until_the_longest_horizon_has_passed(monkeypatch, tmp_path, broken):
     """Nothing in it can be trusted: Fri still starts and answers, but with no saved context at all, across restarts,
-    until a week has passed. The record is set aside unread, so nothing overwrites it."""
+    for as long as anything a withdrawal protects can be kept (a note's 90 days). The record is set aside unread, so
+    nothing overwrites it."""
     async def scenario():
         import fri.fri_turn_withdrawal as withdrawal
         from fri.fri_turn_withdrawal import SavedTurns
@@ -644,23 +660,23 @@ def test_an_unreadable_record_fails_closed_until_a_week_has_passed(monkeypatch, 
         try:
             await pending_on_disk(w, tmp_path)
             await w.agent.handle(w.said('fri and lunch?'))  # Another saved exchange, nothing withdrawn.
-            kept = (tmp_path/'withdrawals.json').read_text()
-            text = {'cut off': kept[:len(kept)//2], 'not json': '{"pending": {'+'x'*50+'}}', 'too large': kept,
-                    'pending not a list of entries': '{"pending": [1, 2, 3]}'}[broken]
+            text = BROKEN[broken]((tmp_path/'withdrawals.json').read_text())
             (tmp_path/'withdrawals.json').write_text(text)
-            if broken == 'too large':
-                monkeypatch.setattr(withdrawal, 'RECORD_BYTES', len(kept)-1)
             monkeypatch.setattr(withdrawal, 'MARKED_SECONDS', 0)
             w.agent.saved_turns = SavedTurns(w.agent)
             assert MARKER not in await next_request(w) and history(w) == 0  # No saved history at all.
             aside = sorted(tmp_path.glob('withdrawals.unreadable-*.json'))
             assert len(aside) == 1 and aside[0].read_text() == text  # Set aside as it was, unread.
+            assert withdrawal.CLOSED_SECONDS == max(withdrawal.KEPT_SECONDS, withdrawal.NOTED_SECONDS)
             w.agent.saved_turns = SavedTurns(w.agent)  # Another start: still closed.
             assert MARKER not in await next_request(w) and history(w) == 0
-            monkeypatch.setattr(withdrawal, 'CLOSED_SECONDS', 0)  # A week on.
+            module_clock(monkeypatch, 8*86400)  # Past a week: a note it protected can still be kept.
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert MARKER not in await next_request(w) and history(w) == 0
+            module_clock(monkeypatch, withdrawal.CLOSED_SECONDS)  # Past the longest horizon.
             w.agent.saved_turns = SavedTurns(w.agent)
             await next_request(w)
-            assert history(w) > 0
+            assert history(w) > 0 and not (tmp_path/'withdrawals.closed.json').exists()
         finally:
             await w.fri.close()
     asyncio.run(scenario())
@@ -699,6 +715,284 @@ def test_a_hold_outlives_a_later_event_for_its_message_and_another_start(monkeyp
             await delete(w, held_back, guild=123)
             w.agent.saved_turns = SavedTurns(w.agent)
             assert w.agent.saved_turns.withheld([held_back.id]) == {str(held_back.id)}
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+# Sol round 5 of fri #250: the closed state is durable before any other write, and lasts the longest horizon.
+
+PADDING = 16*2**20+1  # Past the size the reader used to stop at.
+CLOSED = 'withdrawals.closed.json'
+
+
+def padded(tmp_path):
+    """The valid record as it stands, padded past 16 MB with whitespace and an unused field, as main reads it."""
+    import json
+    path = tmp_path/'withdrawals.json'
+    text = path.read_text()
+    path.write_text(text[:-1]+', "unused": "'+'x'*(PADDING//2)+'"'+' '*(PADDING//2)+'}')
+    assert json.loads(path.read_text())['pending'] == json.loads(text)['pending']
+
+
+def renames(monkeypatch, times=None):
+    """Path.rename fails `times` times (always, for None), as a full disk or a permission change would."""
+    import pathlib
+    left, real = [times], pathlib.Path.rename
+    def rename(self, target):
+        if left[0] is None or left[0] > 0:
+            if left[0] is not None:
+                left[0] -= 1
+            raise PermissionError('injected')
+        return real(self, target)
+    monkeypatch.setattr(pathlib.Path, 'rename', rename)
+
+
+def reads(monkeypatch, path, times=1):
+    """Opening `path` fails `times` times, as a transient I/O error would."""
+    import pathlib
+    left, real = [times], pathlib.Path.open
+    def opening(self, *args, **kwargs):
+        if self == path and left[0] > 0:
+            left[0] -= 1
+            raise OSError(5, 'injected')
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(pathlib.Path, 'open', opening)
+
+
+def markers(monkeypatch):
+    """Writing the closed marker fails, as a full disk would."""
+    import fri.fri_turn_withdrawal as withdrawal
+    real = withdrawal.private_json
+    def writing(path, data):
+        if path.name == CLOSED:
+            raise OSError(28, 'injected')
+        return real(path, data)
+    monkeypatch.setattr(withdrawal, 'private_json', writing)
+
+
+async def kept_pending(w, tmp_path, monkeypatch):
+    """A withdrawal left on disk whose controller keeps timing out, so only Fri holds its exchange back."""
+    import fri.fri_turn_withdrawal as withdrawal
+    earlier = await pending_on_disk(w, tmp_path)
+    failing(w, WITHDRAW)
+    monkeypatch.setattr(withdrawal, 'MARKED_SECONDS', 0)  # Only the record (or the closed state) holds it back.
+    return earlier
+
+
+def test_the_reviewers_repro_a_failed_set_aside_never_lets_a_later_write_release_the_withdrawal(monkeypatch, tmp_path):
+    """Round 5's repro: a valid record padded past 16 MB, a transient rename failure, an unrelated member's "forget
+    me", a restart. The withdrawn exchange stays out of the next request, as main keeps it."""
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = await kept_pending(w, tmp_path, monkeypatch)
+            padded(tmp_path)
+            renames(monkeypatch, times=1)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert MARKER not in await next_request(w)
+            w.agent.saved_turns.forget('30')
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert MARKER not in await next_request(w)
+            assert str(earlier.id) in w.agent.saved_turns.pending and not w.agent.saved_turns.closed()
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_record_main_reads_is_read_whole_however_large(monkeypatch, tmp_path):
+    """No file main reads correctly loses an entry: past 16 MB, the record is still read, in bounded pieces."""
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = await kept_pending(w, tmp_path, monkeypatch)
+            padded(tmp_path)
+            turns = w.agent.saved_turns = SavedTurns(w.agent)
+            assert str(earlier.id) in turns.pending and not turns.closed()
+            assert MARKER not in await next_request(w) and history(w) > 0  # Only that exchange is held back.
+            assert not list(tmp_path.glob('withdrawals.unreadable-*.json'))
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('failure', ['the rename', 'the rename and the marker'])
+def test_an_unreadable_record_that_cant_be_set_aside_is_never_overwritten(monkeypatch, tmp_path, failure):
+    """Neither a queue write nor anything else replaces it: it stays as it was, and the next start is closed too."""
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            await kept_pending(w, tmp_path, monkeypatch)
+            text = (tmp_path/'withdrawals.json').read_text()[:-5]  # Cut off.
+            (tmp_path/'withdrawals.json').write_text(text)
+            renames(monkeypatch)
+            if failure == 'the rename and the marker':
+                markers(monkeypatch)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert MARKER not in await next_request(w) and history(w) == 0
+            w.agent.saved_turns.forget('30')  # An unrelated member's "forget me", and a new withdrawal: both would write the queue.
+            more = w.said('fri one more')
+            await w.agent.handle(more)
+            await delete(w, more)
+            assert (tmp_path/'withdrawals.json').read_text() == text
+            assert (tmp_path/CLOSED).exists() is (failure == 'the rename')
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert MARKER not in await next_request(w) and history(w) == 0
+            assert (tmp_path/'withdrawals.json').read_text() == text
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_closed_state_outlasts_a_transient_read_failure(monkeypatch, tmp_path):
+    """The record couldn't be read once and couldn't be set aside: closed is on disk before anything else is written,
+    so a start that reads the record fine afterwards is still closed, and its entries are all there."""
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = await kept_pending(w, tmp_path, monkeypatch)
+            text = (tmp_path/'withdrawals.json').read_text()
+            reads(monkeypatch, tmp_path/'withdrawals.json')
+            renames(monkeypatch, times=1)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert MARKER not in await next_request(w) and history(w) == 0
+            w.agent.saved_turns.forget('30')
+            assert (tmp_path/'withdrawals.json').read_text() == text
+            turns = w.agent.saved_turns = SavedTurns(w.agent)
+            assert turns.closed() and str(earlier.id) in turns.pending
+            assert MARKER not in await next_request(w) and history(w) == 0
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def later(monkeypatch, seconds):
+    """Fri's, Gene's and Discord's clocks `seconds` on: time.time everywhere here, and new messages' IDs."""
+    import datetime as dt
+    import time
+
+    import discord
+    now, snowflake = time.time, discord.utils.time_snowflake
+    monkeypatch.setattr(time, 'time', lambda: now()+seconds)
+    monkeypatch.setattr(discord.utils, 'time_snowflake',
+                        lambda when, high=False: snowflake(when+dt.timedelta(seconds=seconds), high=high))
+
+
+def sourced_note(w):
+    """A preference learned from a message whose exchange is gone since: only the note holds its words."""
+    from compat_tests.test_fri_withheld_history import LIKE
+    said = w.said(LIKE)
+    source = {'kind': 'discord_message', 'id': str(said.id), 'user_id': '20', 'channel_id': '1', 'guild_id': '123',
+              'display_name': 'member'}
+    w.store.save_chat('123', 'public:1', '20', 0, LIKE, 'okay', 'model', 'high', source=source, provenance=[],
+                      notes=[{'category': 'hobbies', 'evidence': LIKE}])
+    with w.store.connection() as db:
+        db.execute('DELETE FROM chat_turns')
+    return said
+
+
+async def asked(w):
+    w.requests.clear()
+    await w.agent.handle(w.said('fri what do i like'))
+    assert w.requests
+    return str(w.requests)
+
+
+@pytest.mark.parametrize('record', ['larger than 16 MB', 'unreadable'])
+def test_a_withdrawn_note_stays_held_back_past_a_week(monkeypatch, tmp_path, record):
+    """Round 5's repro: a sourced preference whose exchange was removed, its valid scoped withdrawal left in a record
+    larger than 16 MB (or one that can't be read at all), and every clock eight days on. The note still stays out of
+    the request: the entry is read, or the closed state lasts as long as a note can be kept."""
+    async def scenario():
+        import json
+
+        from compat_tests.test_fri_withheld_history import LIKE, needs_sources
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        needs_sources(w)
+        try:
+            said = sourced_note(w)
+            assert LIKE in await asked(w)  # Nothing withdrawn yet: the note is there.
+            revision = w.store.chat_context('123', 'public:1', '20').get('revision', 0)
+            scope = {'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20'}
+            (tmp_path/'withdrawals.json').write_text(json.dumps({'pending': {str(said.id): {
+                'scope': scope, 'revision': revision if type(revision) is int else 0, 'deleted': True}}}))
+            if record == 'larger than 16 MB':
+                padded(tmp_path)
+            else:
+                (tmp_path/'withdrawals.json').write_text((tmp_path/'withdrawals.json').read_text()[:-2])
+            failing(w, WITHDRAW)  # The controller never takes it: only Fri holds the note back.
+            failing(w, SAVED)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert LIKE not in await asked(w)
+            later(monkeypatch, 8*86400)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert LIKE not in await asked(w)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_deadline_is_kept_once_normalized_whatever_the_clock_or_a_set_aside_name_says(monkeypatch, tmp_path):
+    """A record set aside under a name dated in the future (a clock set back since) closes for the longest horizon
+    from the first start that sees it, kept on disk: later starts don't push it on."""
+    async def scenario():
+        import fri.fri_turn_withdrawal as withdrawal
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            await pending_on_disk(w, tmp_path)
+            (tmp_path/'withdrawals.json').write_text('{"pending": {')
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert w.agent.saved_turns.closed()
+            aside = next(tmp_path.glob('withdrawals.unreadable-*.json'))
+            aside.rename(tmp_path/'withdrawals.unreadable-99999999999.json')  # Dated in the year 5138.
+            module_clock(monkeypatch, -30*86400)  # The clock set back a month.
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert w.agent.saved_turns.closed()
+            first = w.agent.saved_turns.closed_until
+            assert first <= withdrawal.time.time()+withdrawal.CLOSED_SECONDS
+            module_clock(monkeypatch, 86400)  # A day later.
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert w.agent.saved_turns.closed() and w.agent.saved_turns.closed_until == first
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_skipped_value_is_checked_as_json_loads_checks_it():
+    """A container nested past what's kept is still JSON or the record isn't: no bracket count passes '1 2'."""
+    from fri.fri_turn_withdrawal import Unreadable, read_record
+    with pytest.raises(Unreadable):
+        read_record('{"pending":{},"junk":'+'['*16+'1 2'+']'*16+'}')
+    with pytest.raises(Unreadable):
+        read_record('{"pending":{},"junk":'+'['*17+'1,]'+']'*16+'}')
+    with pytest.raises(Unreadable):
+        read_record('{"pending":{},"junk":'+'['*17+']'*16+'}}')
+
+
+def test_fri_health_shows_the_closed_state_and_its_end_without_contents(monkeypatch, tmp_path):
+    async def scenario():
+        import json
+
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            await pending_on_disk(w, tmp_path)
+            (tmp_path/'withdrawals.json').write_text('{"pending": {"1": '+MARKER)
+            turns = w.agent.saved_turns = SavedTurns(w.agent)
+            assert turns.closed()
+            w.fri.get_guild = lambda _: None
+            report = await w.fri.watcher.report()
+            lines = [line for line in report.splitlines() if 'saved context' in line]
+            assert len(lines) == 1 and f'<t:{int(turns.closed_until)}:' in lines[0] and MARKER not in report
+            await w.fri.health.coro(w.fri)
+            health = json.loads((tmp_path/'fri-health.json').read_text())['withdrawals']
+            assert health['closed_until'] == turns.closed_until and MARKER not in json.dumps(health)
         finally:
             await w.fri.close()
     asyncio.run(scenario())
