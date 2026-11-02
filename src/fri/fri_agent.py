@@ -2173,6 +2173,8 @@ class Agent:
         if fence and (reason := await self.erasure(message.author.id, fence[0],
                                                    fence[1] if invitation or dm or not since else None)):
             return await self.dropped(message, events, reason, invitation, fence, burst)
+        if dm and memory_intent(text) not in MEMORY_CONTROLS and not self.config['support_dms']:
+            return missed('dms off')  # Gone off during that read, as dm_closed checks after its lookup.
         def taken_back():
             """Why what the model made can't go out, or be saved, now: a message it answers or one it was shown,
             deleted since. Checked again after each wait below, up to the save (the delivered part stays)."""
