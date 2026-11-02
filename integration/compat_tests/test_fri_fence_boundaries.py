@@ -204,3 +204,39 @@ def test_a_dm_reply_is_held_to_its_baseline_through_its_last_membership_lookup(m
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_dm_reply_stops_if_dms_go_off_during_its_last_privacy_read(monkeypatch, tmp_path):
+    """fri #272 review: Gene's revision read after a DM reply's last membership lookup is a wait of its own. DMs going
+    off during it stop the reply, as they do during the lookup (Agent.dm_closed): nothing goes out or is saved."""
+    async def scenario():
+        fri, agent, store, _, _, _, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        channel, message = direct(fri, agent, rows)
+        trigger = message('whats the best album')
+        composed, looked = [], []
+        async def respond(text, context, ready):
+            await ready()
+            composed.append(True)
+            return ChatResult(status='completed', reply='an answer')
+        model(fri, tmp_path, respond)
+        async def member(user, **kwargs):
+            if composed and composed.pop():  # The lookup after the model: the reply's last before it goes out.
+                looked.append(True)
+            return SimpleNamespace(id=20)
+        agent.member = AsyncMock(side_effect=member)
+        revision = agent.revision
+        async def reading(user):
+            current = await revision(user)
+            if looked:  # The read after that lookup: DMs go off while it waits.
+                agent.config['support_dms'] = False
+            return current
+        agent.revision = reading
+        try:
+            await agent.handle(trigger)
+            assert looked and not agent.config['support_dms']
+            trigger.reply.assert_not_awaited()
+            assert not saved(calls) and agent.ledger.snapshot()['in_flight'] == 0
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
