@@ -101,7 +101,7 @@ def test_real_learning_harness_explores_old_messages_and_deduplicates_cross_quer
             agent.run = infer
             return agent
         # Summary mocks consume the real normalized records, not Discord response objects.
-        async def summarize(role, instruction, data, schema, model, effort):
+        async def summarize(role, instruction, data, schema, model, effort, erased=None):
             if role == 'summary':
                 model_inputs.append((role, data))
                 assert [r['user_id'] for r in data['messages']] == ['11']

@@ -82,7 +82,7 @@ def test_initial_scan_then_new_messages_drain_without_skips_after_restart(learni
         requests.append((path, payload))
         return response.json()
 
-    async def model(role, instructions, context, schema, model, effort):
+    async def model(role, instructions, context, schema, model, effort, erased=None):
         assert (role, model, effort) == ('summary', 'gpt-6-luna', 'medium')
         summaries.append(context['messages'])
         return {'summary': 'Music chat.', 'notes': []}, {'input_tokens': 20, 'output_tokens': 5}, 'completed'
@@ -295,7 +295,7 @@ def test_learning_keeps_what_a_member_is_working_on_in_its_channel(learning):
         assert response.status_code == 200, response.text
         return response.json()
 
-    async def model(role, instructions, context, schema, model, effort):
+    async def model(role, instructions, context, schema, model, effort, erased=None):
         asked.append((instructions, schema))
         return {'summary': 'Modding chat.', 'notes': [{'source_id': context['messages'][0]['id'], 'category': 'projects',
                                                        'evidence': "I'm building a Factorio mod"}]}, {}, 'completed'
