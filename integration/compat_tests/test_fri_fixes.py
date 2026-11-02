@@ -2467,3 +2467,76 @@ def test_a_note_whose_report_cant_be_read_is_never_left_up_where_main_takes_it_b
     answered = record == 'as_recorded' and rechecks(world)
     kept = not erased and reads == 'answer' and not answered
     assert [str(id) for id in deleted] == ([] if kept else [str(copy.id)])
+
+
+@pytest.mark.parametrize('read', ['fails', 'says nothing'])
+def test_a_copy_that_comes_during_the_report_read_never_turns_mains_bury_into_keep(world, monkeypatch, read):
+    """#260's round 5: a note from before this change (it can't say what was asked), its message ID never noted, while
+    the controller recorded the tap's send as sent. The pass asks for an unconfirmed record and hears the sent one (or,
+    from a controller that keeps no lease, is refused), so it reads the report, and the copy comes during that read,
+    which then fails or says nothing. Main had buried by then, and took the copy back. What main does is decided from
+    the note as it was before the read; the copy learned during it only says what to take back."""
+    from fri.fri_errors import UNREACHABLE, ControllerUnavailable
+    job_id, lease, copy = cut_off_once_cleared(world, erase=False)
+    tapped = world.client.post(f'/requests/{job_id}/requester-notice/finish', headers=headers('fri'), json={
+        'guild_id': '123', 'user_id': str(OWNER), 'lease': lease, 'state': 'sent', 'message_id': str(copy.id)})
+    assert tapped.status_code == 200  # The tap's finish, whose answer never came back.
+    deleted = reply_deletions(world)
+    api, reads = world.fri.api.side_effect, []
+
+    async def reading(method, path, body=None):
+        if method == 'GET' and path == '/requests/'+job_id and not reads:
+            reads.append(path)
+            fri_fixes.seen(world.fri, copy)  # The copy, while the report is read.
+            if read == 'fails':
+                raise ControllerUnavailable(UNREACHABLE)
+            return {**await api(method, path, body), 'source_url': None}
+        return await api(method, path, body)
+
+    world.fri.api.side_effect = reading
+    asyncio.run(fri_fixes.settle(world.agent))
+    asyncio.run(fri_fixes.settle(world.agent))
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
+
+
+@pytest.mark.parametrize('writes', ['the next fails', 'every one fails'])
+@pytest.mark.parametrize('report', ['gone', 'on record', 'unread'])
+def test_a_note_whose_intent_cant_be_saved_still_takes_its_reply_back_once_its_report_is_gone(world, monkeypatch,
+                                                                                             report, writes):
+    """#260's round 5: a note that knows where the reply went, the reporter erased, a second short of KEEP, and the write
+    of what Fri asks next fails. Nothing was asked, the note expired, and the reply stayed up, where main asked, heard
+    the report was gone and took it back. Fri still asks nothing it can't note, but reads the report instead: gone, the
+    reply comes down. On record, or unread, it stays, and the next pass tries again."""
+    from fri.fri_errors import UNREACHABLE, ControllerUnavailable
+    from fri.private_files import private_json
+    job_id, lease, copy = cut_off_once_cleared(world, erase=report == 'gone', asked=[])
+    entries = pending(world)
+    then = time.time()-fri_fixes.KEEP+1
+    entries[job_id] = {**entries[job_id], 'message_id': str(copy.id), 'since': then, 'at': then}
+    private_json(world.fri.data/'requester-notices.json', entries)
+    deleted = reply_deletions(world)
+    finishes, reads = [], []
+    api = world.fri.api.side_effect
+
+    async def counting(method, path, body=None):
+        if path.endswith('/finish'):
+            finishes.append(path)
+        if method == 'GET' and path == '/requests/'+job_id and report == 'unread' and not reads:
+            reads.append(path)
+            raise ControllerUnavailable(UNREACHABLE)
+        return await api(method, path, body)
+
+    world.fri.api.side_effect = counting
+    failing = unwritable(monkeypatch)
+    failing[0] = 1 if writes == 'the next fails' else 10**6
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert finishes == []  # Nothing it couldn't note was asked.
+    if report == 'gone':
+        assert [str(id) for id in deleted] == [str(copy.id)]
+    else:
+        assert not deleted and pending(world)[job_id]['message_id'] == str(copy.id)
+    monkeypatch.setattr(fri_fixes, 'KEEP', fri_fixes.KEEP-5)
+    failing[0] = 0
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert len(deleted) == (report == 'gone') and not pending(world)
