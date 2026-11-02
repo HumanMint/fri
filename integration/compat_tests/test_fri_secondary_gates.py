@@ -512,14 +512,18 @@ def test_an_operational_controls_unconfirmed_command_asks_no_model(monkeypatch, 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('moved', ['local', 'gene', 'someone else'])
+@pytest.mark.parametrize('moved', ['local', 'gene', 'gene, after its own check', 'someone else'])
 @pytest.mark.parametrize('request_', ['research', 'reply'])
 def test_an_outside_pings_requests_are_checked_against_a_local_forget_me(monkeypatch, tmp_path, request_, moved):
     """fri #284: a ping outside the channels Fri answers in has no turn fence of its own, so neither the research
     request nor the ping's own reply request read the author's erasures here. A "forget me" Fri took in during either
     sign-in, before Gene has it, still sent their question. The ping now holds their local count from when it came in,
     read after its own check, Gene's revision with it before research. Nothing is asked, nothing goes out. An
-    erasure through Gene was caught already, by the ping's grant. Someone else's changes nothing."""
+    erasure through Gene was caught already, by the ping's grant, except one after the grant's last read: Gene's
+    revision, read after it, catches that before research. Someone else's changes nothing."""
+    if moved == 'gene, after its own check' and request_ == 'reply':
+        pytest.skip("the reply request reads nothing after the ping's own check")
+
     async def scenario():
         fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path)
         no_debounce(monkeypatch)
@@ -541,19 +545,31 @@ def test_an_outside_pings_requests_are_checked_against_a_local_forget_me(monkeyp
                 agent.forget(20, erased=True)
             elif moved == 'gene':
                 store.personal_control('20', 'disable')
-            else:
+            elif moved == 'someone else':
                 agent.forget(30, erased=True)
 
         model(fri, tmp_path, respond)
         requests = researching(fri, agent, store, 'none')
-        headers = fri.chat.headers
+        headers, signed = fri.chat.headers, []
 
         async def signing():
+            signed.append(True)
             if request_ == 'research':
                 erase()
             return await headers()
 
         fri.chat.headers = signing
+        api, profiles = fri.api, []
+
+        async def granted(method, path, payload=None):
+            result = await api(method, path, payload)
+            if moved == 'gene, after its own check' and signed and path == '/chat/mentions/profiles':
+                profiles.append(path)
+                if len(profiles) == 2:  # The research check's ping check: its last read of their privacy.
+                    store.personal_control('20', 'disable')
+            return result
+
+        fri.api = granted
         try:
             await agent.handle(trigger)
             if moved == 'someone else':
