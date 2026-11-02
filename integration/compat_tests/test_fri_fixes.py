@@ -929,20 +929,19 @@ def recheck_offered(world):
 
 def test_a_reply_whose_claim_stopped_holding_while_it_went_out_is_taken_back(world):
     """A controller that rechecks the claim when the reply is recorded (gene #47) says it no longer held, and Fri
-    deletes its reply. An older controller records it as sent, and Fri answers as before."""
+    deletes its reply. An older controller records it as sent and says nothing more, so Fri asks whether the report is
+    still on record: it isn't, and the reply comes down too (fri #262)."""
     report, job_id, _ = reported(world)
     rechecks = recheck_offered(world)
     erase_while_the_claim_is_out(world)
     deleted = reply_deletions(world)
     text, sent = asyncio.run(tell(world.fri, job_id, OWNER))
-    assert len(world.sent) == 1 and sent is not rechecks
+    assert len(world.sent) == 1 and not sent
     with world.store.connection() as db:
         state = db.execute('SELECT state FROM requester_notices WHERE job_id=?', (job_id,)).fetchone()[0]
-    if rechecks:
-        assert state == 'invalidated' and text == 'took the reply back: the report is no longer on record.'
-        assert len(deleted) == 1 and str(deleted[0]) != str(report.id)
-    else:
-        assert state == 'sent' and text.startswith('told them: ') and not deleted
+    assert state == ('invalidated' if rechecks else 'sent')
+    assert text == 'took the reply back: the report is no longer on record.'
+    assert len(deleted) == 1 and str(deleted[0]) != str(report.id) and not pending(world)
 
 
 def answered(world, verdict):
@@ -1310,8 +1309,10 @@ def test_a_send_cut_off_is_settled_whatever_the_controller_offers_after(world, m
         history(world, monkeypatch, 'before')
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(tell(world.fri, job_id, OWNER))
-    [entry] = pending(world).values()  # The lease, the owner who tapped, where it'd go and when: nothing of theirs.
-    assert set(entry) <= {'lease', 'actor', 'channel_id', 'since', 'at', 'cleared'}
+    # The lease, the owner who tapped, where it'd go and when, and what Fri asked the controller to record: nothing
+    # of theirs.
+    [entry] = pending(world).values()
+    assert set(entry) <= {'lease', 'actor', 'channel_id', 'since', 'at', 'cleared', 'asked'}
     assert entry['actor'] == str(OWNER) and str(report.id) not in json.dumps(entry)
     world.store.erase_user(str(MEMBER))
     world.fri.api.side_effect = api
@@ -2118,15 +2119,31 @@ def test_a_confirmed_notice_whose_id_wasnt_noted_is_kept_when_the_reporter_didnt
     assert tuple(notice_row(world, job_id)) == ('sent', str(copy.id))
 
 
-def test_a_notice_recorded_unchecked_is_taken_back_once_the_reporter_erased(world, monkeypatch):
+@pytest.mark.parametrize('read', ['answers', 'fails once'])
+@pytest.mark.parametrize('note', ['kept from before', 'kept now'])
+def test_a_notice_recorded_unchecked_is_taken_back_once_the_reporter_erased(world, monkeypatch, note, read):
     """fri #262: the reporter erased after the send was cleared, and the copy came before the pass. A controller before
     gene #143 records the sent finish without checking the reporter again, and says nothing more, so Fri forgot the
     note with the reply up. Fri asks the controller whether the report is still on record: it isn't, so the reply
-    comes down. A controller that checks it again says so itself."""
-    job_id, lease, copy = cut_off_once_cleared(world)
+    comes down. When it can't say, the next pass asks again, though its repeat is refused then. A controller that
+    checks it again says so itself."""
+    from fri.fri_errors import UNREACHABLE, ControllerUnavailable
+    job_id, lease, copy = cut_off_once_cleared(world, asked=None if note == 'kept from before' else [])
     deleted = reply_deletions(world)
     fri_fixes.seen(world.fri, copy)
+    api, reads = world.fri.api.side_effect, []
+
+    async def reading(method, path, body=None):
+        if method == 'GET' and path == '/requests/'+job_id and read == 'fails once' and not reads:
+            reads.append(path)
+            raise ControllerUnavailable(UNREACHABLE)
+        return await api(method, path, body)
+
+    world.fri.api.side_effect = reading
     asyncio.run(fri_fixes.settle(world.agent))
+    if reads:
+        assert pending(world) and not deleted
+        asyncio.run(fri_fixes.settle(world.agent))
     assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
     assert notice_row(world, job_id)[0] == ('invalidated' if rechecks(world) else 'sent')
     asyncio.run(fri_fixes.settle(world.agent))
