@@ -148,9 +148,9 @@ class SavedTurns:
             return False
         for n in range(100):
             aside = path.with_name(f'withdrawals.unreadable-{int(now)}{"" if n == 0 else f"-{n}"}.json')
-            if aside.exists():
-                continue
             try:
+                if aside.exists():
+                    continue
                 path.rename(aside)
             except FileNotFoundError:  # Gone already: nothing left to replace.
                 pass
