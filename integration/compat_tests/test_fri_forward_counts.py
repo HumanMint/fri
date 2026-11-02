@@ -140,6 +140,12 @@ def test_dropped_forwards_are_counted_by_gate_in_fri_health_and_its_file(monkeyp
             assert outcomes['forwards'] == {'no text': 2}
             lines = [line for line in (await fri.watcher.report()).splitlines() if 'forwards' in line]
             assert lines == [f"- forwards not read since <t:{int(outcomes['since'])}:R>: 2 (no text ×2)"]
+            # The whole snapshot but its time, so no field of it can hold an ID, a name or a channel in any form, one
+            # the markers below don't name included (fri #286).
+            assert {key: value for key, value in outcomes.items() if key != 'since'} == {
+                'addressed': {}, 'answered': 0, 'cooldown': 0, 'forwards': {'no text': 2}, 'in_flight': 0,
+                'latency': {'p50': None, 'p90': None, 'samples': 0}, 'outage': 0, 'quiet': {}, 'told_why': {},
+                'withheld': {}}
             # The times aren't member data, and digits in them can match a short ID by chance ("…755574" has
             # 555), so they're left out of what's searched.
             shown = json.dumps({key: value for key, value in outcomes.items() if key != 'since'})
