@@ -199,6 +199,7 @@ class Agent:
         self.reruns = set()  # Those answers again still going (see answer_edits).
         self.rerunning = {}  # Message ID -> the newest edited_at seen while it waits to be answered again.
         self.requeued = {}  # Message ID -> its author, from being queued to be answered again until that ends.
+        self.fences = {}  # Message ID -> its first handling's privacy baseline, for that too (see rerun).
         self.edit_seen = {}  # Message ID -> the newest edited_at seen while it was handled (see saw_edit).
         self.last_attention = {}
         self.last_spoke = {}
@@ -871,6 +872,16 @@ class Agent:
             return 'author privacy changed'
         return failed
 
+    def erased_since(self, message, revision=None):
+        """Whether the author of a message being answered again as edited (see rerun) erased since its first
+        handling took their baseline as it came in: here, or through the panel, Gene or Red by `revision`, theirs
+        as read just now (revisions only go up). Only a known baseline counts. Never for another message."""
+        if message.id not in self.rerunning:
+            return False
+        since = self.fences.get(message.id)
+        return (since is None or since[1] is None or self.forgotten.get(message.author.id, 0) != since[0] or
+                revision is not None and revision != since[1])
+
     async def dropped(self, message, events, reason, invitation=None, since=None, burst=()):
         """Drop a message whose author may have erased: quietly, unless all that's known is that the
         controller can't be reached to check, which gets the outage notice."""
@@ -994,7 +1005,7 @@ class Agent:
                     # Sent before one that already went through, e.g. delivered late: it mustn't undo that.
                     return await self.superseded(message, events)
                 if await self.reply_once(message, text, dm, burst=burst, invitation=invitation, since=since,
-                                         addressed=addressed) is not BUSY:
+                                         addressed=addressed, baseline=(forgotten, revision)) is not BUSY:
                     return
             recheck = True
         while True:
@@ -1039,7 +1050,7 @@ class Agent:
                 # it back, is neither answered nor saved. A ping's invitation checks its own message.
                 if not invitation and not await self.unedited(events):
                     if (alone and message.id not in self.unsent and  # Edited, not deleted, as reply_once has it.
-                            self.taken_back(message.id, self.arrival([message.id])) and self.answer_again(message)):
+                            self.taken_back(message.id, self.arrival([message.id])) and self.answer_again(message, since)):
                         return self.missed(events, 'message edited')
                     return self.missed(events, 'message changed')
                 if reason := await self.excluded(message, dm, invitation, privacy, text):
@@ -1147,7 +1158,7 @@ class Agent:
             self.reruns.add(task)
             task.add_done_callback(lambda task, token=token: self.alone_cancelled(task, token))
             task.add_done_callback(self.reruns.discard)
-        answering = [self.answer_again(token.message) for token in again]
+        answering = [self.answer_again(token.message, token.since) for token in again]
         for token in again + gone:  # Kept for its re-run (see settle), or settled: nothing answers it now.
             self.settle(token.message, 'message deleted' if token in gone else 'message changed')
         if any(answering):
@@ -1158,9 +1169,10 @@ class Agent:
         for token in voided:
             self.turns.wake(token.key[1])  # A turn waiting for theirs, given way, stops waiting.
 
-    def answer_again(self, message):
+    def answer_again(self, message, since):
         """Answer an edited message again, once, as it reads now, after nothing handles it any more (see rerun).
-        Not after a tool that may change something ran for it, for a privacy control or after a second edit."""
+        Not after a tool that may change something ran for it, for a privacy control or after a second edit.
+        `since`: its author's (local erasures, privacy revision) as it came in, which that rerun is held to."""
         if (message.id in self.acted or self.memory_control(message) or
                 self.reanswered.get(message.id, 0) >= MAX_REANSWERS):
             return False
@@ -1169,6 +1181,7 @@ class Agent:
             del self.reanswered[next(iter(self.reanswered))]
         self.reanswer[message.id] = message.channel.id
         self.requeued[message.id] = message.author.id  # Attention waits for it meanwhile (see ambient_ready).
+        self.fences[message.id] = since
         return True
 
     async def answer_alone(self, token):
@@ -1281,6 +1294,7 @@ class Agent:
             self.rerunning.pop(i, None)
             self.edit_seen.pop(i, None)
             self.requeued.pop(i, None)
+            self.fences.pop(i, None)
             self.ledger.abandon(i, parked, 'CancelledError')
 
     async def rerun(self, channel_id, message_id):
@@ -1290,18 +1304,23 @@ class Agent:
         edit event); it's tried a few times, then dropped. Only Discord saying the message isn't there counts as
         deleted, and only its saying Fri can't read it there as a closed gate. A fetch that fails otherwise, a
         server error, a timeout or a dropped connection, is tried again after a short backoff while its turn's
-        deadline allows (fri #243, #249), then dropped quietly: unread, Fri can't tell the message still stands, or
-        that its author hasn't erased since. It's then taken in as of when that fetch began, so an edit after is
-        withdrawn like any other, and alone, so it never joins a burst sent after it. If it ends before handling it
-        again, its count from the first handling settles here, for why (see Ledger.park)."""
+        deadline allows (fri #243, #249), each try again ending there too (fri #259), then dropped quietly: unread,
+        Fri can't tell the message still stands, or that its author hasn't erased since. It's then taken in as of
+        when that fetch began, so an edit after is withdrawn like any other, and alone, so it never joins a burst
+        sent after it. Its author is held to the privacy baseline its first handling took as it came in (see
+        answer_again), never one read now: their erasure since, during the fetch too, ends it quietly, as one would
+        have ended that handling (fri #248). Without that baseline, it isn't taken in again at all. If it ends
+        before handling it again, its count from the first handling settles here, for why (see Ledger.park)."""
         parked, reason = self.ledger.parked(message_id), 'no reply'
         until = discord.utils.snowflake_time(message_id).timestamp()+QUEUE_SECONDS
+        since = self.fences.get(message_id)
         try:
             changing = failed = 0
             while True:
                 began = time.time()
                 try:
-                    message = await self.fri.get_channel(channel_id).fetch_message(message_id)
+                    async with asyncio.timeout(until-time.time() if failed else None):  # Discord can hold one open.
+                        message = await self.fri.get_channel(channel_id).fetch_message(message_id)
                 except AttributeError:
                     reason = 'channel gone'
                     return  # Nowhere left to answer it.
@@ -1331,6 +1350,9 @@ class Agent:
             if self.memory_control(message):
                 reason = 'edited into a privacy control'
                 return  # Not a privacy control: it was refused for the edit (see Fri.chat_once), and they send it again.
+            if since is None or since[1] is None:
+                reason = 'no privacy baseline'
+                return  # Nothing to hold its author to: one read now could already hold their erasure.
             self.delivered.pop(message.id, None)
             self.watched.pop(message.id, None)
             await self.handle(message, read=began)
@@ -1344,6 +1366,7 @@ class Agent:
             self.rerunning.pop(message_id, None)
             self.edit_seen.pop(message_id, None)
             self.requeued.pop(message_id, None)
+            self.fences.pop(message_id, None)
             self.ledger.abandon(message_id, parked, reason)
 
     def saw_edit(self, i, edited):
@@ -1572,6 +1595,8 @@ class Agent:
         erasures = self.erased.get(message.author.id, 0)  # The owner settings fence ignores cache resets.
         if getattr(message, 'webhook_id', None) or message.author.id == self.fri.user.id:
             return
+        if message.id in self.rerunning and self.erased_since(message):  # Answered again as edited (see rerun).
+            return self.miss(message, 'author privacy changed')
         dm = message.guild is None
         if dm:
             if message.author.bot:
@@ -1617,7 +1642,8 @@ class Agent:
                 profile = await self.profile(parent, message.author.id)
                 # Deleted or edited while the profile read waited: like a text post, it stays out.
                 if (profile['enabled'] and not before_removal(message.id, profile) and message.id not in self.unsent and
-                        not self.taken_back(message.id, self.arrived.get(message.id, sent))):
+                        not self.taken_back(message.id, self.arrived.get(message.id, sent)) and
+                        not self.erased_since(message, profile.get('revision', 0))):
                     self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                         'name': clean(message.author.display_name, 60), 'text': '', 'attachments': media(message),
                         'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
@@ -1684,8 +1710,8 @@ class Agent:
             self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                 'name': 'Gene', 'text': text[:1800], 'at': time.time(), 'gene_error': True})
             return
-        elif not privacy:  # A DM's too, as it comes in, so an erasure during any wait below counts.
-            try:
+        elif not privacy or message.id in self.rerunning:  # A DM's too, as it comes in, so an erasure during any
+            try:  # wait below counts. A rerun's always: it's compared with its first handling's (see rerun).
                 observed = await self.revision(message.author.id)
             except ControllerUnavailable:
                 if self.forgotten.get(message.author.id, 0) != forgotten:
@@ -1693,7 +1719,7 @@ class Agent:
                 raise  # Its notice is the outage notice (see listen).
             except (commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
                 return await self.unreadable(message, [message], exc, invitation, forgotten)
-            if self.forgotten.get(message.author.id, 0) != forgotten:
+            if self.forgotten.get(message.author.id, 0) != forgotten or self.erased_since(message, observed):
                 return self.miss(message, 'author privacy changed')
         if not dm and gene_command(message.content) and not explicit_mention(message, self.fri.user.id):
             # "!play …", "!stop": Red runs them and answers itself. Not Fri's turn, even in a follow-up window or
@@ -1920,8 +1946,10 @@ class Agent:
     async def incoming(self, message, invitation, channel, forgotten, *, control=False):
         """The author's profile as a message to Fri comes in. A ping keeps it, and the local erasures
         so far, as the baseline its notices compare with. None once a ping was told why it can't be
-        answered (see unreadable for a privacy `control`), or the author erased during the read; other
+        answered (see unreadable for a privacy `control`), or the author erased during the read (one
+        answered again as edited: since its first handling, whatever it says now, see rerun); other
         messages raise as before."""
+        control = control and message.id not in self.rerunning
         if invitation:
             invitation.forgotten = forgotten
         try:
@@ -1935,6 +1963,9 @@ class Agent:
             if not invitation:
                 raise
             await self.unreadable(message, [message], exc, invitation, forgotten, control)
+            return None
+        if self.erased_since(message, profile.get('revision', 0)):
+            self.miss(message, 'author privacy changed')
             return None
         if invitation:
             invitation.revision = profile.get('revision', 0)
@@ -2001,11 +2032,12 @@ class Agent:
             self.replying.discard(message.id)
 
     async def reply_once(self, message, text, dm=False, *, burst=(), ambient=False, invitation=None, since=None,
-                         addressed=False):
+                         addressed=False, baseline=None):
         # `addressed`: someone spoke to Fri (a ping, its name, a reply to Fri, a DM), so it types once the
         # turn is admitted. Otherwise, e.g. a follow-up or ambient attention, it types only for an action.
         # `since`: the author's (local erasures, privacy revision) as the message came in. A ping's
-        # error or a low battery doesn't go out once they erased after it.
+        # error or a low battery doesn't go out once they erased after it. `baseline`: the same for a privacy
+        # control, which `since` leaves out: only its rerun after an edit is held to it (see answer_again).
         events = [message, *(event for _, event, _ in burst if event is not message)]  # This turn answers for all.
         began = time.time()  # A nearby post edited before this was read as it is now (see changed).
         arrival = self.arrival(event.id for event in events)  # Its own messages as they read when they came in.
@@ -2031,7 +2063,7 @@ class Agent:
             """Its one message edited, not deleted, since it came in, and no tool that may change something ran
             for it: nothing goes out, and once this turn is done it's answered again as it reads now (see rerun).
             Not an unprompted reply, a ping (its invitation says why), a burst, a privacy control or a second edit."""
-            if ambient or invitation or burst or not edited() or not self.answer_again(message):
+            if ambient or invitation or burst or not edited() or not self.answer_again(message, since or baseline):
                 return False
             missed('message edited')
             return True
