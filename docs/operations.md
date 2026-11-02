@@ -295,10 +295,17 @@ advertises it, so the controller must be released first.
   again on the retry schedule, so a Gene rolled forward takes it. Right before every request (the first,
   a resend after a refusal, each retry) Fri checks again that the entry is still queued as it was, that
   its member hasn't said "forget me" since, and that the controller can safely take it as it now stands;
-  if not, the request isn't made. The file is read so that no value can fail the whole read (NaN,
-  infinities and over-long numbers read as nothing), and each entry is checked on its own, so a malformed
-  one is left out and never stops the rest or Fri's start. The queue keeps an entry only as long as what
-  it names can
+  if not, the request isn't made. The file is read without recursion and up to 16 MB, so no value can
+  fail the whole read: one nested past 16 levels is skipped where it stands, and NaN, infinities and
+  over-long numbers read as nothing. Each entry is checked on its own. One whose message ID is readable
+  but whose rest isn't one Fri could send is kept as a hold: never sent, its message held back until its
+  week is up. A record that still can't be trusted (cut off, not JSON, too large, the wrong shape) is
+  never read as empty: it's set aside unread as `withdrawals.unreadable-<time>.json` (the newest three are
+  kept, none past a week), and while one younger than a week lies there, every saved context is held
+  back, across restarts: requests and memory views carry no saved exchange, note, elsewhere exchange,
+  pending question or summary. Fri still starts and answers. To end that early, recover the entries by
+  hand (or confirm nothing in it matters) and remove the set-aside file. The queue keeps an entry only as
+  long as what it names can
   be kept (a week, or a note's 90 days, below), and at most 20,000, the oldest messages' going first.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the
