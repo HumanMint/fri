@@ -2540,3 +2540,54 @@ def test_a_note_whose_intent_cant_be_saved_still_takes_its_reply_back_once_its_r
     failing[0] = 0
     asyncio.run(fri_fixes.settle(world.agent))
     assert len(deleted) == (report == 'gone') and not pending(world)
+
+
+def test_a_note_whose_intent_cant_be_saved_before_its_copy_came_stays_for_that_copy(world, monkeypatch):
+    """#260's round 6: a cleared send whose copy hasn't come, the reporter erased, and the write of what Fri asks next
+    fails. There's no reply to take back yet, so nothing is read or asked, and the note stays as it was: dropped, a copy
+    that comes later couldn't be taken back. Once writes work, it's recorded unconfirmed, and its copy comes down."""
+    job_id, lease, copy = cut_off_once_cleared(world, asked=[])
+    deleted = reply_deletions(world)
+    finishes = []
+    api = world.fri.api.side_effect
+
+    async def counting(method, path, body=None):
+        if path.endswith('/finish'):
+            finishes.append(path)
+        return await api(method, path, body)
+
+    world.fri.api.side_effect = counting
+    failing = unwritable(monkeypatch)
+    failing[0] = 1
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert finishes == [] and pending(world)[job_id]['lease'] == lease and 'asked' in pending(world)[job_id]
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert len(finishes) == 1 and not deleted
+    fri_fixes.seen(world.fri, copy)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
+
+
+@pytest.mark.parametrize('meanwhile', ['forgotten', 'claimed again'])
+def test_a_note_that_changes_during_the_read_its_unsaved_intent_falls_back_to_is_left_as_it_is(world, monkeypatch,
+                                                                                               meanwhile):
+    """#260's round 6: the report read a note falls back to when what it asks can't be saved is a wait, like any other.
+    A note forgotten or claimed again meanwhile is that one now: it isn't written back, or over."""
+    from fri.private_files import private_json
+    job_id, lease, copy = cut_off_once_cleared(world, asked=[])
+    entries = pending(world)
+    entries[job_id] = {**entries[job_id], 'message_id': str(copy.id)}
+    private_json(world.fri.data/'requester-notices.json', entries)
+    now = time.time()
+    other = {'lease': 'f'*32, 'actor': str(OWNER), 'channel_id': '456', 'since': now, 'at': now}
+    api = world.fri.api.side_effect
+
+    async def reading(method, path, body=None):
+        if method == 'GET' and path == '/requests/'+job_id:
+            private_json(world.fri.data/'requester-notices.json', {} if meanwhile == 'forgotten' else {job_id: other})
+        return await api(method, path, body)
+
+    world.fri.api.side_effect = reading
+    unwritable(monkeypatch)[0] = 1
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert pending(world) == ({} if meanwhile == 'forgotten' else {job_id: other})
