@@ -998,3 +998,31 @@ def test_fri_health_shows_the_closed_state_and_its_end_without_contents(monkeypa
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+def test_a_set_aside_name_that_cant_be_checked_leaves_fri_starting_closed(monkeypatch, tmp_path):
+    """Round 6: once closed is on disk, checking whether the set-aside name is free can fail too (a disk error, the
+    folder's permissions lost). That never stops Fri starting: the record stays as it was, closed holds, and nothing
+    replaces the record."""
+    import errno
+    import pathlib
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            await kept_pending(w, tmp_path, monkeypatch)
+            text = (tmp_path/'withdrawals.json').read_text()[:-5]  # Cut off.
+            (tmp_path/'withdrawals.json').write_text(text)
+            exists = pathlib.Path.exists
+            def failing_exists(path, *args, **kwargs):
+                if path.name.startswith('withdrawals.unreadable-'):
+                    raise OSError(errno.EIO, 'input/output error')
+                return exists(path, *args, **kwargs)
+            monkeypatch.setattr(pathlib.Path, 'exists', failing_exists)
+            turns = w.agent.saved_turns = SavedTurns(w.agent)
+            assert turns.closed() and MARKER not in await next_request(w) and history(w) == 0
+            turns.forget('30')  # A queue write: it must not replace the record.
+            assert (tmp_path/'withdrawals.json').read_text() == text and (tmp_path/CLOSED).exists()
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
