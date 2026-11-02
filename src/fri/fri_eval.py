@@ -245,6 +245,11 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
         async for case, result in memory(chat, model, effort, voice_notes):
             yield case, result
         return
+    if suite == 'recall':
+        from .fri_recall_eval import evaluate as recall
+        async for case, result in recall(chat, model, effort, voice_notes):
+            yield case, result
+        return
     for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': lambda: [*image_cases(), *link_cases()], 'sass': sass_cases, 'model-text': model_text_cases}[suite]():
         name = case.get('display_name', 'Mint')
         context = {'model': model, 'effort': effort, 'facts': [],
@@ -593,15 +598,16 @@ async def main(suite='voice', baseline=False):
         notes = config['voice_notes']
         failed = []
         async for case, result in evaluate(chat, status['chat_model'], status['chat_effort'], notes, suite, background=config):
-            attempt = uuid.uuid4().hex
-            report = {'attempt_id': attempt, 'model': case.get('model', status['chat_model']),
-                'effort': case.get('effort', status['chat_effort']),
-                'status': result.status, 'counters': result.counters, 'role': 'evaluation'}
-            path = Path(os.getenv('FRI_DATA', '/data'))/'usage'/(attempt+'.json')
-            private_json(path, report)
-            posted = await client.post(url+'/chat/usage/report', json=report)
-            posted.raise_for_status()
-            path.unlink(missing_ok=True)  # The live outbox may already have delivered this receipt.
+            if case.get('model_calls') != 0:  # A case Fri answers locally used nothing to report.
+                attempt = uuid.uuid4().hex
+                report = {'attempt_id': attempt, 'model': case.get('model', status['chat_model']),
+                    'effort': case.get('effort', status['chat_effort']),
+                    'status': result.status, 'counters': result.counters, 'role': 'evaluation'}
+                path = Path(os.getenv('FRI_DATA', '/data'))/'usage'/(attempt+'.json')
+                private_json(path, report)
+                posted = await client.post(url+'/chat/usage/report', json=report)
+                posted.raise_for_status()
+                path.unlink(missing_ok=True)  # The live outbox may already have delivered this receipt.
             print(json.dumps({'case': case['name'], 'expect': case['expect'], 'reply': result.reply,
                 'action': result.action, 'draft': result.draft, 'status': result.status,
                 'response_kind': result.response_kind, 'reaction': result.reaction,
@@ -617,7 +623,7 @@ async def main(suite='voice', baseline=False):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'loops', 'times', 'memory', 'sass', 'model-text'), default='voice')
+    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'loops', 'times', 'memory', 'recall', 'sass', 'model-text'), default='voice')
     parser.add_argument('--baseline', action='store_true', help='ASCII-escape model input, for comparison')
     args = parser.parse_args()
     asyncio.run(main(args.suite, args.baseline))
