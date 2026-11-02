@@ -32,6 +32,22 @@ def test_a_long_repetitive_message_is_checked_quickly(unit):
     # Not a property word in lowercase, nor one in a title-cased question.
     ('what was the song price mentioned?', False), ('what is the Max File Size shared on Discord?', False),
     ('what is the file Size shared on discord?', False), ('WHAT WAS THE SONG PRICE MENTIONED?', False),
+    # Sol round 1 of #294: real plurals ending in "us" or "ss" are still plurals before a name, as on main.
+    ('what are the menus Ross shared?', True), ('what are the emus Gus mentioned?', True),
+    ('what are the haikus 芽依 shared?', True), ('what are the bass jo recommended?', True),
+    ('what are the menus Ross shared here?', True), ('what are the gurus kev recommended?', True),
+    # And the adjectives and modifiers item 1 excludes still are.
+    ('what are the stainless pans recommended?', False), ('what are the nervous habits mentioned?', False),
+    ('what are the chess openings recommended?', False), ('what are the class notes shared?', False),
+    ('what are the bus routes recommended?', False), ('what are the business cards shared?', False),
+    ('what are the buses kev recommended?', True),
+    # A capitalized property label after a property word, or in a known compound, isn't a speaker (as on main),
+    # bare or with "here"; "the song Price" still names one.
+    ('what is the file Size shared?', False), ('what is the screen Resolution recommended?', False),
+    ('what is the data Rate recommended?', False), ('what is the file Size shared here?', False),
+    ('what is the screen Resolution recommended here?', False), ('what is the data Rate recommended here?', False),
+    ('what is the frame Rate posted?', False), ('what is the sample Rate recommended?', False),
+    ('what was the song Price mentioned here?', True), ('what was the song Price mentioned', True),
 ])
 def test_the_speaker_is_a_name_not_a_compound_or_a_property(text, expected):
     """fri #239, items 1 and 2."""
