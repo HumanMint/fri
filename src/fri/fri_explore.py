@@ -104,7 +104,7 @@ async def roster(agent, role_id):
 
 async def explore(agent, claim):
     records, scanned_ids, counters, output, error = [], [], {}, {}, ''
-    held = []  # Each record's author and their erasures here as it was read (see Agent.unmoved).
+    held = []  # Each record's author and their erasures here before the archive was searched (see Agent.unmoved).
     try:
         members = await roster(agent, claim['role_id'])
         claim = await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/target', {'members': members})
@@ -137,6 +137,9 @@ async def explore(agent, claim):
         profile = await agent.profile(channel.id, int(target['user_id']))
         if not member or member.bot or not profile['enabled'] or not any(str(r.id) == claim['role_id'] for r in member.roles):
             raise ValueError('Member eligibility changed')
+        # Members' erasures here, once, before the search: every record is held to this, so a "forget me" during it,
+        # or between two of a member's records, counts against all of theirs (fri #290's round 1).
+        snapshot = dict(agent.forgotten)
         rows = [] if plan['skip'] else await search(agent, claim, plan)
         scanned_ids = [str(row['id']) for row in rows]
         checked = set(await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/checked', {'message_ids': scanned_ids}))
@@ -145,7 +148,6 @@ async def explore(agent, claim):
             if row['id'] in checked or row['author'].get('bot') or row.get('webhook_id') or not row.get('content', '').strip():
                 continue
             user = int(row['author']['id'])
-            forgotten = agent.forgotten.get(user, 0)  # Before the reads: a "forget me" during them counts (fri #289).
             member = await agent.member(user, fresh=True)
             if not member or member.bot or not any(str(r.id) == claim['role_id'] for r in member.roles):
                 continue
@@ -155,13 +157,14 @@ async def explore(agent, claim):
             records.append({'id': str(row['id']), 'user_id': str(user), 'role_id': claim['role_id'],
                 'display_name': clean(member.display_name, 80), 'revision': profile['revision'],
                 'text': clean(row['content'], 500), 'at': discord.utils.snowflake_time(int(row['id'])).timestamp()})
-            held.append((user, forgotten))
+            held.append((user, snapshot.get(user, 0)))
         if records:
             output, usage, status = await agent.run('summary', SUMMARIZER,
                 {'focus': {'member_id': plan['member_id'], 'term': plan['term']}, 'messages': records},
                 FINDINGS, model=claim['model'], effort=claim['effort'], erased=agent.unmoved(channel.id, records, held))
             add_usage(counters, usage)
-            if status != 'completed':
+            # The fence leaving nothing to send ('erased', see Agent.run) is an empty batch, not a failed summary.
+            if status not in ('completed', 'erased'):
                 error = 'Archive summary did not complete; progress retained.'
     except ValueError as exc:
         error = clean(str(exc), 150)+'; progress retained.'

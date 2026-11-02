@@ -1358,11 +1358,10 @@ class Fri(discord.Client):
             result = await self.talk(interaction.guild_id, interaction.channel_id, user, text, 'private',
                                      interaction.user.display_name, event=interaction, revision=revision,
                                      forgotten=forgotten)
-            # Last before it's shown, as before a DM's reply is sent (see Agent.reply_once): Gene's revision, then
-            # their erasures here, after every wait of the turn.
-            if held and (reason := await self.agent.erasure(user, forgotten, revision)):
-                if reason == 'check failed: ControllerUnavailable':
-                    raise ControllerUnavailable(UNREACHABLE)  # The panel's outage text, as for any of its reads.
+            # Last before it's shown, with nothing to wait on: their erasures here since it came in. talk() ends on
+            # Gene's check of the whole turn, everyone it drew on and their own revision (held to the one above), so
+            # a read here would reopen that fence for them alone (fri #290's round 1).
+            if held and self.agent.forgotten.get(user, 0) != forgotten:
                 raise AuthorErased()
             view = (DraftView(self, interaction.user.id, result.draft, fence=result.turn) if result.draft
                     else HomeView(self, interaction.user.id))
