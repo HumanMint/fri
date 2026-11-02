@@ -4,8 +4,9 @@ and a retry of its refetch to its turn's deadline (fri #259)."""
 import asyncio
 import inspect
 import time
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import discord
 import pytest
@@ -29,11 +30,12 @@ from compat_tests.test_fri_continuations import (
     until,
 )
 from compat_tests.test_fri_edit_reanswer import MARKER, edit, model
-from compat_tests.test_fri_mentions import environment
+from compat_tests.test_fri_mentions import attachment, environment
 from compat_tests.test_fri_timing import no_debounce
 from fri import fri_agent
 from fri.fri_agent import Agent
 from fri.fri_chat import ChatResult
+from fri.fri_errors import UNREACHABLE, ControllerUnavailable
 
 ERASURES = ['local', 'gene', 'someone else']
 
@@ -264,6 +266,199 @@ def test_a_memory_listing_edited_into_a_question_is_held_to_its_baseline_too(mon
             else:
                 assert not requests
                 copies[0].reply.assert_not_awaited()
+            assert agent.ledger.snapshot()['in_flight'] == 0
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def direct(fri, agent, rows):
+    """environment()'s member 20, in a DM with Fri instead (DMs on)."""
+    @asynccontextmanager
+    async def typing():
+        yield
+    channel = SimpleNamespace(id=555, guild=None, typing=typing)
+    channel.fetch_message = AsyncMock(side_effect=lambda mid: rows[mid])
+    get_channel = fri.get_channel
+    fri.get_channel = lambda cid: channel if cid == channel.id else get_channel(cid)
+    agent.config['support_dms'] = True
+    agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+    def message(text):
+        mid = max(rows, default=discord.utils.time_snowflake(discord.utils.utcnow()))+1
+        item = Mock(spec=discord.Message, id=mid, content=text, channel=channel, guild=None,
+                    author=SimpleNamespace(id=20, display_name='member 20', bot=False), webhook_id=None, mentions=[],
+                    reference=None, attachments=[], embeds=[], edited_at=None, reply=AsyncMock())
+        rows[mid] = item
+        return item
+    return channel, message
+
+
+@pytest.mark.parametrize('first', ['a question', 'a memory listing'])
+@pytest.mark.parametrize('erasure', ['none', 'local', 'gene'])
+def test_a_dm_edited_while_fri_answers_is_held_to_its_baseline(monkeypatch, tmp_path, erasure, first):
+    """A DM's rerun too, its revision read even for a privacy control. A memory listing in a DM reads no revision
+    as it comes in, so its rerun after an edit into a question has no baseline to be held to: it drops quietly,
+    erasure or not, rather than take one now. A question's is answered with nothing changed."""
+    async def scenario():
+        fri, agent, store, _, _, _, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        channel, message = direct(fri, agent, rows)
+        trigger = message('show my memory' if first == 'a memory listing' else 'whats teh best ' + MARKER)
+        requests, copies = [], []
+        api = fri.api
+        async def listing(method, path, payload=None):
+            result = await api(method, path, payload)
+            if path == '/chat/context' and first == 'a memory listing' and not copies:
+                copies.append(await edit(fri, rows, trigger, 'whats the best album'))
+            return result
+        fri.api = listing
+        async def respond(text, context, ready):
+            await ready()
+            requests.append(text)
+            if not copies:
+                copies.append(await edit(fri, rows, trigger, 'whats the best album'))
+                return ChatResult(status='completed', reply='answer to the old words')
+            return ChatResult(status='completed', reply='answer to the edit')
+        model(fri, tmp_path, respond)
+        if erasure != 'none':
+            during_rerun_fetch(channel, erasing(agent, store, erasure))
+        try:
+            await agent.handle(trigger)
+            await until(lambda: not agent.reruns, 10)
+            assert copies
+            trigger.reply.assert_not_awaited()
+            first_requests = [] if first == 'a memory listing' else ['whats teh best ' + MARKER]
+            if erasure == 'none' and first == 'a question':
+                assert requests == [*first_requests, 'whats the best album']
+                copies[0].reply.assert_awaited_once()
+                assert 'answer to the edit' in str(copies[0].reply.await_args)
+            else:
+                assert requests == first_requests
+                copies[0].reply.assert_not_awaited()
+                assert not saved(calls)
+            outcomes = agent.ledger.snapshot()
+            assert outcomes['in_flight'] == 0
+            if first == 'a memory listing':
+                assert outcomes['quiet'].get('no privacy baseline') == 1
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('place', ['server', 'dm'])
+@pytest.mark.parametrize('erasure', ['none', 'local', 'gene'])
+def test_a_question_edited_into_a_memory_listing_is_held_to_its_baseline(monkeypatch, tmp_path, erasure, place):
+    """Edited into "show my memory", its rerun is a privacy control, which a first handling doesn't fence. A rerun is,
+    whatever the edit made it: with nothing changed the listing goes out, after their erasure nothing does."""
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        prefix = 'fri ' if place == 'server' else ''
+        if place == 'dm':
+            channel, message = direct(fri, agent, rows)
+        trigger = message(prefix+'whats teh best ' + MARKER)
+        requests, copies = [], []
+        async def respond(text, context, ready):
+            await ready()
+            requests.append(text)
+            copies.append(await edit(fri, rows, trigger, prefix+'show my memory'))
+            return ChatResult(status='completed', reply='answer to the old words')
+        model(fri, tmp_path, respond)
+        if erasure != 'none':
+            during_rerun_fetch(channel, erasing(agent, store, erasure))
+        try:
+            await agent.handle(trigger)
+            await until(lambda: not agent.reruns, 10)
+            assert requests == [prefix+'whats teh best ' + MARKER]  # A listing makes no model request.
+            trigger.reply.assert_not_awaited()
+            assert copies[0].reply.await_count == (erasure == 'none')
+            assert agent.ledger.snapshot()['in_flight'] == 0
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_owner_control_an_edit_made_is_held_to_the_reruns_baseline(monkeypatch, tmp_path):
+    """The owner's settings request runs before any privacy read: their "forget me" during the rerun's fetch stops
+    it there, as it would any other edit."""
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        trigger = message('fri whats teh best ' + MARKER, user=10)
+        requests, copies = [], []
+        async def respond(text, context, ready):
+            await ready()
+            requests.append(text)
+            copies.append(await edit(fri, rows, trigger, 'fri show settings'))
+            return ChatResult(status='completed', reply='answer to the old words')
+        model(fri, tmp_path, respond)
+        during_rerun_fetch(channel, lambda: agent.forget(10, erased=True))
+        try:
+            await agent.handle(trigger)
+            await until(lambda: not agent.reruns, 10)
+            assert len(requests) == 1
+            trigger.reply.assert_not_awaited()
+            copies[0].reply.assert_not_awaited()
+            assert agent.ledger.snapshot()['in_flight'] == 0
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('erasure', ['none', 'chats cleared'])
+def test_an_uncaptioned_post_an_edit_left_stays_out_of_the_live_view_after_an_erasure(monkeypatch, tmp_path, erasure):
+    """Edited down to its picture, its rerun only puts the post back in the live view (see receive). Not once they
+    cleared their chats through Gene during its fetch: their revision moved, though memory stays on."""
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        trigger = message('fri whats this ' + MARKER, attachments=[attachment(1)])
+        requests, copies = [], []
+        async def respond(text, context, ready):
+            await ready()
+            requests.append(text)
+            copies.append(await edit(fri, rows, trigger, ''))
+            return ChatResult(status='completed', reply='answer to the old words')
+        model(fri, tmp_path, respond)
+        if erasure != 'none':
+            during_rerun_fetch(channel, lambda: store.clear_chats('20'))
+        try:
+            await agent.handle(trigger)
+            await until(lambda: not agent.reruns, 10)
+            assert len(requests) == 1 and copies
+            kept = [row for row in agent.recent[1] if row['id'] == str(trigger.id)]
+            assert [row['text'] for row in kept] == ([''] if erasure == 'none' else [])
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_reruns_outage_notice_is_fenced_even_for_a_memory_listing(monkeypatch, tmp_path):
+    """A privacy control's outage notice isn't fenced as it first comes in. Edited into one, a rerun's is: their
+    "forget me" while its profile read fails says nothing."""
+    async def scenario():
+        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        no_debounce(monkeypatch)
+        trigger = message('fri whats teh best ' + MARKER)
+        copies = []
+        async def respond(text, context, ready):
+            await ready()
+            copies.append(await edit(fri, rows, trigger, 'fri show my memory'))
+            return ChatResult(status='completed', reply='answer to the old words')
+        model(fri, tmp_path, respond)
+        profile = agent.profile
+        async def down(*args, **kwargs):
+            if asyncio.current_task().get_coro().__name__ == 'rerun':
+                agent.forget(20, erased=True)
+                raise ControllerUnavailable(UNREACHABLE)
+            return await profile(*args, **kwargs)
+        agent.profile = down
+        try:
+            await agent.handle(trigger)
+            await until(lambda: not agent.reruns, 10)
+            assert copies
+            trigger.reply.assert_not_awaited()
+            copies[0].reply.assert_not_awaited()
             assert agent.ledger.snapshot()['in_flight'] == 0
         finally:
             await fri.close()
