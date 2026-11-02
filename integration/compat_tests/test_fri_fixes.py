@@ -2319,3 +2319,110 @@ def test_a_tapped_notice_whose_id_cant_be_noted_is_recorded_only_once_it_is(worl
     monkeypatch.setattr(fri_fixes, 'GAVE_UP', 0)
     asyncio.run(fri_fixes.settle(world.agent))
     assert tuple(notice_row(world, job_id)) == ('sent', str(sent[0])) and not deleted and not pending(world)
+
+
+@pytest.mark.parametrize('after', ['the finish', 'the report read'])
+def test_a_note_that_cant_be_read_after_a_wait_keeps_its_take_back(world, monkeypatch, after):
+    """#260's round 3: the reporter erased and the copy came, and the read of the note after a wait (the finish, or the
+    report read) failed once. That read as the note gone, so the pass settled it, the next read let forget() drop it,
+    and the reply stayed up for good. Unreadable isn't gone: the note keeps where the reply went, and a later pass
+    takes it back. On main the finish's case was taken back at once."""
+    job_id, lease, copy = cut_off_once_cleared(world, asked=None if after == 'the report read' else [])
+    fri_fixes.seen(world.fri, copy)
+    deleted = reply_deletions(world)
+    if after == 'the report read':
+        refuse_finish(world, 409)  # A note from before can't say what was asked: the report decides.
+    failing, armed = unreadable(monkeypatch), []
+    api = world.fri.api.side_effect
+
+    async def then(method, path, body=None):
+        if after == 'the finish' and path.endswith('/finish') and not armed:
+            failing[0] = 1  # The very next read of the notes, once the first finish answers.
+            armed.append(path)
+        result = await api(method, path, body)
+        if after == 'the report read' and method == 'GET' and path == '/requests/'+job_id and not armed:
+            failing[0] = 1
+            armed.append(path)
+        return result
+
+    world.fri.api.side_effect = then
+    asyncio.run(fri_fixes.settle(world.agent))
+    asyncio.run(fri_fixes.settle(world.agent))
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
+
+
+BAD = [('asked', None), ('asked', False), ('asked', 7), ('asked', ['sometime']), ('check', None), ('check', 'yes'),
+       ('take_back', 'no'), ('cleared', None), ('since', 'soon')]
+
+
+@pytest.mark.parametrize('field,value', BAD)
+def test_a_bad_optional_field_never_loses_where_the_reply_went(world, monkeypatch, field, value):
+    """#260's round 3: one optional field that isn't what Fri writes there (`asked: null`, say) made the pass raise, and
+    settle_all forgot the whole note as malformed, message ID and all, before asking anything: the reply stayed up.
+    Each is read conservatively instead: either may have been asked, a read is owed, and a take-back isn't decided
+    until it's decided again. So the note keeps where its reply went, and the reply is taken back."""
+    from fri.private_files import private_json
+    job_id, lease, copy = cut_off_once_cleared(world, asked=[])
+    fri_fixes.seen(world.fri, copy)
+    entries = pending(world)
+    entries[job_id][field] = value
+    private_json(world.fri.data/'requester-notices.json', entries)
+    deleted = reply_deletions(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
+
+
+@pytest.mark.parametrize('field,value', [('since', 'soon'), ('cleared', None), ('asked', None)])
+def test_a_bad_optional_field_never_loses_an_unseen_notes_tombstone(world, monkeypatch, field, value):
+    """The same for a send whose copy hasn't come: a bad field made it forgotten, or recorded as never cleared, so the
+    copy that came later matched nothing. It's settled unconfirmed, and its copy taken back."""
+    from fri.private_files import private_json
+    job_id, lease, copy = cut_off_once_cleared(world, asked=[])
+    entries = pending(world)
+    entries[job_id][field] = value
+    private_json(world.fri.data/'requester-notices.json', entries)
+    deleted = reply_deletions(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert notice_row(world, job_id)[0] == 'uncertain' and pending(world) and not deleted
+    fri_fixes.seen(world.fri, copy)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
+
+
+@pytest.mark.parametrize('record', ['as_recorded', 'rolled_forward'])
+def test_a_sent_record_taken_without_a_check_is_checked_after_its_answer_was_lost(world, monkeypatch, record):
+    """Inside fri #262: the reporter erased, the copy came, and Fri asked a controller that doesn't check a sent reply
+    again (it doesn't offer requester-notice-recheck) to record it as sent. It did, and the answer was lost. Its repeat
+    is refused then, after a restart too, or once that database moved to a later controller, and having asked only
+    for a sent record read as "holds sent": the note went, with the reply up. Fri notes the report read is owed before
+    it asks such a controller, so the refusal still leads to it."""
+    job_id, lease, copy = cut_off_once_cleared(world, asked=[])
+    fri_fixes.seen(world.fri, copy)
+    deleted = reply_deletions(world)
+    assert fri_fixes.RECHECK not in world.fri.capabilities  # As that controller offers it.
+    lost_finish(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert pending(world)[job_id]['message_id'] == str(copy.id) and not deleted
+    if record == 'rolled_forward':
+        lease_dropped(world, job_id)
+    fri_fixes.SEEN.clear()  # What a restart forgets.
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
+
+
+def test_a_tapped_notice_recorded_without_a_check_is_checked_after_its_answer_was_lost(world, monkeypatch):
+    """Inside fri #262, on the tap: a tap that doesn't ask for the send (an older controller), the reporter erasing while
+    Discord sends it, and the finish recorded with its answer lost. Nothing was noted, so nothing ever took the reply
+    back. The tap notes the send before it asks for the record, with the report read owed where the controller won't
+    check it, and a later pass settles it."""
+    report, job_id, _ = reported(world)
+    recheck_offered(world)
+    erase_while_it_sends(world, monkeypatch)
+    lost_finish(world)
+    deleted = reply_deletions(world)
+    asyncio.run(tell(world.fri, job_id, OWNER))
+    assert not deleted and pending(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert len(deleted) == 1 and not pending(world)
