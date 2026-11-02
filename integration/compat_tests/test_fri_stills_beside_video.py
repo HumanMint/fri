@@ -9,7 +9,6 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import discord
 import httpx
 import pytest
 
@@ -127,17 +126,22 @@ def test_four_stills_beside_a_video_card_keep_to_the_image_budget(monkeypatch, t
     asyncio.run(scenario())
 
 
-def test_a_spoilered_bot_or_webhook_post_is_still_not_looked_at(monkeypatch):
+def test_a_spoilered_post_is_still_not_looked_at_and_a_bots_card_never(monkeypatch):
+    """Spoiler markup keeps a post's pictures out, as before. A bot's or webhook's uploads are what they always were
+    to look() (the reads that call it admit no bot but Fri), and their card's thumbnail is never loaded."""
     async def scenario():
-        loads(monkeypatch)
         for change in ('spoiler', 'bot', 'webhook'):
+            load = loads(monkeypatch)
             post = own('look')
             post.content = '||look|| https://youtu.be/xyz' if change == 'spoiler' else post.content
-            post.author = SimpleNamespace(id=10, bot=change == 'bot')
+            post.author = SimpleNamespace(id=10, bot=change == 'bot', display_name='member 10')
             post.webhook_id = 5 if change == 'webhook' else None
+            post.guild = SimpleNamespace(id=123)
             context = {}
             await look(context, [post])
-            assert 'images' not in context, change
+            loaded = [call.args[0] for call in load.await_args_list]
+            assert loaded == ([] if change == 'spoiler' else [str(post.attachments[0].url)]), change
+            assert not any(entry.get('still') for entry in context.get('inspected_images', ())), change
     asyncio.run(scenario())
 
 
@@ -154,6 +158,7 @@ def test_a_pings_own_still_beside_a_video_card_reaches_the_model_with_the_video_
             monkeypatch, tmp_path, '<@99> thoughts? https://youtu.be/xyz', unfurled=[youtube()])
         event.attachments = [attachment(channel.id)]
         event.embeds = [youtube()]
+        (await channel.fetch_message(event.id)).attachments = event.attachments  # Discord's copy has it too.
         try:
             invitation = await Invitation.create(agent, event)
             await fri.invited_talk(invitation, 'thoughts? https://youtu.be/xyz')
@@ -179,9 +184,14 @@ def test_the_rule_beside_a_still_reaches_the_model_only_then():
         await chat.respond(QUESTION, dict(CONTEXT))
         await chat.respond(QUESTION, {**CONTEXT, 'own_media_not_inspected': {'attachments': ['video'], 'reason': 'video'}})
         await chat.respond(QUESTION, {**CONTEXT, 'own_media_not_inspected': UNWATCHED,
+                                      'images': ['data:image/png;base64,aGVsbG8='],
+                                      'image_sources': ['https://cdn.discordapp.com/attachments/456/1/test.png']})
+        # Their own gif unseen while a nearby post's picture is shown: the rule for what they sent, as before.
+        await chat.respond(QUESTION, {**CONTEXT, 'own_media_not_inspected': {'attachments': ['gif'], 'reason': 'gif'},
                                       'images': ['data:image/png;base64,aGVsbG8=']})
-        plain, unseen, beside = seen
+        plain, unseen, beside, nearby = seen
         assert BESIDE_RULE not in plain['instructions'] and UNSEEN_RULE not in plain['instructions']
         assert UNSEEN_RULE in unseen['instructions'] and BESIDE_RULE not in unseen['instructions']
         assert BESIDE_RULE in beside['instructions'] and UNSEEN_RULE not in beside['instructions']
+        assert UNSEEN_RULE in nearby['instructions'] and BESIDE_RULE not in nearby['instructions']
     asyncio.run(scenario())
