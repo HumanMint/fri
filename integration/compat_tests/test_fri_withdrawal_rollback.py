@@ -494,17 +494,18 @@ def test_a_malformed_entry_never_stops_the_others_loading(monkeypatch, tmp_path)
         w = await world(monkeypatch, tmp_path)
         try:
             good = w.said('one')
+            a, b, c, d = (good.id+n for n in (1, 2, 3, 4))  # Recent messages, so a hold isn't past its week.
             scope = '{"guild_id": "123", "channel_id": "1", "conversation_id": "public:1", "user_id": "20"}'
             (tmp_path/'withdrawals.json').write_text(
                 '{"pending": {"'+'9'*400+f'": {{"scope": {scope}, "revision": 0}}, '
-                f'"12": {{"scope": "nope"}}, "13": {{"scope": {scope}, "revision": NaN}}, '
-                f'"14": {{"scope": {scope}, "revision": 1{"0"*400}}}, "15": 7, '
+                f'"{a}": {{"scope": "nope"}}, "{b}": {{"scope": {scope}, "revision": NaN}}, '
+                f'"{c}": {{"scope": {scope}, "revision": 1{"0"*400}}}, "{d}": 7, '
                 f'"{good.id}": {{"scope": {scope}, "revision": 0, "deleted": true}}}}}}')
             turns = w.agent.saved_turns = SavedTurns(w.agent)
             assert str(good.id) in turns.pending and '9'*400 not in turns.pending  # No message ID: nothing to hold.
             # A readable message ID whose entry isn't one Fri could send is still held back, never released (round 4).
-            assert turns.pending['12'].get('hold') and turns.pending['15'].get('hold')
-            assert turns.withheld(['12', '15']) == {'12', '15'}
+            assert turns.pending[str(a)].get('hold') and turns.pending[str(d)].get('hold')
+            assert turns.withheld([a, d]) == {str(a), str(d)} and not turns.closed()
             assert all(entry.get('revision') in (0, None) for entry in turns.pending.values())
         finally:
             await w.fri.close()
@@ -562,6 +563,11 @@ async def pending_on_disk(w, tmp_path):
     state['down'] = False
     assert str(earlier.id) in on_disk(tmp_path)
     return earlier
+
+
+def history(w):
+    """Saved exchanges the last model request carried: every message before its own is one side of one."""
+    return len(w.requests[-1]['input'])-1
 
 
 async def next_request(w):
@@ -646,16 +652,15 @@ def test_an_unreadable_record_fails_closed_until_a_week_has_passed(monkeypatch, 
                 monkeypatch.setattr(withdrawal, 'RECORD_BYTES', len(kept)-1)
             monkeypatch.setattr(withdrawal, 'MARKED_SECONDS', 0)
             w.agent.saved_turns = SavedTurns(w.agent)
-            sent = await next_request(w)
-            assert MARKER not in sent and 'fri and lunch?' not in sent  # No saved history at all.
+            assert MARKER not in await next_request(w) and history(w) == 0  # No saved history at all.
             aside = sorted(tmp_path.glob('withdrawals.unreadable-*.json'))
             assert len(aside) == 1 and aside[0].read_text() == text  # Set aside as it was, unread.
             w.agent.saved_turns = SavedTurns(w.agent)  # Another start: still closed.
-            sent = await next_request(w)
-            assert MARKER not in sent and 'fri and lunch?' not in sent
+            assert MARKER not in await next_request(w) and history(w) == 0
             monkeypatch.setattr(withdrawal, 'CLOSED_SECONDS', 0)  # A week on.
             w.agent.saved_turns = SavedTurns(w.agent)
-            assert 'fri and lunch?' in await next_request(w)
+            await next_request(w)
+            assert history(w) > 0
         finally:
             await w.fri.close()
     asyncio.run(scenario())
