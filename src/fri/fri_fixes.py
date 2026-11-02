@@ -478,6 +478,14 @@ async def tell_once(fri, job_id, actor):
             LOG.warning('Requester notice send not noted: %s', type(exc).__name__)
             return text, False
         message_id, state, text = str(current['message_id']), 'sent', f'told them: {message.jump_url}'
+    out = state == 'sent' and not entry  # A tap that doesn't ask for the send (an older controller): noted now.
+    if out:
+        try:  # So a lost answer leaves the next pass something to settle, the report read owed if it's unchecked.
+            entry = asking(fri, job_id, {'lease': lease, 'actor': str(actor), 'channel_id': str(channel.id),
+                                         'since': time.time(), 'at': time.time(), 'cleared': True,
+                                         'message_id': message_id, 'asked': []}, 'sent')
+        except OSError as exc:  # As before: nothing noted, and the record still asked for.
+            LOG.warning('Requester notice send not noted: %s', type(exc).__name__)
     recorded, answered = None, False
     try:
         recorded = await fri.api('POST', f'/requests/{job_id}/requester-notice/finish',
@@ -486,6 +494,11 @@ async def tell_once(fri, job_id, actor):
     except (commands.UserFeedbackCheckFailure, *TAP_FAILURES) as exc:  # An answer Fri can't read is still unconfirmed.
         answered = isinstance(exc, ControllerRejected)  # Refused: the same again would be too.
         LOG.warning('Requester notice outcome for %s not recorded; it stays unretried', job_id)
+    if out and entry:
+        if not answered:
+            return text, True  # The next pass hears it again (see settle_one).
+        forget(fri, job_id, lease)  # Heard: from here as before, with nothing noted.
+        entry = None
     gone = False
     if state == 'sent' and isinstance(recorded, dict) and 'state' not in recorded:
         # Recorded as sent without a check (a controller before gene #143): its report decides (fri #262). Unread, a
@@ -573,8 +586,8 @@ def matched(job_id, entry, copy):
     if 'nonce' in entry:  # Taken back, unless it was kept while its report stood: that's asked first (see bury).
         if nonce != entry['nonce']:
             return None
-        return {**entry, 'message_id': message_id, **({} if entry.get('check') else {'take_back': True})}
-    if (entry.get('cleared') and (notice := notice_id(job_id, entry.get('lease'))) != job_id and
+        return {**entry, 'message_id': message_id, **({} if 'check' in entry else {'take_back': True})}
+    if ('cleared' in entry and (notice := notice_id(job_id, entry.get('lease'))) != job_id and
             nonce == str(int(notice[:20], 16))):
         return {**entry, 'message_id': message_id}
     return None
@@ -727,25 +740,39 @@ def bury(fri, job_id, entry, check=False):
 
 def asking(fri, job_id, entry, state):
     """The note once it says Fri asks the controller to record the send as `state`, saved before that's asked: what
-    a refusal later can stand for depends on it (see settle_one). Raises if it can't be saved, and then nothing is
-    asked. A note from before Fri kept this may have asked for either (LEGACY)."""
-    asked = entry.get('asked', LEGACY)
-    if state in asked:
+    a refusal later can stand for depends on it (see settle_one). A sent record a controller won't check again
+    (before gene #47) owes the report read too, so a lost answer, a restart or a later controller still asks it
+    (fri #262). Raises if it can't be saved, and then nothing is asked."""
+    asked = asked_for(entry)
+    owed = state == 'sent' and RECHECK not in getattr(fri, 'capabilities', ()) and 'check' not in entry
+    if state in asked and not owed:
         return entry
-    entry = {**entry, 'asked': [*asked, state]}
+    entry = {**entry, 'asked': asked if state in asked else [*asked, state], **({'check': True} if owed else {})}
     note(fri, job_id, entry)
     return entry
 
 
+def asked_for(entry):
+    """What a note says Fri asked the controller to record (see asking). One from before Fri kept this, or one this
+    can't read, may have asked for either (LEGACY)."""
+    asked = entry.get('asked')
+    return asked if isinstance(asked, list) and all(item in LEGACY for item in asked) else list(LEGACY)
+
+
 def current(fri, job_id, entry):
-    """The note as it is after a wait, if it's still this claim's: its copy may have come meanwhile (see seen)."""
-    now = noted(fri).get(job_id)
+    """The note as it is after a wait, if it's still this claim's: its copy may have come meanwhile (see seen). None
+    once it's gone or another claim's. Raises OSError if the notes can't be read now: unreadable isn't gone, so the
+    note stays for the next pass (see settle_all)."""
+    try:
+        now = read(fri).get(job_id)
+    except (ValueError, RecursionError) as exc:
+        raise OSError('Requester notice sends unreadable') from exc
     return now if isinstance(now, dict) and now.get('lease') == entry.get('lease') else None
 
 
-def when(entry):
+def when(entry, key='at'):
     try:
-        return float(entry['at'])
+        return float(entry[key])
     except MALFORMED:
         return 0.0
 
@@ -851,16 +878,18 @@ async def settle_one(fri, job_id, entry):
     message_id = str(entry.get('message_id') or '')
     if 'nonce' in entry and not message_id:
         return False  # Settled unconfirmed: only its copy, if it comes, leaves anything to do.
-    if not message_id and time.time()-float(entry['since']) < GAVE_UP:
+    if not message_id and time.time()-when(entry, 'since') < GAVE_UP:
         return False  # A send from a tap that just stopped may still land.
-    if 'nonce' in entry and not entry.get('take_back'):  # Kept while its report stood, its copy come (see bury).
+    # Each optional field as Fri writes it, and otherwise read so the reply isn't lost: cleared and a read owed once
+    # present at all, and a take-back decided only as True, else decided again.
+    if 'nonce' in entry and entry.get('take_back') is not True:  # Kept while its report stood, its copy come (see bury).
         decided, entry = await by_report(fri, job_id, entry)
         if decided is not None:
             return decided
         message_id = str(entry['message_id'])
         entry = keep(fri, job_id, {**entry, 'take_back': True})
-    elif not entry.get('take_back'):
-        state = 'sent' if message_id else 'uncertain' if entry.get('cleared') else 'failed'
+    elif entry.get('take_back') is not True:
+        state = 'sent' if message_id else 'uncertain' if 'cleared' in entry else 'failed'
         if state != 'failed':
             entry = asking(fri, job_id, entry, state)  # Raises if it can't be saved, and then nothing is asked.
         refused = False
@@ -876,7 +905,7 @@ async def settle_one(fri, job_id, entry):
             return True  # Gone meanwhile (see expire).
         message_id = str(entry.get('message_id') or '')
         held = recorded.get('state') if isinstance(recorded, dict) else None
-        asked, owed = entry.get('asked', LEGACY), entry.get('check')
+        asked, owed = asked_for(entry), 'check' in entry
         if not refused and held is None and state == 'uncertain':
             held = 'uncertain'  # Recorded so by an older controller, which says nothing more.
         elif refused and not owed and state == 'uncertain' and 'sent' not in asked:
@@ -912,7 +941,7 @@ async def by_report(fri, job_id, entry):
     """Whether a reply whose record leaves it open has to come down, from whether its report is still on record (see
     settle_one): (None, the note as it is now) once it does, else (whether nothing's left to do, the note). Noted
     first that this is owed, so a later pass asks again whatever the controller answers then."""
-    if not entry.get('check'):
+    if 'check' not in entry:
         entry = {**entry, 'check': True}
         note(fri, job_id, entry)  # Raises if it can't be saved, and then nothing is asked.
     gone = await withdrawn(fri, job_id)
