@@ -162,6 +162,39 @@ def test_a_panel_reply_is_held_to_its_authors_erasures_like_a_dms(monkeypatch, t
     asyncio.run(scenario())
 
 
+def test_a_panel_reply_whose_last_check_cant_reach_the_controller_gets_the_outage_text(monkeypatch, tmp_path):
+    """fri #288: the panel's last check reads Gene's revision. The controller unreachable there isn't an erasure: the
+    reply isn't shown or recorded, and the panel says the controller is down, as for any of its reads."""
+    async def scenario():
+        fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+        interaction = panel(fri)
+        answered = []
+
+        async def respond(text, context, ready):
+            await ready()
+            answered.append(True)
+            return ChatResult(status='completed', reply='lol same')
+
+        model(fri, tmp_path, respond)
+        api, saved = fri.api, []
+
+        async def down(method, path, payload=None):
+            if answered and path == '/agent/context':
+                raise ControllerUnavailable(UNREACHABLE)
+            if path == '/chat/turn':
+                saved.append(payload)
+            return await api(method, path, payload)
+
+        fri.api = down
+        try:
+            await fri.chat_interaction(interaction, 'how was your day')
+            assert answered and not saved and 'lol same' not in shown(interaction)
+            assert shown(interaction) == notice_text(UNREACHABLE)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_memory_control_from_the_panel_still_hears_how_it_went(monkeypatch, tmp_path):
     """Guard: "forget me" from the panel is the member's own erasure, not one that stops their turn: it says it's done."""
     async def scenario():
@@ -244,8 +277,8 @@ def test_a_learning_passs_summary_request_carries_no_record_whose_author_erased(
 
         if moved == 'local, during the read':
             def reading(channel, user):
-                if user == 11:
-                    agent.forget(11, erased=True)  # Taken in while its record's privacy is read.
+                if user == 11 and not agent.forgotten.get(11):
+                    agent.forget(11, erased=True)  # Taken in while its record's privacy is read, once.
                 return profile(channel, user)
             agent.profile.side_effect = reading
         else:
