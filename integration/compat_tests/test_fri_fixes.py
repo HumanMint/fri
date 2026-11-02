@@ -2426,3 +2426,44 @@ def test_a_tapped_notice_recorded_without_a_check_is_checked_after_its_answer_wa
     assert not deleted and pending(world)
     asyncio.run(fri_fixes.settle(world.agent))
     assert len(deleted) == 1 and not pending(world)
+
+
+@pytest.mark.parametrize('reads', ['fail', 'answer', 'answer, then fail'])
+@pytest.mark.parametrize('erased', [True, False], ids=['erased', 'kept'])
+@pytest.mark.parametrize('record', ['as_recorded', 'rolled_forward'])
+def test_a_note_whose_report_cant_be_read_is_never_left_up_where_main_takes_it_back(world, monkeypatch, record, erased,
+                                                                                    reads):
+    """#260's round 4: a note from before this change (it can't say what was asked), the reporter erased, a controller
+    before gene #143 recorded the send as unconfirmed with its answer lost, and the repeat is refused, here or once a
+    later controller reads that record. The report couldn't be read, its copy came, and the note expired with the
+    reply up, two failed reads and no delete. Main buries a tombstone there, and takes the copy back when it comes.
+    A read that can't say now falls back to just that: only a read that positively says the report is still on
+    record keeps the reply up, which round 1's blocker needs."""
+    from fri.fri_errors import UNREACHABLE, ControllerUnavailable
+    job_id, lease, copy = cut_off_once_cleared(world, erase=erased)
+    deleted = reply_deletions(world)
+    lost_finish(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert notice_row(world, job_id)[0] == 'uncertain' and pending(world)
+    if record == 'rolled_forward':
+        lease_dropped(world, job_id)
+    api, failing = world.fri.api.side_effect, [reads == 'fail']
+
+    async def reading(method, path, body=None):
+        if method == 'GET' and path == '/requests/'+job_id and failing[0]:
+            raise ControllerUnavailable(UNREACHABLE)
+        return await api(method, path, body)
+
+    world.fri.api.side_effect = reading
+    asyncio.run(fri_fixes.settle(world.agent))
+    failing[0] = reads != 'answer'
+    fri_fixes.seen(world.fri, copy)
+    asyncio.run(fri_fixes.settle(world.agent))
+    monkeypatch.setattr(fri_fixes, 'KEEP', 0)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not pending(world)
+    # A controller answering the repeat with its unconfirmed record (gene #143, the lease kept) says that's what it
+    # holds: taken back whatever the report, as on main. Otherwise only a read that says it's on record spares it.
+    answered = record == 'as_recorded' and rechecks(world)
+    kept = not erased and reads == 'answer' and not answered
+    assert [str(id) for id in deleted] == ([] if kept else [str(copy.id)])
