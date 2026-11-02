@@ -662,7 +662,11 @@ Fri can't restart anything. It only notices and says so.
   controller is down and records no turn. It shows Fri's release, Discord connection, heartbeat
   status and age, loop states, waiting usage receipts, live `/status` (Gene's deployed release, and
   whether deploys are paused) and `/controls/health`
-  (4 s each, failures shown as "unreachable" or "rejected"), and the watch state.
+  (4 s each, failures shown as "unreachable" or "rejected"), and the watch state. Fri can't read a
+  forwarded post yet, so it drops members' forwards: `fri health` and `fri-health.json` (under
+  `outcomes.forwards`) count them since Fri started, by the gate that dropped them, and each drop is
+  also logged as `Forward <channel or dm>/<message id> not read: <gate>` to count them across restarts.
+  Neither holds anything of the forward's content or its author.
 
 ## When Gene gets fixed
 

@@ -361,8 +361,11 @@ class Watch:
             waiting = '?'
         lines.append(f'- usage receipts waiting: {waiting}')
         if agent:
-            from .fri_ledger import describe
-            lines.append(describe(agent.ledger.snapshot()))
+            from .fri_ledger import describe, describe_forwards
+            outcomes = agent.ledger.snapshot()
+            lines.append(describe(outcomes))
+            if forwards := describe_forwards(outcomes):
+                lines.append(forwards)
         scope = {'guild_id': str(fri.guild_id), 'user_id': str(fri.owner_id),
                  'channel_id': str(fri.workshop_id), 'conversation_id': f'public:{fri.workshop_id}'}
         status, health = await asyncio.gather(self.probe('GET', '/status'),
