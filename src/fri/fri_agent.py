@@ -952,6 +952,8 @@ class Agent:
             return False
         if since and await self.erasure(message.author.id, *since):  # Last, after the reads above.
             return False
+        if not self.config['enabled'] or dm and not self.config['support_dms']:  # Gone off during them.
+            return False
         try:
             await message.add_reaction(RECHARGING)
             return True
@@ -2335,6 +2337,10 @@ class Agent:
                 if not message.guild and await self.dm_closed(user.id):  # A DM's own gates, after that read.
                     return
                 if erased and await erased():
+                    return
+                # Its switches again after that read, with nothing to wait on before the reaction (fri #276).
+                if (not self.config['enabled'] or message.guild and not self.allowed(channel) or
+                        not message.guild and not self.config['support_dms']):
                     return
                 # Reserve before sending: an ambiguous HTTP failure must not cause retries.
                 self.acknowledged[message.id] = now
