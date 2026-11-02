@@ -603,7 +603,7 @@ class Fri(discord.Client):
         typing = typing or noop
         began = time.time()  # Every copy this turn reads of a post is taken after this (see chat_once).
         if invitation and invitation.outside:
-            return await self.invited_talk(invitation, text, typing)
+            return await self.invited_talk(invitation, text, typing, forgotten)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
         heard = [self.hear(item) for item in (event, *(row[1] for row in burst))
                  if getattr(item, 'guild', None) is not None]  # Before anything here waits.
@@ -1260,12 +1260,14 @@ class Fri(discord.Client):
         return ChatResult(reply=(f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
                                 f'back in about {minutes} mins') if admission.get('notice') else '', status='cooldown')
 
-    async def invited_talk(self, invitation, text, typing=None):
-        """Outside the ambient scope, one ping has only conversation and public research."""
+    async def invited_talk(self, invitation, text, typing=None, forgotten=None):
+        """Outside the ambient scope, one ping has only conversation and public research. `forgotten`: the author's
+        erasures here as it came in (see talk), else as the ping counted them."""
         from .fri_context import addressed_content
         from .fri_images import attach, image_context, own_links
         from .fri_mentions import force_text
         event, user = invitation.event, invitation.event.author.id
+        forgotten = invitation.forgotten if forgotten is None else forgotten
         expected = addressed_content(event.content, self.user.id) or 'hey'
         if text != expected or not 1 <= len(text) <= 4000:
             raise commands.UserFeedbackCheckFailure('that’s either empty or a novel. keep it between 1 and 4000 characters.')
@@ -1293,13 +1295,20 @@ class Fri(discord.Client):
                 actions.web_research = context.get('web_research', [])
                 actions.message, actions.model, actions.effort = clean(text, 4000), context['model'], context['effort']
                 actions.private_evidence = True
+
+                def erased(read=False):
+                    """Their erasures here since the ping came in, after its own check, which holds the rest of their
+                    privacy to the grant (fri #284). `read`: Gene's revision too, as a tool's own request reads it."""
+                    return self.agent.erasure(user, forgotten, invitation.revision if read else None)
+                actions.erasure_check = erased
                 context['actions'] = await actions.available()
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
                 await own_links(context, event, invitation=invitation)  # The ping's own card, before the nearby posts' pictures.
                 await invitation.look(context)  # Up front: an outside ping has no read to decide on.
                 actions.image_context = image_context(context)
                 # See chat_once. What a Fri answer it reads drew on counts as shown: a delete of it withholds the reply.
-                context['fence'] = {'invitation': invitation, 'shown': set(), 'messages': set(invitation.carried)}
+                context['fence'] = {'invitation': invitation, 'shown': set(), 'messages': set(invitation.carried),
+                                    'erased': erased}
                 result = await self.chat_once(text, context)
                 research = None
                 if result.action:
