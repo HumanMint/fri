@@ -251,7 +251,9 @@ class SavedTurns:
                     queued = True
             elif server is not None and sent_at(i) > now-horizon:
                 if self.offered() and self.capable(SAVED_CAPABILITY):
-                    if 'scope' in known:  # Fri knows where it was saved: that one stands, deleted or not.
+                    if known.get('hold'):  # Held from disk: it stays held, and on disk, whatever comes by ID.
+                        pass
+                    elif 'scope' in known:  # Fri knows where it was saved: that one stands, deleted or not.
                         if deleted and not known.get('deleted'):
                             self.pending[str(i)] = self.entry(**{key: known[key] for key in ('scope', 'revision')},
                                                               deleted=True, restored=known.get('restored'))
