@@ -2111,7 +2111,8 @@ class Agent:
                 result = await self.fri.talk(self.fri.guild_id if dm else message.guild.id, message.channel.id, message.author.id,
                     text, 'private' if dm else 'public', message.author.display_name, event=message,
                     burst=burst, inspect_images=not ambient, typing=typing, **({'invitation': invitation} if invitation else {}),
-                    **({'revision': since[1]} if since else {}), **({'last_look': room} if ambient else {}))
+                    **({'revision': since[1], 'forgotten': since[0]} if since else {}),
+                    **({'last_look': room} if ambient else {}))
         except Continued:
             return
         except AuthorErased:
@@ -2164,11 +2165,16 @@ class Agent:
             result = force_text(result)
         if dm and memory_intent(text) not in MEMORY_CONTROLS and (closed := await self.dm_closed(message.author.id)):
             return missed(closed)  # Left, or DMs went off, while Fri wrote it: nothing goes out or is saved.
-        if since:  # Last before sending. Talk ended on Gene's fence, but a ping's reads above came after it.
-            reason = (await self.erasure(message.author.id, *since) if invitation else
-                      'author privacy changed' if self.forgotten.get(message.author.id, 0) != since[0] else None)
-            if reason:
-                return await self.dropped(message, events, reason, invitation, since, burst)
+        # Last before sending. Talk ended on Gene's fence, but a ping's reads above came after it, and so did a DM's
+        # membership lookup (fri #266): Gene is asked again for those. A rerun edited into a memory listing is held
+        # to its first handling's baseline (see rerun), Gene's too, after talk's read of it (fri #264).
+        fence = since or (self.fences.get(message.id) if message.id in self.rerunning and
+                          memory_intent(text) not in MEMORY_CONTROLS else None)
+        if fence and (reason := await self.erasure(message.author.id, fence[0],
+                                                   fence[1] if invitation or dm or not since else None)):
+            return await self.dropped(message, events, reason, invitation, fence, burst)
+        if dm and memory_intent(text) not in MEMORY_CONTROLS and not self.config['support_dms']:
+            return missed('dms off')  # Gone off during that read, as dm_closed checks after its lookup.
         def taken_back():
             """Why what the model made can't go out, or be saved, now: a message it answers or one it was shown,
             deleted since. Checked again after each wait below, up to the save (the delivered part stays)."""

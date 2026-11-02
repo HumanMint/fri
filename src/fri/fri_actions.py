@@ -12,7 +12,7 @@ from . import feedback as commands
 from .fri_agent_model import ATTENTION, DIAGNOSIS
 from .fri_context import discord_source
 from .fri_conversation import PERSISTENT_MODEL_WRITES
-from .fri_errors import ControllerRejected, ControllerUnavailable
+from .fri_errors import AuthorErased, ControllerRejected, ControllerUnavailable
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
 from .fri_images import details, image_context, look, lookable, media, started_a_thread
@@ -382,6 +382,9 @@ class Actions:
         if not channels:
             return {'blocked': 'No approved channels are currently readable.'}
         await self.summary_unchanged()  # After those waits; a write sends the generation too, for its own wait.
+        fence = (self.turn_context or {}).get('fence') or {}
+        if fence.get('erased') and await fence['erased']():  # And their own erasures here, after them (fri #265).
+            raise AuthorErased()
         if self.history.pages and kind not in READ_ONLY_AFTER_HISTORY:
             return {'blocked': 'Archive evidence cannot authorize another action. Ask for that action in a fresh message.'}
         if kind == 'history_search':
