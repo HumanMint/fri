@@ -78,3 +78,54 @@ def test_a_queued_message_from_before_the_erasure_goes_unanswered_wherever_it_wa
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('where,channel_id,text', [
+    ('chat', 1, 'fri what do you think?'),
+    ('ping', 1, '<@99> what do you think?'),
+    ('outside ping', 8, '<@99> what do you think?'),
+    ('dm', 8, 'what do you think?'),
+])
+def test_with_memory_still_off_a_queued_message_is_answered_as_before(monkeypatch, tmp_path, where, channel_id, text):
+    """Only memory back on holds a message to the cutoff: with it still off, Fri answers it as before."""
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=channel_id)
+        if where == 'dm':
+            agent.config['support_dms'] = True
+            agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+        queued = message(text, age=30)
+        if where == 'dm':
+            queued.guild = None
+        queued.reply.return_value = SimpleNamespace(id=queued.id+1, content='sure')
+        store.personal_control('20', 'disable')
+        time.sleep(0.01)
+        fri.chat_once.return_value = ChatResult(status='completed', reply='sure')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(queued)
+            fri.chat_once.assert_awaited_once()
+            assert [item.args for item in queued.reply.await_args_list] == [('sure',)]
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['fri forget me', '<@99> forget me'])
+def test_a_queued_memory_control_from_before_the_erasure_is_still_carried_out(monkeypatch, tmp_path, text):
+    """A memory control is never held to the cutoff."""
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        queued = message(text, age=30)
+        queued.reply.return_value = SimpleNamespace(id=queued.id+1, content='done')
+        store.personal_control('20', 'disable')
+        store.personal_control('20', 'enable')
+        time.sleep(0.01)
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(queued)
+            assert [payload['action'] for path, payload in calls if path == '/chat/memory/control'] == ['disable']
+            assert queued.reply.await_args.args[0].startswith('done. i erased our saved chats')
+            fri.chat_once.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
