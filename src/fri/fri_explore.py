@@ -110,6 +110,7 @@ async def explore(agent, claim):
     # its author's, so a "forget me" while the roster, the target, the search or a record is read counts (fri #290's
     # round 1, #304, #310's round 1).
     baseline = dict(agent.forgotten)
+    window = agent.watching()  # And what's taken back from now on, every wait of the pass included (fri #325).
     try:
         members = await roster(agent, claim['role_id'])
         claim = await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/target', {'members': members})
@@ -139,10 +140,17 @@ async def explore(agent, claim):
             async def moved():
                 """Signed in, the target as the request would carry them: the historical topics' evidence is their
                 words, so their Gene revision is held to the one the context was read at, and their erasures here to
-                theirs from before it was asked for. Moved, nothing is asked (fri #292, #304)."""
+                theirs from before it was asked for. Moved, nothing is asked (fri #292, #304). Then, with nothing
+                awaited after it, a topic whose message was taken back since the pass began is left out of the request
+                (fri #325)."""
                 now = await agent.profile(channel.id, targeted)
-                return (not now['enabled'] or now['revision'] != read_at or
-                        agent.forgotten.get(targeted, 0) != forgotten)
+                if (not now['enabled'] or now['revision'] != read_at or
+                        agent.forgotten.get(targeted, 0) != forgotten):
+                    return True
+                topics = context.get('historical_topics') or []
+                gone = agent.retracted(window, [topic.get('source_id') for topic in topics])
+                context['historical_topics'] = [topic for topic in topics if str(topic.get('source_id')) not in gone]
+                return False
             plan, usage, status = await agent.run('exploration_plan', PLANNER+'\nOwner learning preferences: '+agent.config['learning_notes'],
                 context, PLAN, model=claim['model'], effort=claim['effort'], erased=moved)
             add_usage(counters, usage)
@@ -177,7 +185,8 @@ async def explore(agent, claim):
         if records:
             output, usage, status = await agent.run('summary', SUMMARIZER,
                 {'focus': {'member_id': plan['member_id'], 'term': plan['term']}, 'messages': records},
-                FINDINGS, model=claim['model'], effort=claim['effort'], erased=agent.unmoved(channel.id, records, held))
+                FINDINGS, model=claim['model'], effort=claim['effort'],
+                erased=agent.unmoved(channel.id, records, held, window))
             add_usage(counters, usage)
             # The fence leaving nothing to send ('erased', see Agent.run) is an empty batch, not a failed summary.
             if status not in ('completed', 'erased'):
@@ -186,6 +195,7 @@ async def explore(agent, claim):
         error = clean(str(exc), 150)+'; progress retained.'
     except (discord.HTTPException, commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
         error = type(exc).__name__+': archive exploration could not complete; progress retained.'
+    agent.passes.discard(window)  # Nothing more of the pass is sent.
     receipt = await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/finish', {
         'records': records, 'result': output, 'scanned': len(scanned_ids), 'scanned_ids': scanned_ids,
         'before': str(min(map(int, scanned_ids))) if scanned_ids else None, 'done': not scanned_ids,

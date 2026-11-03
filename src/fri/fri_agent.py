@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+import weakref
 from collections import Counter, defaultdict, deque
 from contextlib import AsyncExitStack, closing, nullcontext
 from types import SimpleNamespace
@@ -78,6 +79,23 @@ RECHECK_TIMEOUT = 3  # Seconds one recheck of Fri's summary-derived replies wait
 # said then is kept nowhere, so it goes unanswered, quietly, as a turn whose author changed their privacy does (fri
 # #331). One from before a note's removal is still answered, and kept nowhere; a memory control is never held to it.
 PREDATES = 'said before their memory was turned off'
+PASS_WATCH = 10000  # Messages taken back one learning pass keeps track of; past that it can't tell (see Watch).
+
+
+class Watch:
+    """The messages deleted or edited while one learning or exploration pass runs, any and anywhere, as the gateway
+    reports them, so the pass leaves out what it holds of them before each model request (fri #325). Its own, and
+    gone with it: nothing else reads it, so unlike unsend's marks it needn't be what Fri has in hand. Past PASS_WATCH,
+    it's full and can't tell any more (see Agent.retracted)."""
+
+    def __init__(self):
+        self.ids, self.full = set(), False
+
+    def taken(self, ids):
+        if not self.full:
+            self.ids.update(int(i) for i in ids)
+            if len(self.ids) > PASS_WATCH:
+                self.full, self.ids = True, set()
 RECHECK_BUDGET = 6  # And all of one turn's rechecks together: a full wait before its request and one before delivery.
 STALE_CONTROL = 'skipped that one. a newer memory request of yours already went through. send it again if you still mean it.'
 
@@ -251,6 +269,7 @@ class Agent:
         self.unreachable_notices = {}  # channel: when Discord took Fri's notice (monotonic), or None in flight.
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
+        self.passes = weakref.WeakSet()  # Each running learning or exploration pass's Watch, while it runs (fri #325).
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
         # Messages a turn's model request carried -> (when (monotonic), whether Fri or Gene wrote it), oldest first:
         # see unsend and edit.
@@ -489,6 +508,8 @@ class Agent:
         Gene's error posts stay until they expire, so a quick delete can't hide one from the repair
         investigation."""
         ids, now = {int(i) for i in ids}, time.monotonic()
+        for window in list(self.passes):  # Every one, for a running learning pass to leave out (fri #325).
+            window.taken(ids)
         def handled(i):
             return self.handling[i] or i in self.replying or i in self.saving or i in self.looked
         rows = self.recent.get(channel)  # Never index: that would add a channel for attention to scan.
@@ -578,6 +599,8 @@ class Agent:
             self.receipts.changed(message.id)
         if edited:
             self.saved_turns.withdraw([message.id], saved_in, authors={message.id: sender.id} if sender else None)
+            for window in list(self.passes):  # Every member's edit, for a running learning pass to leave out (fri #325).
+                window.taken([message.id])
         if edited and message.id in self.looked:
             self.revise(message.id)
         if (self.handling[message.id] or message.id in self.rerunning) and edited:
@@ -2409,14 +2432,32 @@ class Agent:
             await self.fri.api('POST', '/agent/reports/'+report['id']+'/delivered')
 
 
-    def unmoved(self, channel, records, held):
+    def watching(self):
+        """A new pass's Watch, kept while the pass holds it (fri #325)."""
+        window = Watch()
+        self.passes.add(window)
+        return window
+
+    def retracted(self, window, ids):
+        """Of these message IDs, those a pass mustn't send: deleted or edited since it began (see Watch), or held back
+        anyway, marked deleted (see unsend) or withdrawn (see withdraw), or in the withdrawal queue (see
+        SavedTurns.withheld). Raises ValueError when Fri can't tell: the queue's record unreadable, or the window
+        full. The pass then stops as a failed read does, and its batch is read again (fri #325)."""
+        if window.full or self.saved_turns.closed():
+            raise ValueError("Messages taken back meanwhile can't be told apart; this pass waits")
+        ids = {str(i) for i in ids if str(i).isdigit()}
+        return ({i for i in ids if int(i) in window.ids or int(i) in self.unsent} | (ids & self.withdrawn.keys())
+                | self.saved_turns.withheld(ids))
+
+    def unmoved(self, channel, records, held, window=None):
         """A learning pass's summary request's fence (Agent.run's `erased`, see learn and explore), so no erased
         member's words reach the model (fri #289). `held` is each record's (author, their erasures here before the
         history was read). Signed in, every author kept is checked by Gene at once, at the revision their record was
-        read under (see moved), then their erasures here. A record whose author moved is dropped before anything is
+        read under (see moved), then their erasures here, and with `window`, what was taken back since the pass began
+        (see retracted). A record whose author moved, or whose message was taken back, is dropped before anything is
         sent, from the request and the finish alike, which share `records`; True once none is left, and then nothing
         is. The controller unreachable, or refusing throughout, raises: the pass's own failure, as for any read
-        before it."""
+        before it, and so does not being able to tell what was taken back."""
         def keep(still):
             kept = [(record, baseline) for record, baseline in zip(records, held) if still(record, baseline)]
             records[:] = [record for record, _ in kept]
@@ -2454,6 +2495,9 @@ class Agent:
             else:  # A controller without it: each author read, as before.
                 await reread()
             keep(lambda record, baseline: self.forgotten.get(baseline[0], 0) == baseline[1])  # Then, with no wait.
+            if window is not None:  # Nor any after this: what was taken back since the pass began goes (fri #325).
+                gone = self.retracted(window, [record['id'] for record in records])
+                keep(lambda record, baseline: str(record['id']) not in gone)
             return not records
         return moved
 
@@ -2470,6 +2514,7 @@ class Agent:
         # Members' erasures here, once, before anything is read: every record is held to this, so a "forget me" during
         # the history read, or between two of a member's records, counts against all of theirs (fri #290's round 1).
         snapshot = dict(self.forgotten)
+        window = self.watching()  # And what's taken back from now on, the history request's wait included (fri #325).
         oldest = newest = newest_id = None
         try:
             channel = self.fri.get_channel(int(claim['channel_id']))
@@ -2515,7 +2560,7 @@ class Agent:
                     'Use source_id for attribution; empty notes is normal. Do not turn role membership into authority. '
                     'Owner topic preferences (never override these constraints): '+self.config['learning_notes'],
                     {'messages': records}, SUMMARY, claim['model'], claim['effort'],
-                    erased=self.unmoved(channel.id, records, held))
+                    erased=self.unmoved(channel.id, records, held, window))
                 if status == ERASED:  # The fence left nothing to send: an empty batch, not a failed summary.
                     output, counters = {}, dict(NO_USAGE)
                 elif status != 'completed':
@@ -2524,6 +2569,7 @@ class Agent:
                 counters = dict(NO_USAGE)
         except (discord.HTTPException, ValueError, commands.UserFeedbackCheckFailure) as exc:
             error = type(exc).__name__+': learning pass could not complete'
+        self.passes.discard(window)  # Nothing more of the batch is sent.
         receipt = await self.fri.api('POST', '/agent/learning/'+claim['id']+'/finish', {
             'records': records, 'result': output, 'scanned': scanned, 'before': before,
             'done': done, 'counters': counters, 'error': error, 'oldest': oldest, 'newest': newest,
