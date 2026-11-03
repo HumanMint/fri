@@ -691,7 +691,11 @@ Fri can't restart anything. It only notices and says so.
   (4 s each, failures shown as "unreachable" or "rejected"), and the watch state. While a pending
   withdrawals record that couldn't be read holds every saved context back, it shows until when, and
   whether new withdrawals are being saved to disk (no IDs or contents); `fri-health.json` carries the
-  same under `withdrawals`.
+  same under `withdrawals`. Fri can't read a
+  forwarded post yet, so it drops members' forwards: `fri health` and `fri-health.json` (under
+  `outcomes.forwards`) count them since Fri started, by the gate that dropped them, and each drop is
+  also logged as `Forward <channel or dm>/<message id> not read: <gate>` to count them across restarts.
+  Neither holds anything of the forward's content or its author.
 
 ## When Gene gets fixed
 

@@ -7,7 +7,7 @@ import discord
 
 from . import feedback as commands
 from .fri_chat import ChatResult
-from .fri_errors import ControllerRejected
+from .fri_errors import ControllerRejected, TurnUnreachable
 from .fri_images import require_current as require_current_images
 from .fri_outcomes import Outcome, fallback
 from .fri_outcomes import receipt as tool_receipt
@@ -68,6 +68,8 @@ async def _run(fri, actions, text, context, result, progress):
         progress['active'] = kind
         try:
             receipt = await actions.execute(action)
+        except TurnUnreachable:
+            raise  # The turn's outage, not this step's (see Actions.fenced).
         except ControllerRejected as exc:
             receipt = {'blocked': str(exc)}
         except (commands.UserFeedbackCheckFailure, discord.HTTPException):

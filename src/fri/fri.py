@@ -85,7 +85,9 @@ CHANGED = 'someone in that context changed their privacy settings while i was re
 CONVERSATION_CHANGED = 'the conversation changed while i was typing. ask again and i’ll catch up.'
 READ_CHANGED = 'that chat changed while i was reading it. ask again.'
 WITHDRAWN = 'the message i was answering got edited or deleted while i was on it. ask again if you still want it.'
-CLOSED = 'a channel i was pulling from just went private while i was replying, so that stays unsaid. ask again.'
+# A /fri panel turn that stopped, as a DM's goes quiet: the panel says so rather than keep thinking (fri #288).
+PANEL_SKIPPED = 'skipped that one, something changed while i was on it. ask again if you still want it.'
+CLOSED ='a channel i was pulling from just went private while i was replying, so that stays unsaid. ask again.'
 # Reads of other channels, archives, learning reports or diagnostics stay neutral breadcrumbs.
 PRIVATE_READS = frozenset({'read_recent', 'history_search', 'learning_overview', 'run_learning', 'gene_diagnose'})
 
@@ -567,6 +569,9 @@ class Fri(discord.Client):
             # wait on Discord and Gene, and the owner can turn DMs off meanwhile.
             if fence and fence.get('dms') and not fence['dms']():
                 raise GateClosed('dms off')
+            # Their own erasures here, after every wait above, Gene's turn check included (fri #265). It reads nothing.
+            if fence and fence.get('erased') and await fence['erased']():
+                raise AuthorErased()
             # Last, with nothing to wait on before the request: a short line from the member that joined the turn
             # by now is answered with it instead, and one after this is answered on its own (see Continuation).
             if fence and fence.get('commit') and not fence['commit']():
@@ -590,16 +595,17 @@ class Fri(discord.Client):
             agent.ledger.composed(context)
         return result
 
-    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, typing=None, last_look=None):
+    async def talk(self, guild_id, channel_id, user_id, text, visibility, display_name='', *, event=None, burst=(), inspect_images=True, invitation=None, revision=None, forgotten=None, typing=None, last_look=None):
         # `revision`: the author's privacy revision as their message came in, if known. Gene fences the
-        # reply against the one read below, so an erasure before that read must stop it here.
+        # reply against the one read below, so an erasure before that read must stop it here. `forgotten`: their
+        # local erasures then (see Agent.erasure), which the turn's fence carries beside it (fri #265).
         # `typing(stage)`: told once a model turn is 'admitted' (no closing, control or cooldown) and
         # before an 'action' runs, so the caller shows typing only when words are coming. `last_look(result)`:
         # the caller's own last Discord read, run before the turn's last privacy checks so they cover it.
         typing = typing or noop
         began = time.time()  # Every copy this turn reads of a post is taken after this (see chat_once).
         if invitation and invitation.outside:
-            return await self.invited_talk(invitation, text, typing)
+            return await self.invited_talk(invitation, text, typing, forgotten)
         source = discord_source(event, text, getattr(self.user, 'id', 0)).check(guild_id, f'{visibility}:{channel_id}', user_id)
         heard = [self.hear(item) for item in (event, *(row[1] for row in burst))
                  if getattr(item, 'guild', None) is not None]  # Before anything here waits.
@@ -830,6 +836,12 @@ class Fri(discord.Client):
                                     'actions': actions, 'shown': set(), 'began': began}
                 if self.agent and source.kind == 'discord_message':
                     context['fence']['commit'] = lambda: self.agent.commit(event)
+                if self.agent and forgotten is not None:
+                    # Why it can't go on, from their own erasures here: a "forget me" Fri took in counts at once,
+                    # before Gene has it, so Gene's turn check can't see it. Asked after every wait (see chat_once).
+                    # `read`: Gene's revision too, for a model request a tool makes of its own (see Actions.fenced).
+                    context['fence']['erased'] = lambda read=False: self.agent.erasure(
+                        user_id, forgotten, context['revision'] if read else None)
                 if self.agent and visibility == 'private' and source.kind == 'discord_message':
                     async def gate():  # A DM's own gates: its author still a member, as Discord has it now, and DMs on.
                         if closed := await self.agent.dm_closed(user_id):
@@ -1250,12 +1262,14 @@ class Fri(discord.Client):
         return ChatResult(reply=(f'bro im cooked rn, gotta recharge my social battery and save daniel’s ai wallet lol. '
                                 f'back in about {minutes} mins') if admission.get('notice') else '', status='cooldown')
 
-    async def invited_talk(self, invitation, text, typing=None):
-        """Outside the ambient scope, one ping has only conversation and public research."""
+    async def invited_talk(self, invitation, text, typing=None, forgotten=None):
+        """Outside the ambient scope, one ping has only conversation and public research. `forgotten`: the author's
+        erasures here as it came in (see talk), else as the ping counted them."""
         from .fri_context import addressed_content
         from .fri_images import attach, image_context, own_links
         from .fri_mentions import force_text
         event, user = invitation.event, invitation.event.author.id
+        forgotten = invitation.forgotten if forgotten is None else forgotten
         expected = addressed_content(event.content, self.user.id) or 'hey'
         if text != expected or not 1 <= len(text) <= 4000:
             raise commands.UserFeedbackCheckFailure('that’s either empty or a novel. keep it between 1 and 4000 characters.')
@@ -1283,13 +1297,20 @@ class Fri(discord.Client):
                 actions.web_research = context.get('web_research', [])
                 actions.message, actions.model, actions.effort = clean(text, 4000), context['model'], context['effort']
                 actions.private_evidence = True
+
+                def erased(read=False):
+                    """Their erasures here since the ping came in, after its own check, which holds the rest of their
+                    privacy to the grant (fri #284). `read`: Gene's revision too, as a tool's own request reads it."""
+                    return self.agent.erasure(user, forgotten, invitation.revision if read else None)
+                actions.erasure_check = erased
                 context['actions'] = await actions.available()
                 await attach(context, event, text, source=invitation.image, invitation=invitation)
                 await own_links(context, event, invitation=invitation)  # The ping's own card, before the nearby posts' pictures.
                 await invitation.look(context)  # Up front: an outside ping has no read to decide on.
                 actions.image_context = image_context(context)
                 # See chat_once. What a Fri answer it reads drew on counts as shown: a delete of it withholds the reply.
-                context['fence'] = {'invitation': invitation, 'shown': set(), 'messages': set(invitation.carried)}
+                context['fence'] = {'invitation': invitation, 'shown': set(), 'messages': set(invitation.carried),
+                                    'erased': erased}
                 result = await self.chat_once(text, context)
                 research = None
                 if result.action:
@@ -1324,11 +1345,24 @@ class Fri(discord.Client):
             from .fri_memory_panel import show
             await show(self, interaction)
             return
+        # The author's baseline as it comes in, as a DM's (see Agent.receive): their erasures here before anything
+        # waits, then their privacy revision once the panel is answered. Their turn is held to both, its research and
+        # image looks too (fri #288). A memory control isn't: it always hears how it went.
+        user = interaction.user.id
+        held = self.agent is not None and memory_intent(text) not in ('disable', 'enable')
+        forgotten = self.agent.forgotten.get(user, 0) if held else None
         await defer_panel(interaction)
-        await reply(self, interaction, 'Thinking…', view=HomeView(self, interaction.user.id))
+        await reply(self, interaction, 'Thinking…', view=HomeView(self, user))
         try:
-            result = await self.talk(interaction.guild_id, interaction.channel_id, interaction.user.id, text, 'private',
-                                     interaction.user.display_name, event=interaction)
+            revision = await self.agent.revision(user) if held else None
+            result = await self.talk(interaction.guild_id, interaction.channel_id, user, text, 'private',
+                                     interaction.user.display_name, event=interaction, revision=revision,
+                                     forgotten=forgotten)
+            # Last before it's shown, with nothing to wait on: their erasures here since it came in. talk() ends on
+            # Gene's check of the whole turn, everyone it drew on and their own revision (held to the one above), so
+            # a read here would reopen that fence for them alone (fri #290's round 1).
+            if held and self.agent.forgotten.get(user, 0) != forgotten:
+                raise AuthorErased()
             view = (DraftView(self, interaction.user.id, result.draft, fence=result.turn) if result.draft
                     else HomeView(self, interaction.user.id))
             if result.settings_preview:
@@ -1341,6 +1375,8 @@ class Fri(discord.Client):
             saved = await self.record_turn(result) if sessions(self).displayed(interaction) else None
             if saved and saved.get('first_memory') and not result.settings_preview:
                 await reply(self, interaction, embed=card('Fri', result.reply+self.first_memory(saved)), view=view)
+        except (AuthorErased, GateClosed):  # Nothing of it shown or saved, and nothing said why.
+            await reply(self, interaction, PANEL_SKIPPED, view=HomeView(self, user))
         except commands.UserFeedbackCheckFailure as exc:
             await reply(self, interaction, str(exc), view=HomeView(self, interaction.user.id))
         await self.waiting_notices.clear(interaction.user.id)

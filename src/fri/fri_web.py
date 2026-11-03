@@ -13,8 +13,9 @@ from .subscription import RESOURCE, SubscriptionError
 from .web_policy import public_url
 
 
-async def lookup(chat, query, model, effort, *, previous=None):
-    """No Discord context is accepted here. Only completed, cited searches become evidence."""
+async def lookup(chat, query, model, effort, *, previous=None, ready=None):
+    """No Discord context is accepted here. Only completed, cited searches become evidence. `ready`: the caller's last
+    checks, run once signed in so nothing waits between them and the request; one that raises sends nothing."""
     limit = 3 if previous else 5
     public_input = {'utc_date': dt.datetime.now(dt.timezone.utc).date().isoformat(), 'question': query}
     if previous:
@@ -38,8 +39,10 @@ async def lookup(chat, query, model, effort, *, previous=None):
     try:
         async with asyncio.timeout(110), httpx.AsyncClient(timeout=httpx.Timeout(75, connect=15),
                 trust_env=False, transport=chat.transport) as client:
-            async with client.stream('POST', RESOURCE+'/responses', json=payload,
-                                     headers=await chat.headers()) as response:
+            headers = await chat.headers()
+            if ready:
+                await ready()
+            async with client.stream('POST', RESOURCE+'/responses', json=payload, headers=headers) as response:
                 if response.status_code != 200:
                     return {'error': 'Live search is unavailable on the current connection/model. No search result was obtained.'}, counters, 'failed'
                 async for event in events(response.aiter_lines()):
