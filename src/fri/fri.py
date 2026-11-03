@@ -1,6 +1,7 @@
 """Fri's separate Discord identity; trusted UI, bounded chat, one controller authority."""
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
@@ -501,14 +502,24 @@ class Fri(discord.Client):
             if self.agent:
                 seen.update(int(i) for i in self.agent.saved_turns.withhold(context))
             # One this turn quotes or replies to refuses it instead: the answer would be about words taken back,
-            # which saved turns may still hold. So does one the turn itself answers, its own message or one of
-            # its burst, if taken back since it came in (see Agent.rerun).
+            # which saved turns may still hold. Not a reply target this turn read after it was taken back, showing
+            # what it says now, from a controller that takes back saved exchanges (fri #101): the withdrawal took its
+            # saved exchange, or holds it out above (see SavedTurns.withhold). One read before, or whose read can't be
+            # placed, still refuses. So does one the turn itself answers, its own message or one of its burst, if taken
+            # back since it came in (see Agent.rerun).
             if self.agent:
                 own = [row.get('source', {}).get('id') for row in context.get('message_burst', []) +
                        ([fence['turn']] if fence and 'turn' in fence else [])]
                 since = self.agent.arrival(own)
-                if (any(str(row.get('source', {}).get('id')) in self.agent.withdrawn for row in
-                        context.get('reply_target', []) + context.get('invited_context', [])) or
+                reads = context.get('target_reads') or {}
+
+                def stale(row, target):
+                    i = str(row.get('source', {}).get('id'))
+                    return i in self.agent.withdrawn and not (
+                        target and self.agent.saved_turns.offered() and self.agent.read_after_withdrawal(
+                            i, reads.get('mark'), (reads.get('edited') or {}).get(i)))
+                if (any(stale(row, True) for row in context.get('reply_target', [])) or
+                        any(stale(row, False) for row in context.get('invited_context', [])) or
                         any(self.agent.taken_back(i, since) for i in own)):
                     raise commands.UserFeedbackCheckFailure(WITHDRAWN)
             # A post it quotes, looked at or read, edited since the turn began (after its last fetch, say): this
@@ -671,11 +682,17 @@ class Fri(discord.Client):
                 conversation, targets = {}, []
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence
+                    mark = self.agent.withdrawal_mark()  # Before the targets are fetched (see chat_once, fri #101).
                     try:
                         conversation = await evidence(self.agent, event, burst, targets)
                     except ValueError as exc:
                         raise commands.UserFeedbackCheckFailure(str(exc)) from None
                     context.update(conversation)
+                    # When the targets were read, and the edit each copy shows: kept beside them, never in what the
+                    # model reads.
+                    context['target_reads'] = {'mark': mark, 'edited': {
+                        str(post.id): post.edited_at.timestamp() for post in targets
+                        if isinstance(getattr(post, 'edited_at', None), dt.datetime)}}
                     await self.resolve_references(scope, context)
                 context['source'] = source.evidence()
                 from .fri_addressing import explicit_mention

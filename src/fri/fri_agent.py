@@ -191,6 +191,9 @@ class Agent:
         self.riders = set()  # Message IDs a turn answers for a line let in that way: they wait without a notice.
         self.seen = {}
         self.withdrawn = {}  # Message IDs edited or deleted while handled, newest last (see withdraw).
+        # Message ID -> (the order it was last withdrawn in, the newest edit seen of it as a timestamp, or None): what
+        # a copy read since must show to pass (see read_after_withdrawal). Kept with withdrawn.
+        self.withdrawals, self.withdrawal_count = {}, 0
         self.revised = {}  # Message ID -> when a member edited it after a model request carried it (see edit).
         self.arrived = {}  # Discord message ID -> time.time() as handle() took it (see taken_back).
         self.edits = {}  # Discord message ID -> its edited_at as handle() took it, if edited by then (see rerun).
@@ -556,6 +559,11 @@ class Agent:
             self.receipts.withdraw([message.id])  # receipt naming it.
         else:  # Any other update of a member's post one names too, a card suppressed during a check's last wait say.
             self.receipts.changed(message.id)
+        if edited and isinstance(message.edited_at, dt.datetime) and str(message.id) in self.withdrawals:
+            # Taken back, then edited again: a copy read since must show this edit (see read_after_withdrawal).
+            order, newest = self.withdrawals[str(message.id)]
+            if newest is None or message.edited_at.timestamp() > newest:
+                self.withdrawals[str(message.id)] = (order, message.edited_at.timestamp())
         if edited:
             self.saved_turns.withdraw([message.id], saved_in, authors={message.id: sender.id} if sender else None)
         if edited and message.id in self.looked:
@@ -1134,9 +1142,15 @@ class Agent:
         now = time.time()
         self.withdrawn.pop(str(message.id), None)
         self.withdrawn[str(message.id)] = now
+        # In order, not by a clock, and with the newest edit seen of it: what a copy read since must show (fri #101).
+        self.withdrawal_count += 1
+        edited = self.edit_seen.get(message.id)
+        self.withdrawals.pop(str(message.id), None)
+        self.withdrawals[str(message.id)] = (self.withdrawal_count, edited.timestamp() if edited else None)
         # Kept an hour, longer than any turn that could still hold a copy runs; the cap only bounds memory.
         while self.withdrawn and (next(iter(self.withdrawn.values())) < now-3600 or len(self.withdrawn) > 100000):
-            del self.withdrawn[next(iter(self.withdrawn))]
+            self.withdrawals.pop(oldest := next(iter(self.withdrawn)), None)
+            del self.withdrawn[oldest]
         # And from its author's saved exchange (fri #129); a deletion takes what carried it too (gene #141).
         self.saved_turns.withdraw([message.id], deleted=message.id in self.unsent)
         self.receipts.withdraw([message.id])
@@ -1262,6 +1276,21 @@ class Agent:
         """The turn answering `message` spent the member's allowance, for the whole exchange (see Continuation)."""
         if token := self.continuations.get(message):
             token.spent[0] = True
+
+    def withdrawal_mark(self):
+        """Where withdrawals stand now: a copy read after this reads past every withdrawal so far (see
+        read_after_withdrawal)."""
+        return self.withdrawal_count
+
+    def read_after_withdrawal(self, i, mark, edited):
+        """Whether a copy of message `i`, taken back, holds what it says now: its read began after `mark` (see
+        withdrawal_mark) was taken, after its last withdrawal, and it shows an edit (`edited`, Discord's edited_at as
+        a timestamp) no older than the newest seen of it. Discord's copy can lag an edit, so being read after isn't
+        enough. Anything unknown, the mark, the copy's edit or the one it was taken back for, counts as not (fri
+        #101)."""
+        order, newest = self.withdrawals.get(str(i), (None, None))
+        return (order is not None and mark is not None and order <= mark and edited is not None and
+                newest is not None and edited >= newest)
 
     def taken_back(self, i, since):
         """Whether message `i` was edited or deleted at or after `since`, the time.time() its words were read.
