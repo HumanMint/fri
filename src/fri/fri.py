@@ -449,8 +449,9 @@ class Fri(discord.Client):
                 invitation = getattr(actions, 'invitation', None)
                 checked = getattr(invitation, 'checked', 0)
                 # Every post Fri looked at is still there as it was read: an edit or delete while Fri signed
-                # in, or while the access check above waited on Discord, never reaches the model.
-                if actions and not await images_unchanged(actions.image_context, actions.event):
+                # in, or while the access check above waited on Discord, never reaches the model. A video card
+                # that unfurled beside their own still since is said to be unwatched (fri #307).
+                if actions and not await images_unchanged(actions.image_context, actions.event, turn=context):
                     raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
                 # A ping's own check before every request, the first too, now that Fri signed in, as an outside
                 # ping's (above): its access, the ping, every nearby post its read showed and their authors' privacy.
