@@ -34,11 +34,18 @@ def saved_preference(store, user):
                     notes=[{'category': 'music', 'evidence': 'I like trance'}])
 
 
-def test_a_learning_pass_never_sends_words_from_before_a_removal_during_its_read(learning, monkeypatch):  # noqa: F811
+READ_OVER = ('removal, while its rows are read', 'memory off and on, while its rows are read')
+
+
+@pytest.mark.parametrize('moved', ['a removal', 'memory off and on'])
+def test_a_learning_pass_never_sends_words_from_before_a_removal_during_its_read(learning, monkeypatch,  # noqa: F811
+                                                                                 moved):
     """fri #305: member 11 removes a saved preference through Gene while the pass's history request is out. Their
     message from before that came back with it, was stamped with their revision after the removal, and so passed the
     atomic author check: the summary model got words Gene keeps nowhere now (it refused the derived result only at
-    the finish). A record at or before the member's removal cutoff is dropped before the request; member 14's goes."""
+    the finish). A record at or before the member's removal cutoff is dropped before the request; member 14's goes.
+    fri #321: so is one from before they turned memory off through Gene, and on again, which kept no removal to say
+    so (HumanMint/gene#202)."""
     async def scenario():
         agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch)
         saved_preference(store, '11')
@@ -47,7 +54,11 @@ def test_a_learning_pass_never_sends_words_from_before_a_removal_during_its_read
 
         async def reading(*args, **kwargs):
             rows = await logs(*args, **kwargs)
-            remove_a_preference(store, '11')  # While the history request is out.
+            if moved == 'a removal':  # While the history request is out.
+                remove_a_preference(store, '11')
+            else:
+                store.personal_control('11', 'disable')
+                store.personal_control('11', 'enable')
             return rows
 
         channel._state.http.logs_from = reading
@@ -88,9 +99,13 @@ def explored(learning, monkeypatch, moved):  # noqa: F811
         return response.json()
 
     async def member(user, **_):
-        if checked and passes == [1] and moved == 'removal, while its rows are read' and not getattr(member, 'done', 0):
+        if checked and passes == [1] and moved in READ_OVER and not getattr(member, 'done', 0):
             member.done = 1
-            remove_a_preference(store, '11')  # After the search came back and was checked.
+            if moved == 'removal, while its rows are read':
+                remove_a_preference(store, '11')  # After the search came back and was checked.
+            else:  # Memory turned off and on again through Gene, there (fri #321).
+                store.personal_control('11', 'disable')
+                store.personal_control('11', 'enable')
         return SimpleNamespace(id=user, bot=False, display_name='friend', roles=[SimpleNamespace(id=90)])
 
     async def http(route, params):
@@ -124,7 +139,7 @@ def explored(learning, monkeypatch, moved):  # noqa: F811
         agent.record = AsyncMock()
         passes.append(1)
         await agent.learn()
-        if moved == 'removal, while its rows are read':
+        if moved in READ_OVER:
             return
         clock[0] += 1800
         agent.state = scheduler.state()
@@ -135,14 +150,16 @@ def explored(learning, monkeypatch, moved):  # noqa: F811
     return planned, summarized, targets
 
 
+@pytest.mark.parametrize('moved', READ_OVER)
 def test_an_archive_search_never_sends_words_from_before_a_removal_while_its_rows_are_read(learning,  # noqa: F811
-                                                                                           monkeypatch):
+                                                                                           monkeypatch, moved):
     """fri #305 on the exploration path: the archive search came back and Gene checked it, and member 11 removes a
     saved preference through Gene while Fri reads its rows. Their older message was stamped with their revision after
     the removal and went to the summary model (Gene refused the result only at the finish). It's at or before their
     removal cutoff, so it's dropped first, and with nothing left nothing is asked. A removal while the search is out
-    was already safe: Gene drops the planned search, and its check refuses."""
-    _, summarized, _ = explored(learning, monkeypatch, 'removal, while its rows are read')
+    was already safe: Gene drops the planned search, and its check refuses. fri #321: the same with memory turned off
+    and on again through Gene there, which kept no removal to say so (HumanMint/gene#202)."""
+    _, summarized, _ = explored(learning, monkeypatch, moved)
     assert summarized == []
 
 
