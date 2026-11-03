@@ -1,102 +1,96 @@
 """A message taken back by an edit stays out of every copy read before it, but a reply to it read after, holding
-what it says now, is answered (fri #101). Anything about that timing that can't be shown fails closed."""
+what it says now, is answered (fri #101). Anything about that timing that can't be shown fails closed, and so does a
+controller that keeps the old words in saved exchanges.
+
+Against the real controller, with the capabilities it offers (see test_fri_turn_withdrawal.world)."""
 import asyncio
-import copy
 import datetime as dt
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import discord
+import pytest
 
 from compat_tests.test_fri_edit_reanswer import edit
 from compat_tests.test_fri_edit_reanswer import model as respond_with
 from compat_tests.test_fri_mentions import environment
+from compat_tests.test_fri_turn_withdrawal import edited_while_another_turn_carries_it, settled, world
 from compat_tests.test_fri_unsend import no_debounce
-from compat_tests.test_fri_withdrawn_rows import model as real_model
 from fri.fri import WITHDRAWN
 from fri.fri_agent import Agent
 from fri.fri_chat import ChatResult
 
 MARKER = 'synthetic-private-marker'  # Synthetic words a withdrawal must keep from going anywhere.
-CURRENT = 'current safe caption'
+CURRENT = 'current safe caption'  # What edited_while_another_turn_carries_it leaves the message saying.
 
 
-async def withdrawn_by_edit(fri, agent, store, message, rows):
-    """The issue's setup: a member's message Fri answered, saved with its words; another member's reply to it is
-    being answered when the author edits it, so that turn's recheck takes it back (Agent.withdrawn)."""
-    earlier = message('fri explain ' + MARKER)
-    earlier.reply.return_value = SimpleNamespace(id=earlier.id+100, content='okay', edit=AsyncMock())
-    await agent.handle(earlier)
-    assert MARKER in str(store.chat_context('123', 'public:1', '20')['turns'])
-    intermediate = message('fri explain that caption?', user=30)
-    intermediate.reference = SimpleNamespace(message_id=earlier.id, channel_id=1)
-    original_handler = fri.chat.transport.handler
-
-    async def editing_during_response(request):
-        response = original_handler(request)
-        current = copy.copy(earlier)
-        current.content = CURRENT
-        current.edited_at = discord.utils.utcnow()
-        rows[earlier.id] = current
-        await fri.on_raw_message_edit(SimpleNamespace(channel_id=1, message=current))
-        return response
-    fri.chat.transport.handler = editing_during_response
-    await agent.handle(intermediate)
-    fri.chat.transport.handler = original_handler
-    assert str(earlier.id) in agent.withdrawn
+async def taken_back(w):
+    """The issue's setup: member 20's message, answered and saved with its words; another member's reply to it is
+    being answered when member 20 edits it, so that turn takes it back (Agent.withdrawn)."""
+    earlier = w.said('fri explain '+MARKER)
+    await w.agent.handle(earlier)
+    assert MARKER in str(w.store.chat_context('123', 'public:1', '20')['turns'])
+    await edited_while_another_turn_carries_it(w, earlier)
+    assert str(earlier.id) in w.agent.withdrawn
     return earlier
 
 
-def later_reply(message, earlier):
-    later = message('fri explain the current caption?')
-    later.reply.return_value = SimpleNamespace(id=later.id+100, content='okay', edit=AsyncMock())
+async def reply_to(w, earlier):
+    w.requests.clear()
+    later = w.said('fri explain the current caption?')
     later.reference = SimpleNamespace(message_id=earlier.id, channel_id=1)
+    await w.agent.handle(later)
     return later
 
 
-def test_a_fresh_reply_to_current_edited_text_can_be_answered(monkeypatch, tmp_path):
+@pytest.mark.parametrize('settle', [True, False], ids=['taken back by the controller', 'still on its way'])
+def test_a_fresh_reply_to_current_edited_text_can_be_answered(monkeypatch, tmp_path, settle):
     """fri #101: for an hour after an edit took a message back, a new reply to it, which fetches what it says now,
-    was refused as withdrawn. It's answered from the current text; the old words, which its saved exchange held,
-    still reach nothing (fri #129)."""
+    was refused as withdrawn. It's answered from the current text. The old words, which its saved exchange held,
+    reach nothing: the controller dropped that exchange (fri #129), or while that request is still on its way, it's
+    held out of the request (see SavedTurns.withhold)."""
     async def scenario():
-        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
-        no_debounce(monkeypatch)
-        fri.data = tmp_path
-        requests = []
-        real_model(fri, requests)
-        fri.chat_once = type(fri).chat_once.__get__(fri)
+        w = await world(monkeypatch, tmp_path)
         try:
-            earlier = await withdrawn_by_edit(fri, agent, store, message, rows)
-            requests.clear()
-            later = later_reply(message, earlier)
-            await agent.handle(later)
-            assert requests and CURRENT in str(requests[-1]) and MARKER not in str(requests)
+            earlier = await taken_back(w)
+            if settle:
+                await settled(w)
+            later = await reply_to(w, earlier)
+            assert w.requests and CURRENT in str(w.requests[-1]) and MARKER not in str(w.requests)
             assert later.reply.await_count == 1 and WITHDRAWN not in str(later.reply.await_args)
         finally:
-            await fri.close()
+            await w.fri.close()
     asyncio.run(scenario())
 
 
 def test_a_reply_target_copy_still_showing_the_old_words_after_its_withdrawal_is_refused(monkeypatch, tmp_path):
-    """Guard: Discord's copy can lag an edit event. A reply fetched after the withdrawal but still showing the message
-    as it was before that edit holds the old words: refused, as before."""
+    """Guard: Discord's copy can lag an edit. A reply read after the withdrawal but still showing the message as it
+    was before that edit holds the old words: refused, as before."""
     async def scenario():
-        fri, agent, store, _, channel, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
-        no_debounce(monkeypatch)
-        fri.data = tmp_path
-        requests = []
-        real_model(fri, requests)
-        fri.chat_once = type(fri).chat_once.__get__(fri)
+        w = await world(monkeypatch, tmp_path)
         try:
-            earlier = await withdrawn_by_edit(fri, agent, store, message, rows)
-            rows[earlier.id] = earlier  # Discord still shows it unedited.
-            requests.clear()
-            later = later_reply(message, earlier)
-            await agent.handle(later)
-            assert MARKER not in str(requests)
+            earlier = await taken_back(w)
+            await settled(w)
+            w.rows[earlier.id] = earlier  # Discord still shows it unedited.
+            later = await reply_to(w, earlier)
+            assert MARKER not in str(w.requests)
             assert later.reply.await_count == 1 and WITHDRAWN in str(later.reply.await_args)
         finally:
-            await fri.close()
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_controller_that_keeps_the_old_words_still_refuses(monkeypatch, tmp_path):
+    """Guard: a controller without turn-withdrawal keeps the saved exchange's old words, so a reply to the message
+    is refused for the hour, as before."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path, capable=False)
+        try:
+            earlier = await taken_back(w)
+            later = await reply_to(w, earlier)
+            assert MARKER not in str(w.requests)
+            assert later.reply.await_count == 1 and WITHDRAWN in str(later.reply.await_args)
+        finally:
+            await w.fri.close()
     asyncio.run(scenario())
 
 
@@ -106,6 +100,7 @@ def test_a_reply_to_a_message_answered_again_as_edited_can_be_answered(monkeypat
     async def scenario():
         fri, agent, store, _, _, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
         no_debounce(monkeypatch)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
         trigger = message('fri whats teh best ' + MARKER)
         trigger.reply.return_value = SimpleNamespace(id=trigger.id+100, content='okay', edit=AsyncMock())
         requests, edited = [], []
@@ -137,8 +132,8 @@ def test_a_reply_to_a_message_answered_again_as_edited_can_be_answered(monkeypat
 
 def test_a_copy_passes_only_when_read_after_the_withdrawal_and_showing_its_newest_edit():
     """The record itself: a copy of a message taken back passes only if its read began after that withdrawal and it
-    shows the newest edit seen of the message. Read before it or in the same step, a withdrawal whose edit Fri never
-    saw, a copy showing no edit or an older one, and a newer edit seen since: each fails closed."""
+    shows the newest edit seen of the message. Read before it, a withdrawal whose edit Fri never saw, a copy showing
+    no edit or an older one, a newer edit seen since, and a withdrawal again: each fails closed."""
     fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, get_channel=lambda _: None)
     agent = Agent(fri)
     agent.saved_turns.withdraw = lambda *args, **kwargs: None
