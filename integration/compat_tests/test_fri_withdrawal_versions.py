@@ -13,7 +13,11 @@ import pytest
 from compat_tests.test_fri_edit_reanswer import edit
 from compat_tests.test_fri_edit_reanswer import model as respond_with
 from compat_tests.test_fri_mentions import environment
-from compat_tests.test_fri_turn_withdrawal import edited_while_another_turn_carries_it, settled, world
+from compat_tests.test_fri_turn_withdrawal import (
+    edited_while_another_turn_carries_it,
+    settled,
+    world,
+)
 from compat_tests.test_fri_unsend import no_debounce
 from fri.fri import WITHDRAWN
 from fri.fri_agent import Agent
