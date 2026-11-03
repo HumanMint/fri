@@ -52,11 +52,37 @@ def link_previews(message):
     return result
 
 
-def sources(message, most=2, *, gifs=False):
+def video_card(embed):
+    """A video link's card (YouTube, Twitch, an X video): Discord's unfurl of a link, never an uploaded clip."""
+    kind = getattr(embed, 'type', None)
+    return kind != 'gifv' and (kind == 'video' or bool(getattr(embed, 'video', None)))
+
+
+def video_previews(message):
+    """The thumbnail Discord's own proxy made of each video link's card among the first two cards, each one that can
+    be shown whole as link_previews requires; none on a post with spoiler markup. Never the clip, or the site."""
+    embeds = getattr(message, 'embeds', None)
+    if not isinstance(embeds, (list, tuple)) or '||' in str(getattr(message, 'content', '') or ''):
+        return []
+    result = []
+    for embed in [e for e in embeds if getattr(e, 'type', None) in LINK_CARDS][:2]:
+        if not video_card(embed):
+            continue
+        picture = next((part for part in (getattr(embed, 'image', None), getattr(embed, 'thumbnail', None))
+                        if getattr(part, 'proxy_url', None) or getattr(part, 'url', None)), None)
+        url, width, height = (getattr(picture, key, None) for key in ('proxy_url', 'width', 'height'))
+        if url and urlsplit(str(url)).path.startswith('/external/') and measured(width, height):
+            result.append(str(url))
+    return result
+
+
+def sources(message, most=2, *, gifs=False, cards=False):
     """None means incomplete/unsupported media; don't judge a video from its thumbnail.
 
     most: how many images one post may carry; a look around takes a whole gallery post.
-    gifs: a GIF link's still preview counts too. An uploaded GIF never does: nothing here decodes animations."""
+    gifs: a GIF link's still preview counts too. An uploaded GIF never does: nothing here decodes animations.
+    cards: a video link's card is the link's, not media the post carries, so the stills beside it still count
+    (N2a); its thumbnail is video_previews' to show. The meme reactions keep the default: nothing beside a video."""
     attachments = message.attachments
     if len(attachments) > most or any(a.is_spoiler() for a in attachments) or '||' in message.content:
         return None
@@ -75,6 +101,8 @@ def sources(message, most=2, *, gifs=False):
             if not preview or not measured(1 if width is None else width, 1 if height is None else height):
                 return None
             result.append(str(preview))
+            continue
+        if cards and video_card(embed):
             continue
         if embed.type in ('video', 'gifv') or embed.video:
             return None

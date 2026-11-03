@@ -60,8 +60,14 @@ too); a size that's missing or unreadable skips it. Every picture a turn showed 
 as Discord shows its post then, before each later model request and before delivery (a ping's own check
 does it, outside channels too, and for a ping answering a pending clarification, which has no mention
 grant), so a swapped or suppressed one stops the turn. A card that unfurls late on
-a post Fri didn't look at changes nothing. A post with both an attachment and a card's picture is still
-not looked at, and history search rows don't show cards yet.
+a post Fri didn't look at changes nothing. A video link's card (YouTube, Twitch, an X video) beside a
+member's uploaded stills no longer hides them: Fri looks at the uploads and, on someone else's post, at the
+card's thumbnail beside them through the same proxy and limits, as its own `still="link preview"` entry,
+as far as the four-image budget goes (the uploads come first). On the speaker's own post Fri looks at their
+still and is told the video went unwatched (`own_media_not_inspected` with its card's text), so it answers
+from the still and says it couldn't watch the video, never the canned "can't watch videos" line. The meme
+reactions still skip such a post. A post with both an attachment and another card's picture is still not
+looked at, and history search rows don't show cards yet.
 
 Context from other members keeps its actual author and privacy revision and stays
 ephemeral. Saved conversation uses a neutral breadcrumb; no derived personal notes,
