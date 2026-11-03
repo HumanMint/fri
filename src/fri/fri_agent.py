@@ -2450,7 +2450,9 @@ class Agent:
                 if not member or not any(str(r.id) == claim['role_id'] for r in member.roles):
                     continue
                 profile = await self.profile(channel.id, message.author.id)
-                if not profile['enabled']:
+                # Said at or before their latest memory removal, it's kept nowhere: never stamped with the revision
+                # after it (fri #305).
+                if not profile['enabled'] or before_removal(message.id, profile):
                     continue
                 records.append({'id': str(message.id), 'user_id': str(message.author.id),
                     'role_id': claim['role_id'], 'revision': profile['revision'],

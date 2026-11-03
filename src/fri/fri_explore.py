@@ -7,6 +7,7 @@ from discord.http import Route
 
 from . import feedback as commands
 from .fri_agent_model import STRING, obj
+from .fri_memory import before_removal
 from .privacy import clean
 
 PLAN = obj({'term': STRING, 'reason': STRING})
@@ -107,6 +108,9 @@ async def explore(agent, claim):
     held = []  # Each record's author and their erasures here before the archive was searched (see Agent.unmoved).
     try:
         members = await roster(agent, claim['role_id'])
+        # Members' erasures here before the target and its context are asked for: the planner is held to the
+        # target's, so a "forget me" while Gene answers counts (fri #304).
+        assigned = dict(agent.forgotten)
         claim = await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/target', {'members': members})
         target = claim['target']
         channel = agent.fri.get_channel(int(claim['channel_id']))
@@ -118,7 +122,7 @@ async def explore(agent, claim):
         if not permissions.view_channel or not permissions.read_message_history:
             raise ValueError('Exploration channel is not readable')
         targeted = int(target['user_id'])
-        forgotten = agent.forgotten.get(targeted, 0)  # Before the reads: a "forget me" during them counts (fri #292).
+        forgotten = assigned.get(targeted, 0)  # A "forget me" since the target was asked for counts (fri #292, #304).
         member = await agent.member(targeted, fresh=True)
         profile = await agent.profile(channel.id, targeted)
         if not member or member.bot or not profile['enabled'] or not any(str(r.id) == claim['role_id'] for r in member.roles):
@@ -163,7 +167,7 @@ async def explore(agent, claim):
             if not member or member.bot or not any(str(r.id) == claim['role_id'] for r in member.roles):
                 continue
             profile = await agent.profile(channel.id, user)
-            if not profile['enabled']:
+            if not profile['enabled'] or before_removal(row['id'], profile):  # As Agent.learn's (fri #305).
                 continue
             records.append({'id': str(row['id']), 'user_id': str(user), 'role_id': claim['role_id'],
                 'display_name': clean(member.display_name, 80), 'revision': profile['revision'],
