@@ -2,7 +2,6 @@
 capacity (fri #256). Against the real controller."""
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
@@ -56,21 +55,21 @@ def test_a_failed_withdrawal_by_id_holds_its_message_back_across_a_restart(monke
 
 
 def test_capacity_never_releases_a_withdrawal_gene_hasnt_taken(monkeypatch, tmp_path):
-    """fri #256, with a cap of two: one failed withdrawal of an exchange Fri saved, then two unrelated deletions whose
+    """fri #256, with a cap of two: one failed withdrawal of an exchange Fri saved, then two more deletions whose
     withdrawals fail too. The oldest was dropped for room, and once its hour-long mark ran out its words reached the
     next request. Capacity holds back more instead: every saved context, until what was dropped can't be kept any
     more, written down so a restart keeps it."""
     async def scenario():
         w = await world(monkeypatch, tmp_path)
-        capable(w)
-        monkeypatch.setattr(withdrawal, 'MOST', 2)
         try:
             earlier = await earlier_exchange(w)
+            others = [w.said(text) for text in ('fri what about lunch', 'fri and after that')]
+            for other in others:  # Two more exchanges Fri saved, newer.
+                await w.agent.handle(other)
+            monkeypatch.setattr(withdrawal, 'MOST', 2)
             failing(w, WITHDRAW)
-            failing(w, SAVED)
-            await delete(w, earlier, guild=123)
-            for later in (5000, 6000):  # Newer messages, nearby in the channel: asked about by ID.
-                await delete(w, SimpleNamespace(id=earlier.id+later), guild=123)
+            for message in (earlier, *others):
+                await delete(w, message, guild=123)
             await settled(w)
             assert len(w.agent.saved_turns.pending) <= 2
             assert MARKER not in await an_hour_later_asks(monkeypatch, w)
@@ -86,7 +85,6 @@ def test_the_queue_within_its_capacity_holds_nothing_more_back(monkeypatch, tmp_
     """Guard: under the cap, a withdrawal that fails holds back its own message only, as before."""
     async def scenario():
         w = await world(monkeypatch, tmp_path)
-        capable(w)
         try:
             earlier = await earlier_exchange(w)
             failing(w, WITHDRAW)
