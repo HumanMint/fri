@@ -69,6 +69,7 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
     scope = profiled(cog, scope or scope_for(cog, interaction))
     if not await allowed(cog, interaction, scope, message=False, tell=True):
         return
+    forgotten = cog.agent.forgotten.get(interaction.user.id, 0)  # Their erasures here before it's read (fri #302).
     state = state or await cog.api('POST', '/chat/memory/notes', scope)
     state = await screened(cog, scope, state)
     profiles = getattr(cog, 'profiles', False)
@@ -100,9 +101,21 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
                  'server-wide one'+(' or the summary' if summary else '')+'. Discord posts and backups are separate.'
                  if profiles else
                  'Editing or removing a preference clears recent saved context here. Discord posts and backups are separate.')
-    from .fri_panel import card, reply
-    await reply(cog, interaction, embed=card('My memory', '\n\n'.join(lines)),
-                view=MemoryView(cog, scope, state, selected, confirm=confirm))
+    from .fri_panel import HomeView, card, reply
+    moved = []
+
+    async def still():
+        """Once the panel's lock is taken, right before the listing shows (fri #302): their erasures here since it was
+        read, then their revision against the one it was read under, with nothing awaited after that."""
+        if await cog.agent.erasure(interaction.user.id, forgotten, state['revision']):
+            moved.append(True)
+        return not moved
+    view = MemoryView(cog, scope, state, selected, confirm=confirm)
+    await reply(cog, interaction, embed=card('My memory', '\n\n'.join(lines)), view=view, still=still)
+    if moved:  # Nothing of it shown: they ask again, and it's read as it is now.
+        from .fri import PANEL_SKIPPED
+        view.stop()
+        await reply(cog, interaction, PANEL_SKIPPED, view=HomeView(cog, interaction.user.id))
 
 
 async def screened(cog, scope, state):

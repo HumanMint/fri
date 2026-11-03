@@ -1351,6 +1351,9 @@ class Fri(discord.Client):
         user = interaction.user.id
         held = self.agent is not None and memory_intent(text) not in ('disable', 'enable')
         forgotten = self.agent.forgotten.get(user, 0) if held else None
+        # Everyone's erasures here as it comes in too: the reply may carry other members' words (its provenance), and
+        # Gene's check of the turn can't see a "forget me" of theirs Fri took in and hasn't sent on (fri #301).
+        baselines = {str(member): count for member, count in self.agent.forgotten.items()} if held else {}
         await defer_panel(interaction)
         await reply(self, interaction, 'Thinking…', view=HomeView(self, user))
         try:
@@ -1358,16 +1361,20 @@ class Fri(discord.Client):
             result = await self.talk(interaction.guild_id, interaction.channel_id, user, text, 'private',
                                      interaction.user.display_name, event=interaction, revision=revision,
                                      forgotten=forgotten)
-            # Last before it's shown, with nothing to wait on: their erasures here since it came in. talk() ends on
-            # Gene's check of the whole turn, everyone it drew on and their own revision (held to the one above), so
-            # a read here would reopen that fence for them alone (fri #290's round 1).
-            if held and self.agent.forgotten.get(user, 0) != forgotten:
-                raise AuthorErased()
+            # Last before it's shown, with nothing to wait on: their erasures here since it came in, and those of
+            # everyone it drew on (fri #301). talk() ends on Gene's check of the whole turn, everyone it drew on and
+            # their own revision (held to the one above), so a read here would reopen that fence for them alone (fri
+            # #290's round 1).
             fence = result.turn  # The whole turn, kept apart: saving it clears result.turn (see record_turn).
+            authors = {str(user), *(str(row['user_id']) for row in (fence or {}).get('provenance') or [])}
 
             def unmoved():
-                if held and self.agent.forgotten.get(user, 0) != forgotten:
+                if not held:
+                    return
+                now = {str(member): count for member, count in self.agent.forgotten.items()}
+                if any(now.get(member, 0) != baselines.get(member, 0) for member in authors):
                     raise AuthorErased()
+            unmoved()
 
             async def standing(quiet=False):
                 """Once the panel's lock is taken, right before an edit that carries this turn's words: their erasures
@@ -1390,6 +1397,7 @@ class Fri(discord.Client):
             if result.settings_preview:
                 from .fri_agent import BehaviorPreview
                 view = BehaviorPreview(self.agent, **result.settings_preview)
+                view.still = lambda: standing(quiet=True)  # Every later page too, inside its lock (fri #303).
                 await reply(self, interaction, view.content, attachments=[], view=view, verbatim=True, still=standing)
             else:
                 await reply(self, interaction, embed=card('Fri', result.reply), view=view, still=standing)
