@@ -403,31 +403,32 @@ FIX = 'not the one, i meant join us for a bite'
     ("wrong song, 'Love Story' by Taylor heard Alex", 'Love Story', False),
     ("wrong song, 'Love' by Alex Picked Taylor", 'Love', True),
     ('wrong song, "Love" by "Taylor Told Alex"', 'Love', True),  # What they quoted is the artist's, every word.
-    # gene #156 (3): a pronoun they quoted after a connector names no one either, whichever quote they used.
-    ('wrong song, "Not Now by ‘Me’", not now', 'Not Now by Me', False),
-    ('wrong song, “Not Now by ‘Me’”, not now', 'Not Now by Me', False),
-    ('wrong song, "Not Now by ‘Me’", i said not now', 'Not Now by Me', False),
+    # A pronoun they quoted as an artist (gene #156's third part) is left as main has it: split out after four review
+    # rounds. Every quoted artist from those rounds (spaced, nested, unclosed and punctuated quotes) decides exactly as
+    # main does, round 8's two fixes only naming the title over past an artist whose first word isn't a pronoun.
+    ('wrong song, "Not Now by ‘Me’", not now', 'Not Now by Me', True),
+    ('wrong song, “Not Now by ‘Me’”, not now', 'Not Now by Me', True),
+    ('wrong song, "Not Now by ‘Me’", i said not now', 'Not Now by Me', True),
     ('wrong song, "Not Now by \'Me\'", not now', 'Not Now by Me', False),
     ('wrong song, "Not Now by ‘Blink-182’", i said "Not Now"', 'Not Now by Blink-182', True),
-    # A name of several words they quoted is a name, even one starting with a pronoun (round 1 of #165's review).
     ('wrong song, "Not Now by ‘My Chemical Romance’", i said "Not Now"', 'Not Now by My Chemical Romance', True),
     ('wrong song, "Not Now by “My Chemical Romance”", i said "Not Now"', 'Not Now by My Chemical Romance', True),
-    ('wrong song, "Not Now by \'Our Lady Peace\'", i said "Not Now"', 'Not Now by Our Lady Peace', True),
+    ('wrong song, "Not Now by \'Our Lady Peace\'", i said "Not Now"', 'Not Now by Our Lady Peace', False),
     ('wrong song, Glad You Came by "My Chemical Romance", not now', 'Glad You Came My Chemical Romance not now', False),
-    # Round 2 of #165's review: spaces inside the quote, or a quote never closed, don't make a pronoun a name.
     ('wrong song, Stand By "Me ", No More', 'Stand By Me No More', True),
     ("wrong song, Stand By 'Me ', No More", 'Stand By Me No More', True),
     ('wrong song, Stand By “ Me ”, No More', 'Stand By Me No More', True),
     ('wrong song, Stand By "Me, No More', 'Stand By Me No More', True),
     ('wrong song, "Not Now by \'Me \'", not now', 'Not Now by Me', False),
     ('wrong song, "Not Now by ‘My Chemical Romance ’", i said "Not Now"', 'Not Now by My Chemical Romance', True),
-    # Round 3 of #165's review: spaces after a straight opening quote, nested quotes, and punctuation between a quoted
-    # name's words. It's a pronoun only when the quote holds that word alone.
     ("wrong song, Stand By ' Me ', No More", 'Stand By Me No More', True),
     ("wrong song, Stand By ' Me, No More", 'Stand By Me No More', True),
     ('wrong song, Stand By “‘Me’”, No More', 'Stand By Me No More', True),
     ('wrong song, "Not Now by ‘Me & My’", i said "Not Now"', 'Not Now by Me & My', True),
     ('wrong song, "Not Now by ‘You+Me’", i said "Not Now"', 'Not Now by You+Me', True),
+    ("wrong song, Stand By 'Me ' No More", 'Stand By Me No More', True),
+    ('wrong song, "Not Now by ‘ Me & My ’", i said "Not Now"', 'Not Now by Me & My', True),
+    ('wrong song, "Not Now by \'Me \' and You", not now', 'Not Now by Me and You', False),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
