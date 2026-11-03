@@ -69,7 +69,7 @@ def explored(learning, monkeypatch, moved):  # noqa: F811
     channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()),
                               permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True))
     planned, summarized, pages, agents, passes = [], [], iter([[old], [old, later], []]), [], []
-    checked = []
+    checked, targets = [], []
     saved_preference(store, '11')
 
     async def api(method, path, payload=None):
@@ -79,6 +79,8 @@ def explored(learning, monkeypatch, moved):  # noqa: F811
             return {}  # Gene refuses what a removal invalidated; this pass is done either way.
         if response.status_code != 200:
             raise ControllerRejected(response.json().get('detail', ''), response.status_code)
+        if path.endswith('/target'):
+            targets.append(response.json()['target'])
         if path.endswith('/target') and passes == [1, 2] and moved == 'local, while the target is assigned':
             agents[0].forget(11, erased=True)  # Gene built the target's context; this lands before Fri resumes.
         if path.endswith('/checked'):
@@ -130,7 +132,7 @@ def explored(learning, monkeypatch, moved):  # noqa: F811
         await agent.learn()
 
     asyncio.run(scenario())
-    return planned, summarized, old['id']
+    return planned, summarized, targets
 
 
 def test_an_archive_search_never_sends_words_from_before_a_removal_while_its_rows_are_read(learning,  # noqa: F811
@@ -151,8 +153,8 @@ def test_an_explorations_planner_is_held_to_erasures_here_from_before_its_target
     The planner's baseline of their erasures here was taken after that, so the fence passed and the planner got their
     name and historical evidence. It's taken before the target is asked for: the planner isn't asked. With nothing
     moved, it is."""
-    planned, _, _ = explored(learning, monkeypatch, moved)
-    if moved == 'nothing':
+    planned, _, targets = explored(learning, monkeypatch, moved)
+    if moved == 'nothing' and 'revision' in targets[-1]:
         assert len(planned) == 1 and 'historical_topics' in planned[0]
     else:
         assert planned == []

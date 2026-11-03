@@ -105,12 +105,13 @@ async def roster(agent, role_id):
 
 async def explore(agent, claim):
     records, scanned_ids, counters, output, error = [], [], {}, {}, ''
-    held = []  # Each record's author and their erasures here before the archive was searched (see Agent.unmoved).
+    held = []  # Each record's author and their erasures here before the pass read anything (see Agent.unmoved).
+    # Members' erasures here, once, before anything is read: the planner is held to the target's and every record to
+    # its author's, so a "forget me" while the roster, the target, the search or a record is read counts (fri #290's
+    # round 1, #304, #310's round 1).
+    baseline = dict(agent.forgotten)
     try:
         members = await roster(agent, claim['role_id'])
-        # Members' erasures here before the target and its context are asked for: the planner is held to the
-        # target's, so a "forget me" while Gene answers counts (fri #304).
-        assigned = dict(agent.forgotten)
         claim = await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/target', {'members': members})
         target = claim['target']
         channel = agent.fri.get_channel(int(claim['channel_id']))
@@ -122,22 +123,25 @@ async def explore(agent, claim):
         if not permissions.view_channel or not permissions.read_message_history:
             raise ValueError('Exploration channel is not readable')
         targeted = int(target['user_id'])
-        forgotten = assigned.get(targeted, 0)  # A "forget me" since the target was asked for counts (fri #292, #304).
+        forgotten = baseline.get(targeted, 0)  # A "forget me" since the pass began counts (fri #292, #304).
         member = await agent.member(targeted, fresh=True)
         profile = await agent.profile(channel.id, targeted)
         if not member or member.bot or not profile['enabled'] or not any(str(r.id) == claim['role_id'] for r in member.roles):
             raise ValueError('Member eligibility changed')
         context = dict(claim['exploration'])
         context.update(channel=clean(channel.name, 60), lookback_days=claim['depth'], max_messages=claim['limit'])
-        if target['first_visit'] or target['exhausted']:
+        # The target's revision Gene read that context at, in the same transaction (HumanMint/gene#197). A controller
+        # without it can't say what the context is current for, so no planner is asked with it (fri #304).
+        read_at = target.get('revision')
+        if target['first_visit'] or target['exhausted'] or not isinstance(read_at, int) or isinstance(read_at, bool):
             plan = {'term': '', 'reason': "Read this member's own wording before choosing topic filters."}
         else:
             async def moved():
                 """Signed in, the target as the request would carry them: the historical topics' evidence is their
-                words, so their Gene revision and erasures here are read again, and moved, nothing is asked (fri
-                #292)."""
+                words, so their Gene revision is held to the one the context was read at, and their erasures here to
+                theirs from before it was asked for. Moved, nothing is asked (fri #292, #304)."""
                 now = await agent.profile(channel.id, targeted)
-                return (not now['enabled'] or now['revision'] != profile['revision'] or
+                return (not now['enabled'] or now['revision'] != read_at or
                         agent.forgotten.get(targeted, 0) != forgotten)
             plan, usage, status = await agent.run('exploration_plan', PLANNER+'\nOwner learning preferences: '+agent.config['learning_notes'],
                 context, PLAN, model=claim['model'], effort=claim['effort'], erased=moved)
@@ -152,9 +156,6 @@ async def explore(agent, claim):
         profile = await agent.profile(channel.id, int(target['user_id']))
         if not member or member.bot or not profile['enabled'] or not any(str(r.id) == claim['role_id'] for r in member.roles):
             raise ValueError('Member eligibility changed')
-        # Members' erasures here, once, before the search: every record is held to this, so a "forget me" during it,
-        # or between two of a member's records, counts against all of theirs (fri #290's round 1).
-        snapshot = dict(agent.forgotten)
         rows = [] if plan['skip'] else await search(agent, claim, plan)
         scanned_ids = [str(row['id']) for row in rows]
         checked = set(await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/checked', {'message_ids': scanned_ids}))
@@ -172,7 +173,7 @@ async def explore(agent, claim):
             records.append({'id': str(row['id']), 'user_id': str(user), 'role_id': claim['role_id'],
                 'display_name': clean(member.display_name, 80), 'revision': profile['revision'],
                 'text': clean(row['content'], 500), 'at': discord.utils.snowflake_time(int(row['id'])).timestamp()})
-            held.append((user, snapshot.get(user, 0)))
+            held.append((user, baseline.get(user, 0)))
         if records:
             output, usage, status = await agent.run('summary', SUMMARIZER,
                 {'focus': {'member_id': plan['member_id'], 'term': plan['term']}, 'messages': records},

@@ -65,11 +65,13 @@ def test_real_learning_harness_explores_old_messages_and_deduplicates_cross_quer
     plans = iter([{'member_id': '11', 'term': 'minecraft', 'reason': 'follow their Minecraft discussions'},
                   {'member_id': '11', 'term': 'minecraft', 'reason': 'continue the unchecked older results'}])
     pages = iter([[old], [old, new], []])
-    model_inputs, searches = [], []
+    model_inputs, searches, targets = [], [], []
 
     async def api(method, path, payload=None):
         response = client.request(method, path, json=payload, headers=headers('fri'))
         assert response.status_code == 200, response.text
+        if path.endswith('/target'):
+            targets.append(response.json()['target'])
         return response.json()
 
     async def http(route, params):
@@ -126,6 +128,11 @@ def test_real_learning_harness_explores_old_messages_and_deduplicates_cross_quer
         agent = runtime()  # Restart and overlap a different search with a previously read message.
         agent.run = summarize
         second = await agent.learn()
+        if 'revision' not in targets[-1]:
+            # A controller before HumanMint/gene#197 can't say what the planner's context is current for: no planner
+            # request, and a broad read instead (fri #304). The rest of this follows the planner's search.
+            assert 'exploration_plan' not in [role for role, _ in model_inputs] and 'content' not in searches[-1]
+            return
         assert second['scanned'] == 2 and second['eligible'] == second['historical_notes'] == 1
         assert model_inputs[-1][1]['messages'][0]['id'] == new['id']
         assert searches[1]['author_id'] == '11' and searches[1]['content'] == 'minecraft'
