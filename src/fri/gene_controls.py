@@ -324,8 +324,9 @@ def masked(text, spans):
 
 def artist_first(text, artist):
     """The first word of the artist named at this ARTIST match, past any marks and spaces they opened a quote with
-    ("by ‘Me’", "by ' Me '", "by “‘Me’”"). It decides only whether the title is over past that artist (see
-    replacement): a pronoun or their own "i" there names no one, so main's decision stands."""
+    ("by ‘Me’", "by ' Me '", "by “‘Me’”"), or '' when no word comes first ("by ‘…Me’", "by "", Me"). It decides only
+    whether the title is over past that artist (see replacement): no word, a pronoun or their own "i" there names no
+    one, so main's decision stands."""
     word = FIRST_WORD.match(text, artist.end(1))
     return word['word'].strip("'") if word else ''
 
@@ -419,11 +420,11 @@ def replacement(text, song, start, named):
     if not quoted:  # Its own title is the words before an artist they named in it ("Not Now by Blink-182").
         own = min((m.start() for m, *_ in artists if m.start() < song_end), default=song_end)
     # Past the song they named, or past an artist named in it, where its title is over ('Glad You Came by "The
-    # Wanted", not now'), though not a connector naming no one ("Stand By Me, No More"); or their own "i said not now"
-    # it took in. Not that song said again: the named song, or its own title before that, grounded as the named song
-    # is ("the Not Now" may be "Not Now").
-    past = next((name[1] for m, _, name, _ in artists if m.start() < song_end
-                 and (first := artist_first(text, m)) not in NOT_ARTISTS and not SPEAKER.fullmatch(first)), song_end)
+    # Wanted", not now'), though not a connector naming no one ("Stand By Me, No More", "Stand By ‘…Me’, No More"); or
+    # their own "i said not now" it took in. Not that song said again: the named song, or its own title before that,
+    # grounded as the named song is ("the Not Now" may be "Not Now").
+    past = next((name[1] for m, _, name, _ in artists if m.start() < song_end and (first := artist_first(text, m))
+                 and first not in NOT_ARTISTS and not SPEAKER.fullmatch(first)), song_end)
     stopped = STOPPED.search(plain, min(past, song_end)) or SAID_STOPPED.search(plain, title)
     if stopped:
         title_words = [word for word, at, _ in said if at < min(own, stopped.start())]
