@@ -24,3 +24,6 @@ def test_a_long_caption_is_checked_in_one_pass(build):
     # Scaling, not a fixed ceiling, so a slow runner doesn't fail it: four times the caption costs about four
     # times as long in one pass, and sixteen times as long when every position rescans the rest.
     assert best(build(40000)) < 8*best(build(10000)) + 0.005
+    # And a larger pair, where a small quadratic term (one rescan every few dozen words) outgrows the linear work
+    # that hides it below the bound at the smaller sizes (fri #271).
+    assert best(build(160000)) < 8*best(build(40000)) + 0.005
