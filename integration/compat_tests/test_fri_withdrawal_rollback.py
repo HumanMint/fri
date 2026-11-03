@@ -848,25 +848,53 @@ def test_an_unreadable_record_that_cant_be_set_aside_is_never_overwritten(monkey
     asyncio.run(scenario())
 
 
-def test_the_closed_state_outlasts_a_transient_read_failure(monkeypatch, tmp_path):
-    """The record couldn't be read once and couldn't be set aside: closed is on disk before anything else is written,
-    so a later start is still closed, and the record is kept as it was (set aside once a later write could move it)."""
+def test_a_transient_read_failure_keeps_the_record_where_it_is_and_reads_it_again(monkeypatch, tmp_path):
+    """Round 7: the disk failed one read of a valid record. That says nothing about the record, so it's kept where it
+    is, unrenamed, with no closed marker: an older Fri rolled back onto this disk still finds its entries. Until it's
+    read, every saved context is held back and no queue write replaces it; the next write reads it again, restores
+    its entries, and the hold-back ends, the withdrawn exchange still held back by its own entry."""
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = await kept_pending(w, tmp_path, monkeypatch)
+            text = (tmp_path/'withdrawals.json').read_text()
+            reads(monkeypatch, tmp_path/'withdrawals.json')
+            turns = w.agent.saved_turns = SavedTurns(w.agent)
+            assert turns.closed() and MARKER not in await next_request(w) and history(w) == 0
+            assert (tmp_path/'withdrawals.json').read_text() == text  # Where an older Fri reads it, as it was.
+            assert not (tmp_path/CLOSED).exists() and not list(tmp_path.glob('withdrawals.unreadable-*.json'))
+            turns.forget('30')  # A queue write: it reads the record again first.
+            assert str(earlier.id) in turns.pending and not turns.closed()
+            assert MARKER not in await next_request(w)
+            assert str(earlier.id) in (tmp_path/'withdrawals.json').read_text()
+            turns = w.agent.saved_turns = SavedTurns(w.agent)  # A restart finds it as usual.
+            assert str(earlier.id) in turns.pending and not turns.closed()
+            assert MARKER not in await next_request(w)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_record_the_disk_keeps_failing_is_never_replaced(monkeypatch, tmp_path):
+    """The disk keeps failing reads: the record stays as it was through queue writes, and saved context stays held
+    back, for as long as it can't be read."""
     async def scenario():
         from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
         try:
             await kept_pending(w, tmp_path, monkeypatch)
             text = (tmp_path/'withdrawals.json').read_text()
-            reads(monkeypatch, tmp_path/'withdrawals.json')
-            renames(monkeypatch, times=1)
-            w.agent.saved_turns = SavedTurns(w.agent)
-            assert MARKER not in await next_request(w) and history(w) == 0
-            w.agent.saved_turns.forget('30')
-            assert text in [path.read_text() for path in tmp_path.glob('withdrawals*.json')]
+            reads(monkeypatch, tmp_path/'withdrawals.json', times=10**6)
             turns = w.agent.saved_turns = SavedTurns(w.agent)
-            assert turns.closed() and (tmp_path/CLOSED).exists()
-            assert MARKER not in await next_request(w) and history(w) == 0
-            assert text in [path.read_text() for path in tmp_path.glob('withdrawals*.json')]
+            turns.forget('30')
+            more = w.said('fri one more')
+            await w.agent.handle(more)
+            await delete(w, more)
+            assert turns.closed() and MARKER not in await next_request(w) and history(w) == 0
+            with open(tmp_path/'withdrawals.json') as stream:  # Not through Path.open, which the disk fails here.
+                assert stream.read() == text
+            assert not (tmp_path/CLOSED).exists() and not list(tmp_path.glob('withdrawals.unreadable-*.json'))
         finally:
             await w.fri.close()
     asyncio.run(scenario())
