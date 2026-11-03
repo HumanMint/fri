@@ -1363,16 +1363,23 @@ class Fri(discord.Client):
             # a read here would reopen that fence for them alone (fri #290's round 1).
             if held and self.agent.forgotten.get(user, 0) != forgotten:
                 raise AuthorErased()
+            fence = result.turn  # The whole turn, kept apart: saving it clears result.turn (see record_turn).
+
+            def unmoved():
+                if held and self.agent.forgotten.get(user, 0) != forgotten:
+                    raise AuthorErased()
 
             async def standing(quiet=False):
                 """Once the panel's lock is taken, right before an edit that carries this turn's words: their erasures
-                here, then Gene's check of the whole turn again, everyone it drew on and their own revision (fri #293).
-                Moved, nothing is shown: the turn stops, or with `quiet`, that edit is just left out."""
+                here, then Gene's check of the whole turn again, everyone it drew on and their own revision, then their
+                erasures here once more, with nothing awaited after that before the edit (fri #293). The first-memory
+                edit after the save is held to the same turn. Moved, nothing is shown: the turn stops, or with `quiet`,
+                that edit is just left out."""
                 try:
-                    if held and self.agent.forgotten.get(user, 0) != forgotten:
-                        raise AuthorErased()
-                    if held and result.turn:
-                        await self.api('POST', '/chat/turn/check', result.turn)
+                    unmoved()
+                    if held and fence:
+                        await self.api('POST', '/chat/turn/check', fence)
+                        unmoved()  # A "forget me" taken in while Gene answered.
                 except (AuthorErased, commands.UserFeedbackCheckFailure):
                     if quiet:
                         return False
