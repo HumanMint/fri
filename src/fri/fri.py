@@ -1363,18 +1363,34 @@ class Fri(discord.Client):
             # a read here would reopen that fence for them alone (fri #290's round 1).
             if held and self.agent.forgotten.get(user, 0) != forgotten:
                 raise AuthorErased()
+
+            async def standing(quiet=False):
+                """Once the panel's lock is taken, right before an edit that carries this turn's words: their erasures
+                here, then Gene's check of the whole turn again, everyone it drew on and their own revision (fri #293).
+                Moved, nothing is shown: the turn stops, or with `quiet`, that edit is just left out."""
+                try:
+                    if held and self.agent.forgotten.get(user, 0) != forgotten:
+                        raise AuthorErased()
+                    if held and result.turn:
+                        await self.api('POST', '/chat/turn/check', result.turn)
+                except (AuthorErased, commands.UserFeedbackCheckFailure):
+                    if quiet:
+                        return False
+                    raise
+                return True
             view = (DraftView(self, interaction.user.id, result.draft, fence=result.turn) if result.draft
                     else HomeView(self, interaction.user.id))
             if result.settings_preview:
                 from .fri_agent import BehaviorPreview
                 view = BehaviorPreview(self.agent, **result.settings_preview)
-                await reply(self, interaction, view.content, attachments=[], view=view, verbatim=True)
+                await reply(self, interaction, view.content, attachments=[], view=view, verbatim=True, still=standing)
             else:
-                await reply(self, interaction, embed=card('Fri', result.reply), view=view)
+                await reply(self, interaction, embed=card('Fri', result.reply), view=view, still=standing)
             # A newer panel interaction can supersede this one; record only what was displayed.
             saved = await self.record_turn(result) if sessions(self).displayed(interaction) else None
             if saved and saved.get('first_memory') and not result.settings_preview:
-                await reply(self, interaction, embed=card('Fri', result.reply+self.first_memory(saved)), view=view)
+                await reply(self, interaction, embed=card('Fri', result.reply+self.first_memory(saved)), view=view,
+                            still=lambda: standing(quiet=True))
         except (AuthorErased, GateClosed):  # Nothing of it shown or saved, and nothing said why.
             await reply(self, interaction, PANEL_SKIPPED, view=HomeView(self, user))
         except commands.UserFeedbackCheckFailure as exc:
