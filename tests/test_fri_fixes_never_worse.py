@@ -41,6 +41,9 @@ JOB, LEASE, SHA = 'abcdef012345', '0123456789abcdef0123456789abcdef', 'b'*40
 NONCE = str(int((JOB+LEASE[:8])[:20], 16))
 COPY, OTHER_CLAIM, OTHER_CHANNEL, OTHER_AUTHOR, REPORT = 1111, 2222, 3333, 4444, 5555
 STRANGERS = {OTHER_CLAIM, OTHER_CHANNEL, OTHER_AUTHOR}
+# Another job's send, settled unconfirmed before the case starts: its tombstone waits for its one copy (#260's round 7).
+NEIGHBOUR, NEIGHBOUR_LEASE, NEIGHBOUR_COPY = 'fedcba987654', 'fedcba98'+'0'*24, 6666
+NEIGHBOUR_NONCE = str(int((NEIGHBOUR+NEIGHBOUR_LEASE[:8])[:20], 16))
 SOURCE = f'https://discord.com/channels/{GUILD}/{CHANNEL}/{REPORT}'
 
 
@@ -64,6 +67,8 @@ SHAPES = {  # The job's note as a pass finds it.
 FINISHES = ('sent', 'uncertain', 'invalidated', 'no state', 'failed', 'nothing', 'garbage', 'refused', 'lost')
 READS = ('on record', 'gone', 'lost', 'refused', 'garbage', 'nothing')
 FAULTS = (None, ('write', 1), ('write', 2), ('write', 3), ('write', 'all'), ('read', 1), ('read', 2), ('read', 'all'))
+EVERY_READ = tuple(('read', n) for n in range(1, 9))  # Each read of a pass in turn (#260's round 7).
+EVERY_WRITE = tuple(('write', n) for n in range(1, 6))
 ECHOES = (None, 'before', 'send', 'finish', 'read', 'delete', 'after')
 DELETES = ('ok', 'forbidden', 'unconfirmed', 'already gone')
 LATER = ('sent', 'refused', 'uncertain')
@@ -92,6 +97,29 @@ def answer(token, kind):
 
 def refusal(status):
     return SimpleNamespace(status=status, reason='Discord said no')
+
+
+class Gene:
+    """What a controller answers each finish, from what it holds: 'pin' (the pinned Gene: it checks a sent reply again
+    and answers a repeat with its record) or 'live' (one before gene #143: it records without checking, says nothing
+    of the state, and refuses a repeat). recorded: a record it already holds. lose: the first answer is lost after it
+    records."""
+
+    def __init__(self, kind, erased, recorded, lose):
+        self.kind, self.erased, self.record, self.lose = kind, erased, recorded, lose
+
+    def finish(self, state):
+        if self.record is None:
+            self.record = 'invalidated' if self.kind == 'pin' and state == 'sent' and self.erased else state
+            reply = {'state': self.record, 'reason': None} if self.kind == 'pin' else {'ok': True}
+        elif self.kind == 'pin':
+            reply = {'state': self.record, 'reason': None}
+        else:
+            raise ControllerRejected('This reply has already been recorded', 409)
+        if self.lose:
+            self.lose = False
+            raise ControllerUnavailable('Gene did not answer')
+        return reply
 
 
 class Storage:
@@ -126,9 +154,15 @@ class World:
     def __init__(self, module, case):
         self.module, self.case = module, case
         self.deleted, self.heard_gone, self.heard_on_record, self.remembered = [], False, False, False
-        self.echoed = case.get('echo') is None
-        self.finishes, self.tapping, self.deletes = [case['finish']], 'shape' not in case, [case.get('delete', 'ok')]
-        self.storage = Storage({JOB: SHAPES[case['shape']]()} if 'shape' in case else {}, case.get('fault'))
+        self.echoed, self.again, self.phase = case.get('echo') is None, case.get('again') is None, 1
+        self.finishes, self.tapping, self.deletes = [case.get('finish')], 'shape' not in case, [case.get('delete', 'ok')]
+        self.gene = Gene(case['controller'], case['erased'], case['recorded'], case['lose']) if 'controller' in case \
+            else None
+        entries = {JOB: SHAPES[case['shape']]()} if 'shape' in case else {}
+        if case.get('neighbour', True):  # Another claim's send settled unconfirmed, waiting for its one copy.
+            entries[NEIGHBOUR] = {'nonce': NEIGHBOUR_NONCE, 'lease': NEIGHBOUR_LEASE[:8], 'channel_id': str(CHANNEL),
+                                  'at': head.time.time()-300}
+        self.storage = Storage(entries, case.get('fault'))
         room = SimpleNamespace(id=CHANNEL, guild=SimpleNamespace(id=GUILD, me=SimpleNamespace(id=FRI)),
                                permissions_for=lambda _: discord.Permissions.all(), parent_id=None,
                                get_partial_message=lambda message_id: SimpleNamespace(
@@ -160,9 +194,18 @@ class World:
     async def dm(self, text, **_):
         self.told.append(text)
 
+    def copy(self, message_id, nonce, channel=CHANNEL, author=FRI):
+        self.module.seen(self.fri, SimpleNamespace(id=message_id, nonce=nonce, author=SimpleNamespace(id=author),
+                                                   channel=SimpleNamespace(id=channel)))
+        self.remembered = self.remembered or bool(getattr(self.module, 'COPIES', None))
+
     def arrive(self, point):
         """Discord's copy of the notice, at this point of the case if it's this one: with three of Fri's that
-        aren't it (another claim's nonce, another channel, another author)."""
+        aren't it (another claim's nonce, another channel, another author). `again`: the gateway delivers that same
+        message a second time, at that point of the passes after storage came back."""
+        if not self.again and point == self.case.get('again'):
+            self.again = True
+            self.copy(COPY, NONCE)
         if self.echoed or point != self.case.get('echo') and point != 'late':
             return
         self.echoed = True
@@ -170,9 +213,7 @@ class World:
                                                    (OTHER_CHANNEL, NONCE, ELSEWHERE, FRI),
                                                    (OTHER_AUTHOR, NONCE, CHANNEL, MEMBER),
                                                    (COPY, NONCE, CHANNEL, FRI)):
-            self.module.seen(self.fri, SimpleNamespace(id=message_id, nonce=nonce, author=SimpleNamespace(id=author),
-                                                       channel=SimpleNamespace(id=channel)))
-        self.remembered = self.remembered or bool(getattr(self.module, 'COPIES', None))
+            self.copy(message_id, nonce, channel, author)
 
     async def api(self, method, path, body=None):
         if path == '/requests/'+JOB and self.tapping:
@@ -184,14 +225,21 @@ class World:
         if path.endswith('/requester-notice/authorize'):
             return {'ok': True}
         if path.endswith('/requester-notice/finish'):
+            assert path == f'/requests/{JOB}/requester-notice/finish'  # The neighbour's tombstone asks nothing.
             self.tapping = False  # Any read of the request from here on is the new one (see fri_fixes.withdrawn).
             self.arrive('finish')
+            self.arrive('finish '+str(self.phase))
+            if self.gene:
+                return self.gene.finish(body['state'])
             return answer(self.finishes.pop(0) if self.finishes else self.case.get('later', 'sent'), 'finish')
         if path == '/requests/'+JOB:
             self.arrive('read')
-            self.heard_gone = self.heard_gone or self.case['read'] == 'gone'
-            self.heard_on_record = self.heard_on_record or self.case['read'] == 'on record'
-            return answer(self.case['read'], 'read')
+            read = self.case['read']
+            if read == 'model':  # What the modelled controller holds: the report, unless the reporter erased.
+                read = 'gone' if self.case['erased'] else 'on record'
+            self.heard_gone = self.heard_gone or read == 'gone'
+            self.heard_on_record = self.heard_on_record or read == 'on record'
+            return answer(read, 'read')
         raise AssertionError(path)
 
     async def send(self, fri, post, *, reply_to=None, **_):
@@ -238,8 +286,12 @@ class World:
             await self.heartbeat()
         self.storage.fault = None  # Storage is back.
         self.arrive('late')  # A copy whose moment never came here (a wait main doesn't have) comes now.
-        self.finishes = []
+        if self.case.get('neighbour', True):
+            self.copy(NEIGHBOUR_COPY, NEIGHBOUR_NONCE)  # The neighbour's one copy, which main takes back.
+        self.finishes, self.phase = [], 2
         await self.heartbeat()
+        self.arrive('after 2')
+        self.phase = 3
         await self.heartbeat()
         return self
 
@@ -259,7 +311,9 @@ def check(cases, monkeypatch):
     for case in cases:
         main, mine = run(MAIN, case, monkeypatch), run(head, case, monkeypatch)
         assert not STRANGERS & set(main.deleted), case
-        missing, extra = set(main.deleted)-set(mine.deleted), set(mine.deleted)-set(main.deleted)
+        missing = set(main.deleted)-set(mine.deleted)
+        # The neighbour's reply is held only to main's: one main's own write over unreadable notes lost may come down.
+        extra = set(mine.deleted)-set(main.deleted)-{NEIGHBOUR_COPY}
         if STRANGERS & extra or missing and not mine.heard_on_record:
             wrong.append((case, main.deleted, mine.deleted))
         elif missing:
@@ -329,3 +383,42 @@ def test_a_tap_never_leaves_up_what_main_takes_back_whatever_fails_to_save(monke
 
 def test_a_tap_never_leaves_up_what_main_takes_back_in_any_mix(monkeypatch):
     check(sample(2000, 262, **TAP), monkeypatch)
+
+
+MODEL = dict(controller=('pin', 'live'), erased=(True, False), recorded=(None, 'sent', 'uncertain'), lose=(False, True))
+AGAIN = (None, 'finish 1', 'finish 2', 'after 2')
+
+
+def test_a_take_back_never_writes_another_notices_tombstone_away(monkeypatch):
+    """#260's round 7: taking one notice back wrote its mark through note(), whose own read could fail after the one
+    before it worked, and then saved that note alone: the neighbour's tombstone went, and its one copy, coming later,
+    matched nothing. Every read and every write of a pass fails in turn here, with that tombstone beside the note."""
+    check(cases(shape=PASS['shape'], finish=FINISHES, read=('gone', 'on record', 'lost'),
+                fault=(None, ('read', 'all'), ('write', 'all'))+EVERY_READ+EVERY_WRITE,
+                echo=(None, 'before', 'finish', 'after')), monkeypatch)
+
+
+def test_a_pass_records_what_main_records_whatever_copies_it_kept(monkeypatch):
+    """#260's round 7: a copy kept in memory while its note couldn't be saved was applied to the next read, so the pass
+    recorded the send as sent where main recorded it unconfirmed. A controller that records a sent one unchecked then
+    held that, and with the request read failing the note was forgotten with the reply up, where main, hearing the
+    same copy again during its finish, took it back. The controller answers here from what it holds and is asked."""
+    by_read, by_memory = check(cases(
+        shape=('cleared', 'cleared, copy noted', 'tombstone', 'take-back owed'), **MODEL, read=('model', 'lost'),
+        fault=(None, ('write', 1), ('write', 'all'), ('read', 1)), echo=(None, 'before', 'finish'), again=AGAIN),
+        monkeypatch)
+    assert by_read and by_memory
+
+
+def test_a_tap_records_what_main_records_against_a_controller_answering_from_what_it_holds(monkeypatch):
+    check(cases(capabilities=('older', 'authorize', 'authorize, recheck'), send=('ok', 'lost'), **{
+        **MODEL, 'recorded': (None,)}, read=('model', 'lost'), fault=(None, ('write', 3), ('write', 4), ('read', 2)),
+        echo=(None, 'send', 'after'), again=AGAIN), monkeypatch)
+
+
+def test_a_pass_or_tap_never_leaves_up_what_main_takes_back_in_any_mix_against_a_controller(monkeypatch):
+    check(sample(1500, 2607, shape=PASS['shape'], **MODEL, read=('model', 'lost', 'garbage'),
+                 fault=FAULTS+EVERY_READ+EVERY_WRITE, echo=PASS['echo'], again=AGAIN, delete=DELETES), monkeypatch)
+    check(sample(1000, 2608, capabilities=TAP['capabilities'], send=SENDS, **{**MODEL, 'recorded': (None,)},
+                 read=('model', 'lost'), fault=TAP['fault']+EVERY_READ, echo=ECHOES, again=AGAIN, delete=DELETES),
+          monkeypatch)
