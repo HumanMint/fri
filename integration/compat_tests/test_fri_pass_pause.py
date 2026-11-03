@@ -118,3 +118,23 @@ def test_an_archive_search_cancelled_while_reading_the_roster_leaves_no_watch(le
         assert stopped.value.__traceback__ is not None and not agent.passes
 
     asyncio.run(scenario())
+
+
+def test_the_owners_learning_run_is_refused_with_why_while_the_queue_is_closed(monkeypatch, tmp_path):
+    """Their own run asked Gene for a batch that the pass then couldn't send. It's refused before it asks, saying why."""
+    from compat_tests.test_fri_actions import harness
+    from fri.fri_actions import Actions
+
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        closed(agent, tmp_path)
+        overview = {'history_channels': [], 'reports': [], 'summaries': [], 'historical_notes': []}
+        fri.api = AsyncMock(side_effect=lambda method, path, payload=None: overview if path.endswith('/overview') else {})
+        try:
+            result = await Actions(agent, 10, 999, False).execute({'kind': 'run_learning', 'channel_id': ''})
+            assert 'withdrawals record' in result.get('blocked', '')
+            assert not [c for c in fri.api.await_args_list if c.args[1] == '/agent/learning/request']
+        finally:
+            await fri.close()
+
+    asyncio.run(scenario())
