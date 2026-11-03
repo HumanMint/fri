@@ -167,7 +167,6 @@ TITLE_QUOTE = re.compile(rf'(?P<double>["“])|(?P<link>https://\S+)|{OPENER}')
 CLOSER = re.compile(rf"(?P<loose>{OPENER}|(?<!\S)['‘](?!\w))|(?P<dropped>(?:(?<=in)|(?<=\bol)|(?<=\blil)|(?<=\bn)|(?<=\bo)|(?<=\ban))'"
                     r"(?=\s+\w))|(?<=\S)'(?!\w)")
 WORD = re.compile(r"[\w']+")
-FIRST_WORD = re.compile(r"[\s\"“”‘’']*+(?P<word>[\w']+)")  # Past opening marks, once: a run of them can't backtrack.
 CLAUSE = r"(?:^|[,;:.!?—–\-\"'‘“”]\s*|\b(?:and|but|or|so|then|also|plus|like|actually|wait|lol|nah|no|oh|please|pls|just)\s+)"
 # Outside a quoted title, any of these means the message is not asking for that song now.
 REFUSED = re.compile(
@@ -323,12 +322,20 @@ def masked(text, spans):
 
 
 def artist_first(text, artist):
-    """The first word of the artist named at this ARTIST match, past any marks and spaces they opened a quote with
-    ("by ‘Me’", "by ' Me '", "by “‘Me’”"), or '' when no word comes first ("by ‘…Me’", "by "", Me"). It decides only
-    whether the title is over past that artist (see replacement): no word, a pronoun or their own "i" there names no
-    one, so main's decision stands."""
-    word = FIRST_WORD.match(text, artist.end(1))
-    return word['word'].strip("'") if word else ''
+    """The first word of the artist named at this ARTIST match. One they quoted is read inside its quote, never past
+    its closing mark: its first word past any marks, spaces or other punctuation ("by ‘Me’", "by “‘Me’”", "by "…The
+    Wanted""), or '' when the quote holds no word or doesn't close ("by "" No More", "by "Me, no more"). It decides
+    only whether the title is over past that artist (see replacement): no word, a pronoun or their own "i" there
+    names no one, so main's decision stands."""
+    at = artist.end(1)
+    if text[at:at+1] in ('"', '“', "'", '‘'):
+        close = quoted_title(text, at)  # The quote artist_spans reads.
+        if not (close and close > 0):
+            return ''
+        word = WORD.search(text, at+1, close-1)
+    else:
+        word = WORD.match(text, at)
+    return word[0].strip("'") if word else ''
 
 
 def artist_spans(text, artist):
