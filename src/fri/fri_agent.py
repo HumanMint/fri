@@ -42,7 +42,7 @@ from .fri_responses import REACTIONS
 from .fri_turn_withdrawal import SavedTurns
 from .fri_turns import Arrivals, Turns
 from .fri_usage import usage_requested
-from .previews import PagedPreview
+from .previews import PagedPreview, turn_fence
 from .privacy import clean
 from .subscription import SubscriptionError, private_json
 
@@ -785,6 +785,15 @@ class Agent:
                     await message.reply('that change is too large for one preview. please change one behavior at a time.', allowed_mentions=NO_MENTIONS)
                 else:
                     view = BehaviorPreview(self, changes, state['version'])
+
+                    async def standing():
+                        """The owner's fence for every later page and Apply, as for its making (fri #322): their
+                        erasures here and their revision. One that can't be read counts as moved."""
+                        try:
+                            return not await erased()
+                        except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
+                            return False
+                    view.still = standing
                     # Its buttons come off that reply when it times out (fri #176).
                     view.message = await message.reply(view.content, view=view, allowed_mentions=NO_MENTIONS,
                                                        suppress_embeds=True)
@@ -2056,6 +2065,8 @@ class Agent:
         # error or a low battery doesn't go out once they erased after it. `baseline`: the same for a privacy
         # control, which `since` leaves out: only its rerun after an edit is held to it (see answer_again).
         events = [message, *(event for _, event, _ in burst if event is not message)]  # This turn answers for all.
+        # Every member's erasures here before the turn reads anything, for a preview it makes (fri #322).
+        counts = {str(member): count for member, count in self.forgotten.items()}
         began = time.time()  # A nearby post edited before this was read as it is now (see changed).
         arrival = self.arrival(event.id for event in events)  # Its own messages as they read when they came in.
         own = {event.id for event in events}
@@ -2265,9 +2276,9 @@ class Agent:
             return
         view = None
         if result.settings_preview:
-            from .previews import turn_fence
             view = BehaviorPreview(self, **result.settings_preview)
-            view.still = turn_fence(self, result.turn, message.author.id)  # Later pages and Apply too (fri #316).
+            # Later pages and Apply too (fri #316), held to the erasures here as the turn began (fri #322).
+            view.still = turn_fence(self, result.turn, message.author.id, counts)
         elif result.memory_scope:
             from .fri_memory_panel import MemoryLauncher
             view = MemoryLauncher(self.fri, result.memory_scope)
