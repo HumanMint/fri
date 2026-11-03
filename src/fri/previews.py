@@ -31,6 +31,8 @@ async def strip(message):
 
 
 class PagedPreview(discord.ui.View):
+    still = None  # The privacy fence of the turn that made it, when it has one (fri #303): see move().
+
     def __init__(self, title, body, note, label, prefix, confirm):
         super().__init__(timeout=600)
         self.message = None  # The message it went out on, when its sender knows it (see Agent.reply_once).
@@ -78,6 +80,17 @@ class PagedPreview(discord.ui.View):
             if self.finished:
                 return
             await self.recheck()
+            # Last before another page shows, with nothing awaited after it: the whole privacy fence of the turn that
+            # made it, its members' erasures here and Gene's check (fri #303). Moved, the preview ends, no more of it
+            # shown.
+            if self.still is not None and not await self.still():
+                from .fri import PANEL_SKIPPED
+                from .fri_notices import notice_text
+                self.finished = True
+                self.stop()
+                await interaction.response.edit_message(content=notice_text(PANEL_SKIPPED), embed=None, attachments=[],
+                                                         view=None, allowed_mentions=NO_MENTIONS)
+                return
             old_page, old_seen = self.page, self.seen.copy()
             self.page = max(0, min(len(self.pages)-1, self.page+offset))
             self.seen.add(self.page)
