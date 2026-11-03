@@ -127,10 +127,13 @@ def test_an_explorations_planner_is_fenced_against_its_target(learning, monkeypa
     channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()),
                               permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True))
     finishes, roles, pages, agents, passes = [], [], iter([[old], [old, later], []]), [], []
+    targets = []
 
     async def api(method, path, payload=None):
         response = client.request(method, path, json=payload, headers=headers('fri'))
         assert response.status_code == 200, response.text
+        if path.endswith('/target'):
+            targets.append(response.json()['target'])
         if path.endswith('/finish'):
             finishes.append(payload)
         return response.json()
@@ -178,7 +181,9 @@ def test_an_explorations_planner_is_fenced_against_its_target(learning, monkeypa
         await agent.learn()
 
     asyncio.run(scenario())
-    if moved == 'nothing':
+    if 'revision' not in targets[-1]:  # Before HumanMint/gene#197: never a planner request (fri #304).
+        assert roles == []
+    elif moved == 'nothing':
         assert len(roles) == 1 and 'historical_topics' in roles[0]
     else:
         assert roles == [] and finishes[-1]['error']

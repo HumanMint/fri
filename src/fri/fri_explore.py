@@ -129,15 +129,18 @@ async def explore(agent, claim):
             raise ValueError('Member eligibility changed')
         context = dict(claim['exploration'])
         context.update(channel=clean(channel.name, 60), lookback_days=claim['depth'], max_messages=claim['limit'])
-        if target['first_visit'] or target['exhausted']:
+        # The target's revision Gene read that context at, in the same transaction (HumanMint/gene#197). A controller
+        # without it can't say what the context is current for, so no planner is asked with it (fri #304).
+        read_at = target.get('revision')
+        if target['first_visit'] or target['exhausted'] or not isinstance(read_at, int) or isinstance(read_at, bool):
             plan = {'term': '', 'reason': "Read this member's own wording before choosing topic filters."}
         else:
             async def moved():
                 """Signed in, the target as the request would carry them: the historical topics' evidence is their
-                words, so their Gene revision and erasures here are read again, and moved, nothing is asked (fri
-                #292)."""
+                words, so their Gene revision is held to the one the context was read at, and their erasures here to
+                theirs from before it was asked for. Moved, nothing is asked (fri #292, #304)."""
                 now = await agent.profile(channel.id, targeted)
-                return (not now['enabled'] or now['revision'] != profile['revision'] or
+                return (not now['enabled'] or now['revision'] != read_at or
                         agent.forgotten.get(targeted, 0) != forgotten)
             plan, usage, status = await agent.run('exploration_plan', PLANNER+'\nOwner learning preferences: '+agent.config['learning_notes'],
                 context, PLAN, model=claim['model'], effort=claim['effort'], erased=moved)
