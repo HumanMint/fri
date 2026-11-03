@@ -12,6 +12,7 @@ records only anonymous usage, and none for a case that made no model call.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 from .fri_chat import ChatResult
@@ -41,8 +42,10 @@ def cases():
         recall('named_thread', 'what was the snack lee recommended in the cooking thread?', True),
         recall('plural_after_are', 'what are the tracks mo recommended?', True),
         recall('name_ending_like_a_noun', 'what was the song Felicity mentioned?', True),
+        recall('name_that_is_a_property_word', 'what was the song Price mentioned?', True),  # fri #239, item 2.
         recall('general_place_alone', 'what is the maximum file size shared in a server?', False),
         recall('general_plural_phrase', 'what are the personal details shared in a server?', False),
+        recall('general_adjective_compound', 'what are the wireless routers recommended?', False),  # Item 1.
         {'name': 'unseen_gif_short_take', 'text': 'gif broken?', 'gif': 'local',
          'expect': 'The local notice, with no model call.'},
         {'name': 'unseen_gif_general_question', 'text': 'what is a video codec?', 'gif': 'model',
@@ -77,10 +80,34 @@ async def evaluate(chat, model, effort, voice_notes):
         yield {**case, 'passed': passed, 'evidence': evidence}, result
 
 
+LOCAL_FAILED = []  # Cases portable() scored itself that failed.
+
+
+async def portable(chat, model, effort, voice_notes='', suite='', **_):
+    """This suite for fri_eval's runner on a build whose fri_eval doesn't list it (python -m fri.fri_recall_eval). That
+    runner reports usage for every case it's given, so a case answered locally, with no model call, never reaches it:
+    it's printed here, as the runner prints a case, and scored here (fri #239, item 4)."""
+    async for case, result in evaluate(chat, model, effort, voice_notes):
+        if case.get('model_calls') != 0:
+            yield case, result
+            continue
+        print(json.dumps({'case': case['name'], 'expect': case['expect'], 'reply': result.reply, 'action': result.action,
+                          'draft': result.draft, 'status': result.status, 'response_kind': result.response_kind,
+                          'reaction': result.reaction, 'allow_closing': result.allow_closing, 'error': result.error,
+                          'counters': result.counters, 'passed': case['passed'], 'evidence': case['evidence']}),
+              flush=True)
+        if not case['passed']:
+            LOCAL_FAILED.append(case['name'])
+
+
 if __name__ == '__main__':
     from . import fri_eval
 
     # Only this suite, through fri_eval's runner, so a build whose fri_eval doesn't list it can still run it.
-    fri_eval.evaluate = lambda chat, model, effort, voice_notes='', suite='', **_: evaluate(chat, model, effort,
-                                                                                             voice_notes)
-    asyncio.run(fri_eval.main('recall'))
+    fri_eval.evaluate = portable
+    try:
+        asyncio.run(fri_eval.main('recall'))
+    except SystemExit as stopped:  # The runner's own failures, with the local ones it never saw.
+        raise SystemExit('; '.join([str(stopped.code), *LOCAL_FAILED])) from None
+    if LOCAL_FAILED:
+        raise SystemExit('Evaluation failed: '+', '.join(LOCAL_FAILED))
