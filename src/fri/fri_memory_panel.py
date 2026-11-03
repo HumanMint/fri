@@ -72,6 +72,17 @@ def forgets(agent):
     return {str(member): count for member, count in counts.items()} if isinstance(counts, dict) else {}
 
 
+def withdrawals(cog):
+    """Where the withdrawals Fri holds stand (see SavedTurns): one queued or taken back since, or their record
+    failing to read, moves it. None without them."""
+    turns = getattr(getattr(cog, 'agent', None), 'saved_turns', None)
+    if turns is None:
+        return None
+    marked = getattr(turns, 'marked', None)
+    newest = next(reversed(marked.values()), None) if isinstance(marked, dict) and marked else None
+    return getattr(turns, 'generation', None), newest, bool(turns.closed())
+
+
 async def show(cog, interaction, scope=None, *, state=None, selected=None, notice='', confirm=False, erased=None):
     """My memory, as Gene lists it. `state`: the listing as an earlier answer read it, with `erased`, every member's
     "forget me"s here (see forgets) from before that read, so one taken in since still counts (fri #315)."""
@@ -82,6 +93,7 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
         return
     state = state or await cog.api('POST', '/chat/memory/notes', scope)
     state = await screened(cog, scope, state)
+    screening = withdrawals(cog)  # As the screen just left them, with nothing awaited between (fri #322).
     profiles = getattr(cog, 'profiles', False)
     lines = [notice] if notice else []
     lines += ['Memory is '+('on.' if state['enabled'] else 'off.'),
@@ -119,7 +131,12 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
 
     def unmoved():
         now = forgets(cog.agent)
-        return all(now.get(member, 0) == baselines.get(member, 0) for member in authors)
+        if not all(now.get(member, 0) == baselines.get(member, 0) for member in authors):
+            return False
+        # And no withdrawal taken in here since the screen (fri #322): one still on its way to Gene, which accepts
+        # the summary's generation until it arrives, or just taken, may be of a message under the summary or a note,
+        # and only reading the listing again can tell. Held back until then; nothing listed rests on none.
+        return withdrawals(cog) == screening or not (summary or state['entries'])
 
     async def stands():
         """Gene's word that the listing still stands: their revision as it was read under. With a summary, Gene's
@@ -138,8 +155,9 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
 
     async def still():
         """Once the panel's lock is taken, right before the listing shows (fri #302): the "forget me"s here, since it
-        was read, of the member and of everyone their summary drew on, then Gene's word, then those here again, with
-        nothing awaited after that. Anything that can't be checked counts as moved."""
+        was read, of the member and of everyone their summary drew on, and the withdrawals taken in here since its
+        screen, then Gene's word, then those here again, with nothing awaited after that. Anything that can't be
+        checked counts as moved."""
         try:
             stood = unmoved() and await stands() and unmoved()
         except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
