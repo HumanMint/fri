@@ -1354,6 +1354,7 @@ class Fri(discord.Client):
         # Everyone's erasures here as it comes in too: the reply may carry other members' words (its provenance), and
         # Gene's check of the turn can't see a "forget me" of theirs Fri took in and hasn't sent on (fri #301).
         baselines = {str(member): count for member, count in self.agent.forgotten.items()} if held else {}
+        began = time.time()  # A message the turn carries taken back after this is held back (fri #306).
         await defer_panel(interaction)
         await reply(self, interaction, 'Thinking…', view=HomeView(self, user))
         try:
@@ -1367,12 +1368,23 @@ class Fri(discord.Client):
             # #290's round 1).
             fence = result.turn  # The whole turn, kept apart: saving it clears result.turn (see record_turn).
             authors = {str(user), *(str(row['user_id']) for row in (fence or {}).get('provenance') or [])}
+            carried = {int(i) for i in getattr(result, 'shown', ()) or () if str(i).isdigit()}  # See chat_once.
+
+            def taken_back():
+                """A message the model's requests carried (the live view, what it quoted or read, saved history) deleted
+                or edited, or its saved exchange withdrawn, here since the turn began: its withdrawal may still be on
+                its way to Gene, which accepts the turn until it lands (fri #306), as Agent.reply_once's changed()."""
+                agent = self.agent
+                since = {int(i) for i, at in agent.withdrawn.items() if at >= began and i.isdigit()}
+                since |= {i for i, at in agent.revised.items() if at >= began}
+                since |= {int(i) for i, at in agent.saved_turns.marked.items() if at >= began and i.isdigit()}
+                return bool((agent.unsent.keys() | since) & carried)
 
             def unmoved():
                 if not held:
                     return
                 now = {str(member): count for member, count in self.agent.forgotten.items()}
-                if any(now.get(member, 0) != baselines.get(member, 0) for member in authors):
+                if any(now.get(member, 0) != baselines.get(member, 0) for member in authors) or taken_back():
                     raise AuthorErased()
             unmoved()
 
