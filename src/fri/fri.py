@@ -1392,7 +1392,8 @@ class Fri(discord.Client):
                         return False
                     raise
                 return True
-            view = (DraftView(self, interaction.user.id, result.draft, fence=result.turn) if result.draft
+            view = (DraftView(self, interaction.user.id, result.draft, fence=result.turn,
+                              baselines=baselines if held else None) if result.draft
                     else HomeView(self, interaction.user.id))
             if result.settings_preview:
                 from .fri_agent import BehaviorPreview

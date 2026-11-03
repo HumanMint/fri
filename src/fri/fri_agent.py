@@ -112,6 +112,15 @@ class BehaviorPreview(PagedPreview):
         async with self.lock:
             if self.finished or self.confirm_button.disabled:
                 return
+            # The whole fence of the turn that made it, right before the save: settings built from words someone
+            # erased since are never kept, for any later request to read (fri #316). Moved, the preview ends.
+            if self.still is not None and not await self.still():
+                from .fri import PANEL_SKIPPED
+                self.finished = True
+                self.stop()
+                await interaction.edit_original_response(content=notice_text(PANEL_SKIPPED), embed=None,
+                                                           attachments=[], view=None, allowed_mentions=NO_MENTIONS)
+                return
             try:
                 state = await self.agent.fri.api('POST', '/agent/settings', {
                     **self.agent.identity(interaction.user.id), 'changes': self.changes, 'version': self.version})
@@ -2256,7 +2265,9 @@ class Agent:
             return
         view = None
         if result.settings_preview:
+            from .previews import turn_fence
             view = BehaviorPreview(self, **result.settings_preview)
+            view.still = turn_fence(self, result.turn, message.author.id)  # Later pages and Apply too (fri #316).
         elif result.memory_scope:
             from .fri_memory_panel import MemoryLauncher
             view = MemoryLauncher(self.fri, result.memory_scope)

@@ -4,7 +4,41 @@ import asyncio
 
 import discord
 
+from . import feedback as commands
+
 NO_MENTIONS = discord.AllowedMentions.none()
+
+
+def erasures(agent):
+    """Every member's privacy controls taken in here so far, by ID as text (see Agent.forget)."""
+    counts = getattr(agent, 'forgotten', None)
+    return {str(member): count for member, count in counts.items()} if isinstance(counts, dict) else {}
+
+
+def turn_fence(agent, turn, user, baselines=None):
+    """The privacy fence of a turn a draft or a preview shows (fri #316): the erasures here of its requester and of
+    everyone its words came from (its provenance), against `baselines` (every member's, as the turn came in, or else
+    as this is made), then Gene's check of the whole turn, then those erasures here again, with nothing awaited after.
+    An async callable: True while all of it stands. `unmoved` is the part that reads nothing."""
+    turn = dict(turn) if turn else None
+    baselines = dict(baselines) if baselines is not None else erasures(agent)
+    authors = {str(user), *(str(row['user_id']) for row in (turn or {}).get('provenance') or [])}
+
+    def unmoved():
+        now = erasures(agent)
+        return all(now.get(member, 0) == baselines.get(member, 0) for member in authors)
+
+    async def still():
+        if not unmoved():
+            return False
+        if turn:
+            try:
+                await agent.fri.api('POST', '/chat/turn/check', turn)
+            except commands.UserFeedbackCheckFailure:
+                return False
+        return unmoved()
+    still.unmoved = unmoved
+    return still
 
 
 def pages(text):

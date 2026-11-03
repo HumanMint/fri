@@ -65,11 +65,21 @@ async def allowed(cog, interaction, scope, *, message=True, tell=False):
     return True
 
 
-async def show(cog, interaction, scope=None, *, state=None, selected=None, notice='', confirm=False):
+def forgets(agent):
+    """Every member's "forget me"s taken in here so far, by ID as text (see Agent.forget): what makes a listing read
+    before them stale. A member's own memory control isn't one."""
+    counts = getattr(agent, 'erased', None)
+    return {str(member): count for member, count in counts.items()} if isinstance(counts, dict) else {}
+
+
+async def show(cog, interaction, scope=None, *, state=None, selected=None, notice='', confirm=False, erased=None):
+    """My memory, as Gene lists it. `state`: the listing as an earlier answer read it, with `erased`, every member's
+    "forget me"s here (see forgets) from before that read, so one taken in since still counts (fri #315)."""
     scope = profiled(cog, scope or scope_for(cog, interaction))
+    # Taken before anything here waits, the membership lookup included (fri #315), unless the listing came with its own.
+    baselines = dict(erased) if state is not None and erased is not None else forgets(getattr(cog, 'agent', None))
     if not await allowed(cog, interaction, scope, message=False, tell=True):
         return
-    forgotten = cog.agent.forgotten.get(interaction.user.id, 0)  # Their erasures here before it's read (fri #302).
     state = state or await cog.api('POST', '/chat/memory/notes', scope)
     state = await screened(cog, scope, state)
     profiles = getattr(cog, 'profiles', False)
@@ -102,14 +112,41 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
                  if profiles else
                  'Editing or removing a preference clears recent saved context here. Discord posts and backups are separate.')
     from .fri_panel import HomeView, card, reply
+    # Whose words the summary drew on, and which summary it is, as the chat context a request reads them (fri #315).
+    drawn = (await cog.api('POST', '/chat/context', scope)).get('member_summary') or {} if summary else None
+    authors = {str(interaction.user.id), *(str(row['user_id']) for row in (drawn or {}).get('provenance') or [])}
     moved = []
 
+    def unmoved():
+        now = forgets(cog.agent)
+        return all(now.get(member, 0) == baselines.get(member, 0) for member in authors)
+
+    async def stands():
+        """Gene's word that the listing still stands: their revision as it was read under. With a summary, Gene's
+        check of it as a turn would carry it: their revision, the revisions of everyone it drew on, and its
+        generation, so one it dropped since (an erasure of theirs, a message taken back) counts (fri #315)."""
+        if drawn is None:
+            return await cog.agent.revision(interaction.user.id) == state['revision']
+        if drawn.get('text') != summary.get('text'):  # Not the one listed, so it can't be checked: as if moved.
+            return False
+        await cog.api('POST', '/chat/turn/check', {
+            **scope, 'source': discord_source(interaction).model_dump(), 'revision': state['revision'],
+            'input': 'My memory', 'reply': '', 'model': 'none', 'effort': 'none',
+            'provenance': list(drawn.get('provenance') or []),
+            **({'summary_generation': drawn['generation']} if drawn.get('generation') is not None else {})})
+        return True
+
     async def still():
-        """Once the panel's lock is taken, right before the listing shows (fri #302): their erasures here since it was
-        read, then their revision against the one it was read under, with nothing awaited after that."""
-        if await cog.agent.erasure(interaction.user.id, forgotten, state['revision']):
+        """Once the panel's lock is taken, right before the listing shows (fri #302): the "forget me"s here, since it
+        was read, of the member and of everyone their summary drew on, then Gene's word, then those here again, with
+        nothing awaited after that. Anything that can't be checked counts as moved."""
+        try:
+            stood = unmoved() and await stands() and unmoved()
+        except (commands.UserFeedbackCheckFailure, KeyError, TypeError):
+            stood = False
+        if not stood:
             moved.append(True)
-        return not moved
+        return stood
     view = MemoryView(cog, scope, state, selected, confirm=confirm)
     await reply(cog, interaction, embed=card('My memory', '\n\n'.join(lines)), view=view, still=still)
     if moved:  # Nothing of it shown: they ask again, and it's read as it is now.
@@ -236,11 +273,12 @@ class MemoryView(discord.ui.View):
         if not await self.interaction_check(interaction):
             return
         try:
+            erased = forgets(self.cog.agent)  # Before the answer's listing is read (fri #315).
             state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
                 **self.scope, 'source': discord_source(interaction).model_dump(), 'revision': self.state['revision'],
                 'action': 'remove'})
             self.cog.agent.forget(interaction.user.id)
-            await show(self.cog, interaction, self.scope, state=state, notice='Removed that preference.')
+            await show(self.cog, interaction, self.scope, state=state, notice='Removed that preference.', erased=erased)
         except commands.UserFeedbackCheckFailure as exc:
             await show(self.cog, interaction, self.scope, notice=str(exc))
 
@@ -260,12 +298,13 @@ class MemoryView(discord.ui.View):
         if not await self.interaction_check(interaction):
             return
         try:
+            erased = forgets(self.cog.agent)  # Before the answer's listing is read (fri #315).
             state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
                 **self.scope, 'source': discord_source(interaction).model_dump(), 'revision': self.state['revision'],
                 'action': action})
             if action == 'keep':  # It no longer shows in the server, so nothing Fri holds there may keep it.
                 self.cog.agent.forget(interaction.user.id)
-            await show(self.cog, interaction, self.scope, state=state, notice=notice)
+            await show(self.cog, interaction, self.scope, state=state, notice=notice, erased=erased)
         except commands.UserFeedbackCheckFailure as exc:
             await show(self.cog, interaction, self.scope, notice=str(exc))
 
@@ -285,11 +324,12 @@ class MemoryView(discord.ui.View):
 async def summarized(view, interaction, action, text, notice):
     """The member's edit or clear of Fri's summary; like a server-wide note's, it clears their saved chats."""
     try:
+        erased = forgets(view.cog.agent)  # Before the answer's listing is read (fri #315).
         state = await view.cog.api('POST', '/chat/memory/summary', {
             **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
             'action': action, 'text': text})
         view.cog.agent.forget(interaction.user.id)
-        await show(view.cog, interaction, view.scope, state=state, notice=notice)
+        await show(view.cog, interaction, view.scope, state=state, notice=notice, erased=erased)
     except commands.UserFeedbackCheckFailure as exc:
         await show(view.cog, interaction, view.scope, notice=str(exc))
 
@@ -327,10 +367,11 @@ class EditMemory(discord.ui.Modal):
             return
         view = self.view
         try:
+            erased = forgets(view.cog.agent)  # Before the answer's listing is read (fri #315).
             state = await view.cog.api('POST', '/chat/memory/notes/'+str(view.selected['id']), {
                 **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
                 'action': 'replace', 'evidence': self.preference.value})
             view.cog.agent.forget(interaction.user.id)
-            await show(view.cog, interaction, view.scope, state=state, notice='Updated that preference.')
+            await show(view.cog, interaction, view.scope, state=state, notice='Updated that preference.', erased=erased)
         except commands.UserFeedbackCheckFailure as exc:
             await show(view.cog, interaction, view.scope, notice=str(exc))
