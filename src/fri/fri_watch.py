@@ -360,6 +360,12 @@ class Watch:
         except OSError:
             waiting = '?'
         lines.append(f'- usage receipts waiting: {waiting}')
+        turns = getattr(agent, 'saved_turns', None) if agent else None
+        if turns is not None and (held := turns.status())['closed_until']:  # A withdrawals record couldn't be read.
+            until = int(held['closed_until'])
+            lines.append(f"- saved context: held back until <t:{until}:f> (<t:{until}:R>), a withdrawals record "
+                         "couldn't be read" + ('' if held['saved_to_disk'] else
+                                               "; it couldn't be set aside, so new withdrawals aren't saved to disk"))
         if agent:
             from .fri_ledger import describe, describe_forwards
             outcomes = agent.ledger.snapshot()

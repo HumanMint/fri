@@ -1351,6 +1351,9 @@ class Fri(discord.Client):
         user = interaction.user.id
         held = self.agent is not None and memory_intent(text) not in ('disable', 'enable')
         forgotten = self.agent.forgotten.get(user, 0) if held else None
+        # Everyone's erasures here as it comes in too: the reply may carry other members' words (its provenance), and
+        # Gene's check of the turn can't see a "forget me" of theirs Fri took in and hasn't sent on (fri #301).
+        baselines = {str(member): count for member, count in self.agent.forgotten.items()} if held else {}
         await defer_panel(interaction)
         await reply(self, interaction, 'Thinking…', view=HomeView(self, user))
         try:
@@ -1358,23 +1361,51 @@ class Fri(discord.Client):
             result = await self.talk(interaction.guild_id, interaction.channel_id, user, text, 'private',
                                      interaction.user.display_name, event=interaction, revision=revision,
                                      forgotten=forgotten)
-            # Last before it's shown, with nothing to wait on: their erasures here since it came in. talk() ends on
-            # Gene's check of the whole turn, everyone it drew on and their own revision (held to the one above), so
-            # a read here would reopen that fence for them alone (fri #290's round 1).
-            if held and self.agent.forgotten.get(user, 0) != forgotten:
-                raise AuthorErased()
+            # Last before it's shown, with nothing to wait on: their erasures here since it came in, and those of
+            # everyone it drew on (fri #301). talk() ends on Gene's check of the whole turn, everyone it drew on and
+            # their own revision (held to the one above), so a read here would reopen that fence for them alone (fri
+            # #290's round 1).
+            fence = result.turn  # The whole turn, kept apart: saving it clears result.turn (see record_turn).
+            authors = {str(user), *(str(row['user_id']) for row in (fence or {}).get('provenance') or [])}
+
+            def unmoved():
+                if not held:
+                    return
+                now = {str(member): count for member, count in self.agent.forgotten.items()}
+                if any(now.get(member, 0) != baselines.get(member, 0) for member in authors):
+                    raise AuthorErased()
+            unmoved()
+
+            async def standing(quiet=False):
+                """Once the panel's lock is taken, right before an edit that carries this turn's words: their erasures
+                here, then Gene's check of the whole turn again, everyone it drew on and their own revision, then their
+                erasures here once more, with nothing awaited after that before the edit (fri #293). The first-memory
+                edit after the save is held to the same turn. Moved, nothing is shown: the turn stops, or with `quiet`,
+                that edit is just left out."""
+                try:
+                    unmoved()
+                    if held and fence:
+                        await self.api('POST', '/chat/turn/check', fence)
+                        unmoved()  # A "forget me" taken in while Gene answered.
+                except (AuthorErased, commands.UserFeedbackCheckFailure):
+                    if quiet:
+                        return False
+                    raise
+                return True
             view = (DraftView(self, interaction.user.id, result.draft, fence=result.turn) if result.draft
                     else HomeView(self, interaction.user.id))
             if result.settings_preview:
                 from .fri_agent import BehaviorPreview
                 view = BehaviorPreview(self.agent, **result.settings_preview)
-                await reply(self, interaction, view.content, attachments=[], view=view, verbatim=True)
+                view.still = lambda: standing(quiet=True)  # Every later page too, inside its lock (fri #303).
+                await reply(self, interaction, view.content, attachments=[], view=view, verbatim=True, still=standing)
             else:
-                await reply(self, interaction, embed=card('Fri', result.reply), view=view)
+                await reply(self, interaction, embed=card('Fri', result.reply), view=view, still=standing)
             # A newer panel interaction can supersede this one; record only what was displayed.
             saved = await self.record_turn(result) if sessions(self).displayed(interaction) else None
             if saved and saved.get('first_memory') and not result.settings_preview:
-                await reply(self, interaction, embed=card('Fri', result.reply+self.first_memory(saved)), view=view)
+                await reply(self, interaction, embed=card('Fri', result.reply+self.first_memory(saved)), view=view,
+                            still=lambda: standing(quiet=True))
         except (AuthorErased, GateClosed):  # Nothing of it shown or saved, and nothing said why.
             await reply(self, interaction, PANEL_SKIPPED, view=HomeView(self, user))
         except commands.UserFeedbackCheckFailure as exc:
@@ -1509,6 +1540,7 @@ class Fri(discord.Client):
                 'status': self.agent.heartbeat_status, 'stages': self.agent.stages,
                 'current': self.agent.heartbeat_current} if self.agent else None,
             'outcomes': self.agent.ledger.snapshot() if self.agent else None,
+            'withdrawals': self.agent.saved_turns.status() if self.agent else None,
             'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,

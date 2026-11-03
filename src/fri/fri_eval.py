@@ -250,6 +250,11 @@ async def evaluate(chat, model, effort, voice_notes='', suite='voice', *, backgr
         async for case, result in recall(chat, model, effort, voice_notes):
             yield case, result
         return
+    if suite == 'stills':
+        from .fri_stills_eval import evaluate as stills
+        async for case, result in stills(chat, model, effort, voice_notes):
+            yield case, result
+        return
     for case in {'controls': control_cases, 'diagnosis': diagnosis_cases, 'voice': cases, 'settings': settings_cases, 'pronouns': pronoun_cases, 'foundation': foundation_cases, 'endings': ending_cases, 'images': lambda: [*image_cases(), *link_cases()], 'sass': sass_cases, 'model-text': model_text_cases}[suite]():
         name = case.get('display_name', 'Mint')
         context = {'model': model, 'effort': effort, 'facts': [],
@@ -623,7 +628,7 @@ async def main(suite='voice', baseline=False):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'loops', 'times', 'memory', 'recall', 'sass', 'model-text'), default='voice')
+    parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'loops', 'times', 'memory', 'recall', 'stills', 'sass', 'model-text'), default='voice')
     parser.add_argument('--baseline', action='store_true', help='ASCII-escape model input, for comparison')
     args = parser.parse_args()
     asyncio.run(main(args.suite, args.baseline))

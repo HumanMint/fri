@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from fri import fri_eval, fri_recall_eval
 from fri.fri_chat import ChatResult
@@ -44,7 +45,7 @@ def test_each_message_takes_the_route_fri_gives_it():
     chat = responder()
     rows = run(chat)
     assert all(row['passed'] for row in rows.values()), {name: row['evidence'] for name, row in rows.items()}
-    assert len(RECALL) == 5 and len(GENERAL) == 2
+    assert len(RECALL) == 6 and len(GENERAL) == 3
     assert all(rows[name]['evidence'] == {'offered': True, 'local_notice': False, 'chosen': 'history_search'}
                for name in RECALL)
     assert all(rows[name]['evidence'] == {'offered': False, 'local_notice': False, 'chosen': None} for name in GENERAL)
@@ -99,3 +100,40 @@ def test_a_recall_run_reports_usage_only_for_model_calls(monkeypatch, tmp_path):
         assert rows['unseen_gif_short_take']['reply'] == LIMITS['gif']
         assert [path for path, _ in reports] == ['/chat/usage/report']*(len(cases())-1)
         assert all(report['role'] == 'evaluation' and report['status'] == 'completed' for _, report in reports)
+
+
+def test_the_portable_suite_reports_nothing_for_a_local_case_on_an_older_runner(monkeypatch):
+    """fri #239, item 4: the portable entry point runs on a build whose fri_eval doesn't list this suite, and that
+    runner reports usage for every case it's given, a local one too (on main it made seven model calls and posted
+    nine usage receipts). The entry point keeps a case answered locally away from such a runner, and prints and
+    scores it itself, so only model calls are reported."""
+    reported, printed = [], io.StringIO()
+
+    async def older(suite='voice', baseline=False):  # fri_eval.main without its own skip: a report for every case.
+        async for case, result in fri_eval.evaluate(responder(), 'gpt-6.1-sol', 'high', '', suite):
+            reported.append(case['name'])
+            print(json.dumps({'case': case['name'], 'passed': case.get('passed')}), flush=True)
+
+    monkeypatch.setattr(fri_eval, 'main', older)
+    monkeypatch.setattr(fri_eval, 'evaluate', fri_eval.evaluate)  # Put back after the standalone run replaces it.
+    monkeypatch.delitem(sys.modules, 'fri.fri_recall_eval')
+    with redirect_stdout(printed):
+        runpy.run_module('fri.fri_recall_eval', run_name='__main__')
+    rows = {row['case']: row for row in map(json.loads, printed.getvalue().splitlines())}
+    assert list(rows) == [case['name'] for case in cases()] and all(row['passed'] for row in rows.values())
+    assert reported == [case['name'] for case in cases() if case['name'] != 'unseen_gif_short_take']
+
+
+def test_a_portable_run_still_fails_on_a_local_case_that_fails(monkeypatch):
+    """And a local case the entry point keeps from the runner, which so never sees it, still fails the run when it
+    fails: here the general question goes local, as a build without fri #234's media check sends it."""
+    async def older(suite='voice', baseline=False):
+        async for _ in fri_eval.evaluate(responder(), 'gpt-6.1-sol', 'high', '', suite):
+            pass
+
+    monkeypatch.setattr(fri_eval, 'main', older)
+    monkeypatch.setattr(fri_eval, 'evaluate', fri_eval.evaluate)
+    monkeypatch.delitem(sys.modules, 'fri.fri_recall_eval')
+    monkeypatch.setattr('fri.fri_images.about_media', lambda text: text == 'what is a video codec?')
+    with redirect_stdout(io.StringIO()), pytest.raises(SystemExit, match='unseen_gif_general_question'):
+        runpy.run_module('fri.fri_recall_eval', run_name='__main__')
