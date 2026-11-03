@@ -110,6 +110,8 @@ async def screened(cog, scope, state):
     couldn't read them (fri #215). Asked again with where each note came from, and with the member's chat context, only
     while something is held back."""
     turns = getattr(getattr(cog, 'agent', None), 'saved_turns', None)
+    if turns is not None and turns.closed():  # A withdrawals record couldn't be read: nothing saved shows (round 4).
+        return turns.screen(None, state)
     if turns is None or not turns.withholding() or SOURCES not in getattr(cog, 'capabilities', ()):
         return state
     asked = {**scope, 'sources': True}

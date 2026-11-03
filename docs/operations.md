@@ -286,8 +286,40 @@ advertises it, so the controller must be released first.
   queued entry has its own generation, and an answer settles only the entries it was sent for, so one
   queued for the same message meanwhile (its save landed and named it, say) stands and goes next. A
   timeout or an outage is logged with the message IDs and error type only, and sent again after 2, 15
-  and 60 seconds, then every five minutes; a start sends everything still pending. A refusal (a 4xx) can
-  never succeed, so it's logged and dropped. The queue keeps an entry only as long as what it names can
+  and 60 seconds, then every five minutes; a start sends everything still pending. So is a refusal (a
+  4xx): none is dropped for one, so it stays held back until the controller takes it. A refusal may come
+  from a Gene rolled back alone while Fri runs, which doesn't know a field (`deleted`, `revision`) or the
+  by-ID request Fri learned at its start. Fri reads the controller's contract again then, at most once a
+  minute, and its capabilities follow it everywhere; if the request it would make now differs, it's sent
+  once more right away. One the controller can't take at all now waits, held back, until it can again.
+  One left in `withdrawals.json` by an earlier process (anything read from that file, which every entry
+  rebuilt for that message stays: an edit's turned into a deletion, say; nothing in the file decides it,
+  and one queued in this process never counts, whatever the clock does) is sent only, with its revision,
+  to a controller offering `withdrawal-sources`, which checks the revision it was saved under: a rolled-back Fri may
+  have carried out that member's "forget me" meanwhile, and an unguarded replay would write their IDs
+  back. Against any other it's neither sent nor dropped but kept, held back, and the contract is read
+  again on the retry schedule, so a Gene rolled forward takes it. Right before every request (the first,
+  a resend after a refusal, each retry) Fri checks again that the entry is still queued as it was, that
+  its member hasn't said "forget me" since, and that the controller can safely take it as it now stands;
+  if not, the request isn't made. The file is read in pieces and without recursion, in bounded
+  memory whatever its size or nesting: every file `json.loads` reads is read, with the same entries, and
+  only an entry's message ID, scope, revision and deletion are kept; everything else is checked as JSON
+  and passed over. NaN, infinities and over-long numbers read as nothing. Each entry is checked on its
+  own. One whose message ID is readable but whose rest isn't one Fri could send is kept as a hold: never
+  sent, its message held back for as long as what it names can be kept. A record that still can't be
+  trusted (cut off, not JSON, the wrong shape) is never read as empty: every saved context is held back,
+  across restarts, for 90 days (as long as a note a withdrawal protects can be kept): requests and memory
+  views carry no saved exchange, note, elsewhere exchange, pending question or summary. Fri still starts
+  and answers. The deadline is written first, to `withdrawals.closed.json`; only then is the record set
+  aside unread as `withdrawals.unreadable-<time>.json` (the newest three are kept, none past 90 days).
+  Until both are done the record stays where it is and no write replaces it: queued withdrawals stay in
+  memory, and each attempt to save them moves the deadline to 90 days from then. A deadline past 90 days
+  from now (a clock set back since) is cut to that once and written back. `fri health` shows the end
+  date while it lasts, and whether new withdrawals are being saved. To end it early, recover the
+  entries by hand into `withdrawals.json` (or confirm nothing in the set-aside file matters; an
+  unreadable record still in place as `withdrawals.json` has to be fixed or moved too), then remove
+  `withdrawals.closed.json`; the next start reads normally. The queue keeps an entry only as
+  long as what it names can
   be kept (a week, or a note's 90 days, below), and at most 20,000, the oldest messages' going first.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the
@@ -662,7 +694,10 @@ Fri can't restart anything. It only notices and says so.
   controller is down and records no turn. It shows Fri's release, Discord connection, heartbeat
   status and age, loop states, waiting usage receipts, live `/status` (Gene's deployed release, and
   whether deploys are paused) and `/controls/health`
-  (4 s each, failures shown as "unreachable" or "rejected"), and the watch state. Fri can't read a
+  (4 s each, failures shown as "unreachable" or "rejected"), and the watch state. While a pending
+  withdrawals record that couldn't be read holds every saved context back, it shows until when, and
+  whether new withdrawals are being saved to disk (no IDs or contents); `fri-health.json` carries the
+  same under `withdrawals`. Fri can't read a
   forwarded post yet, so it drops members' forwards: `fri health` and `fri-health.json` (under
   `outcomes.forwards`) count them since Fri started, by the gate that dropped them, and each drop is
   also logged as `Forward <channel or dm>/<message id> not read: <gate>` to count them across restarts.
