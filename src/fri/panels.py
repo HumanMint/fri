@@ -39,7 +39,9 @@ class PrivatePanels:
         if entry and is_private(interaction) and interaction.message.id == entry.message_id:
             return entry.view
 
-    async def show(self, interaction, *, content=None, embed=None, embeds=None, attachments=None, view):
+    async def show(self, interaction, *, content=None, embed=None, embeds=None, attachments=None, view, still=None):
+        """`still()`: whether what this shows may still go out, run once the lock is taken, right before the edit, so
+        a wait for the lock can't outlast the caller's checks (fri #293). Falsy, nothing is shown; it may raise."""
         await defer_panel(interaction)
         key = self.key(interaction)
         async with self.locks.setdefault(key, asyncio.Lock()):
@@ -53,6 +55,8 @@ class PrivatePanels:
                     except discord.HTTPException:
                         pass
                 return entry.message if entry else None
+            if still is not None and not await still():
+                return None
             payload = {'content': content, 'view': view, 'allowed_mentions': discord.AllowedMentions.none()}
             payload['embeds'] = embeds if embeds is not None else ([embed] if embed else [])
             if attachments is not None:
