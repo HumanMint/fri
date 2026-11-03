@@ -270,6 +270,7 @@ class Agent:
         self.responded = {}  # Messages Fri visibly answered, oldest first: no outage notice after those.
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.passes = weakref.WeakSet()  # Each running learning or exploration pass's Watch, while it runs (fri #325).
+        self.learning_paused = False  # The last scheduled pass asked for no batch: the withdrawal queue is closed.
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
         # Messages a turn's model request carried -> (when (monotonic), whether Fri or Gene wrote it), oldest first:
         # see unsend and edit.
@@ -2503,6 +2504,12 @@ class Agent:
 
     async def learn(self, claim=None):
         if claim is None:
+            # A closed withdrawal queue stops every pass at its first model request (see retracted), after it claimed
+            # its batch and read it, so none is asked for until the queue reopens; fri health says so (fri #335). The
+            # owner's own run is refused before it asks too (see fri_actions).
+            self.learning_paused = self.saved_turns.closed()
+            if self.learning_paused:
+                return
             claim = await self.fri.api('POST', '/agent/learning/claim')
         if not claim:
             return
@@ -2569,7 +2576,8 @@ class Agent:
                 counters = dict(NO_USAGE)
         except (discord.HTTPException, ValueError, commands.UserFeedbackCheckFailure) as exc:
             error = type(exc).__name__+': learning pass could not complete'
-        self.passes.discard(window)  # Nothing more of the batch is sent.
+        finally:  # Nothing more of the batch is sent, whatever stopped it, a cancellation too (fri #335).
+            self.passes.discard(window)
         receipt = await self.fri.api('POST', '/agent/learning/'+claim['id']+'/finish', {
             'records': records, 'result': output, 'scanned': scanned, 'before': before,
             'done': done, 'counters': counters, 'error': error, 'oldest': oldest, 'newest': newest,

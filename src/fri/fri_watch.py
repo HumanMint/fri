@@ -365,7 +365,9 @@ class Watch:
             until = int(held['closed_until'])
             lines.append(f"- saved context: held back until <t:{until}:f> (<t:{until}:R>), a withdrawals record "
                          "couldn't be read" + ('' if held['saved_to_disk'] else
-                                               "; it couldn't be set aside, so new withdrawals aren't saved to disk"))
+                                               "; it couldn't be set aside, so new withdrawals aren't saved to disk")
+                         # A scheduled pass skipped for it asks for no batch until then (fri #335).
+                         + ('; learning passes wait until then' if getattr(agent, 'learning_paused', False) else ''))
         if agent:
             from .fri_ledger import describe, describe_forwards
             outcomes = agent.ledger.snapshot()

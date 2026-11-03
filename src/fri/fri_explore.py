@@ -195,7 +195,8 @@ async def explore(agent, claim):
         error = clean(str(exc), 150)+'; progress retained.'
     except (discord.HTTPException, commands.UserFeedbackCheckFailure, KeyError, TypeError) as exc:
         error = type(exc).__name__+': archive exploration could not complete; progress retained.'
-    agent.passes.discard(window)  # Nothing more of the pass is sent.
+    finally:  # Nothing more of the pass is sent, whatever stopped it, a cancellation too (fri #335).
+        agent.passes.discard(window)
     receipt = await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/finish', {
         'records': records, 'result': output, 'scanned': len(scanned_ids), 'scanned_ids': scanned_ids,
         'before': str(min(map(int, scanned_ids))) if scanned_ids else None, 'done': not scanned_ids,
