@@ -46,6 +46,13 @@ async def build(agent):
         except SubscriptionError:
             LOG.warning('Member summaries wait for the subscription sign-in')
             return None
+        # A member's exchange taken back may still be among what the controller offers, and a claim names no message
+        # to screen by. While Fri's withdrawal queue holds anything back (a record it can't read, a withdrawal the
+        # controller hasn't taken, a message taken back within the hour), nothing is claimed, so the work waits for a
+        # later build (fri #268, #318).
+        if agent.saved_turns.withholding():
+            LOG.info('Member summaries wait while withdrawals settle')
+            return None
         try:
             claim = await agent.fri.api('POST', '/agent/member-summary/claim')
         except ControllerRejected:
@@ -60,7 +67,9 @@ async def build(agent):
         if previous and not all(readable(agent, origin) for origin in previous['origins']):
             previous = None
         result, counters, status = {}, {}, 'skipped'
-        if exchanges:
+        # Again after the claim's wait, with nothing awaited before the request: held back by then, nothing is sent,
+        # and the claim is let go as skipped, so the controller keeps nothing of it.
+        if exchanges and not agent.saved_turns.withholding():
             result, counters, status = await analyze(
                 agent.fri.chat, INSTRUCTION, {'previous_summary': previous['text'] if previous else '',
                                               'messages': [row['message'] for row in exchanges]},
