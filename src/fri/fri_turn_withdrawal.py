@@ -14,8 +14,10 @@ many events name it. Meanwhile, and for an hour after (past any turn still holdi
 message stays out of every request and memory view: saved history, a pending question, an exchange elsewhere, a note
 learned from it and the member's summary (see withhold and screen); once deleted, a reply of Fri's in the channel's
 view that carried it too (see Agent.withdrawn_from). A member's "forget me" takes their queued withdrawals with it.
-Only one for an exchange this process saved (under the erasure guard, see kept) is kept on disk, so a restart sends it
-again; one by ID is retried in memory only, so a restart loses it, as before this queue (see lasting).
+One for an exchange this process saved (under the erasure guard, see kept) is kept on disk whole, so a restart sends it
+again; one by ID is retried in memory, and kept on disk only as a hold of its message's ID, so a restart holds it back
+without sending it (fri #252, see lasting). Past the queue's capacity, the oldest go, but every saved context is held
+back until nothing they name can be kept (fri #256, see prune).
 """
 
 import asyncio
@@ -246,10 +248,15 @@ class SavedTurns:
 
     @staticmethod
     def lasting(entry):
-        """Whether a queued withdrawal goes to disk: only one for an exchange this process saved, which names its member
-        so their "forget me" finds it, and which a save answered after one never records (see kept). Never one by ID:
-        Fri may not know whose it is, and a restart forgets any "forget me" before it (fri #224 round 3)."""
-        return 'scope' in entry or entry.get('hold') is True
+        """What of a queued withdrawal goes to disk, so a restart can't release it before the controller took it (fri
+        #252). One for an exchange this process saved, whole: it names its member, so their "forget me" finds it, and a
+        save answered after one never records it (see kept). One by ID only as a hold, the message's ID and nothing else:
+        Fri may not know whose it is, and a restart forgets any "forget me" before it, so it's never sent again from
+        there (fri #224 round 3) and names no member; it holds the message back until nothing it names can be kept (see
+        prune). A hold stays one."""
+        if 'scope' in entry:
+            return {key: value for key, value in entry.items() if key not in ('gen', 'erasure', 'restored')}
+        return {'hold': True}
 
     def persist(self):
         """The lasting withdrawals to disk (see lasting). Never over an unreadable record not yet set aside: it's set
@@ -262,9 +269,7 @@ class SavedTurns:
                             'stays as it was and every saved context stays held back')
                 return
             try:
-                private_json(path, {'pending': {i: {key: value for key, value in entry.items()
-                                                    if key not in ('gen', 'erasure', 'restored')}
-                                                for i, entry in pending.items() if self.lasting(entry)}})
+                private_json(path, {'pending': {i: self.lasting(entry) for i, entry in pending.items()}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
                 LOG.warning('Pending withdrawals could not be saved: %s', type(exc).__name__)
 
@@ -366,7 +371,9 @@ class SavedTurns:
 
     def prune(self, now):
         """Marks an hour, and queued withdrawals as long as anything they name can be kept (a week, or a note's 90 days
-        from a controller offering SOURCES), at most MOST of them: past that, the oldest messages' go first."""
+        from a controller offering SOURCES), at most MOST of them. Past that, the oldest messages' go first, but never
+        released (fri #256): every saved context is held back instead, until nothing they name can be kept, written
+        down first (see mark_closed), so a restart keeps it too. If that can't be written, none goes."""
         while self.marked and len(self.marked) > MOST*5:
             del self.marked[next(iter(self.marked))]
         for i, at in list(self.marked.items()):
@@ -376,15 +383,24 @@ class SavedTurns:
                 del self.marked[i]
         if self._pending is None:
             return
-        horizon = now-(NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS)
+        kept = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
+        horizon = now-kept
         old = [i for i in self._pending if sent_at(int(i)) <= horizon]
         for i in old:
             del self._pending[i]
         extra = sorted(self._pending, key=int)[:max(0, len(self._pending)-MOST)]
+        if not extra:
+            return
+        until = max(self.closed_until, max(sent_at(int(i)) for i in extra)+kept)
+        if not self.mark_closed(until):
+            LOG.warning('More than %s withdrawals are queued, and holding saved context back could not be written down, '
+                        'so none was dropped', MOST)
+            return
+        self.closed_until = until
         for i in extra:
             del self._pending[i]
-        if extra:
-            LOG.warning('%s pending withdrawals dropped, the oldest messages first: more than %s queued', len(extra), MOST)
+        LOG.warning('%s pending withdrawals dropped, the oldest messages first: more than %s queued, so every saved '
+                    'context is held back for %s days', len(extra), MOST, max(1, int((until-now)//86400)))
 
     def withholding(self):
         """Whether anything is held back now, so a memory view should be screened (see screen)."""
@@ -884,9 +900,9 @@ def entries(reader):
 
 
 def entry(reader):
-    """An entry's scope, revision and whether it was a deletion; None if its scope isn't one /chat/turn/withdraw takes.
-    Nothing else of it decides anything."""
-    scope, revision, deleted = None, None, False
+    """An entry's scope, revision and whether it was a deletion; {'hold': True} for a hold (see SavedTurns.lasting);
+    None if neither, its scope not one /chat/turn/withdraw takes. Nothing else of it decides anything."""
+    scope, revision, deleted, hold = None, None, False, False
     for name in reader.members():
         if name == 'scope':
             scope = place(reader) if reader.ahead() == '{' else reader.skip()
@@ -895,9 +911,13 @@ def entry(reader):
             revision = value if type(value) is int and 0 <= value < 2**63 else None
         elif name == 'deleted':
             deleted = reader.value() is True
+        elif name == 'hold':
+            hold = reader.value() is True
         else:
             reader.skip()
-    return None if scope is None else {'scope': scope, 'revision': revision, 'deleted': deleted}
+    if scope is None:
+        return {'hold': True} if hold else None
+    return {'scope': scope, 'revision': revision, 'deleted': deleted}
 
 
 def place(reader):
