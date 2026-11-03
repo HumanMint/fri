@@ -167,7 +167,7 @@ TITLE_QUOTE = re.compile(rf'(?P<double>["“])|(?P<link>https://\S+)|{OPENER}')
 CLOSER = re.compile(rf"(?P<loose>{OPENER}|(?<!\S)['‘](?!\w))|(?P<dropped>(?:(?<=in)|(?<=\bol)|(?<=\blil)|(?<=\bn)|(?<=\bo)|(?<=\ban))'"
                     r"(?=\s+\w))|(?<=\S)'(?!\w)")
 WORD = re.compile(r"[\w']+")
-UNCLOSED = re.compile(r"[\s\"“”‘']*(?P<words>[\w']+(?:\s+[\w']+)*)")  # Marks, then words up to a pause.
+FIRST_WORD = re.compile(r"[\s\"“”‘’']*+(?P<word>[\w']+)")  # Past opening marks, once: a run of them can't backtrack.
 CLAUSE = r"(?:^|[,;:.!?—–\-\"'‘“”]\s*|\b(?:and|but|or|so|then|also|plus|like|actually|wait|lol|nah|no|oh|please|pls|just)\s+)"
 # Outside a quoted title, any of these means the message is not asking for that song now.
 REFUSED = re.compile(
@@ -323,22 +323,11 @@ def masked(text, spans):
 
 
 def artist_first(text, artist):
-    """The first word of the artist named at this ARTIST match. One they quoted names a pronoun only when the quote
-    holds that word alone, however it's spaced or nested ("by ‘Me’", "by ' Me '", "by “‘Me’”"): any more words make it
-    a name, whatever comes between them ("by ‘My Chemical Romance’", "by ‘Me & My’"). It's the quote artist_spans
-    reads; one that doesn't close counts its words up to a pause ("by "Me, no more")."""
-    at = artist.end(1)
-    if text[at:at+1] not in ('"', '“', "'", '‘'):
-        word = WORD.match(text, at)
-        return word[0].strip("'") if word else ''
-    close = quoted_title(text, at)
-    if close and close > 0:
-        said = WORD.findall(text, at+1, close-1)
-    else:
-        run = UNCLOSED.match(text, at)
-        said = run['words'].split() if run else []
-    said = [word.strip("'") for word in said if word.strip("'")]
-    return said[0] if len(said) == 1 else ''
+    """The first word of the artist named at this ARTIST match, past any marks and spaces they opened a quote with
+    ("by ‘Me’", "by ' Me '", "by “‘Me’”"). It decides only whether the title is over past that artist (see
+    replacement): a pronoun or their own "i" there names no one, so main's decision stands."""
+    word = FIRST_WORD.match(text, artist.end(1))
+    return word['word'].strip("'") if word else ''
 
 
 def artist_spans(text, artist):
@@ -403,8 +392,8 @@ def replacement(text, song, start, named):
     title = said[0][2]  # An artist follows the title's first word, never starts it.
     if quoted:  # Only this title is protected, never another quote in the message, and it ends where they closed it.
         # Its own title is what they quoted, up to an artist they quoted with it ("Not Now by Blink-182"), though not
-        # a connector before a pronoun, quoted or not ("Stand By Me", "Not Now by ‘Me’").
-        own = next((m.start() for m in ARTIST.finditer(text, title, end) if artist_first(text, m) not in NOT_ARTISTS),
+        # a connector before a pronoun ("Stand By Me").
+        own = next((m.start() for m in ARTIST.finditer(text, title, end) if m['first'].strip("'") not in NOT_ARTISTS),
                    end)
         text = text[:start]+'"'+' '*(end-start-2)+'"'+text[end:]
         song_end = clause = end
