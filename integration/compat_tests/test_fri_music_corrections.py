@@ -429,8 +429,9 @@ FIX = 'not the one, i meant join us for a bite'
     ("wrong song, Stand By 'Me ' No More", 'Stand By Me No More', True),
     ('wrong song, "Not Now by ‘ Me & My ’", i said "Not Now"', 'Not Now by Me & My', True),
     ('wrong song, "Not Now by \'Me \' and You", not now', 'Not Now by Me and You', False),
-    # Round 5 of gene#165's review: an artist read as no word at all (punctuation before its first word, or an empty
-    # quote) isn't one, so the title isn't over past it and main's decision stands.
+    # Round 5 of gene#165's review: an artist read as no word at all (an empty quote, or a quote that doesn't close)
+    # or whose first word past any punctuation is a pronoun isn't one, so the title isn't over past it and main's
+    # decision stands.
     ('wrong song, Stand By ‘…Me’, No More', 'Stand By Me No More', True),
     ('wrong song, Stand By ‘—Me’, No More', 'Stand By Me No More', True),
     ('wrong song, Stand By ‘...Me’, No More', 'Stand By Me No More', True),
@@ -438,7 +439,24 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, Stand By "", Me, No More', 'Stand By Me No More', True),
     ("wrong song, Stand By '', Me, No More", 'Stand By Me No More', True),
     ('wrong song, Stand By “”, Me, No More', 'Stand By Me No More', True),
-    ('wrong song, Glad You Came by ‘…The Wanted’, not now', 'Glad You Came The Wanted not now', True),
+    # Round 6 of gene#165's review: an artist they quoted is read inside the quote, never past its closing mark. One
+    # that holds no word (an empty or blank quote, nested or not) names no one, so a title's words after it stay the
+    # title's. Within a quote they closed, the first word past any punctuation names the artist, so a closing "not
+    # now" past it is theirs, as past "The Wanted" (S1).
+    ('wrong song, Stand By "" No More', 'Stand By No More', True),
+    ('wrong song, Stand By " " No More', 'Stand By No More', True),
+    ('wrong song, Stand By "  " No More', 'Stand By No More', True),
+    ("wrong song, Stand By ' ' No More", 'Stand By No More', True),
+    ('wrong song, Stand By ‘’ No More', 'Stand By No More', True),
+    ('wrong song, Stand By ‘ ’ No More', 'Stand By No More', True),
+    ('wrong song, Stand By "“”" No More', 'Stand By No More', True),
+    ('wrong song, Stand By "‘’" No More', 'Stand By No More', True),
+    ('wrong song, Glad You Came by ‘…The Wanted’, not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Glad You Came by "…The Wanted", not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Glad You Came by "\U0001f3b5 The Wanted", not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Love Story by "…Taylor Swift", no more', 'Love Story Taylor Swift no more', False),
+    ('wrong song, Stand By "…Me" No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By "…" No More', 'Stand By No More', True),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
