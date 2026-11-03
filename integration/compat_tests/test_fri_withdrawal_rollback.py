@@ -864,6 +864,7 @@ def test_a_transient_read_failure_keeps_the_record_where_it_is_and_reads_it_agai
             assert turns.closed() and MARKER not in await next_request(w) and history(w) == 0
             assert (tmp_path/'withdrawals.json').read_text() == text  # Where an older Fri reads it, as it was.
             assert not (tmp_path/CLOSED).exists() and not list(tmp_path.glob('withdrawals.unreadable-*.json'))
+            assert turns.status()['unread'] and turns.status()['closed_until'] is None  # fri health says why.
             turns.forget('30')  # A queue write: it reads the record again first.
             assert str(earlier.id) in turns.pending and not turns.closed()
             assert MARKER not in await next_request(w)

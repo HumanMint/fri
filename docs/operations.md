@@ -312,7 +312,12 @@ advertises it, so the controller must be released first.
   date while it lasts, and whether new withdrawals are being saved. To end it early, recover the
   entries by hand into `withdrawals.json` (or confirm nothing in the set-aside file matters; an
   unreadable record still in place as `withdrawals.json` has to be fixed or moved too), then remove
-  `withdrawals.closed.json`; the next start reads normally. The queue keeps an entry only as
+  `withdrawals.closed.json`; the next start reads normally. A read the disk itself fails (an I/O
+  error, not the record's content) is different: the record is kept where it is, with no set-aside and
+  no deadline, so an older Fri rolled back onto the same disk still finds its entries. Every saved
+  context is held back and no write replaces the record until it can be read, which Fri tries again
+  before each save and at most every 30 seconds while held back; then its entries are restored and the
+  hold-back ends. `fri health` says so while it lasts. The queue keeps an entry only as
   long as what it names can
   be kept (a week, or a note's 90 days, below), and at most 20,000, the oldest messages' going first.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one

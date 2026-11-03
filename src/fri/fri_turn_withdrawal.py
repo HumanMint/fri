@@ -41,6 +41,7 @@ NOTED_SECONDS = 90*86400  # As long as it keeps a note, which a controller offer
 MOST = 20000  # Bounds memory only: the controller keeps six exchanges per member and conversation.
 MARKED_SECONDS = 3600  # As Agent.withdrawn: longer than any turn that could still hold a copy runs.
 BATCH = 10  # As many IDs as /chat/turn/withdraw/saved takes at once.
+RECORD_RETRY_SECONDS = 30  # How often a record the disk failed is read again while every saved context is held back.
 RETRY_SECONDS = (2, 15, 60, 300)  # After each failure, then every five minutes while it stays pending.
 REREAD_SECONDS = 60  # At most this often, the controller's contract read again for a refusal (see reread).
 RECORD = 'withdrawals.json'
@@ -71,6 +72,8 @@ class SavedTurns:
         self.reread_at = 0.0  # time.monotonic() as the contract was last read again (see reread).
         self.closed_until = 0.0  # time.time() until which every saved context is held back (see fail_closed).
         self.blocked = False  # An unreadable record not yet set aside: no queue write replaces it (see persist).
+        self.unread = None  # A record whose read the disk failed (not its content): kept as it is, read again.
+        self.unread_at = 0.0  # time.monotonic() as it was last tried (see read_again).
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -108,24 +111,69 @@ class SavedTurns:
                         found = read_record(stream)
                 except FileNotFoundError:
                     pass  # Nothing pending.
-                except (OSError, ValueError) as exc:  # Unreadable and UnicodeDecodeError are ValueErrors.
+                except ValueError as exc:  # Unreadable, and UnicodeDecodeError: the record itself can't be trusted.
                     self.fail_closed(path, exc)
-            held = 0
-            for i, facts in found.items():
-                if facts is not None:
-                    # From an earlier process, whatever it says: replayed only where its revision is checked (sendable).
-                    self._pending[i] = self.entry(**facts, restored=True)
-                else:  # Its message is known, the rest isn't one Fri could send: held back, never released (round 4).
-                    held += 1
-                    self._pending[i] = self.entry(hold=True, restored=True)
-            if held:
-                LOG.warning('%s pending withdrawals on disk were malformed, so their messages are held back unsent', held)
+                except OSError as exc:  # The disk failed the read, which says nothing about the record (round 7).
+                    self.read_failed(path, exc)
+            self.restore(found)
             self.tidy()
             self.prune(time.time())
             now = time.time()
             for i in self._pending:  # Taken back before the restart: still held back until they land.
                 self.marked.setdefault(i, now)
         return self._pending
+
+    def restore(self, found):
+        """Entries read from the record, each as one an earlier process left (see entry). One already queued here for the
+        same message (the record was read late, see read_again) keeps what it has, and keeps it held back."""
+        held = 0
+        for i, facts in found.items():
+            if i in self._pending:
+                continue
+            if facts is not None:
+                # From an earlier process, whatever it says: replayed only where its revision is checked (sendable).
+                self._pending[i] = self.entry(**facts, restored=True)
+            else:  # Its message is known, the rest isn't one Fri could send: held back, never released (round 4).
+                held += 1
+                self._pending[i] = self.entry(hold=True, restored=True)
+        if held:
+            LOG.warning('%s pending withdrawals on disk were malformed, so their messages are held back unsent', held)
+
+    def read_failed(self, path, exc):
+        """The disk failed reading the record. It's kept where it is, unrenamed and with no closed marker, so an older
+        Fri rolled back onto this disk still finds its entries (round 7). Until it's read, every saved context is held
+        back and no queue write replaces it (see persist); it's read again before a write, and at most every
+        RECORD_RETRY_SECONDS while held back (see closed). Logged without its contents."""
+        LOG.warning('Pending withdrawals could not be read (%s), so every saved context is held back until they are',
+                    type(exc).__name__)
+        self.unread, self.blocked, self.unread_at = path, True, time.monotonic()
+
+    def read_again(self, force=False):
+        """Read a record the disk failed again (see read_failed). True once it's read, its entries restored and the
+        hold-back over; a record that turns out unreadable takes the closed path (see fail_closed)."""
+        if self.unread is None:
+            return True
+        if not force and time.monotonic()-self.unread_at < RECORD_RETRY_SECONDS:
+            return False
+        path, self.unread_at = self.unread, time.monotonic()
+        try:
+            with path.open() as stream:
+                found = read_record(stream)
+        except FileNotFoundError:
+            found = {}  # Gone since: nothing left to keep.
+        except ValueError as exc:
+            self.unread = None
+            self.fail_closed(path, exc)
+            return False
+        except OSError:
+            return False
+        self.unread, self.blocked = None, False
+        self.restore(found)
+        now = time.time()
+        for i in found:
+            self.marked.setdefault(i, now)
+        LOG.warning('Pending withdrawals were read after all, so saved context is no longer held back for them')
+        return True
 
     def fail_closed(self, path, exc):
         """A record that can't be trusted at all is never read as empty: what it held back would come back. Every saved
@@ -231,13 +279,16 @@ class SavedTurns:
     def closed(self):
         """Whether every saved context is held back now: a record couldn't be read (see fail_closed)."""
         self.pending  # Read first: that's what can close it.
+        if self.unread is not None and not self.read_again():
+            return True
         return time.time() < self.closed_until
 
     def status(self):
         """For fri health and its file: until when every saved context is held back (None if it isn't), whether queued
         withdrawals are saved to disk meanwhile, and how many wait. No IDs, nothing of the record."""
         closed = self.closed()
-        return {'closed_until': self.closed_until if closed else None, 'saved_to_disk': not self.blocked,
+        return {'closed_until': self.closed_until if closed and self.unread is None else None,
+                'unread': self.unread is not None, 'saved_to_disk': not self.blocked,
                 'pending': len(self.pending)}
 
     def record(self):
@@ -257,6 +308,10 @@ class SavedTurns:
         what's queued only in memory is covered too (see fail_closed)."""
         if path := self.record():
             pending = self.pending  # Read first: reading is what finds a record unreadable.
+            if self.unread is not None and not self.read_again(force=True):
+                LOG.warning('Pending withdrawals were not saved: the record could not be read, so it stays as it was '
+                            'and every saved context stays held back')
+                return
             if self.blocked and not self.set_aside(path):
                 LOG.warning('Pending withdrawals were not saved: the unreadable record could not be set aside, so it '
                             'stays as it was and every saved context stays held back')

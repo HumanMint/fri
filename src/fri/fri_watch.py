@@ -361,7 +361,11 @@ class Watch:
             waiting = '?'
         lines.append(f'- usage receipts waiting: {waiting}')
         turns = getattr(agent, 'saved_turns', None) if agent else None
-        if turns is not None and (held := turns.status())['closed_until']:  # A withdrawals record couldn't be read.
+        held = turns.status() if turns is not None else {}
+        if held.get('unread'):  # The disk failed reading the withdrawals record: read again until it works.
+            lines.append("- saved context: held back until the withdrawals record can be read; the disk failed "
+                         "reading it, so it's kept as it was and new withdrawals aren't saved to disk")
+        elif held.get('closed_until'):  # A withdrawals record couldn't be read.
             until = int(held['closed_until'])
             lines.append(f"- saved context: held back until <t:{until}:f> (<t:{until}:R>), a withdrawals record "
                          "couldn't be read" + ('' if held['saved_to_disk'] else
