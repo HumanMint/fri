@@ -299,6 +299,8 @@ class World:
 def run(module, case, monkeypatch):
     world = World(module, case)
     monkeypatch.setattr(module, 'private_json', lambda path, data: path.write(data))
+    # After a tap, the passes settle what it left at once, as they would once it's a minute old.
+    monkeypatch.setattr(module, 'GAVE_UP', 0 if world.tapping else MAIN.GAVE_UP)
     monkeypatch.setattr('fri.fri_workspace.send_once', world.send)
     return asyncio.run(world.play())
 
