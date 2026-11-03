@@ -2365,19 +2365,49 @@ class Agent:
 
     def unmoved(self, channel, records, held):
         """A learning pass's summary request's fence (Agent.run's `erased`, see learn and explore), so no erased
-        member's words reach the model (fri #289). `held` is each record's (author, their erasures here as it was
-        read). Signed in, every record's author is read again, Gene's revision first and the authors together, then
-        their erasures here. A record whose author moved is dropped before anything is sent, from the request and the
-        finish alike, which share `records`; True once none is left, and then nothing is. The controller unreachable
-        raises: the pass's own failure, as for any read before it."""
-        async def moved():
-            users = sorted({author for author, _ in held})
-            profiles = dict(zip(users, await asyncio.gather(*(self.profile(channel, user) for user in users))))
-            kept = [(record, (author, since)) for record, (author, since) in zip(records, held)
-                    if profiles[author]['enabled'] and profiles[author]['revision'] == record['revision']
-                    and self.forgotten.get(author, 0) == since]
+        member's words reach the model (fri #289). `held` is each record's (author, their erasures here before the
+        history was read). Signed in, every author kept is checked by Gene at once, at the revision their record was
+        read under (see moved), then their erasures here. A record whose author moved is dropped before anything is
+        sent, from the request and the finish alike, which share `records`; True once none is left, and then nothing
+        is. The controller unreachable, or refusing throughout, raises: the pass's own failure, as for any read
+        before it."""
+        def keep(still):
+            kept = [(record, baseline) for record, baseline in zip(records, held) if still(record, baseline)]
             records[:] = [record for record, _ in kept]
             held[:] = [baseline for _, baseline in kept]
+
+        async def reread():  # Who moved, one read per author, together; their records go.
+            users = sorted({author for author, _ in held})
+            profiles = dict(zip(users, await asyncio.gather(*(self.profile(channel, user) for user in users))))
+            keep(lambda record, baseline: profiles[baseline[0]]['enabled'] and
+                 profiles[baseline[0]]['revision'] == record['revision'])
+
+        async def checked():
+            """Gene's one atomic check of every author kept, at the revision their record was read under (fri #291):
+            True only on its explicit yes; a refusal names nobody."""
+            authors = sorted({(str(author), record['revision']) for record, (author, _) in zip(records, held)})
+            try:
+                answer = await self.fri.api('POST', '/agent/authors/check', {
+                    'guild_id': str(self.channel_guild(channel)), 'channel_id': str(channel),
+                    'authors': [{'user_id': user, 'revision': revision} for user, revision in authors]})
+            except ControllerRejected:
+                return False
+            return isinstance(answer, dict) and answer.get('ok') is True
+
+        async def moved():
+            if 'author-fence' in getattr(self.fri, 'capabilities', ()) and len({author for author, _ in held}) <= 200:
+                # The last word before the request is one atomic check, so no erasure lands between two authors'
+                # reads. Refused, who moved is found and dropped, and the rest checked again; refused throughout, the
+                # pass stops, as any failed read does, and the batch is read again.
+                for _ in range(3):
+                    if not records or await checked():
+                        break
+                    await reread()
+                else:
+                    raise ControllerRejected('An author in this batch changed their privacy settings.')
+            else:  # A controller without it: each author read, as before.
+                await reread()
+            keep(lambda record, baseline: self.forgotten.get(baseline[0], 0) == baseline[1])  # Then, with no wait.
             return not records
         return moved
 

@@ -117,8 +117,10 @@ async def explore(agent, claim):
         permissions = channel.permissions_for(channel.guild.me)
         if not permissions.view_channel or not permissions.read_message_history:
             raise ValueError('Exploration channel is not readable')
-        member = await agent.member(int(target['user_id']), fresh=True)
-        profile = await agent.profile(channel.id, int(target['user_id']))
+        targeted = int(target['user_id'])
+        forgotten = agent.forgotten.get(targeted, 0)  # Before the reads: a "forget me" during them counts (fri #292).
+        member = await agent.member(targeted, fresh=True)
+        profile = await agent.profile(channel.id, targeted)
         if not member or member.bot or not profile['enabled'] or not any(str(r.id) == claim['role_id'] for r in member.roles):
             raise ValueError('Member eligibility changed')
         context = dict(claim['exploration'])
@@ -126,9 +128,18 @@ async def explore(agent, claim):
         if target['first_visit'] or target['exhausted']:
             plan = {'term': '', 'reason': "Read this member's own wording before choosing topic filters."}
         else:
+            async def moved():
+                """Signed in, the target as the request would carry them: the historical topics' evidence is their
+                words, so their Gene revision and erasures here are read again, and moved, nothing is asked (fri
+                #292)."""
+                now = await agent.profile(channel.id, targeted)
+                return (not now['enabled'] or now['revision'] != profile['revision'] or
+                        agent.forgotten.get(targeted, 0) != forgotten)
             plan, usage, status = await agent.run('exploration_plan', PLANNER+'\nOwner learning preferences: '+agent.config['learning_notes'],
-                context, PLAN, model=claim['model'], effort=claim['effort'])
+                context, PLAN, model=claim['model'], effort=claim['effort'], erased=moved)
             add_usage(counters, usage)
+            if status == 'erased':
+                raise ValueError('Member eligibility changed')  # Its context dropped with it: nothing was sent.
             if status != 'completed':
                 raise ValueError('Exploration plan could not complete')
         plan = await agent.fri.api('POST', '/agent/learning/'+claim['id']+'/plan', {
