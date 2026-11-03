@@ -154,6 +154,7 @@ class World:
     def __init__(self, module, case):
         self.module, self.case = module, case
         self.deleted, self.heard_gone, self.heard_on_record, self.remembered = [], False, False, False
+        self.asks = []  # What each finish asked the controller to record.
         self.echoed, self.again, self.phase = case.get('echo') is None, case.get('again') is None, 1
         self.finishes, self.tapping, self.deletes = [case.get('finish')], 'shape' not in case, [case.get('delete', 'ok')]
         self.gene = Gene(case['controller'], case['erased'], case['recorded'], case['lose']) if 'controller' in case \
@@ -226,6 +227,7 @@ class World:
             return {'ok': True}
         if path.endswith('/requester-notice/finish'):
             assert path == f'/requests/{JOB}/requester-notice/finish'  # The neighbour's tombstone asks nothing.
+            self.asks.append(body['state'])
             self.tapping = False  # Any read of the request from here on is the new one (see fri_fixes.withdrawn).
             self.arrive('finish')
             self.arrive('finish '+str(self.phase))
@@ -313,6 +315,9 @@ def check(cases, monkeypatch):
     for case in cases:
         main, mine = run(MAIN, case, monkeypatch), run(head, case, monkeypatch)
         assert not STRANGERS & set(main.deleted), case
+        if mine.asks[:1] != main.asks[:1]:  # How a send is first recorded is main's, from what's saved (round 7).
+            wrong.append((case, main.asks, mine.asks))
+            continue
         missing = set(main.deleted)-set(mine.deleted)
         # The neighbour's reply is held only to main's: one main's own write over unreadable notes lost may come down.
         extra = set(mine.deleted)-set(main.deleted)-{NEIGHBOUR_COPY}
@@ -398,6 +403,13 @@ def test_a_take_back_never_writes_another_notices_tombstone_away(monkeypatch):
     check(cases(shape=PASS['shape'], finish=FINISHES, read=('gone', 'on record', 'lost'),
                 fault=(None, ('read', 'all'), ('write', 'all'))+EVERY_READ+EVERY_WRITE,
                 echo=(None, 'before', 'finish', 'after')), monkeypatch)
+
+
+def test_a_refused_take_back_never_writes_another_notices_tombstone_away_either(monkeypatch):
+    """The same, where Discord refuses the added take-back with a 403 and the owner is told: that note's `told` mark is
+    written from one read too."""
+    check(cases(shape=PASS['shape'], finish=FINISHES, read=('gone',), fault=EVERY_READ, echo=(None, 'before'),
+                delete=('forbidden',)), monkeypatch)
 
 
 def test_a_pass_records_what_main_records_whatever_copies_it_kept(monkeypatch):

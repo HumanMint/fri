@@ -2359,6 +2359,7 @@ def test_a_copy_kept_in_memory_never_changes_how_its_send_is_recorded(world, mon
         return await api(method, path, body)
 
     world.fri.api.side_effect = replaying
+    fri_fixes.expire(world.fri)  # The heartbeat's tick first, as Agent.heartbeat runs it: nothing saved into a cleared note.
     asyncio.run(fri_fixes.settle(world.agent))
     assert asked == ['uncertain']
     assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
