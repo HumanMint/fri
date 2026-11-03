@@ -314,7 +314,10 @@ def test_a_pass_never_leaves_up_what_main_takes_back_in_any_mix(monkeypatch):
 def test_a_tap_never_leaves_up_what_main_takes_back_whatever_the_controller_answers(monkeypatch):
     by_read, _ = check(cases(capabilities=TAP['capabilities'], send=SENDS, finish=FINISHES, read=READS,
                              echo=(None, 'send', 'read', 'after')), monkeypatch)
-    assert by_read  # #262 on the tap.
+    assert by_read
+    # #262 on the tap itself: a controller that isn't asked for the send leaves no note for a pass to read again.
+    by_read, _ = check(cases(capabilities=('older',), send=('ok',), finish=FINISHES, read=READS), monkeypatch)
+    assert by_read
 
 
 def test_a_tap_never_leaves_up_what_main_takes_back_whatever_fails_to_save(monkeypatch):

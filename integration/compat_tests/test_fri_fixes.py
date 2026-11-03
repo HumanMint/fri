@@ -2231,3 +2231,47 @@ def test_a_note_whose_write_and_report_read_fail_is_taken_back_where_main_takes_
     asyncio.run(fri_fixes.settle(world.agent))
     assert [str(id) for id in deleted] == [str(copy.id)]*rechecks(world)
     assert notice_row(world, job_id)[0] == ('invalidated' if rechecks(world) else 'sent')
+
+
+@pytest.mark.parametrize('erased', ['after the record', 'before it'])
+def test_a_sent_record_heard_again_is_taken_back_once_the_reporter_erased(world, monkeypatch, erased):
+    """fri #270 and #277: a pass recorded the notice as sent, and its answer was lost. The reporter erased after that
+    record, which the controller checked then (#270), or before it, on a controller that records it unchecked (#277,
+    after a Gene-only rollback). The next pass reports it sent again: the pinned controller answers with its sent
+    record, and one before gene #143 refuses the repeat. Main forgot the note with the reply up. Fri reads the request
+    too: the report is no longer on record, so the reply comes down."""
+    job_id, lease, copy = cut_off_once_cleared(world, erase=erased == 'before it')
+    deleted = reply_deletions(world)
+    fri_fixes.seen(world.fri, copy)
+    lost_finish(world)
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert not deleted and pending(world)[job_id]['message_id'] == str(copy.id)
+    if erased == 'after the record':
+        assert notice_row(world, job_id)[0] == 'sent'
+        world.store.erase_user(str(MEMBER))
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(copy.id)] and not pending(world)
+
+
+@pytest.mark.parametrize('meanwhile', ['claimed again', 'dropped'])
+def test_a_note_that_changes_while_its_report_is_read_is_left_as_it_is(world, monkeypatch, meanwhile):
+    """While Fri reads the request of a note it's settling, another claim's note takes its place, or it's dropped (its
+    KEEP passed, see expire). The reply still comes down, since its report is gone, but nothing is written over the
+    note there now, or back for the one that went."""
+    from fri.private_files import private_json
+    job_id, lease, copy = cut_off_once_cleared(world)
+    deleted = reply_deletions(world)
+    fri_fixes.seen(world.fri, copy)
+    refuse_finish(world, 404)
+    later = {'lease': 'e'*32, 'actor': str(OWNER), 'channel_id': '456', 'since': time.time(), 'at': time.time()}
+    api = world.fri.api.side_effect
+
+    async def reading(method, path, body=None):
+        if method == 'GET' and path == '/requests/'+job_id:
+            private_json(world.fri.data/'requester-notices.json', {job_id: later} if meanwhile == 'claimed again' else {})
+        return await api(method, path, body)
+
+    world.fri.api.side_effect = reading
+    asyncio.run(fri_fixes.settle(world.agent))
+    assert [str(id) for id in deleted] == [str(copy.id)]
+    assert pending(world) == ({job_id: later} if meanwhile == 'claimed again' else {})
