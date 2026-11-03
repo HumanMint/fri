@@ -61,19 +61,23 @@ def test_a_learning_pass_never_sends_a_message_taken_back_while_it_holds_it(lear
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('why', ['the withdrawal record is unreadable', 'too much was taken back to keep'])
+@pytest.mark.parametrize('why', ['the withdrawal record is found unreadable', 'too much was taken back to keep'])
 def test_a_learning_pass_that_cant_tell_stops_and_keeps_its_progress(learning, monkeypatch, tmp_path, why):  # noqa: F811
     """When Fri can't tell what was taken back, nothing is sent and the pass stops as a failed one does, so its batch
-    is read again: the withdrawal queue's record can't be read, or more was deleted meanwhile than a pass keeps."""
+    is read again: the withdrawal queue's record is found unreadable once the pass is under way (one closed before it
+    asks for its batch asks for none, see test_fri_pass_pause), or more was deleted meanwhile than a pass keeps."""
     import fri.fri_agent as fri_agent
 
     async def scenario():
         agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch)
-        if why == 'the withdrawal record is unreadable':
-            agent.fri.data = tmp_path
-            (tmp_path/'withdrawals.json').write_text('{"pending": {')
-            agent.saved_turns = SavedTurns(agent)
-            assert agent.saved_turns.closed()
+        if why == 'the withdrawal record is found unreadable':
+            def unreadable():
+                agent.fri.data = tmp_path
+                (tmp_path/'withdrawals.json').write_text('{"pending": {')
+                agent.saved_turns = SavedTurns(agent)
+                assert agent.saved_turns.closed()
+
+            signing.append(unreadable)
         else:
             monkeypatch.setattr(fri_agent, 'PASS_WATCH', 2, raising=False)
             signing.append(lambda: agent.unsend(7, [101, 102, 103]))  # Anyone's, anywhere.
