@@ -429,6 +429,16 @@ FIX = 'not the one, i meant join us for a bite'
     ("wrong song, Stand By 'Me ' No More", 'Stand By Me No More', True),
     ('wrong song, "Not Now by ‘ Me & My ’", i said "Not Now"', 'Not Now by Me & My', True),
     ('wrong song, "Not Now by \'Me \' and You", not now', 'Not Now by Me and You', False),
+    # Round 5 of gene#165's review: an artist read as no word at all (punctuation before its first word, or an empty
+    # quote) isn't one, so the title isn't over past it and main's decision stands.
+    ('wrong song, Stand By ‘…Me’, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By ‘—Me’, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By ‘...Me’, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By ‘ … Me’, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By "", Me, No More', 'Stand By Me No More', True),
+    ("wrong song, Stand By '', Me, No More", 'Stand By Me No More', True),
+    ('wrong song, Stand By “”, Me, No More', 'Stand By Me No More', True),
+    ('wrong song, Glad You Came by ‘…The Wanted’, not now', 'Glad You Came The Wanted not now', True),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
