@@ -540,8 +540,9 @@ def on_disk(tmp_path):
     return path.read_text() if path.exists() else ''
 
 
-def test_a_by_id_withdrawal_whose_author_is_unknown_never_reaches_disk(monkeypatch, tmp_path):
-    """F1: Fri can't name whose it is, so "forget me" couldn't find it there. It's retried in memory only."""
+def test_a_by_id_withdrawal_whose_author_is_unknown_reaches_disk_only_as_a_hold(monkeypatch, tmp_path):
+    """F1: Fri can't name whose it is, so "forget me" couldn't find it there. It's retried in memory, and on disk it's
+    only a hold, its message's ID and nothing else, never sent from there (fri #252: a restart mustn't release it)."""
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         if 'saved-turn-withdrawal' not in w.fri.capabilities:
@@ -552,9 +553,9 @@ def test_a_by_id_withdrawal_whose_author_is_unknown_never_reaches_disk(monkeypat
             failing(w, SAVED)
             await delete(w, earlier, guild=123)
             assert str(earlier.id) in w.agent.saved_turns.pending  # Still sent again while Fri runs.
-            assert str(earlier.id) not in on_disk(tmp_path)
+            assert json.loads(on_disk(tmp_path))['pending'] == {str(earlier.id): {'hold': True}}
             await w.agent.handle(w.said('fri forget me'))
-            assert str(earlier.id) not in on_disk(tmp_path)
+            assert '"20"' not in on_disk(tmp_path)  # Nothing on disk names them.
         finally:
             await w.fri.close()
     asyncio.run(scenario())
@@ -572,7 +573,7 @@ def test_a_by_id_withdrawal_whose_author_fri_knows_goes_with_their_forget_me(mon
             failing(w, SAVED)
             await delete(w, nearby, guild=123)
             assert w.agent.saved_turns.pending[str(nearby.id)].get('user_id') == '20'  # Theirs, in memory only.
-            assert str(nearby.id) not in on_disk(tmp_path)
+            assert json.loads(on_disk(tmp_path))['pending'] == {str(nearby.id): {'hold': True}}  # A hold (fri #252).
             await w.agent.handle(w.said('fri forget me'))
             assert str(nearby.id) not in on_disk(tmp_path) and str(nearby.id) not in w.agent.saved_turns.pending
         finally:
@@ -602,7 +603,8 @@ def test_a_save_answered_after_forget_me_records_nothing_of_them(monkeypatch, tm
             await w.agent.handle(earlier)
             await settled(w)
             kept = on_disk(tmp_path)
-            assert str(earlier.id) not in kept and '"20"' not in kept
+            # Asked about by ID, its author unknown by then: on disk only as a hold, naming no one (fri #252).
+            assert '"20"' not in kept and json.loads(kept)['pending'] == {str(earlier.id): {'hold': True}}
             assert not any((entry.get('scope') or {}).get('user_id') == '20' or entry.get('user_id') == '20'
                            for entry in w.agent.saved_turns.pending.values())
         finally:
@@ -641,8 +643,9 @@ def test_the_private_overview_screens_after_its_own_read(monkeypatch, tmp_path):
 # Sol round 3 of fri #224.
 
 def test_an_edit_after_forget_me_and_a_restart_writes_nothing_of_them_to_disk(monkeypatch, tmp_path):
-    """F1r: by ID, nothing goes to disk at all, so a restart that forgot their "forget me" can't write their message
-    back. It's retried in memory, as before."""
+    """F1r: by ID, nothing that names them goes to disk, and nothing there is ever sent, so a restart that forgot their
+    "forget me" can't write their message back. It's retried in memory, as before; on disk it's only a hold, its
+    message's ID (fri #252)."""
     async def scenario():
         from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
@@ -655,7 +658,8 @@ def test_an_edit_after_forget_me_and_a_restart_writes_nothing_of_them_to_disk(mo
             failing(w, SAVED)
             await edit(w, edited(before))
             assert str(before.id) in w.agent.saved_turns.pending  # Sent again while Fri runs.
-            assert str(before.id) not in on_disk(tmp_path) and '"20"' not in on_disk(tmp_path)
+            assert '"20"' not in on_disk(tmp_path)
+            assert json.loads(on_disk(tmp_path))['pending'] == {str(before.id): {'hold': True}}
         finally:
             await w.fri.close()
     asyncio.run(scenario())

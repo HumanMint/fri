@@ -280,7 +280,8 @@ advertises it, so the controller must be released first.
 - **Until the controller takes a withdrawal (fri #215).** Each withdrawal waits in one queue until the
   controller answers it. One for an exchange this process saved is kept in `withdrawals.json` in Fri's
   data directory (message ID, where it was saved, the member's privacy revision then and whether the
-  message was deleted; never words), so a restart sends it again; one by ID is kept in memory only.
+  message was deleted; never words), so a restart sends it again; one by ID is kept there only as a hold
+  (its message ID and nothing else, never sent from there), so a restart holds it back (fri #252).
   One worker sends them, one call at a time: each on its own through `/chat/turn/withdraw`, and those by
   ID ten a call (edits and deletions apart), each ID once however many edits and deletes name it. Each
   queued entry has its own generation, and an answer settles only the entries it was sent for, so one
@@ -320,12 +321,17 @@ advertises it, so the controller must be released first.
   unreadable record still in place as `withdrawals.json` has to be fixed or moved too), then remove
   `withdrawals.closed.json`; the next start reads normally. The queue keeps an entry only as
   long as what it names can
-  be kept (a week, or a note's 90 days, below), and at most 20,000, the oldest messages' going first.
+  be kept (a week, or a note's 90 days, below), and at most 20,000. Past that the oldest messages' go
+  first, but none is released before the controller took it (fri #256): every saved context is held back
+  until nothing those name can be kept, that deadline written to `withdrawals.closed.json` first (as for an
+  unreadable record, above), and if it can't be written none goes.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the
   controller writes nothing for it, and a save whose answer comes after it records nothing. A withdrawal
-  by ID, whoever's it is, is retried in memory only: a restart loses it, as before this queue, and can't
-  write back a message of someone who said "forget me" before the restart. Meanwhile, and for an hour after (past any turn still holding a
+  by ID, whoever's it is, is retried in memory; on disk it's only a hold naming no one, never sent from
+  there, so a restart holds its message back until what it names can't be kept, and can't write back a
+  message of someone who said "forget me" before the restart. One whose author Fri knows goes with their
+  "forget me" while Fri runs; after a restart, a hold names no one, so it stays until then. Meanwhile, and for an hour after (past any turn still holding a
   copy), what a turn read that holds a taken-back message stays out of its request, checked right before
   each one: an exchange of its history, a pending question, an exchange elsewhere, a note learned from
   it, and the member's summary, which may have read it. What's left counts as carried, so if one of those
