@@ -82,6 +82,13 @@ RECHECK_BUDGET = 6  # And all of one turn's rechecks together: a full wait befor
 STALE_CONTROL = 'skipped that one. a newer memory request of yours already went through. send it again if you still mean it.'
 
 
+class Revision(int):
+    """A member's privacy revision as Agent.revision read it. `erased_at` is when they last turned memory off, if it's
+    on now (0: it's off, they never did, or the controller doesn't say), for a DM's own check as it comes in (fri
+    #331). Only that time rides along, never the rest of their profile."""
+    erased_at = 0
+
+
 class BehaviorPreview(PagedPreview):
     def __init__(self, agent, changes, version):
         self.agent, self.changes, self.version = agent, changes, version
@@ -880,7 +887,13 @@ class Agent:
 
     async def revision(self, user):
         """The member's privacy revision, which erasing through Fri, the panel, Gene or Red advances."""
-        return (await self.profile(self.fri.workshop_id, user))['revision']
+        profile = await self.profile(self.fri.workshop_id, user)
+        current = profile['revision']
+        if not isinstance(current, int) or isinstance(current, bool):
+            return current  # As the controller gave it, so callers check it as before.
+        read = Revision(current)
+        read.erased_at = (profile.get('erased_at') or 0) if profile.get('enabled') else 0
+        return read
 
     async def erasure(self, user, forgotten, revision=None):
         """Why a member's earlier message must now go unanswered: they erased since, here or (with a
@@ -1644,9 +1657,12 @@ class Agent:
                                  else 'not a visible user mention')
             from .fri_mentions import Invitation
             invitation = await Invitation.create(self, message)
-            if invitation and await self.incoming(message, invitation, self.fri.workshop_id, forgotten) is not None:
+            if invitation and (profile := await self.incoming(message, invitation, self.fri.workshop_id,
+                                                              forgotten)) is not None:
                 if self.forgotten.get(message.author.id, 0) != forgotten:
                     return self.miss(message, 'author privacy changed')  # During that read, as below.
+                if profile.get('enabled') and before_erasure(message.id, profile.get('erased_at')):  # Never a control.
+                    return self.miss(message, PREDATES)
                 await self.respond(message, await addressed_text(message, self.fri.user.id), invitation=invitation, addressed=True,
                                    forgotten=forgotten, revision=invitation.revision)
             return
@@ -1724,7 +1740,7 @@ class Agent:
             if not privacy and self.forgotten.get(message.author.id, 0) != forgotten:
                 return self.miss(message, 'author privacy changed')  # During that read: it may be from after.
             observed = profile.get('revision', 0)
-            if profile['enabled'] and not privacy and before_erasure(message.id, profile):
+            if profile['enabled'] and not privacy and before_erasure(message.id, profile.get('erased_at')):
                 return self.miss(message, PREDATES)
             # Not if it was deleted or edited while its profile was read.
             if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
@@ -1744,8 +1760,7 @@ class Agent:
             # A DM's too, as it comes in, so an erasure during any wait below counts. A rerun's always, a privacy
             # control's too: it's compared with its first handling's (see rerun).
             try:
-                profile = await self.profile(self.fri.workshop_id, message.author.id)
-                observed = profile['revision']
+                observed = await self.revision(message.author.id)
             except ControllerUnavailable:
                 if self.forgotten.get(message.author.id, 0) != forgotten:
                     return self.miss(message, 'author privacy changed')
@@ -1754,7 +1769,7 @@ class Agent:
                 return await self.unreadable(message, [message], exc, invitation, forgotten)
             if self.forgotten.get(message.author.id, 0) != forgotten or self.erased_since(message, observed):
                 return self.miss(message, 'author privacy changed')
-            if profile.get('enabled') and not privacy and before_erasure(message.id, profile):
+            if not privacy and before_erasure(message.id, getattr(observed, 'erased_at', 0)):
                 return self.miss(message, PREDATES)
         if not dm and gene_command(message.content) and not explicit_mention(message, self.fri.user.id):
             # "!play …", "!stop": Red runs them and answers itself. Not Fri's turn, even in a follow-up window or
