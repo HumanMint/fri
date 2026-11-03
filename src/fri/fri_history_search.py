@@ -19,11 +19,28 @@ READ_ONLY_AFTER_HISTORY = {'history_search', 'read_recent', 'learning_overview',
                            'channel_capabilities', 'work_list', 'work_read'}
 
 
-# Where or when it was said, after the verb: a channel (#name or its whole mention), here, this chat, server or
-# thread, or a day. A place ends there ("in server documentation" names a document, not where it was said).
-PLACE = (r'(?:(?:in|on)\s+(?:#[\w-]+|<#\d+>)|in\s+here\b|(?:in|on)\s+(?:(?:this|the|that|our|a)\s+)?'
-         r'(?:channel|chat|server|thread|gc|vc)|on\s+(?:mon|tues|wednes|thurs|fri|satur|sun)day|(?:on|over)\s+the\s+weekend)'
-         r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|lol|lmao|rn)\b))')
+# Where it was said, after the verb: a channel (#name or its whole mention), here, this chat, server or thread,
+# or a named one ("the cooking thread", but not "the minecraft server"). A place ends there or runs into a time
+# ("in server documentation" names a document, not where it was said).
+HERE = (r'(?:(?:in|on)\s+(?:#[\w-]+|<#\d+>)|in\s+here\b|(?:in|on)\s+(?:(?:this|the|that|our)\s+)?'
+        r'(?:channel|chat|server|thread|gc|vc)|(?:in|on)\s+(?:this|the|that|our)\s+\w+\s+(?:channel|chat|thread|gc|vc))')
+SOMEWHERE = r'(?:in|on)\s+a\s+(?:channel|chat|server|thread|gc|vc)'  # Some place, which a general fact names too.
+DAY = r'(?:mon|tues|wednes|thurs|fri|satur|sun)day'
+# When: a day or a part of one, a date, or a while ago. Each is a few words at most.
+THEN = (r'(?:yesterday|earlier|last\s+(?:night|week|weekend|month|year|time)|this\s+(?:morning|afternoon|evening|week|weekend)'
+        r'|the\s+other\s+(?:day|night)|(?:on\s+)?'+DAY+r'(?:\s+(?:morning|afternoon|evening|night))?|(?:on|over)\s+the\s+weekend'
+        r'|(?:on\s+)?(?:\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{4}-\d{2}-\d{2}|the\s+\d{1,2}(?:st|nd|rd|th)'
+        r'|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]{0,6}\.?\s+\d{1,2}(?:st|nd|rd|th)?)'
+        r'|(?:(?:like|about|around)\s+)?(?:an?|\d{1,3}|(?:a\s+)?(?:few|couple(?:\s+of)?))\s+'
+        r'(?:mins?|minutes?|hrs?|hours?|days?|weeks?|months?|years?|while|bit)\s+ago)\b')
+END = r'\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|tonight|before|last|again|pls|plz|please|lol|lmao|rn)\b)'
+# What may follow the verb: nothing, a word like "earlier", or a place and a time in either order.
+AFTER = (r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|tonight|before|last|here|there|again|pls|plz|please|lol|'
+         r'lmao|rn)\b'
+         r'|(?:'+HERE+'|'+SOMEWHERE+'|'+THEN+r')(?:\s+(?:'+HERE+'|'+SOMEWHERE+'|'+THEN+r'))?(?='+END+')))')
+# Only this server's places and past times show a question is about the chat with no speaker named.
+SAID_HERE = (r'(?=\s*(?:(?:earlier|yesterday|last)\b|(?:'+HERE+'|'+THEN+r')(?:\s+(?:'+HERE+'|'+THEN+r'))?(?='+END+')'
+             r'|'+SOMEWHERE+r'\s+'+THEN+'(?='+END+')))')
 
 
 def cues(*patterns):
@@ -44,22 +61,49 @@ RECALL = (
     cues(r'\b(?:find|search|look\s+up|dig\s+up|pull\s+up)\b',
          r'\b(?:memes?|pics?|pictures?|images?|photos?|screenshots?|gifs?|videos?|clips?|links?|files?)\b',
          # The verb ends the clause, as in recall; "a shared drive" uses it as an adjective.
-         r'\b(?:posted|sent|shared|dropped|uploaded|linked)\b'
-         r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn)\b|'+PLACE+r'))'),
+         r'\b(?:posted|sent|shared|dropped|uploaded|linked)\b'+AFTER),
 )
-# Recall within a few words.
-NAMED = re.compile(
-    r'(?is)\bwho\s+(said|recommended|mentioned|posted|talked|discussed|linked)\b'
-    # "what was that song kev mentioned": a thing someone said, named before the verb. The word
-    # before the verb is who said it, so "the most commonly recommended laptop" or "the difference
-    # between shared and dedicated" stay general questions.
-    r"|\b(?:what(?:'s|’s|s)?|which)\s+(?:(?:was|were|is)\s+)?(?:that|the|those)\s+\w+(?:\s+\w+){0,3}?\s+"
-    r'(?!(?:\w+ly|most|more|least|between|and|or|of|for|with|in|on|to|by|than|as|being|been)\b)\w+\s+'
-    # The verb ends the clause, as in recall; "doctor recommended dose" uses it as an adjective.
-    # Only a place in the server or a day may follow: "the file size shared on discord" is passive.
-    r'(said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
-    r'(?=\s*(?:$|[?.!,)]|(?:earlier|yesterday|today|before|last|here|there|again|lol|lmao|rn)\b'
-    r'|'+PLACE+r'))')
+# Who said it, in "what was that song kev mentioned": a mention or a pronoun, or a name after the thing. A name
+# doesn't follow a word that needs its noun ("the best laptop recommended", "the max bitrate sent"), and isn't an
+# adverb or a word for a property ("the most commonly recommended laptop", "the file size shared"). The words are
+# listed, not guessed from an ending: Felicity, Clement and Charity are names.
+PERSON = r'(?:i|you|u|ya|yall|he|she|they|we|someone|somebody|anyone|anybody|everyone|everybody)\b'
+NEEDS_NOUN = (r'(?:best|worst|top|max|maximum|min|minimum|average|avg|typical|standard|default|ideal|optimal|usual|'
+              r'normal|daily|weekly|monthly|yearly|annual|total|overall|general|official|current|recommended|suggested|'
+              r'right|correct|proper|exact|actual|main|common|popular|safe|good|great|better|new|old|first|next|'
+              r'same|whole|full|free|minimal|basic|latest|newest|oldest|biggest|largest|smallest|fastest|slowest|'
+              r'cheapest|easiest|hardest|highest|lowest|longest|shortest|safest|simplest|strongest|quickest|quietest|'
+              r'lightest|cleanest|coolest|nicest|healthiest|warmest|loudest|smartest|greatest|finest)\s')
+GRAMMAR = r'(?:\w+ly|most|more|least|between|and|or|of|for|with|in|on|to|by|than|as|being|been)\b'
+PROPERTY = (r'(?:size|limit|rate|bitrate|speed|price|cost|fee|amount|number|count|value|setting|config|option|'
+            r'mode|version|format|type|kind|style|model|brand|codec|driver|quality|length|width|height|depth|weight|'
+            r'range|ratio|level|score|rating|grade|dose|dosage|intake|temp|temperature|time|date|age|distance|duration|'
+            r'frequency|bandwidth|capacity|storage|memory|power|budget|wage|rule|policy|law|spec|method|way|'
+            r'approach|step|process|technique|strategy|answer|source|reason|name|word|term|title|data|info|text|'
+            r'content|file|software|app|tool|site|website|server|bot|system|program|device|package|library|plugin|'
+            r'extension|command|key|port|password|account|gpu|cpu|laptop|phone|browser|monitor|keyboard|mouse|headset|'
+            r'effect|point|tag|schedule|plan|requirement|feature|symptom|benefit|risk|ingredient|tip|idea|example|'
+            r'resolution|configuration|information|documentation|attachment|quantity|density|position|dimension|'
+            r'location|section|description|instruction|solution|suggestion|equipment|payment|treatment|permission|'
+            r'security|compatibility|detail|pattern)(?:e?s)?\b')
+WHO = r'(?:<@!?\d{1,25}>|'+PERSON+')'
+NAME = r'(?!'+GRAMMAR+'|'+PROPERTY+r')\w+'
+WHAT = r"\b(?:what(?:'s|’s|s)?|which)\s+"
+THING = r'(?:that|the|those)\s+(?:\w+\s+){0,3}?'  # A few words, then the speaker, then the verb.
+NAMED_VERB = r'\s+(?:said|mentioned|recommended|posted|linked|shared|sent|dropped)\b'
+NAMED = re.compile('(?is)'+'|'.join((
+    r'\bwho\s+(?:said|recommended|mentioned|posted|talked|discussed|linked)\b',
+    # "what was that song kev mentioned": a thing someone said, named before the verb. The verb ends the clause,
+    # as in recall: "doctor recommended dose" uses it as an adjective.
+    WHAT+r'(?:(?:was|were|is)\s+)?'+THING+r'(?:\w+\s+'+WHO+r'|(?!'+NEEDS_NOUN+r')\w+\s+'+NAME+')'+NAMED_VERB+AFTER,
+    # After "are" the thing is plural before a name ("the tracks mo recommended"), so "the design patterns
+    # recommended" names no one.
+    WHAT+r'are\s+'+THING+r'(?:\w+\s+'+WHO+r'|\w+s\s+'+NAME+')'+NAMED_VERB+AFTER,
+    # With no one named ("what was the new song posted in #music"), only a place here or a past time makes it
+    # recall, and not after "is": "what is the max file size shared in this server?" asks about the server.
+    WHAT+r'(?:(?:was|were)\s+)?'+THING+r'(?!'+GRAMMAR+r')\w+'+NAMED_VERB+SAID_HERE,
+    # "what was the song posted here?": a bare "here" counts after a past "was", not after "what's".
+    WHAT+r'(?:was|were)\s+'+THING+r'(?!'+GRAMMAR+r')\w+'+NAMED_VERB+r'(?=\s+here\b(?:\s+'+THEN+')?(?='+END+'))')))
 
 
 def in_order(text, run):

@@ -12,7 +12,14 @@ from . import feedback as commands
 from .fri_agent_model import ATTENTION, DIAGNOSIS
 from .fri_context import discord_source
 from .fri_conversation import PERSISTENT_MODEL_WRITES
-from .fri_errors import ControllerRejected, ControllerUnavailable
+from .fri_errors import (
+    UNREACHABLE,
+    AuthorErased,
+    ControllerRejected,
+    ControllerUnavailable,
+    GateClosed,
+    TurnUnreachable,
+)
 from .fri_history_search import READ_ONLY_AFTER_HISTORY, HistorySearch
 from .fri_history_search import requested as history_requested
 from .fri_images import details, image_context, look, lookable, media, started_a_thread
@@ -72,6 +79,9 @@ class Actions:
         self.invitation = None
         self.reopened = False  # Its burst was reopened by a short line (see Continuation): it completes nothing.
         self.turn_context = None
+        # The author's erasures since their message came in, for a turn whose fence isn't in turn_context (an outside
+        # ping, see Fri.invited_talk): called like the fence's own (see Fri.talk).
+        self.erasure_check = None
         self.reads = []  # What each read showed, and the history window that finds it again.
         from .fri_image_share import ImageShare
         self.image_share = ImageShare(self)
@@ -382,6 +392,11 @@ class Actions:
         if not channels:
             return {'blocked': 'No approved channels are currently readable.'}
         await self.summary_unchanged()  # After those waits; a write sends the generation too, for its own wait.
+        fence = (self.turn_context or {}).get('fence') or {}
+        if fence.get('erased') and await fence['erased']():  # And their own erasures here, after them (fri #265).
+            raise AuthorErased()
+        if fence.get('dms') and not fence['dms']():  # And a DM's switch, as before the model request.
+            raise GateClosed('dms off')
         if self.history.pages and kind not in READ_ONLY_AFTER_HISTORY:
             return {'blocked': 'Archive evidence cannot authorize another action. Ask for that action in a fresh message.'}
         if kind == 'history_search':
@@ -434,7 +449,7 @@ class Actions:
                 return {'blocked': 'There is no current public lookup to refine.'}
             self.search_count += 1
             result, counters, status = await lookup(self.fri.chat, self.research['query'], self.model, self.effort,
-                                                   previous=self.research)
+                                                   previous=self.research, ready=self.fenced)
             await self.agent.record('web_search', self.model, self.effort, counters, status)
             if status == 'completed' and result.get('answer') and result.get('sources'):
                 result['query'] = self.research['query']
@@ -452,7 +467,7 @@ class Actions:
                     'revision': self.revision, 'source': discord_source(self.event).model_dump(),
                     'input': self.message, 'query': query})
             self.search_count += 1
-            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort)
+            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort, ready=self.fenced)
             await self.agent.record('web_search', self.model, self.effort, counters, status)
             if status == 'completed' and result.get('answer') and result.get('sources'):
                 result['query'] = query
@@ -700,11 +715,15 @@ class Actions:
                 auto_available = False  # Preserve read-only diagnosis and its normal review preview.
         evidence = {'source_id': str(self.event.id), 'report': self.message, 'health': health, 'receipts': receipts,
                     'previous_repairs': repairs}
+        # Both requests carry the member's report: each is fenced like a tool's own (fri #283), web lookups aside.
+        async def moved():
+            await self.fenced(web=False)
+            return False
         gate, _, state = await self.agent.run('attention',
             'Triage a current member report about Gene. Choose investigate for a reported failure, no reply, '
             'unconfirmed command, or unhealthy runtime that warrants diagnosis. Choose quiet for unrelated chat '
             'or a normal status question with healthy evidence. Do not diagnose or approve repairs. '
-            'Use the supplied source_id.', evidence, ATTENTION)
+            'Use the supplied source_id.', evidence, ATTENTION, erased=moved)
         result = {'kind': 'gene_diagnose', 'health': health, 'receipts': receipts, 'triage_status': state,
                   'previous_repairs': repairs}
         if state != 'completed' or gate.get('action') != 'investigate' or gate.get('source_id') != str(self.event.id):
@@ -718,7 +737,7 @@ class Actions:
             'tests/features/, docs/features/. Flag infrastructure, dependencies and controller issues as maintainer '
             'work. An eligible existing-feature fault can be sent to independent verification; do not promise '
             'a fix or grant approval yourself. New features and protected changes need the owner. At most 2500 characters total.',
-            evidence, DIAGNOSIS, model='gpt-6.1-sol', effort='xhigh')
+            evidence, DIAGNOSIS, model='gpt-6.1-sol', effort='xhigh', erased=moved)
         result.update(diagnosis_status=state, diagnosis_model='gpt-6.1-sol', diagnosis_effort='xhigh')
         if state == 'completed':
             result.update(assessment=clean(diagnosis.get('summary', ''), 1500),
@@ -789,6 +808,44 @@ class Actions:
         except (commands.UserFeedbackCheckFailure, discord.HTTPException, TimeoutError):
             return False
 
+    async def fenced(self, *, web=True):
+        """The turn's last checks before a model request a tool makes of its own (web research, an image search's
+        looks, Gene diagnosis's), once signed in, so nothing waits between them and the request (fri #273, #283): a
+        ping's own, then the author's erasures, Gene's revision read first and their erasures here after it (the turn's
+        fence, or an outside ping's, fri #284). Then, with nothing to wait on, its switches and where it answers (fri
+        #285, see closed). Moved, nothing is asked and the turn stops as at any of its checks. The controller
+        unreachable is the turn's outage, not an uncertain tool result."""
+        fence = (self.turn_context or {}).get('fence') or {}
+        erased = fence.get('erased') or self.erasure_check
+        try:
+            if self.invitation:
+                await self.invitation.require_current()
+            reason = await erased(read=True) if erased else None
+        except ControllerUnavailable:
+            raise TurnUnreachable(UNREACHABLE) from None
+        if reason == 'check failed: ControllerUnavailable':
+            raise TurnUnreachable(UNREACHABLE)
+        if reason:
+            raise AuthorErased()
+        if closed := self.closed(fence, web):
+            raise GateClosed(closed)
+
+    def closed(self, fence, web):
+        """Which of a secondary request's gates is shut now, if any, read without waiting: Fri's switch, web lookups'
+        for research and image looks (`web`), a DM's switch, and whether a channel turn's channel is still one Fri
+        answers in. An outside ping answers where it is, in the main server, which no setting moves (see Invitation)."""
+        if not self.agent.config['enabled']:
+            return 'fri disabled'
+        if web and not self.agent.state.get('web_search_enabled'):
+            return 'web lookups off'
+        if fence.get('dms') and not fence['dms']():
+            return 'dms off'
+        channel = getattr(self.event, 'channel', None)
+        if (self.public and channel is not None and not (self.invitation and self.invitation.outside) and
+                not self.agent.allowed(channel)):
+            return 'channel not configured'
+        return None
+
     async def invited_web(self, action):
         """Only public excerpts of this event can leave an outside invitation."""
         kind = action.get('kind')
@@ -804,13 +861,14 @@ class Actions:
             await self.fri.api('POST', '/chat/research/start', {**self.scope, 'revision': self.revision,
                 'input': self.message, 'query': query})
             self.search_count = 1
-            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort)
+            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort, ready=self.fenced)
         elif kind == 'web_refine':
             if not self.research or self.search_count != 1 or action.get('query') not in ('', self.research['query']):
                 return {'blocked': 'There is no current public lookup to refine.'}
             self.search_count = 2
             query = self.research['query']
-            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort, previous=self.research)
+            result, counters, status = await lookup(self.fri.chat, query, self.model, self.effort, previous=self.research,
+                                                   ready=self.fenced)
         else:
             return {'blocked': 'That action is unavailable in a one-message invitation.'}
         await self.agent.record('web_search', self.model, self.effort, counters, status)

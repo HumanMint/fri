@@ -117,3 +117,41 @@ def test_a_forward_refused_at_a_dm_gate_is_counted_too(monkeypatch, tmp_path, ca
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_dropped_forwards_are_counted_by_gate_in_fri_health_and_its_file(monkeypatch, tmp_path, caplog):
+    """The log line counts forwards across restarts; fri health and its file count them since Fri started, by the
+    gate only: no IDs, names or words of the forward or the post it copies."""
+    import json
+    caplog.set_level(logging.INFO, logger='fri')
+    async def scenario():
+        fri, agent, _, _, _, message, _, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.data = tmp_path
+        events = [forward(message('', user=30)), forward(message('', user=31))]
+        try:
+            await fri.health.coro(fri)
+            assert json.loads((tmp_path/'fri-health.json').read_text())['outcomes']['forwards'] == {}
+            assert not [line for line in (await fri.watcher.report()).splitlines() if 'forwards' in line]
+            for event in events:
+                await agent.handle(event)
+            await agent.handle(forward(message('', user=32), snapshot=False, typed=False))  # No forward at all.
+            await fri.health.coro(fri)
+            outcomes = json.loads((tmp_path/'fri-health.json').read_text())['outcomes']
+            assert outcomes['forwards'] == {'no text': 2}
+            lines = [line for line in (await fri.watcher.report()).splitlines() if 'forwards' in line]
+            assert lines == [f"- forwards not read since <t:{int(outcomes['since'])}:R>: 2 (no text ×2)"]
+            # The whole snapshot but its time, so no field of it can hold an ID, a name or a channel in any form, one
+            # the markers below don't name included (fri #286).
+            assert {key: value for key, value in outcomes.items() if key != 'since'} == {
+                'addressed': {}, 'answered': 0, 'cooldown': 0, 'forwards': {'no text': 2}, 'in_flight': 0,
+                'latency': {'p50': None, 'p90': None, 'samples': 0}, 'outage': 0, 'quiet': {}, 'told_why': {},
+                'withheld': {}}
+            # The times aren't member data, and digits in them can match a short ID by chance ("…755574" has
+            # 555), so they're left out of what's searched.
+            shown = json.dumps({key: value for key, value in outcomes.items() if key != 'since'})
+            shown += lines[0].replace(f"<t:{int(outcomes['since'])}:R>", '')
+            for private in (*[event.id for event in events], TEXT, 'member 30', '"30"', '4242', '9999', '555'):
+                assert str(private) not in shown
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
