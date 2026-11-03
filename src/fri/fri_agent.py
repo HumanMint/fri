@@ -34,7 +34,7 @@ from .fri_errors import (
 )
 from .fri_images import forwarded, media, started_a_thread
 from .fri_ledger import COOLDOWN, Ledger, addressed, notice_reason
-from .fri_memory import before_removal, memory_intent
+from .fri_memory import before_erasure, before_removal, memory_intent
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
 from .fri_reports import report_message
@@ -74,6 +74,10 @@ NO_USAGE = {'input_tokens': 0, 'output_tokens': 0, 'reasoning_output_tokens': 0}
 CHECK_SECONDS = 10  # A slower owner settings check gives way to the Sol settings call.
 MEMORY_CONTROLS = ('disable', 'enable')  # "forget me", "remember me again": they change what Fri keeps.
 RECHECK_TIMEOUT = 3  # Seconds one recheck of Fri's summary-derived replies waits on the controller (see Agent.retired).
+# A member's message sent before they last turned memory off, and handled once it's on again (a queued one): what they
+# said then is kept nowhere, so it goes unanswered, quietly, as a turn whose author changed their privacy does (fri
+# #331). One from before a note's removal is still answered, and kept nowhere; a memory control is never held to it.
+PREDATES = 'said before their memory was turned off'
 RECHECK_BUDGET = 6  # And all of one turn's rechecks together: a full wait before its request and one before delivery.
 STALE_CONTROL = 'skipped that one. a newer memory request of yours already went through. send it again if you still mean it.'
 
@@ -1720,6 +1724,8 @@ class Agent:
             if not privacy and self.forgotten.get(message.author.id, 0) != forgotten:
                 return self.miss(message, 'author privacy changed')  # During that read: it may be from after.
             observed = profile.get('revision', 0)
+            if profile['enabled'] and not privacy and before_erasure(message.id, profile):
+                return self.miss(message, PREDATES)
             # Not if it was deleted or edited while its profile was read.
             if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
                     message.id not in self.unsent and not self.taken_back(message.id, self.arrived.get(message.id, sent))):
@@ -1738,7 +1744,8 @@ class Agent:
             # A DM's too, as it comes in, so an erasure during any wait below counts. A rerun's always, a privacy
             # control's too: it's compared with its first handling's (see rerun).
             try:
-                observed = await self.revision(message.author.id)
+                profile = await self.profile(self.fri.workshop_id, message.author.id)
+                observed = profile['revision']
             except ControllerUnavailable:
                 if self.forgotten.get(message.author.id, 0) != forgotten:
                     return self.miss(message, 'author privacy changed')
@@ -1747,6 +1754,8 @@ class Agent:
                 return await self.unreadable(message, [message], exc, invitation, forgotten)
             if self.forgotten.get(message.author.id, 0) != forgotten or self.erased_since(message, observed):
                 return self.miss(message, 'author privacy changed')
+            if profile.get('enabled') and not privacy and before_erasure(message.id, profile):
+                return self.miss(message, PREDATES)
         if not dm and gene_command(message.content) and not explicit_mention(message, self.fri.user.id):
             # "!play …", "!stop": Red runs them and answers itself. Not Fri's turn, even in a follow-up window or
             # Fri's own channel, and not attention's pick either. Its row above still shows what was asked.

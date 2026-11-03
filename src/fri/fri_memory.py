@@ -136,6 +136,12 @@ def before_removal(message_id, profile):
     return discord.utils.snowflake_time(int(message_id)).timestamp() <= (profile.get('removed_at') or 0)
 
 
+def before_erasure(message_id, profile):
+    """Sent before the member last turned memory off (the controller's erased_at, HumanMint/gene#206), so Fri doesn't
+    answer it once memory is on again (fri #331). A controller that doesn't say holds nothing to it."""
+    return discord.utils.snowflake_time(int(message_id)).timestamp() <= (profile.get('erased_at') or 0)
+
+
 def memory_intent(text):
     """Handle direct privacy requests locally, without asking a model to authorize them."""
     text = text.lower().strip().replace('’', "'")
