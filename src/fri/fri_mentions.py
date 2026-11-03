@@ -454,7 +454,7 @@ class Invitation:
         self.images = [] if self.image else [m for m in self.events.values() if lookable(m)]
         # Contextual images use attachments, a GIF link's Discord-made preview or a link card's picture (see
         # fri_images.stills). Never a page a link points at.
-        if self.image and sources(self.image) != [str(a.url) for a in self.image.attachments]:
+        if self.image and sources(self.image, cards=True) != [str(a.url) for a in self.image.attachments]:
             self.image = None
         await self.require_current()
 
