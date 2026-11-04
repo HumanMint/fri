@@ -41,6 +41,7 @@ class PriceTable:
     twilio_per_minute: float = 0.0746
     twilio_mobile_per_minute: float = 0.185
     media_streams_per_minute: float = 0.0044
+    amd_per_call: float = 0.0075
 
     def token_cost(self, model: str, units: dict[str, float]) -> float | None:
         rates = self.per_million.get(model, {})

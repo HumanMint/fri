@@ -328,7 +328,8 @@ class _Session:
         self._brief, self._number = brief, number
         self._audio, self._events, self._meter = audio, events, meter
         self._rt = RealtimeClient(engine.config, brief, audio, self, meter,
-                                  on_tool_call=self._tool, tools=TOOLS, clock=engine._clock)
+                                  on_tool_call=self._tool, tools=TOOLS, clock=engine._clock,
+                                  on_speech=self._speech_event)
         self._hold = HoldController(request.request_id, engine.config.limits, self._emit,
                                      self._rt.say, self._rt.tool_result, self._hold_state,
                                      clock=engine._clock, sleep=engine._sleep,
@@ -341,6 +342,15 @@ class _Session:
         self._translations: set[asyncio.Task] = set()
         self._transcript: list[dict[str, str]] = []
         self._answered_at: float | None = None
+        self._media_ready = False
+        self._greeting_item: str | None = None
+        self._greeting_finished = False
+        self._callee_speaking: set[str] = set()
+        self._amd_result: str | None = None
+        self._opening_changed = asyncio.Event()
+        self._opener_task: asyncio.Task | None = None
+        self._opener_started = False
+        self._voicemail = False
         self._ending = False
         self._creating = False
         self._failed = False
@@ -442,6 +452,26 @@ class _Session:
         if self._sid and sid != self._sid:
             return
         self._sid = sid
+        answered_by = params.get('AnsweredBy')
+        if answered_by:
+            self._meter.amd()
+            machine = (answered_by == 'machine_start' or answered_by.startswith('machine_end_')
+                       or answered_by == 'fax')
+            if machine and not self._voicemail and not self._finished.is_set():
+                self._voicemail = True
+                self._failed, self._detail = True, 'went to voicemail'
+                if self._rt is not None:
+                    spoken = self._rt.has_spoken
+                    self._rt.silence()
+                    if self._ending:
+                        self._stop_now.set()
+                    self._begin_finish(failed=True, detail='went to voicemail', goodbye=spoken)
+                return
+            if answered_by in ('human', 'unknown') and not self._ending:
+                self._amd_result = answered_by
+                self._opening_changed.set()
+            if 'CallStatus' not in params:
+                return  # AMD callbacks have no progress sequence; never advance its watermark.
         if params.get('CallStatus') in ('completed', 'busy', 'no-answer', 'failed', 'canceled'):
             self._stop_now.set()
         if self._ending:
@@ -470,8 +500,10 @@ class _Session:
     async def _answered(self) -> None:
         if self._answered_at is None:
             self._answered_at = self.engine._clock()
+            self._meter.amd()
             await self._status(CallState.IN_PROGRESS)
             self._spawn(self._time_limit())
+            self._opener_task = self._spawn(self._await_opener())
 
     async def start(self, media: TwilioMedia) -> None:
         if self._ending:
@@ -479,6 +511,46 @@ class _Session:
             return
         await self._answered()
         await self._rt.start(media)
+        self._media_ready = True
+        self._opening_changed.set()
+
+    def _speech_event(self, started: bool, item_id: str) -> None:
+        if self._ending or self._opener_started:
+            return
+        if started:
+            if self._greeting_item is None:
+                self._greeting_item = item_id
+            self._callee_speaking.add(item_id)
+        else:
+            self._callee_speaking.discard(item_id)
+            if item_id == self._greeting_item:
+                self._greeting_finished = True
+        self._opening_changed.set()
+
+    async def _await_opener(self) -> None:
+        while not self._ending:
+            self._opening_changed.clear()
+            elapsed = self.engine._clock() - self._answered_at
+            hello = self._greeting_finished or (self._greeting_item is None and elapsed >= 3)
+            amd = self._amd_result in ('human', 'unknown') or elapsed >= 4
+            if self._media_ready and hello and amd and not self._callee_speaking:
+                self._opener_started = True  # Claim the one opener before any await.
+                await self._rt.open_conversation()
+                return
+            deadlines = []
+            if self._greeting_item is None and elapsed < 3:
+                deadlines.append(3 - elapsed)
+            if self._amd_result is None and elapsed < 4:
+                deadlines.append(4 - elapsed)
+            tasks = [asyncio.create_task(self._opening_changed.wait())]
+            if deadlines:
+                tasks.append(asyncio.create_task(self.engine._sleep(min(deadlines))))
+            try:
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def audio(self, ulaw: bytes) -> None:
         if not self._ending:
@@ -540,6 +612,8 @@ class _Session:
     async def _farewell(self) -> None:
         remaining = self.engine.config.limits.max_call_s - (
             self.engine._clock() - self._answered_at)
+        if self._voicemail:
+            remaining = min(remaining, 5)
         if remaining <= 0 or self._stop_now.is_set():
             return
 
@@ -564,13 +638,22 @@ class _Session:
         try:
             with suppress(Exception):
                 await self._hold.close()
+            if self._opener_task is not None:
+                self._opener_task.cancel()
+                await asyncio.gather(self._opener_task, return_exceptions=True)
             # Do not abandon an in-flight REST create: capture its SID and end that call.
             if self._dial_task is not None and not self._dial_task.done():
                 if not self._creating:
                     self._dial_task.cancel()
                 await asyncio.gather(self._dial_task, return_exceptions=True)
             if goodbye and self._answered_at is not None:
-                await self._farewell()
+                if self._voicemail:
+                    with suppress(Exception):
+                        async with asyncio.timeout(5):
+                            await self._rt.interrupt()
+                            await self._farewell()
+                else:
+                    await self._farewell()
             for task in tuple(self._tasks):
                 task.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -590,7 +673,7 @@ class _Session:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
             outcome = self._detail or 'The call ended without a confirmed outcome.'
-            if self._answered_at is not None:
+            if self._answered_at is not None and not self._voicemail:
                 try:
                     outcome = await self.engine._text.generate('summary', self._meter,
                         f'The call transcript is {self.engine.config.language.name}. '

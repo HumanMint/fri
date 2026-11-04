@@ -113,3 +113,18 @@ def test_phone_estimate_uses_destination(number, rate):
     assert not meter.lines()[0].exact
     meter.twilio(61, posted_usd=.2, exact=True)
     assert meter.lines()[0].usd == .2 and meter.lines()[0].exact
+
+
+def test_amd_is_one_overridable_estimate_per_answered_call(tmp_path):
+    meter = UsageMeter(PriceTable(amd_per_call=.01))
+    assert not meter.lines()
+    meter.amd()
+    meter.amd()
+    line, = meter.lines()
+    assert line.component == 'amd' and line.model == 'twilio-amd'
+    assert line.units == {'calls': 1} and line.usd == .01 and not line.exact
+    meter.twilio(30, posted_usd=.08, exact=True)
+    assert next(line for line in meter.lines() if line.component == 'amd').usd == .01
+    meter.write_ledger(tmp_path)
+    ledger = json.loads((tmp_path / 'jpcall-usage.jsonl').read_text())
+    assert ledger['usage'][-1]['component'] == 'amd'
