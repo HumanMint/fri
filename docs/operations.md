@@ -325,7 +325,9 @@ advertises it, so the controller must be released first.
   memory, and each attempt to save them moves the deadline to 90 days from then. A deadline once written
   down is never cut short, one past 90 days from now (a clock set back since) included, and nor is when a
   withdrawal was queued (fri #339). `fri health` shows the end
-  date while it lasts, and whether new withdrawals are being saved. To end it early, recover the
+  date while it lasts, and whether new withdrawals are being saved; one past any date Fri sets (more
+  than 90 days from now) is flagged instead of shown, with this way to end it (fri #343). To end it
+  early, recover the
   entries by hand into `withdrawals.json` (or confirm nothing in the set-aside file matters; an
   unreadable record still in place as `withdrawals.json` has to be fixed or moved too), then remove
   `withdrawals.closed.json`; the next start reads normally. The queue keeps an entry only as
@@ -333,7 +335,9 @@ advertises it, so the controller must be released first.
   be kept (a week, or a note's 90 days, below), counted from when it was queued, which each entry keeps on
   disk as `queued_at` (whole seconds), or from its message's time if that's later (fri #329): what a turn
   saved from a message lasts from the save, which is before the message was taken back. An entry an older
-  Fri wrote, without one, counts from the start that reads it. At most 20,000 are kept. Past that, those
+  Fri wrote, without one, counts from the start that reads it, which saves the queue then, so later starts
+  keep that date instead of dating it again (fri #343); a save that fails leaves the record as it was, for
+  the next start to date, no earlier. At most 20,000 are kept. Past that, those
   whose names can be kept least long go first, but none is released before the controller took it (fri
   #256): every saved context is held back until nothing those name can be kept, that deadline written to
   `withdrawals.closed.json` first (as for an unreadable record, above), and if it can't be written none
