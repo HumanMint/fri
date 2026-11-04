@@ -210,12 +210,16 @@ def explorer(learning, moved):  # noqa: F811
             found = current.get(route.url.rsplit('/', 1)[-1])
             if found is None:
                 raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+            if found == 'refused':  # Discord won't say (fri #358).
+                raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Access')
             return found
         return {'messages': [[found] for found in next(pages, [])], 'doing_deep_historical_index': False}
 
     async def sign_in():
         if passes == [1] and moved == 'its row, in Discord alone, while the summary signs in':
             current.pop(old['id'], None)  # No event reaches the agent.
+        if passes == [1] and moved == 'its row, refused by its ID, while the summary signs in':
+            current[old['id']] = 'refused'
         if passes == [1] and moved == 'its row, through Gene alone, while the summary signs in':
             store.withdraw_saved('123', [old['id']], deleted=True)
         if passes == [1, 2] and moved == 'its topic, through Gene alone, while the planner signs in' and not planned:

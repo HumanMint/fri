@@ -201,6 +201,12 @@ def read_harness(monkeypatch, tmp_path):
             if item.created_at > kwargs['after']:
                 yield item
     channel.history = history
+
+    async def fetch(mid):  # By its ID, as Discord answers: a 404 once it's gone.
+        if mid not in rows:
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+        return rows[mid]
+    channel.fetch_message = AsyncMock(side_effect=fetch)
     return fri, agent, channel, rows, post
 
 

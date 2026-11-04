@@ -50,7 +50,7 @@ class HistoryChannel(discord.abc.Messageable):
     def __init__(self):
         self.id, self.guild = 1, SimpleNamespace(id=123)
         self.rows, self.reads = [], []
-        self._state = SimpleNamespace(http=SimpleNamespace(logs_from=self.logs),
+        self._state = SimpleNamespace(http=SimpleNamespace(logs_from=self.logs, get_message=self.message),
             create_message=lambda channel, data: data['message'])
 
     async def _get_channel(self):
@@ -62,6 +62,13 @@ class HistoryChannel(discord.abc.Messageable):
                 and (after is None or row.id > int(after))]
         rows = sorted(rows, key=lambda row: row.id, reverse=after is None)[:limit]
         return [{'id': str(row.id), 'message': row} for row in sorted(rows, key=lambda row: row.id, reverse=True)]
+
+    async def message(self, channel, message_id):
+        """One message by its ID, as Discord answers it: a 404 once it's gone."""
+        row = next((row for row in self.rows if row.id == int(message_id)), None)
+        if row is None:
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+        return {'id': str(row.id), 'message': row}
 
     def add(self, at, user=11, bot=False, text='I love trance'):
         row = SimpleNamespace(id=int(snowflake_floor(at))+1,
