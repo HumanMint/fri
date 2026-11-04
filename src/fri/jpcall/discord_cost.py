@@ -2,10 +2,13 @@
 
 import asyncio
 import logging
+import re
+import textwrap
+import uuid
 
 import discord
 
-from .contract import CallFinished, UsageUpdated
+from .contract import CallFinished, CallState, StatusChanged, UsageUpdated
 from .discord_text import chunks
 
 LOG = logging.getLogger(__name__)
@@ -47,38 +50,126 @@ def render_usage(usage, usage_final):
     return '\n'.join(lines)
 
 
+class CostDetails(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.usage, self.usage_final = (), False
+
+    @discord.ui.button(label='cost details', custom_id='jpcall:cost_details')
+    async def details(self, interaction, button):
+        pages = chunks(render_usage(self.usage, self.usage_final))
+        for index, content in enumerate(pages):
+            send = (interaction.response.send_message if index == 0
+                    else interaction.followup.send)
+            await send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    async def on_error(self, interaction, error, item):
+        LOG.warning('jpcall cost details failed: %s', type(error).__name__)
+
+
+def failure_reason(finished, failure):
+    text = finished.outcome_en.strip().casefold()
+    # Only recognize an explicit voicemail outcome, not a passing reference to it.
+    if re.match(r'^(?:(?:the call |call )?(?:went (?:straight )?to |reached ))?'
+                r'voicemail(?:[.!;:]|$)', text):
+        return 'went to voicemail'
+    if failure is None and finished.duration_s > 0:
+        return None
+    detail = (failure.detail if failure is not None else finished.outcome_en).casefold()
+    if 'busy' in detail:
+        return 'busy'
+    if any(word in detail for word in ('no answer', 'no-answer', 'did not answer', "didn't answer")):
+        return 'no answer'
+    return 'connection failed' if failure is not None else None
+
+
+def render_final(finished, usage, usage_final, failure=None):
+    reason = failure_reason(finished, failure)
+    if reason:
+        lines = [f"call didn't connect · {reason}"]
+    else:
+        lines = [f'call ended · {finished.duration_s / 60:.1f} min']
+        outcome = ' '.join(finished.outcome_en.split()) or 'no confirmed outcome.'
+        # Keep reference codes and names intact while using Fri's sentence style.
+        outcome = re.sub(r'^(The|They|It|We|I|No|Booked|Confirmed|Declined|Call|Fri)\b',
+                         lambda match: match.group().lower(), outcome)
+        short = textwrap.wrap(outcome, width=100)
+        lines.extend(short[:3])
+        if len(short) > 3:
+            lines[-1] = lines[-1][:-1] + '…'
+    known = [row.usd for row in usage if row.usd is not None]
+    pending = not usage or len(known) != len(usage)
+    estimated = pending or not usage_final or any(not row.exact for row in usage)
+    label = 'estimated cost total' if estimated else 'cost total'
+    price = f'${sum(known):.2f}' if known else 'pending'
+    suffix = ' (pending prices)' if pending and known else ''
+    lines.append(f'{label}: {price}{suffix}')
+    return '\n'.join(lines)
+
+
 class CostSummary:
-    """Update the same message on UsageUpdated. Overflow gets bounded companion pages."""
+    """One public report; the breakdown lives in the ephemeral details view."""
 
     def __init__(self, send, edit):
         self.send, self.edit = send, edit
-        self.finished = None
+        self.finished = self.failure = self.message = None
         self.usage = ()
         self.usage_final = False
-        self.messages = []
-        self._lock = asyncio.Lock()
+        self.view = CostDetails()
+        self._nonce = uuid.uuid4().int >> 64
+        self._revision = 0
+        self._event_type = 'CallFinished'
+        self._send_attempts = 0
+        self._content = None
+        self._publish_task = None
 
     async def emit(self, event):
-        async with self._lock:
-            if isinstance(event, CallFinished):
-                self.finished = event
-                self.usage, self.usage_final = event.usage, event.usage_final
-            elif isinstance(event, UsageUpdated):
-                self.usage, self.usage_final = event.usage, event.usage_final
-            else:
-                return
+        if isinstance(event, StatusChanged):
+            if event.state == CallState.FAILED:
+                self.failure = event
+            return
+        if isinstance(event, CallFinished):
+            # Replayed terminal events must not overwrite a newer posted phone price.
             if self.finished is None:
-                return
-            text = (f'call ended · {self.finished.duration_s / 60:.1f} min\n'
-                    f'{self.finished.outcome_en}\n\n'
-                    f'{render_usage(self.usage, self.usage_final)}')
-            pages = chunks(text)
-            pages += ['costs continued above.'] * (len(self.messages) - len(pages))
-            try:
-                for index, content in enumerate(pages):
-                    if index == len(self.messages):
-                        self.messages.append(await self.send(content))
-                    else:
-                        await self.edit(self.messages[index], content)
-            except discord.HTTPException as exc:
-                LOG.warning('jpcall cost write failed: HTTP %s', exc.status)
+                self.finished = event
+                if self._revision == 0:
+                    self.usage, self.usage_final = event.usage, event.usage_final
+        elif isinstance(event, UsageUpdated):
+            self.usage, self.usage_final = event.usage, event.usage_final
+        else:
+            return
+        self._revision += 1
+        self._event_type = type(event).__name__
+        self.view.usage, self.view.usage_final = self.usage, self.usage_final
+        if self.finished is None:
+            return
+        if self._publish_task is None or self._publish_task.done():
+            self._publish_task = asyncio.create_task(self._publish())
+        # A cancelled waiter must not orphan an already accepted Discord message.
+        await asyncio.shield(self._publish_task)
+
+    async def _publish(self):
+        try:
+            while True:
+                revision = self._revision
+                event_type = self._event_type
+                text = render_final(self.finished, self.usage, self.usage_final, self.failure)
+                if self.message is None:
+                    self._send_attempts += 1
+                    self.message = await self.send(text, view=self.view, nonce=self._nonce)
+                    if self._send_attempts > 1:
+                        # Nonce deduplication can return the earlier accepted message's
+                        # old body. Reconcile it with the newest price after recovering its ID.
+                        await self.edit(self.message, text, view=self.view)
+                elif text != self._content:
+                    await self.edit(self.message, text, view=self.view)
+                self._content = text
+                if revision == self._revision:
+                    return
+        except Exception as exc:
+            # Retain the message ID and pending state; never send a replacement for a failed edit.
+            LOG.warning('jpcall final report failed: %s %s', event_type, type(exc).__name__)
+
+    async def flush(self):
+        if self._publish_task is not None:
+            await asyncio.shield(self._publish_task)

@@ -408,3 +408,47 @@ def test_jpcall_open_failure_disables_only_jpcall(monkeypatch, tmp_path, caplog,
         engine.close.assert_awaited_once()
         bot.session.close.assert_awaited_once()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('standalone', [False, True])
+def test_shutdown_drains_reports_admitted_during_engine_close(monkeypatch, tmp_path, standalone):
+    from fri.jpcall.contract import CallFinished, CallRequest, UsageLine, UsageUpdated
+    from fri.jpcall.discord_command import DiscordCall
+    from fri.jpcall.discord_cost import CostSummary
+
+    async def run():
+        cfg, events = config(), []
+        engine = engine_stub(monkeypatch, cfg, events)
+        if standalone:
+            bot = devbot.DevBot(engine, 1, cfg.limits)
+        else:
+            bot = fri_bot(monkeypatch, tmp_path, cfg)
+        bot.tree.sync = AsyncMock()
+        await bot.setup_hook()
+        calls = bot.calls if standalone else bot.jpcall_calls
+        sink = DiscordCall(calls, CallRequest('r', 1, 2, 10, '+81', 'goal'), None, None)
+
+        async def send(content, **kwargs):
+            await asyncio.sleep(0)
+            events.append('report')
+            return object()
+
+        sink.cost = CostSummary(send, AsyncMock())
+
+        async def engine_close():
+            events.append('engine close')
+            await sink.emit(CallFinished('r', 'done.', 24))
+            await sink.emit(UsageUpdated('r',
+                (UsageLine('twilio', 'phone', {'minutes': 1}, .05, True),), True))
+
+        async def discord_close(client):
+            assert sink.cost.message is not None
+            assert sink.cost.usage[-1].exact
+            events.append('discord close')
+
+        engine.close.side_effect = engine_close
+        monkeypatch.setattr(discord.Client, 'close', discord_close)
+        await bot.close()
+        assert events[-3:] == ['engine close', 'report', 'discord close']
+        sink.cost.view.stop()
+    asyncio.run(run())

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import deque
 
 import discord
 from discord import app_commands
@@ -222,7 +223,8 @@ class DiscordCall:
         self.hangup = self.hangup_message = None
         self.questions = {}
         self.phase = 'planning'
-        self._events_lock = asyncio.Lock()
+        self._pending_events = deque()
+        self._event_worker = None
         self._cleanup_lock = asyncio.Lock()
         self._watchdog = None
         self._audio_monitor = None
@@ -246,15 +248,15 @@ class DiscordCall:
     async def send(self, content, **kwargs):
         return await self.text_channel.send(content, allowed_mentions=NO_MENTIONS, **kwargs)
 
-    async def edit(self, message, content):
-        await message.edit(content=content, allowed_mentions=NO_MENTIONS)
+    async def edit(self, message, content, **kwargs):
+        await message.edit(content=content, allowed_mentions=NO_MENTIONS, **kwargs)
 
     async def edit_view(self, message, view):
         if message is not None:
             try:
                 await message.edit(view=view)
-            except discord.HTTPException as exc:
-                LOG.warning('jpcall control edit failed: HTTP %s', exc.status)
+            except Exception as exc:
+                LOG.warning('jpcall control edit failed: %s', type(exc).__name__)
 
     async def start(self, interaction):
         if not self.requester(interaction) or not self.in_channel(interaction):
@@ -382,48 +384,82 @@ class DiscordCall:
             pass
 
     async def emit(self, event):
-        """Contract EventSink: UI failures must never propagate into the phone engine."""
-        if event.request_id != self.request.request_id:
-            return
-        async with self._events_lock:
+        """Admit without awaiting Discord: the engine puts a five-second deadline here."""
+        try:
+            if event.request_id != self.request.request_id:
+                return
+            if isinstance(event, CallFinished) or (isinstance(event, StatusChanged)
+                    and event.state in (CallState.ENDED, CallState.FAILED)):
+                self.phase = 'ended'
+                if self.audio is not None:
+                    self.audio.close()
+            self._pending_events.append(event)
+            if self._event_worker is None or self._event_worker.done():
+                self._event_worker = asyncio.create_task(self._drain_events())
+                self.owner._event_tasks.add(self._event_worker)
+                self._event_worker.add_done_callback(self.owner._event_tasks.discard)
+        except Exception as exc:
+            LOG.warning('jpcall event admission failed: %s %s',
+                        type(event).__name__, type(exc).__name__)
+
+    async def _drain_events(self):
+        while self._pending_events:
+            event = self._pending_events.popleft()
             try:
-                if isinstance(event, UsageUpdated):
-                    if self.cost is not None:
-                        await self.cost.emit(event)
-                    if self.pager is not None and self.phase == 'ended':
-                        await self.pager.flush()
-                    return
-                if isinstance(event, CallFinished):
-                    await self.cleanup()
-                    await self.pager.close()
-                    await self.cost.emit(event)
-                    return
-                if isinstance(event, (Utterance, Translation, QuestionClosed)):
-                    await self.pager.emit(event)
-                    if isinstance(event, QuestionClosed) and event.question_id in self.questions:
-                        await self.questions[event.question_id].close()
-                    return
-                if self.phase == 'ended':
-                    return
-                if isinstance(event, StatusChanged) and event.state in (
-                        CallState.ENDED, CallState.FAILED):
-                    await self.pager.emit(event)
-                    await self.cleanup()
-                    await self.pager.close()
-                    return
-                await self.pager.emit(event)
-                if isinstance(event, QuestionAsked):
-                    view = QuestionView(self, event)
-                    self.questions[event.question_id] = view
-                    options = ''.join(f'\n{i}. {text}'
-                                      for i, text in enumerate(event.options, 1))
-                    pages = chunks(f'a question for the group · {event.text_en}{options}')
-                    for index, content in enumerate(pages):
-                        message = await self.send(content, view=view if index == len(pages) - 1
-                                                  else None)
-                    view.message = message
+                await self._display_event(event)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+                LOG.warning('jpcall event display failed: %s CancelledError', type(event).__name__)
             except Exception as exc:
-                LOG.warning('jpcall event display failed: %s', type(exc).__name__)
+                LOG.warning('jpcall event display failed: %s %s',
+                            type(event).__name__, type(exc).__name__)
+
+    async def flush_events(self):
+        while self._event_worker is not None and not self._event_worker.done():
+            await asyncio.shield(self._event_worker)
+
+    async def _display_event(self, event):
+        if isinstance(event, UsageUpdated):
+            if self.cost is not None:
+                await self.cost.emit(event)
+            if self.pager is not None and self.phase == 'ended':
+                await self.pager.flush()
+            return
+        if isinstance(event, CallFinished):
+            # A transcript/control failure must not suppress the final report.
+            try:
+                await self.cleanup()
+                if self.pager is not None:
+                    await self.pager.close()
+            finally:
+                if self.cost is not None:
+                    await self.cost.emit(event)
+            return
+        if isinstance(event, (Utterance, Translation, QuestionClosed)):
+            await self.pager.emit(event)
+            if isinstance(event, QuestionClosed) and event.question_id in self.questions:
+                await self.questions[event.question_id].close()
+            return
+        if isinstance(event, StatusChanged) and event.state in (CallState.ENDED, CallState.FAILED):
+            # Progress stays in the transcript; terminal status belongs to the single final report.
+            if self.cost is not None:
+                await self.cost.emit(event)
+            await self.cleanup()
+            if self.pager is not None:
+                await self.pager.close()
+            return
+        if self.phase == 'ended':
+            return
+        await self.pager.emit(event)
+        if isinstance(event, QuestionAsked):
+            view = QuestionView(self, event)
+            self.questions[event.question_id] = view
+            options = ''.join(f'\n{i}. {text}' for i, text in enumerate(event.options, 1))
+            pages = chunks(f'a question for the group · {event.text_en}{options}')
+            for index, content in enumerate(pages):
+                message = await self.send(content, view=view if index == len(pages) - 1 else None)
+            view.message = message
 
 
 class DiscordCalls:
@@ -433,6 +469,7 @@ class DiscordCalls:
         self.guild_ids = frozenset(guild_ids)
         self.limits = limits
         self.active = {}
+        self._event_tasks = set()
 
     def accepts(self, interaction):
         if interaction.guild_id not in self.guild_ids:
@@ -498,8 +535,14 @@ class DiscordCalls:
         finally:
             call._operation = None
 
+    async def flush_events(self):
+        while self._event_tasks:
+            await asyncio.gather(*(asyncio.shield(task) for task in tuple(self._event_tasks)),
+                                 return_exceptions=True)
+
     async def close(self):
         await asyncio.gather(*(call.stop('shutdown') for call in list(self.active.values())))
+        await self.flush_events()
 
 
 def register(tree, client, engine, guild_ids, *, limits: Limits | None = None, audio_check=False):

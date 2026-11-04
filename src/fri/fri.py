@@ -1614,8 +1614,12 @@ class Fri(discord.Client):
                 if self.jpcall_calls is not None:
                     await self.jpcall_calls.close()
             finally:
-                if self.jpcall_engine is not None:
-                    await self.jpcall_engine.close()
+                try:
+                    if self.jpcall_engine is not None:
+                        await self.jpcall_engine.close()
+                finally:
+                    if self.jpcall_calls is not None:
+                        await self.jpcall_calls.flush_events()
         finally:
             if self.agent:
                 self.agent.close()
