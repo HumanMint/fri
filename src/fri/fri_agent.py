@@ -282,6 +282,8 @@ class Agent:
         self.unsent = {}  # In-flight Discord message ID -> when it was deleted (monotonic), oldest first.
         self.passes = weakref.WeakSet()  # Each running learning or exploration pass's Watch, while it runs (fri #325).
         self.learning_paused = False  # The last scheduled pass asked for no batch: the withdrawal queue is closed.
+        # Or the controller doesn't say which messages a pass holds it knows were withdrawn (fri #346).
+        self.learning_waits_for_gene = False
         self.saving = set()  # Fri's delivered replies whose turn is still being saved.
         # Messages a turn's model request carried -> (when (monotonic), whether Fri or Gene wrote it), oldest first:
         # see unsend and edit.
@@ -2461,6 +2463,15 @@ class Agent:
         return ({i for i in ids if int(i) in window.ids or int(i) in self.unsent} | (ids & self.withdrawn.keys())
                 | self.saved_turns.withheld(ids))
 
+    async def learning_offered(self):
+        """Whether the controller says which messages a learning pass holds it knows were withdrawn (see gene_withdrawn),
+        which a pass needs before it sends anything. While it doesn't, its contract is read again first, no more often
+        than the withdrawal queue's own reread allows (REREAD_SECONDS), so a controller upgraded since resumes learning
+        (fri #346)."""
+        if LEARNING_WITHDRAWALS not in getattr(self.fri, 'capabilities', ()):
+            await self.saved_turns.reread()
+        return LEARNING_WITHDRAWALS in getattr(self.fri, 'capabilities', ())
+
     async def gene_withdrawn(self, batch, held):
         """Of these (message ID, author) a learning pass is about to send, those Gene knows were withdrawn, as its
         finish would refuse them: a withdrawal only Gene knows about, one Fri never saw (fri #335). A controller that
@@ -2473,9 +2484,14 @@ class Agent:
             raise ValueError("Messages Gene knows were taken back can't be told apart; this pass waits")
         answer = await self.fri.api('POST', f'/agent/learning/{batch}/withdrawn',
                                     {'messages': [{'id': i, 'user_id': user} for i, user in held]})
-        if not isinstance(answer, dict) or not isinstance(answer.get('withdrawn'), list):
+        withdrawn = answer.get('withdrawn') if isinstance(answer, dict) else None
+        asked = {i for i, _ in held}
+        # Only the IDs it was asked about, as strings: anything else (null, an object, a number, another ID) means the
+        # answer can't be trusted at all, so nothing is sent (fri #346).
+        if (not isinstance(withdrawn, list) or len(withdrawn) > len(asked)
+                or not all(isinstance(i, str) and i in asked for i in withdrawn)):
             raise ValueError("What Gene knows was taken back couldn't be read; this pass waits")
-        return {str(i) for i in answer['withdrawn']}
+        return set(withdrawn)
 
     def unmoved(self, channel, records, held, window=None, verify=None):
         """A learning pass's summary request's fence (Agent.run's `erased`, see learn and explore), so no erased
@@ -2543,6 +2559,11 @@ class Agent:
             # owner's own run is refused before it asks too (see fri_actions).
             self.learning_paused = self.saved_turns.closed()
             if self.learning_paused:
+                return
+            # Nor while the controller can't say which messages it knows were withdrawn: the pass's request would wait
+            # anyway, and its claim would spend the day's allowance (fri #346). Read again first, it may say now.
+            self.learning_waits_for_gene = not await self.learning_offered()
+            if self.learning_waits_for_gene:
                 return
             claim = await self.fri.api('POST', '/agent/learning/claim')
         if not claim:

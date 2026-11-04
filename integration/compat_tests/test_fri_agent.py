@@ -214,7 +214,8 @@ def test_behavior_preview_rejects_nonowner_and_spoofed_message():
 def test_fri_chat_archive_never_enters_startup_learning(monkeypatch):
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=AsyncMock(),
-            get_channel=lambda _: SimpleNamespace(id=789), wait_until_ready=AsyncMock())
+            get_channel=lambda _: SimpleNamespace(id=789), wait_until_ready=AsyncMock(),
+            capabilities=frozenset({'learning-withdrawals'}))  # Else no batch is asked for (fri #346).
         agent = Agent(fri)
         agent.dedicated = 789
         agent.state['channels'] = ['789']

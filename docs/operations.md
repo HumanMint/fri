@@ -272,8 +272,13 @@ advertises it, so the controller must be released first.
   dropped, so a deletion or edit whose event never reached Fri doesn't go (fri #335). Then a
   controller offering `learning-withdrawals` says which of the messages it knows were withdrawn
   (`/agent/learning/{batch}/withdrawn`, what the pass's finish would refuse), and those go too; the
-  planner's historical topics are checked the same way. A controller without it can't say, so nothing
-  is sent: the pass stops as a failed read does and keeps its progress, its batch read again.
+  planner's historical topics are checked the same way. Only the IDs it was asked about count: an answer
+  with anything else (null, an object, a number, another ID) can't be trusted, so nothing is sent, and the
+  pass stops as a failed read does and keeps its progress, its batch read again (fri #346). A controller
+  without it can't say, so no batch is asked for: a scheduled pass skips, the owner's run is refused
+  saying why, and `fri health` says learning waits for it. Its contract is read again before each pass
+  (at most once a minute), so learning resumes once it's offered. One that stops offering it after a
+  batch was claimed holds the pass back as a failed read does.
 - **Withdrawn messages' saved exchanges.** When a member's message Fri saved an exchange with is
   edited, however long ago Fri last carried it (fri #174), or deleted, Fri asks a controller that
   offers `turn-withdrawal` to drop that exchange through `/chat/turn/withdraw`, so the old words stop

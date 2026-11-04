@@ -103,10 +103,37 @@ def test_a_learning_pass_never_sends_what_only_gene_knows_was_withdrawn(learning
 
 
 def test_a_learning_pass_holds_back_where_gene_cant_say_what_was_withdrawn(learning, monkeypatch):  # noqa: F811
-    """A controller that can't say which messages it knows were withdrawn (before learning-withdrawals): nothing is
-    sent, and the pass stops as a failed read does, keeping its progress, so its batch is read again (fri #335)."""
+    """A controller that stopped saying which messages it knows were withdrawn after the batch was claimed (rolled back
+    under the pass): nothing is sent, and the pass stops as a failed read does, keeping its progress, so its batch is
+    read again (fri #335). One that doesn't say before the claim gets none asked for (see test_fri_pass_pause)."""
     async def scenario():
-        agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch, older=True)
+        agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch)
+        signing.append(lambda: setattr(agent.fri, 'capabilities', agent.fri.capabilities-{'learning-withdrawals'}))
+        await agent.learn()
+        assert asked == [] and 'learning pass could not complete' in finishes[-1]['error']
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('answer', [lambda first: [None], lambda first: [{'id': first}], lambda first: [True],
+                                    lambda first: ['1'], lambda first: [int(first)], lambda first: [first, None]],
+                         ids=['null', 'an object', 'a boolean', 'an ID it was not asked about', 'a number',
+                              'one good, one null'])
+def test_a_learning_pass_sends_nothing_on_a_withdrawn_list_it_cant_trust(learning, monkeypatch, answer):  # noqa: F811
+    """fri #346 item 1, the issue's repro: member 11's message is withdrawn through Gene alone while the summary request
+    signs in, and Gene's answer names it as null. Fri read that as "None", matching nothing, and sent both records. An
+    object, a boolean, an ID it wasn't asked about or a number went the same way. Only the IDs it asked about, as
+    strings, count; anything else is a failed check: nothing is sent, and the pass keeps its progress."""
+    async def scenario():
+        agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch)
+        signing.append(lambda: store.withdraw_saved('123', [first], deleted=True))
+        api, said = agent.fri.api, answer(first)
+
+        async def answering(method, path, payload=None):
+            result = await api(method, path, payload)
+            return {'withdrawn': said} if path.endswith('/withdrawn') else result
+
+        agent.fri.api = answering
         await agent.learn()
         assert asked == [] and 'learning pass could not complete' in finishes[-1]['error']
 
