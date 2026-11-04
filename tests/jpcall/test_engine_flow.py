@@ -286,7 +286,8 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(tmp_path, monkeypatch
             await settled(lambda: any(isinstance(e, QuestionClosed) for e in events.items))
             closed = next(e for e in events.items if isinstance(e, QuestionClosed))
             assert closed.reason == 'answered'
-            peer.tool('end_call', {'outcome_en': 'Lunch available; no reservation confirmed.'}, 'end1')
+            peer.tool('end_call', {'outcome_en': 'Lunch available; no reservation confirmed.'},
+                      'end1')
             await asyncio.wait_for(call._finished.wait(), 1)
             finish = next(e for e in events.items if isinstance(e, CallFinished))
             assert not finish.usage_final and 'No reservation was confirmed' in finish.outcome_en
