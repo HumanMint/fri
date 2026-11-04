@@ -188,7 +188,14 @@ def catch_up_channel(channels, reads, rows):
                         key=lambda m: m.id, reverse=True)
         for message in newest[:kwargs['limit']]:
             yield message
+
+    async def fetch_message(mid):  # By its ID, as Discord answers: a 404 once it's gone.
+        found = next((message for message in messages if message.id == mid), None)
+        if found is None:
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+        return found
     channels[1].history = history
+    channels[1].fetch_message = fetch_message
     return messages
 
 
