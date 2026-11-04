@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 
 from compat_tests.test_api import headers
-from compat_tests.test_fri_exploration import archive, row
+from compat_tests.test_fri_exploration import archive, by_id, offered, row
 from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
 from fri.fri_agent import Agent
 
@@ -22,6 +22,7 @@ def explore(learning, monkeypatch, erase_at):  # noqa: F811
     yet. Returns each pass's model requests, as (kind, data)."""
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
+    capabilities = offered(client)
     old, later = row(clock[0]-120*86400), row(clock[0]-160*86400, text='minecraft redstone was fun')
     channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()),
                               permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True))
@@ -62,7 +63,8 @@ def explore(learning, monkeypatch, erase_at):  # noqa: F811
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), http=SimpleNamespace(request=http),
+                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), capabilities=capabilities,
+                              http=SimpleNamespace(request=by_id(http, [old, later])),
                               chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri)
         agents.append(agent)

@@ -142,7 +142,12 @@ async def explore(agent, claim):
                 words, so their Gene revision is held to the one the context was read at, and their erasures here to
                 theirs from before it was asked for. Moved, nothing is asked (fri #292, #304). Then, with nothing
                 awaited after it, a topic whose message was taken back since the pass began is left out of the request
-                (fri #325)."""
+                (fri #325). Before those, one whose message Gene knows was withdrawn, which Fri may never have seen
+                (fri #335)."""
+                topics = context.get('historical_topics') or []
+                gone = await agent.gene_withdrawn(claim['id'], [(topic.get('source_id'), targeted) for topic in topics
+                                                                if str(topic.get('source_id') or '').isdigit()])
+                context['historical_topics'] = [topic for topic in topics if str(topic.get('source_id')) not in gone]
                 now = await agent.profile(channel.id, targeted)
                 if (not now['enabled'] or now['revision'] != read_at or
                         agent.forgotten.get(targeted, 0) != forgotten):
@@ -182,11 +187,29 @@ async def explore(agent, claim):
                 'display_name': clean(member.display_name, 80), 'revision': profile['revision'],
                 'text': clean(row['content'], 500), 'at': discord.utils.snowflake_time(int(row['id'])).timestamp()})
             held.append((user, baseline.get(user, 0)))
+
+        async def verify(kept):
+            """Signed in, each row read again from Discord by its ID (fri #335; the archive's index may lag a
+            deletion): one gone, or reading otherwise now, was withdrawn whether or not its event reached Fri; then
+            what Gene knows was. Another failure to read one is the pass's own: nothing is sent."""
+            gone = set()
+            for record in kept:
+                route = Route('GET', '/channels/{channel_id}/messages/{message_id}', channel_id=channel.id,
+                              message_id=record['id'])
+                try:
+                    found = await agent.fri.http.request(route)
+                except discord.NotFound:
+                    found = None
+                if not (isinstance(found, dict) and str((found.get('author') or {}).get('id')) == record['user_id']
+                        and clean(found.get('content') or '', 500) == record['text']):
+                    gone.add(record['id'])
+            return gone | await agent.gene_withdrawn(claim['id'], [(record['id'], record['user_id'])
+                                                                   for record in kept if record['id'] not in gone])
         if records:
             output, usage, status = await agent.run('summary', SUMMARIZER,
                 {'focus': {'member_id': plan['member_id'], 'term': plan['term']}, 'messages': records},
                 FINDINGS, model=claim['model'], effort=claim['effort'],
-                erased=agent.unmoved(channel.id, records, held, window))
+                erased=agent.unmoved(channel.id, records, held, window, verify))
             add_usage(counters, usage)
             # The fence leaving nothing to send ('erased', see Agent.run) is an empty batch, not a failed summary.
             if status not in ('completed', 'erased'):
