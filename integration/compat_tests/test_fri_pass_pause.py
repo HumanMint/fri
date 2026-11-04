@@ -192,9 +192,10 @@ def test_a_learning_pass_cancelled_while_reading_leaves_no_watch(learning, monke
 
 def test_an_archive_search_cancelled_while_reading_the_roster_leaves_no_watch(learning):  # noqa: F811
     """The same for an exploration pass, stopped while it reads the role's members."""
-    from compat_tests.test_fri_exploration import archive
+    from compat_tests.test_fri_exploration import archive, offered
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
+    offered(client)  # A pass asks for no batch from a controller without learning-withdrawals (fri #346).
 
     async def api(method, path, payload=None):
         return client.request(method, path, json=payload, headers=headers('fri')).json()

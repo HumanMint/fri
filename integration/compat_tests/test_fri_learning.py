@@ -32,6 +32,13 @@ def learning(tmp_path, monkeypatch):
     return clock, store, settings, agent
 
 
+def needs_learning_withdrawals(client):
+    """A pass asks for a batch only from a controller that says which messages it knows were withdrawn (fri #346): a
+    test of one that learns skips against a controller that doesn't."""
+    if 'learning-withdrawals' not in client.get('/fri/contract', headers=headers('fri')).json()['capabilities']:
+        pytest.skip('needs a controller offering learning-withdrawals')
+
+
 def value(store, key):
     with store.connection() as db:
         return AgentStore.get(db, key)
@@ -74,6 +81,7 @@ def test_initial_scan_then_new_messages_drain_without_skips_after_restart(learni
     store.personal_control('13', 'disable')
     owner = SimpleNamespace(send=AsyncMock())
     client = TestClient(create_app(settings))
+    needs_learning_withdrawals(client)
     requests, summaries = [], []
 
     async def api(method, path, payload=None):
@@ -288,6 +296,7 @@ def test_learning_keeps_what_a_member_is_working_on_in_its_channel(learning):
     channel = HistoryChannel()
     channel.add(clock[0]-100, text="I'm building a Factorio mod")
     client = TestClient(create_app(settings))
+    needs_learning_withdrawals(client)
     asked = []
 
     async def api(method, path, payload=None):
