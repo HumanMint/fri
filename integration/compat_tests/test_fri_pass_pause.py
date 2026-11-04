@@ -292,3 +292,36 @@ def test_the_owners_learning_run_is_refused_with_why_while_the_queue_is_closed(m
             await fri.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('why', [['capacity'], ['unreadable'], ['capacity', 'unreadable'], None],
+                         ids=['capacity', 'unreadable', 'both', 'an older fri'])
+def test_the_owners_learning_run_says_why_saved_context_is_held_back(monkeypatch, tmp_path, why):
+    """fri #361: with saved context held back because more withdrawals were queued than Fri keeps, the owner's own run
+    paused rightly, but said a withdrawals record couldn't be read. It gives the reasons fri health gives, as far as
+    they're known (none for a deadline an older Fri wrote), and still asks for no batch."""
+    import json
+    import time
+
+    from compat_tests.test_fri_actions import harness
+    from fri.fri_actions import Actions
+
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        fri.api = AsyncMock(return_value={})
+        agent.fri.data = tmp_path
+        marker = {'closed_until': time.time()+86400, **({'why': why} if why is not None else {})}
+        (tmp_path/CLOSED_RECORD).write_text(json.dumps(marker))
+        agent.saved_turns = SavedTurns(agent)
+        assert agent.saved_turns.closed()
+        try:
+            blocked = (await Actions(agent, 10, 999, False).execute({'kind': 'run_learning', 'channel_id': ''}))['blocked']
+            unreadable = "couldn't be read" in blocked or 'could not be read' in blocked
+            assert unreadable is ('unreadable' in (why or ()))
+            assert ('more withdrawals were queued' in blocked) is ('capacity' in (why or ()))
+            assert 'Learning is paused' in blocked and 'fri health' in blocked
+            assert not [c for c in fri.api.await_args_list if c.args[1] == '/agent/learning/request']
+        finally:
+            await fri.close()
+
+    asyncio.run(scenario())
