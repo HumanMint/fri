@@ -38,7 +38,8 @@ jpcall is Fri-only. It does not use the Gene controller.
 - Holds are app-timed: an apology about every 15 s and a call-back fallback after the hold limit.
 - Transcripts include third parties. They live only in the Discord messages; jpcall persists no call content.
   The usage ledger stores counts and costs only.
-- Costs: every model call and the Twilio leg is metered; the summary shows tokens/minutes and USD per component,
+- Costs: every model call and the Twilio leg is metered. One compact final message shows
+  the outcome and total; `cost details` shows component tokens/minutes and USD ephemerally,
   marking estimates and pending Twilio prices.
 
 ## Discord development
@@ -89,9 +90,17 @@ operations do not use the Gene controller. Disabled configuration keeps the exis
 and channel behavior. The isolated Discord branch also treats an absent engine configuration
 module as unavailable; real mode requires the separately implemented engine modules.
 
-The cost summary lists units and USD per component/model, then sums input and output tokens
-across models. Cached modality counts are included once; explicit aggregate token counts take
-precedence over breakdowns. Prices retain `~` for estimates and `pending` until posted.
+The public final report has the call duration, one to three short outcome lines and a cost
+total. Busy, no-answer and voicemail outcomes get a plain `call didn't connect` line. Exact
+phone prices edit that same message; repeated finish events never create additional reports.
+`cost details` opens the per-component/model units and USD privately, including input/output
+token totals across models. Cached counts are included once, with `~` for estimates and
+`pending` for unposted prices. A stable Discord nonce also deduplicates initial send retries.
+
+EventSink admission does not await Discord HTTP. An owned worker serializes the display work,
+so the engine's delivery deadline cannot cancel an accepted message before its ID is stored.
+Shutdown drains display work again after engine close, before closing Discord. No call content
+is written to disk by the display worker.
 
 ### Audio diagnostic
 

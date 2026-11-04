@@ -219,7 +219,11 @@ class DevBot(discord.Client):
                 if self.engine is not None:
                     await self.engine.close()
             finally:
-                await super().close()
+                try:
+                    if self.calls is not None:
+                        await self.calls.flush_events()
+                finally:
+                    await super().close()
 
 
 def main():

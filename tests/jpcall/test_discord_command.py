@@ -30,6 +30,11 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, 'getaddrinfo', deny)
 
 
+async def deliver(call, event):
+    await call.emit(event)
+    await call.flush_events()
+
+
 class Message:
     def __init__(self, content=None, **kwargs):
         self.content, self.kwargs = content, kwargs
@@ -129,6 +134,7 @@ class Setup:
     async def start(self):
         call, interaction = await self.plan()
         await call.brief_view.dial.callback(self.interaction())
+        await call.flush_events()
         return call
 
 
@@ -274,11 +280,11 @@ def test_finish_during_start_and_late_price_update_after_disconnect():
         call = await setup.start()
         assert call.phase == 'ended' and not setup.calls.active
         setup.session.hang_up.assert_awaited_once_with('closed_during_start')
-        summary = call.cost.messages[0]
+        summary = call.cost.message
         assert 'pending' in summary.content
-        await call.emit(UsageUpdated(call.request.request_id,
+        await deliver(call, UsageUpdated(call.request.request_id,
                                     (UsageLine('twilio', 'phone', {'minutes': 1}, .1, True),), True))
-        assert call.cost.messages[0] is summary
+        assert call.cost.message is summary
         assert 'pending' not in summary.content and 'booked.' in summary.content
     asyncio.run(run())
 
@@ -287,7 +293,7 @@ def test_question_membership_modal_first_answer_and_close():
     async def run():
         setup = Setup()
         call = await setup.start()
-        await call.emit(QuestionAsked(call.request.request_id, 'q', 'six?', ('yes', 'no')))
+        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?', ('yes', 'no')))
         view = call.questions['q']
         outsider = setup.interaction(11)
         outsider.user.voice = None
@@ -301,7 +307,7 @@ def test_question_membership_modal_first_answer_and_close():
                              view.submit(setup.interaction(12), 'no'))
         setup.session.answer.assert_awaited_once_with('q', 'yes', 11)
         assert view.closed and all(child.disabled for child in view.children)
-        await call.emit(QuestionClosed(call.request.request_id, 'q', 'answered', 'yes'))
+        await deliver(call, QuestionClosed(call.request.request_id, 'q', 'answered', 'yes'))
         await call.stop('test')
     asyncio.run(run())
 
@@ -310,7 +316,7 @@ def test_membership_rechecked_after_defer_and_terminal_status_closes_question():
     async def run():
         setup = Setup()
         call = await setup.start()
-        await call.emit(QuestionAsked(call.request.request_id, 'q', 'six?'))
+        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?'))
         view = call.questions['q']
         member = setup.interaction(11)
 
@@ -321,8 +327,9 @@ def test_membership_rechecked_after_defer_and_terminal_status_closes_question():
         member.response.defer = defer
         await view.submit(member, 'yes')
         setup.session.answer.assert_not_awaited()
-        await call.emit(StatusChanged(call.request.request_id, CallState.FAILED, 'busy'))
+        await deliver(call, StatusChanged(call.request.request_id, CallState.FAILED, 'busy'))
         assert not setup.calls.active and view.closed
+        await deliver(call, CallFinished(call.request.request_id, 'busy', 0))
         assert 'busy' in '\n'.join(m.content or '' for m in setup.messages)
     asyncio.run(run())
 
@@ -333,8 +340,8 @@ def test_event_sink_http_failure_does_not_escape_and_still_disconnects():
         call = await setup.start()
         setup.channel.send.side_effect = discord.HTTPException(
             SimpleNamespace(status=429, reason='rate limit'), 'try later')
-        await call.emit(QuestionAsked(call.request.request_id, 'q', 'six?'))
-        await call.emit(CallFinished(call.request.request_id, 'done.', 10))
+        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?'))
+        await deliver(call, CallFinished(call.request.request_id, 'done.', 10))
         assert not setup.calls.active and call.audio.read() == b''
         setup.voice.disconnect.assert_awaited_once_with(force=True)
     asyncio.run(run())
@@ -407,9 +414,9 @@ def test_late_translation_after_finish_updates_original_line():
     async def run():
         setup = Setup()
         call = await setup.start()
-        await call.emit(Utterance(call.request.request_id, '1', 'callee', 'はい', 0))
-        await call.emit(CallFinished(call.request.request_id, 'done.', 10))
-        await call.emit(Translation(call.request.request_id, '1', 'yes'))
+        await deliver(call, Utterance(call.request.request_id, '1', 'callee', 'はい', 0))
+        await deliver(call, CallFinished(call.request.request_id, 'done.', 10))
+        await deliver(call, Translation(call.request.request_id, '1', 'yes'))
         await call.pager.flush()
         assert 'callee · はい\n↳ yes' in call.pager.pages[0].message.content
         assert not setup.calls.active
@@ -466,7 +473,7 @@ def test_engine_audio_close_does_not_cancel_terminal_event_path():
         setup.voice.play.call_args.kwargs['after'](None)
         await asyncio.sleep(0)
         setup.session.hang_up.assert_not_awaited()
-        await call.emit(CallFinished(call.request.request_id, 'done.', 10))
+        await deliver(call, CallFinished(call.request.request_id, 'done.', 10))
         assert not setup.calls.active
         setup.voice.disconnect.assert_awaited_once_with(force=True)
     asyncio.run(run())
@@ -501,7 +508,7 @@ def test_all_controls_and_modals_have_stable_prefixed_ids():
         setup = Setup()
         call = await setup.start()
         event = QuestionAsked(call.request.request_id, 'q' * 200, 'six?', ('yes', 'no'))
-        await call.emit(event)
+        await deliver(call, event)
         view = call.questions[event.question_id]
         duplicate = QuestionView(call, event)
         assert [child.custom_id for child in view.children] == [
@@ -574,9 +581,9 @@ def test_all_messages_use_invoking_text_channel_while_voice_and_answers_stay_in_
         assert call.voice_channel is setup.channel and call.text_channel is text
         await call.brief_view.dial.callback(setup.interaction())
         assert setup.channel.connect.await_count == 1
-        await call.emit(Utterance(call.request.request_id, '1', 'callee', 'はい', 0))
-        await call.emit(Translation(call.request.request_id, '1', 'yes'))
-        await call.emit(QuestionAsked(call.request.request_id, 'q', 'six?', ('yes', 'no')))
+        await deliver(call, Utterance(call.request.request_id, '1', 'callee', 'はい', 0))
+        await deliver(call, Translation(call.request.request_id, '1', 'yes'))
+        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?', ('yes', 'no')))
         question = call.questions['q']
         outsider = setup.interaction(11)
         outsider.user.voice = None
@@ -584,12 +591,12 @@ def test_all_messages_use_invoking_text_channel_while_voice_and_answers_stay_in_
         setup.session.answer.assert_not_awaited()
         await question.submit(setup.interaction(12), 'yes')
         setup.session.answer.assert_awaited_once_with('q', 'yes', 12)
-        await call.emit(CallFinished(call.request.request_id, 'done.', 10,
+        await deliver(call, CallFinished(call.request.request_id, 'done.', 10,
                                      (UsageLine('twilio', 'phone', {'minutes': 1}, None),)))
-        summary = call.cost.messages[0]
-        await call.emit(UsageUpdated(call.request.request_id,
+        summary = call.cost.message
+        await deliver(call, UsageUpdated(call.request.request_id,
                                     (UsageLine('twilio', 'phone', {'minutes': 1}, .1, True),), True))
-        assert call.cost.messages[0] is summary
+        assert call.cost.message is summary
         assert 'pending' not in summary.content
         assert call.brief_message in setup.messages and question.message in setup.messages
         assert call.pager.pages[0].message in setup.messages and summary in setup.messages
@@ -611,4 +618,87 @@ def test_brief_shows_short_opener_and_request_fields_without_a_script_claim():
         assert text == ('opener · 안녕하세요.\n\ngoal · ' + goal + '\n\n'
                         'share · Name: Alex\nnever · No payment')
         await setup.calls.close()
+    asyncio.run(run())
+
+
+def test_engine_deadline_does_not_cancel_accepted_final_send_or_duplicate_late_price():
+    async def run():
+        setup = Setup()
+        call = await setup.start()
+        accepted, release = asyncio.Event(), asyncio.Event()
+        original = setup.channel.send.side_effect
+        reports = []
+
+        async def send(content, **kwargs):
+            message = await original(content, **kwargs)
+            if content.startswith('call ended'):
+                reports.append(message)  # Server has accepted the message; its response is delayed.
+                accepted.set()
+                await release.wait()
+            return message
+
+        setup.channel.send.side_effect = send
+        # Same deadline pattern as engine 598e1b8._deliver_event, shortened for the test.
+        async with asyncio.timeout(.01):
+            await call.emit(CallFinished(call.request.request_id, 'done.', 24,
+                                         (UsageLine('twilio', 'phone', {'minutes': 1}, None),)))
+        await accepted.wait()
+        async with asyncio.timeout(.01):
+            await call.emit(UsageUpdated(call.request.request_id,
+                (UsageLine('twilio', 'phone', {'minutes': 1}, .05, True),), True))
+        assert len(reports) == 1
+        release.set()
+        await call.flush_events()
+        assert len(reports) == 1 and call.cost.message is reports[0]
+        assert reports[0].content.endswith('cost total: $0.05')
+        assert not setup.calls.active
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('failure', [RuntimeError, asyncio.CancelledError])
+def test_transcript_failure_does_not_suppress_final_or_late_price(monkeypatch, caplog, failure):
+    async def run():
+        setup = Setup()
+        call = await setup.start()
+        call.pager.close = AsyncMock(side_effect=failure('synthetic-private-details'))
+        await call.emit(CallFinished(call.request.request_id, 'done.', 24))
+        await call.emit(UsageUpdated(call.request.request_id,
+            (UsageLine('twilio', 'phone', {'minutes': 1}, .05, True),), True))
+        await call.flush_events()
+        assert call.cost.message.content.endswith('cost total: $0.05')
+        reports = [message for message in setup.messages
+                   if (message.content or '').startswith('call ended')]
+        assert reports == [call.cost.message]
+        assert 'CallFinished' in caplog.text and failure.__name__ in caplog.text
+        assert 'synthetic-private-details' not in caplog.text
+        assert not setup.calls.active
+    asyncio.run(run())
+
+
+def test_malformed_event_is_contained_at_admission(caplog):
+    async def run():
+        setup = Setup()
+        call = await setup.start()
+        await call.emit(object())
+        assert 'admission failed: object AttributeError' in caplog.text
+        await call.stop('test')
+    asyncio.run(run())
+
+
+def test_terminal_status_and_finish_produce_only_one_public_end_report():
+    async def run():
+        setup = Setup()
+        call = await setup.start()
+        await deliver(call, StatusChanged(call.request.request_id, CallState.IN_PROGRESS))
+        await call.emit(StatusChanged(call.request.request_id, CallState.ENDED))
+        await call.emit(CallFinished(call.request.request_id, 'done.', 24))
+        await call.emit(UsageUpdated(call.request.request_id,
+            (UsageLine('twilio', 'phone', {'minutes': 1}, .05, True),), True))
+        await setup.calls.close()
+        reports = [message for message in setup.messages
+                   if (message.content or '').startswith('call ended')]
+        assert reports == [call.cost.message]
+        assert not any('call · ended' in (message.content or '') for message in setup.messages)
+        assert reports[0].content.endswith('cost total: $0.05')
+        assert 'minutes' not in reports[0].content and 'phone' not in reports[0].content
     asyncio.run(run())
