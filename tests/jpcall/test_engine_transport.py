@@ -77,6 +77,12 @@ class RealtimePeer:
         self.sent.append(event)
         if event['type'] == EVENTS['session_update']:
             self.feed({'type': EVENTS['session_updated']})
+        if event['type'] == EVENTS['response_create']:
+            response = {'id': 'command-' + event['response']['metadata']['jpcall_command'],
+                        'metadata': event['response']['metadata'], 'output': [],
+                        'usage': {'input_tokens': 0, 'output_tokens': 0}, 'status': 'completed'}
+            self.feed({'type': EVENTS['response_created'], 'response': response})
+            self.feed({'type': EVENTS['response_done'], 'response': response})
 
     async def receive(self):
         return await self.incoming.get()
@@ -119,7 +125,8 @@ class Media:
 def bridge(**kwargs):
     config = JpcallConfig.from_env(environment())
     audio, events, meter, peer = Audio(), Events(), UsageMeter(), RealtimePeer()
-    client = RealtimeClient(config, CallBrief('request1', 'Ask about lunch.', 'こんにちは。', (), ()),
+    brief = CallBrief('request1', 'Ask about lunch.', OPENING_NOTICES + 'こんにちは。', (), ())
+    client = RealtimeClient(config, brief,
                             audio, events, meter, session=RealtimeHTTP(peer), **kwargs)
     return client, audio, events, meter, peer
 
@@ -136,7 +143,7 @@ def test_realtime_ga_session_input_output_and_final_transcripts():
             assert session['audio']['output']['format'] == {'type': 'audio/pcmu'}
             assert session['audio']['input']['transcription']['language'] == 'ja'
             assert session['audio']['output']['voice'] == 'marin'
-            assert OPENING_NOTICES in session['instructions']
+            assert OPENING_NOTICES not in session['instructions']
             assert OPENING_NOTICES in peer.sent[1]['response']['instructions']
             await client.audio(ULAW)
             assert peer.sent[-1] == {'type': EVENTS['input_append'],
@@ -162,6 +169,9 @@ def test_realtime_ga_session_input_output_and_final_transcripts():
                           'content_index': 0, 'transcript': 'ありがとうございます。'}
             await client.handle_event(transcript)
             await client.handle_event(transcript)
+            await client.handle_event({'type': EVENTS['output_audio_done'],
+                                       'item_id': 'fri1', 'content_index': 0})
+            await client.mark('1')
             assert len(events.items) == 3 and events.items[-1].speaker == 'fri'
             event = {'type': EVENTS['response_done'], 'response': {
                 'id': 'r1', 'usage': realtime_usage(), 'status': 'completed', 'output': []}}
@@ -239,7 +249,8 @@ def test_receive_failure_closes_media_and_exposes_only_safe_error():
         client, audio, events, meter, peer = bridge()
         media = Media()
         await client.start(media)
-        peer.feed({'type': EVENTS['error'], 'error': {'message': 'private-dialogue-secret'}})
+        peer.feed({'type': EVENTS['error'], 'error': {
+            'code': 'session_expired', 'message': 'private-dialogue-secret'}})
         with pytest.raises(RealtimeError) as error:
             await asyncio.wait_for(client.wait(), 1)
         assert 'private' not in str(error.value)
@@ -505,6 +516,8 @@ def test_full_twilio_realtime_bridge_with_in_memory_peers(monkeypatch):
             if event['type'] == EVENTS['input_append']:
                 peer.feed({'type': EVENTS['output_audio'], 'item_id': 'fri1', 'content_index': 0,
                            'delta': base64.b64encode(ULAW).decode()})
+                peer.feed({'type': EVENTS['output_audio_done'], 'item_id': 'fri1',
+                           'content_index': 0})
                 peer.feed({'type': EVENTS['output_transcript'], 'item_id': 'fri1',
                            'content_index': 0, 'transcript': 'こんにちは。'})
                 peer.feed({'type': EVENTS['response_done'], 'response': {
@@ -521,6 +534,11 @@ def test_full_twilio_realtime_bridge_with_in_memory_peers(monkeypatch):
         server.bind(routes, SID)
 
         class ScriptedTwilio(TwilioSocket):
+            async def send_json(self, event):
+                await super().send_json(event)
+                if event['event'] == 'mark':
+                    await client.mark(event['mark']['name'])
+
             def __aiter__(self):
                 async def receive():
                     for event in [start_frame(config), {'event': 'media', 'streamSid': STREAM,
@@ -541,4 +559,132 @@ def test_full_twilio_realtime_bridge_with_in_memory_peers(monkeypatch):
         assert audio.frames == [('callee', ulaw_to_pcm16(ULAW)), ('fri', ulaw_to_pcm16(ULAW))]
         assert events.items[0].text_ja == 'こんにちは。' and socket.closed and peer.closed
         assert meter.lines()[0].component == 'realtime'
+    asyncio.run(run())
+
+
+def test_recoverable_error_keeps_receiver_alive_and_logs_only_code(caplog):
+    async def run():
+        client, audio, events, meter, peer = bridge()
+        await client.connect()
+        try:
+            codes = ('conversation_already_has_active_response', 'invalid_value', 'truncate_failed')
+            for code in codes:
+                await client.handle_event({'type': EVENTS['error'], 'error': {
+                    'code': code, 'message': 'private words or credential'}})
+            await client.audio(ULAW)
+            assert peer.sent[-1]['type'] == EVENTS['input_append'] and not peer.closed
+            assert 'private words' not in caplog.text and 'invalid_value' in caplog.text
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_setup_ignores_unrelated_events_and_prewarm_has_no_response():
+    async def run():
+        client, audio, events, meter, peer = bridge()
+        peer.feed({'type': 'rate_limits.updated', 'rate_limits': []})
+        await client.connect()
+        try:
+            assert not any(e['type'] == EVENTS['response_create'] for e in peer.sent)
+            assert not meter.lines()
+            await client.start(Media())
+            assert sum(e['type'] == EVENTS['session_update'] for e in peer.sent) == 1
+            assert peer.sent[-1]['response']['instructions'].count(OPENING_NOTICES) == 1
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_interrupted_transcript_is_marked_even_when_generation_finished_first():
+    async def run():
+        client, audio, events, meter, peer = bridge()
+        await client.start(Media())
+        try:
+            await client.handle_event({'type': EVENTS['output_audio'], 'item_id': 'fri1',
+                'content_index': 0, 'delta': base64.b64encode(ULAW).decode()})
+            await client.handle_event({'type': EVENTS['output_audio_done'], 'item_id': 'fri1',
+                                       'content_index': 0})
+            await client.handle_event({'type': EVENTS['output_transcript'], 'item_id': 'fri1',
+                                       'content_index': 0, 'transcript': '途中の文章'})
+            assert not events.items
+            await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'callee1',
+                                       'audio_start_ms': 20})
+            assert events.items[0].text_ja == '途中の文章 …'
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_invalid_tool_json_returns_tool_error_and_keeps_connection():
+    async def run():
+        async def tool(*args):
+            raise AssertionError('Invalid JSON must not reach the tool')
+        client, audio, events, meter, peer = bridge(on_tool_call=tool)
+        await client.start(Media())
+        try:
+            await client.handle_event({'type': EVENTS['response_done'], 'response': {
+                'id': 'tool-response', 'status': 'completed', 'usage': None, 'output': [{
+                    'type': 'function_call', 'status': 'completed', 'name': 'ask_group',
+                    'call_id': 'tool1', 'arguments': '{not-json'}]}})
+            for _ in range(20):
+                if any(e['type'] == EVENTS['item_create'] for e in peer.sent):
+                    break
+                await asyncio.sleep(0)
+            output = next(e for e in peer.sent if e['type'] == EVENTS['item_create'])
+            assert 'Invalid arguments' in output['item']['output'] and not peer.closed
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_app_response_waits_for_server_vad_response():
+    async def run():
+        client, audio, events, meter, peer = bridge()
+        await client.connect()
+        try:
+            await client.handle_event({'type': EVENTS['response_created'],
+                                       'response': {'id': 'vad1'}})
+            task = asyncio.create_task(client.say('少々お待ちください。', out_of_band=True))
+            await asyncio.sleep(0)
+            assert not task.done() and len(peer.sent) == 1
+            await client.handle_event({'type': EVENTS['response_done'], 'response': {
+                'id': 'vad1', 'status': 'completed', 'output': [], 'usage': None}})
+            await task
+            assert peer.sent[-1]['response']['conversation'] == 'none'
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_busy_race_retries_app_response_only_after_active_response_finishes():
+    async def run():
+        client, audio, events, meter, peer = bridge()
+        await client.connect()
+        original = peer.send_json
+        racing = [True]
+
+        async def send(event):
+            if event['type'] == EVENTS['response_create'] and racing[0]:
+                racing[0] = False
+                peer.sent.append(event)
+                peer.feed({'type': EVENTS['response_created'], 'response': {'id': 'vad-race'}})
+                peer.feed({'type': EVENTS['error'], 'error': {
+                    'code': 'conversation_already_has_active_response',
+                    'event_id': event['event_id'], 'message': 'private content'}})
+            else:
+                await original(event)
+
+        peer.send_json = send
+        try:
+            done = await client.say('少々お待ちください。', out_of_band=True)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == 1
+            assert not done.done()
+            peer.feed({'type': EVENTS['response_done'], 'response': {
+                'id': 'vad-race', 'status': 'completed', 'usage': None, 'output': []}})
+            await asyncio.wait_for(done, 1)
+            assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == 2
+        finally:
+            await client.stop()
     asyncio.run(run())

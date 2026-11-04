@@ -14,6 +14,8 @@ def normalize_number(number: str, test_numbers: Collection[str] = ()) -> str:
     compact = re.sub(r'[\s()\-]', '', normalized)
     if compact.startswith('+81'):
         national = compact[3:]
+        if national.startswith('0'):
+            national = national[1:]
     elif compact.startswith('+'):
         if re.fullmatch(r'\+[1-9][0-9]{7,14}', compact) and compact in test_numbers:
             return compact

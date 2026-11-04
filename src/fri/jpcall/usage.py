@@ -64,8 +64,9 @@ def _tokens(usage: dict, *, text_only: bool = False, output_text: bool = False) 
 
 
 class UsageMeter:
-    def __init__(self, prices: PriceTable | None = None):
+    def __init__(self, prices: PriceTable | None = None, *, destination: str = ''):
         self.prices = prices or PriceTable()
+        self._voice_rate = self.prices.voice_rate(destination)
         self._units: dict[tuple[str, str], dict[str, float]] = defaultdict(dict)
         self._unknown: set[tuple[str, str]] = set()
         self._seen: set[tuple[str, str]] = set()
@@ -122,7 +123,7 @@ class UsageMeter:
         if self._twilio is not None and self._twilio.exact and not exact:
             return
         cost = (_count(posted_usd) if posted_usd is not None else
-                None if pending else minutes * self.prices.twilio_per_minute)
+                None if pending else minutes * self._voice_rate)
         self._twilio = UsageLine('twilio', 'twilio-voice', {'minutes': float(minutes)},
                                  cost, exact)
         self._twilio_pending = pending and not exact

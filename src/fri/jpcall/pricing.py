@@ -39,6 +39,7 @@ class PriceTable:
         'gpt-transcribe': 0.0045, 'gpt-realtime-whisper': 0.017,
     })
     twilio_per_minute: float = 0.0746
+    twilio_mobile_per_minute: float = 0.185
     media_streams_per_minute: float = 0.0044
 
     def token_cost(self, model: str, units: dict[str, float]) -> float | None:
@@ -47,3 +48,8 @@ class PriceTable:
             return None
         return sum(amount * rates.get(kind, 0) / 1_000_000
                    for kind, amount in units.items())
+
+    def voice_rate(self, destination: str) -> float:
+        return (self.twilio_mobile_per_minute
+                if destination.startswith(('+8170', '+8180', '+8190'))
+                else self.twilio_per_minute)

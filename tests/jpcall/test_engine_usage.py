@@ -102,3 +102,14 @@ def test_lead_default_models_have_rates():
     meter.transcription({'type': 'duration', 'seconds': 30}, 'gpt-realtime-whisper')
     assert meter.lines()[1].usd == pytest.approx((80 + 20 * .05 + 10 * 5) / 1e6)
     assert meter.lines()[0].usd == pytest.approx(.017 / 2)
+
+
+@pytest.mark.parametrize('number,rate', [('+817012345678', .185), ('+818012345678', .185),
+    ('+819012345678', .185), ('+81312345678', .0746)])
+def test_phone_estimate_uses_destination(number, rate):
+    meter = UsageMeter(destination=number)
+    meter.twilio(61, pending=False)
+    assert meter.lines()[0].usd == pytest.approx(2 * rate)
+    assert not meter.lines()[0].exact
+    meter.twilio(61, posted_usd=.2, exact=True)
+    assert meter.lines()[0].usd == .2 and meter.lines()[0].exact
