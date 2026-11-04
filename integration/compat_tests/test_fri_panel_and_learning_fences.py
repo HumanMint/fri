@@ -26,6 +26,7 @@ from fri.fri_notices import notice_text
 from fri.panels import PrivatePanels
 
 QUESTION = 'what is the current Python release?'
+LEARNING_WITHDRAWALS = 'learning-withdrawals'  # Gene says which messages a pass holds it knows were withdrawn.
 
 
 def panel(fri):
@@ -269,15 +270,20 @@ def test_a_memory_control_from_the_panel_still_hears_how_it_went(monkeypatch, tm
     asyncio.run(scenario())
 
 
-def batch(learning, monkeypatch):  # noqa: F811 (the fixture's value)
+def batch(learning, monkeypatch, older=False):  # noqa: F811 (the fixture's value)
     """Members 11 and 14 each with a public message in channel 1, a learning pass over them, the real fenced model call
-    (Agent.run) with the summary request captured, and what the pass finished with."""
+    (Agent.run) with the summary request captured, and what the pass finished with. A pass sends only once Gene says
+    which of its messages it knows were withdrawn (learning-withdrawals, fri #335), so this needs a controller that
+    can; `older`: as one that can't, whatever this one offers."""
     clock, store, settings, scheduler = learning
     settings = replace(settings, agent_history_channels='1')
     scheduler = AgentStore(store, settings)
     channel = HistoryChannel()
     first, second = channel.add(clock[0]-100, user=11), channel.add(clock[0]-90, user=14, text='I like chess')
     client = TestClient(create_app(settings))
+    offered = set(client.get('/fri/contract', headers=headers('fri')).json()['capabilities']) & {LEARNING_WITHDRAWALS}
+    if not offered and not older:
+        pytest.skip('needs a controller offering '+LEARNING_WITHDRAWALS)
     finishes, asked, signing = [], [], []
 
     async def api(method, path, payload=None):
@@ -287,7 +293,8 @@ def batch(learning, monkeypatch):  # noqa: F811 (the fixture's value)
             finishes.append(payload)
         return response.json()
 
-    fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api,
+    fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, capabilities=frozenset(
+                              () if older else offered),
                           get_channel=lambda _: channel, get_user=lambda _: SimpleNamespace(send=AsyncMock()))
     agent = Agent(fri)
     agent.state = scheduler.state()
