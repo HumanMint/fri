@@ -385,6 +385,10 @@ class Watch:
         if getattr(agent, 'summaries_wait_for_gene', False):  # A build skipped for it (fri #333, #348 round 1).
             lines.append("- member summaries: paused, the controller doesn't name a summary's messages "
                          '(summary-sources), so none can be checked; they resume once it does')
+        if getattr(agent, 'learning_waits_for_gene', False):  # A scheduled pass skipped for it (fri #346).
+            lines.append("- learning: paused, the controller doesn't say which messages it knows were taken back "
+                         "(learning-withdrawals); its contract is read again before each pass, and learning resumes "
+                         'once it does')
         if agent:
             from .fri_ledger import describe, describe_forwards
             outcomes = agent.ledger.snapshot()
