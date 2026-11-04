@@ -477,3 +477,136 @@ def test_an_older_fri_started_during_the_outage_holds_back_what_the_journal_hold
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+# Sol round 1 of #352: three NEW blockers and a should.
+
+DERIVED = 'derived-synthetic-marker'  # Fri's saved reply to someone else, whose request carried the message.
+
+
+class Stop(BaseException):
+    """The process stops here."""
+
+
+def failing_writes(monkeypatch, error, names=None, times=None):
+    """Fri's private writes to these files (any but the closed marker, for None) fail: `error` raised, an exception
+    class or instance; `times` of them (all, for None)."""
+    import fri.fri_turn_withdrawal as withdrawal
+    real, left = withdrawal.private_json, [times]
+    def writing(path, data):
+        if (path.name in names if names else path.name != CLOSED) and (left[0] is None or left[0] > 0):
+            if left[0] is not None:
+                left[0] -= 1
+            raise error
+        return real(path, data)
+    monkeypatch.setattr(withdrawal, 'private_json', writing)
+    return lambda: monkeypatch.setattr(withdrawal, 'private_json', real)
+
+
+@pytest.mark.parametrize('failure', ['the process stops before it is written', 'its write fails on a full disk'])
+def test_the_b1_repro_a_withdrawal_never_written_down_stays_held_back_after_a_restart(monkeypatch, tmp_path, failure):
+    """B1: a withdrawal made while the record couldn't be read, whose own write never landed (the process stopped
+    before it, or the disk was full), and a restart once the record reads: its exchange stays out of the next model
+    request, as main's closure keeps it."""
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier, outage, _ = await outage_start(w, tmp_path, monkeypatch)
+            more = await earlier_exchange(w, 'fri explain '+OTHER)
+            restore = failing_writes(monkeypatch, Stop() if failure.startswith('the process') else
+                                     OSError(errno.ENOSPC, 'injected'))
+            if failure.startswith('the process'):
+                with pytest.raises(Stop):
+                    await delete(w, more)
+            else:
+                await delete(w, more)
+            restore()
+            outage['down'] = False
+            w.agent.saved_turns = SavedTurns(w.agent)  # Restarted; the record reads.
+            recovering(monkeypatch)
+            request = await next_request(w)
+            assert OTHER not in request and MARKER not in request
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+async def derived_reply(w, message):
+    """Member 30's saved exchange, whose model request carried `message` and whose reply repeats it."""
+    asked = w.said('fri what did they mean', user=30)
+    source = {'kind': 'discord_message', 'id': str(asked.id), 'user_id': '30', 'channel_id': '1', 'guild_id': '123',
+              'display_name': 'member'}
+    w.store.save_chat('123', 'public:1', '30', 0, 'fri what did they mean', 'they meant '+DERIVED, 'model', 'high',
+                      source=source, provenance=[], drew_on=[str(message.id)], audience='server')
+    assert DERIVED in saved(w, '30')
+
+
+async def asked_by_30(w):
+    w.requests.clear()
+    await w.agent.handle(w.said('fri hi', user=30))
+    assert w.requests
+    return str(w.requests)
+
+
+@pytest.mark.parametrize('when', ['after a restart', 'in the same process'])
+def test_the_b2_repro_a_deletion_is_never_weakened_by_an_earlier_edit(monkeypatch, tmp_path, when):
+    """B2: the record holds an edit's withdrawal for a message; while it can't be read, the message is deleted, and the
+    controller takes neither. Whatever reads them back together, the deletion stands: Fri's saved reply to someone else
+    that carried the message never reaches the model, as the controller retires it only for a deletion."""
+    async def scenario():
+        from compat_tests.test_fri_saved_withdrawal import SAVED
+        from compat_tests.test_fri_withheld_history import failing
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier = await earlier_exchange(w)
+            down = failing(w, WITHDRAW)
+            await edit(w, edited(earlier))
+            assert json.loads(on_disk(tmp_path))['pending'][str(earlier.id)]['deleted'] is False
+            await derived_reply(w, earlier)
+            by_id = failing(w, SAVED)
+            outage = disk_fails(monkeypatch, tmp_path/RECORD)
+            turns = w.agent.saved_turns = SavedTurns(w.agent)
+            assert turns.closed()
+            await delete(w, earlier, guild=123)  # Its raw delete, by ID: the controller takes neither.
+            outage['down'], down['down'], by_id['down'] = False, False, False
+            recovering(monkeypatch)
+            if when == 'after a restart':
+                w.agent.saved_turns = SavedTurns(w.agent)
+                w.agent.saved_turns.retry()  # As a start does.
+            w.agent.saved_turns.closed()
+            await settled(w)
+            assert DERIVED not in await asked_by_30(w)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_b3_repro_an_older_fri_after_the_first_deadline_still_holds_a_later_withdrawal_back(monkeypatch, tmp_path):
+    """B3: a day into the outage a withdrawal is made, and one write of the closed marker fails. Rolled back after the
+    first deadline, an older Fri reads only the record and the marker's time: the message is in one or the other, until
+    nothing it names can be kept."""
+    async def scenario():
+        from compat_tests.test_fri_withheld_history import needs_sources
+        from fri.fri_turn_withdrawal import CLOSED_SECONDS, deadline, read_record, sent_at
+        w = await world(monkeypatch, tmp_path)
+        needs_sources(w)  # A note's 90 days: the withdrawal outlasts the first deadline.
+        try:
+            first = time.time()
+            await outage_start(w, tmp_path, monkeypatch)
+            module_clock(monkeypatch, DAY)
+            more = await earlier_exchange(w, 'fri explain '+OTHER)
+            restore = failing_writes(monkeypatch, OSError(errno.ENOSPC, 'injected'), names={CLOSED}, times=1)
+            await delete(w, more)
+            restore()
+            await delete(w, w.said('fri another one'))  # Later writes go as they would.
+            until = deadline(raw(tmp_path, CLOSED)) or 0
+            later = first+CLOSED_SECONDS+60  # Past the first deadline, with the withdrawal still able to matter.
+            queued_at = w.agent.saved_turns.pending[str(more.id)]['queued_at']  # A day in, by the queue's clock.
+            assert max(sent_at(more.id), queued_at)+CLOSED_SECONDS > later
+            in_record = str(more.id) in read_record(raw(tmp_path))
+            assert in_record or until >= later
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
