@@ -2,9 +2,14 @@
 screen by, so nothing is claimed or sent until it holds nothing back, and the same work is built then."""
 
 import asyncio
+import datetime as dt
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from compat_tests.test_fri_member_profiles import GENERAL, run, world
-from compat_tests.test_fri_member_summaries import settled, summarizer
+import pytest
+
+from compat_tests.test_fri_member_profiles import GAMING, GENERAL, run, world
+from compat_tests.test_fri_member_summaries import settled, summarized, summarizer
 from fri.fri_member_summary import build
 from fri.fri_turn_withdrawal import SavedTurns
 
@@ -109,6 +114,129 @@ def test_a_summary_waits_once_a_message_is_taken_back_while_it_was_claimed(monke
             w.fri.api = taking_back
             assert await build(agent) == {'kept': False}
             assert seen == [] and [body['status'] for body in finished] == ['skipped']
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def timing_out(w):
+    """The controller doesn't take any withdrawal: it still holds what was taken back."""
+    api = w.fri.api
+
+    async def calling(method, path, payload=None):
+        if path.startswith('/chat/turn/withdraw'):
+            raise TimeoutError()
+        return await api(method, path, payload)
+    w.fri.api = calling
+
+
+def finished(w):
+    return [payload for path, payload in w.calls if path.endswith('/finish') and path.startswith('/agent/member-summary')]
+
+
+@pytest.mark.parametrize('when', ['while the model writes', 'while its cost is recorded'])
+@pytest.mark.parametrize('how', ['a message of it deleted', 'every saved context held back'])
+def test_what_a_summary_drew_on_taken_back_once_the_model_has_it_keeps_nothing(monkeypatch, tmp_path, when, how):
+    """fri #333 item 1, the issue's repro: the build sent member 20's exchanges, the lavender one among them, and it
+    was deleted while the model wrote (or while its usage receipt was recorded), its withdrawal timing out; or the
+    withdrawal record turned unreadable then. The summary with it was kept, and a request in another channel got it
+    while the withdrawal waited. Checked again after the model and after the receipt, nothing is kept, though what it
+    cost is recorded."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await exchanges(w)
+            settled(w, 13*3600)
+            agent = w.fri.agent
+            timing_out(w)
+
+            def take_back():
+                if how == 'a message of it deleted':
+                    agent.unsend(GENERAL, [events[2].id], 123)
+                else:
+                    (tmp_path/'withdrawals.json').write_text('{"pending": {')
+                    agent.saved_turns = SavedTurns(agent)
+                    assert agent.saved_turns.closed()
+
+            seen = summarizer(monkeypatch, w, during=take_back if when == 'while the model writes' else None)
+            if when == 'while its cost is recorded':
+                agent.record.side_effect = lambda *args, **kwargs: take_back()
+            assert await build(agent) == {'kept': False}
+            assert len(seen) == 1 and agent.record.await_count == 1  # The model was asked, and what it cost counts,
+            assert [body['status'] for body in finished(w)] == ['skipped']  # but nothing of it is kept,
+            assert summarized(w, conversation=f'public:{GAMING}') is None  # nor reaches a request elsewhere.
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('change', ['deleted', 'edited'])
+def test_a_message_changed_where_fri_never_heard_of_it_is_never_summarized(monkeypatch, tmp_path, change):
+    """fri #333 item 2, the issue's repro: member 20's lavender message is deleted (or edited) in Discord, and Fri,
+    restarted since, never hears of it, so nothing is queued. The builder sent it and kept the summary. The claim now
+    names each exchange's messages, and each is read again from Discord first: that one is left out, and withdrawn,
+    so the controller drops its exchange too; the others are summarized."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await exchanges(w)
+            agent = w.fri.agent
+            if change == 'deleted':
+                del w.posted[events[2].id]  # In Discord alone: no event reaches Fri.
+            else:
+                w.posted[events[2].id].content = 'never mind'
+                w.posted[events[2].id].edited_at = dt.datetime.now(dt.timezone.utc)
+            agent.saved_turns = SavedTurns(agent)  # Restarted, nothing queued.
+            seen = summarizer(monkeypatch, w)
+            assert await build(agent) == {'kept': True}
+            assert len(seen) == 1 and 'lavender' not in str(seen[0]['data']) and 'raid' in str(seen[0]['data'])
+            await asyncio.gather(*agent.saved_turns.tasks)
+            assert 'lavender' not in str(w.store.chat_context('123', f'public:{GENERAL}', '20')['turns'])
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_an_earlier_summary_one_of_whose_messages_is_gone_isnt_carried_on(monkeypatch, tmp_path):
+    """fri #333 item 2, its earlier summary: one built from the lavender message is carried on into the next, the
+    message deleted in Discord since, unheard. The claim names what the earlier summary drew on too: it isn't sent, and
+    the new summary replaces it."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await exchanges(w)
+            seen = summarizer(monkeypatch, w)
+            agent = w.fri.agent
+            assert await build(agent) == {'kept': True}
+            for text in ('fri raid went fine', 'fri next one friday'):
+                await w.say(GENERAL, text)
+            settled(w)
+            with w.store.connection() as db:
+                db.execute('DELETE FROM fri_member_summary_calls')  # A day later.
+            del w.posted[events[2].id]  # In Discord alone.
+            assert await build(agent) == {'kept': True} and len(seen) == 2
+            assert seen[1]['data']['previous_summary'] == ''
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_controller_that_names_no_messages_gets_no_claim(monkeypatch, tmp_path):
+    """Against a controller that doesn't name a claim's messages (before summary-sources), they can't be checked, so
+    nothing is claimed or sent (fri #333)."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await exchanges(w)
+            asked = []
+
+            async def analyze(*args, **kwargs):
+                asked.append(args)
+                return {'summary': 'x'}, {}, 'completed'
+            monkeypatch.setattr('fri.fri_member_summary.analyze', analyze)
+            w.fri.chat = SimpleNamespace(headers=AsyncMock(return_value={'Authorization': 'Bearer test'}))
+            w.fri.capabilities = w.fri.capabilities - {'summary-sources'}
+            assert await build(w.fri.agent) is None and asked == [] and claimed(w) == []
         finally:
             await w.fri.close()
     run(scenario)
