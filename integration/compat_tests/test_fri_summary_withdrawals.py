@@ -221,6 +221,81 @@ def test_an_earlier_summary_one_of_whose_messages_is_gone_isnt_carried_on(monkey
     run(scenario)
 
 
+@pytest.mark.parametrize('what', ['its exchanges', 'the earlier summary'])
+def test_a_channel_no_longer_readable_while_its_messages_are_read_again_sends_nothing_of_it(monkeypatch, tmp_path, what):
+    """Sol round 1 of #348, B2: #general was checked readable by everyone before its messages were read again from
+    Discord, and restricted while that read was out; its exchanges (or the earlier summary from it) went to the model
+    anyway. Readability is checked again once every read is back."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await exchanges(w)
+            seen = summarizer(monkeypatch, w)
+            agent = w.fri.agent
+            if what == 'the earlier summary':
+                assert await build(agent) == {'kept': True}
+                for text in ('fri gaming tonight', 'fri which map'):
+                    await w.say(GAMING, text)
+                settled(w)
+                with w.store.connection() as db:
+                    db.execute('DELETE FROM fri_member_summary_calls')  # A day later.
+            general = w.channels[GENERAL]
+            fetch = general.fetch_message
+
+            async def restricting(mid):
+                w.readable[GENERAL] = False  # Restricted while the read is out.
+                return await fetch(mid)
+
+            general.fetch_message = restricting
+            await build(agent)
+            sent = seen[-1]['data'] if len(seen) > (what == 'the earlier summary') else {}
+            assert 'raid' not in str(sent) and 'lavender' not in str(sent)
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_an_edit_before_the_save_never_withdraws_the_exchange(monkeypatch, tmp_path):
+    """Sol round 1 of #348, B3: member 20's message was edited a second before its exchange was saved, and not since.
+    The edit was read as one after the save (the save time less a margin), and its exchange and note withdrawn. One
+    that can't be told apart may be left out of a build, but nothing of it is withdrawn."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await exchanges(w)
+            with w.store.connection() as db:
+                saved_at = db.execute("SELECT at FROM chat_turns WHERE json_extract(source,'$.id')=?",
+                                      (str(events[0].id),)).fetchone()[0]
+            w.posted[events[0].id].edited_at = dt.datetime.fromtimestamp(saved_at-1, dt.timezone.utc)
+            seen = summarizer(monkeypatch, w)
+            agent = w.fri.agent
+            await build(agent)
+            await asyncio.gather(*agent.saved_turns.tasks)
+            assert not agent.saved_turns.pending and str(events[0].id) not in agent.withdrawn
+            assert 'raid tonight' in str(w.store.chat_context('123', f'public:{GENERAL}', '20')['turns'])
+            assert len(seen) == 1 and 'which build' in str(seen[0]['data'])  # The others are summarized.
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_fri_health_says_summaries_wait_for_the_controller(monkeypatch, tmp_path):
+    """Sol round 1 of #348, S1: against a controller that doesn't name a claim's messages, summaries paused without a
+    word in fri health. It says so once a build was skipped for it."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            w.fri.chat = SimpleNamespace(headers=AsyncMock(return_value={'Authorization': 'Bearer test'}))
+            w.fri.capabilities = w.fri.capabilities - {'summary-sources'}
+            assert 'summary-sources' not in await w.fri.watcher.report()
+            assert await build(w.fri.agent) is None
+            assert any('summar' in line and 'summary-sources' in line
+                       for line in (await w.fri.watcher.report()).splitlines())
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
 def test_a_controller_that_names_no_messages_gets_no_claim(monkeypatch, tmp_path):
     """Against a controller that doesn't name a claim's messages (before summary-sources), they can't be checked, so
     nothing is claimed or sent (fri #333)."""
