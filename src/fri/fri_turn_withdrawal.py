@@ -17,7 +17,8 @@ view that carried it too (see Agent.withdrawn_from). A member's "forget me" take
 One for an exchange this process saved (under the erasure guard, see kept) is kept on disk whole, so a restart sends it
 again; one by ID is retried in memory, and kept on disk only as a hold of its message's ID, so a restart holds it back
 without sending it (fri #252, see lasting). Past the queue's capacity, the oldest go, but every saved context is held
-back until nothing they name can be kept (fri #256, see prune).
+back until nothing they name can be kept (fri #256, see prune), past what a start reads from disk too, and each lasts
+from when it was queued, after anything saved from its message (fri #329, see lasts and overflowed).
 """
 
 import asyncio
@@ -47,6 +48,8 @@ RETRY_SECONDS = (2, 15, 60, 300)  # After each failure, then every five minutes 
 REREAD_SECONDS = 60  # At most this often, the controller's contract read again for a refusal (see reread).
 RECORD = 'withdrawals.json'
 CLOSED_RECORD = 'withdrawals.closed.json'  # Until when every saved context is held back (see fail_closed).
+# Why, as the closed record says (see mark_closed): a record that couldn't be read, or more queued than the queue keeps.
+UNREADABLE_CAUSE, CAPACITY_CAUSE = 'unreadable', 'capacity'
 # How long saved context stays held back after a record that couldn't be read: as long as anything a withdrawal
 # protects can be kept, by any controller (an exchange, or a note).
 CLOSED_SECONDS = max(KEPT_SECONDS, NOTED_SECONDS)
@@ -72,7 +75,10 @@ class SavedTurns:
         self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
         self.reread_at = 0.0  # time.monotonic() as the contract was last read again (see reread).
         self.closed_until = 0.0  # time.time() until which every saved context is held back (see fail_closed).
+        self.closed_for = set()  # Why (UNREADABLE_CAUSE, CAPACITY_CAUSE), as far as it's known (see mark_closed).
         self.blocked = False  # An unreadable record not yet set aside: no queue write replaces it (see persist).
+        # What the reader let go held back, but not yet written down: no queue write replaces the record (see persist).
+        self.unwritten = False
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -80,15 +86,33 @@ class SavedTurns:
     def capable(self, name):
         return name in getattr(self.agent.fri, 'capabilities', ())
 
-    def entry(self, restored=False, **what):
+    def entry(self, restored=False, queued_at=None, since=None, **what):
         """A queued withdrawal, with its own number and its member's erasure count now (see current). restored: loaded
         from what an earlier process left on disk, or rebuilt from one that was, which every entry rebuilt for that
         message keeps (see withdraw). Set only as it's read, never from what the file says, so one an earlier process
-        left can't pass as this one's, and one queued here never as an earlier one's, whatever the clock does."""
+        left can't pass as this one's, and one queued here never as an earlier one's, whatever the clock does.
+
+        queued_at: when it was queued, a whole second, rounded up (fri #329): after anything Fri saved with its message
+        before the message was taken back, so what that saved lasts at most a horizon from then (see lasts). One read
+        from disk keeps what it says, whatever the clock says now (Sol round 1 of #339): a clock set back since mustn't
+        end it early. Now where it says nothing (main's record), so it's never earlier than the truth, and for one queued
+        here; queued again (`since`, what the one it replaces said), now, but never earlier than before."""
         self.generation += 1
         user = (what.get('scope') or {}).get('user_id') or what.get('user_id')
-        return {**what, 'tries': 0, 'due': 0, 'gen': self.generation, **({'restored': True} if restored else {}),
-                **({'erasure': self.erasure(user)} if user else {})}
+        now = math.ceil(time.time())
+        if restored and queued(queued_at):
+            stamped = queued_at
+        else:
+            stamped = max(since, now) if queued(since) else now
+        return {**what, 'queued_at': stamped, 'tries': 0, 'due': 0, 'gen': self.generation,
+                **({'restored': True} if restored else {}), **({'erasure': self.erasure(user)} if user else {})}
+
+    def lasts(self, i, entry):
+        """Until when what a queued withdrawal names can be kept: a horizon (a week, or a note's 90 days from a
+        controller offering SOURCES) from the later of its message's time and when it was queued (fri #329). Its
+        message's time alone isn't enough: an exchange or a note drawn from it is saved later, and kept from then."""
+        kept = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
+        return max(sent_at(int(i)), entry.get('queued_at', 0))+kept
 
     @property
     def pending(self):
@@ -103,14 +127,15 @@ class SavedTurns:
         if self._pending is None:
             self._pending = {}
             self.closed_until = self.read_closed()
-            path, found = self.record(), {}
+            path, found, overflow = self.record(), {}, {}
             if path is not None:
                 try:
                     with path.open() as stream:
-                        found = read_record(stream)
+                        found = read_record(stream, overflow)
                 except FileNotFoundError:
                     pass  # Nothing pending.
                 except (OSError, ValueError) as exc:  # Unreadable and UnicodeDecodeError are ValueErrors.
+                    overflow.clear()  # Nothing of it is read: all of it is held back (see fail_closed).
                     self.fail_closed(path, exc)
             held = 0
             for i, facts in found.items():
@@ -122,12 +147,30 @@ class SavedTurns:
                     self._pending[i] = self.entry(hold=True, restored=True)
             if held:
                 LOG.warning('%s pending withdrawals on disk were malformed, so their messages are held back unsent', held)
+            if overflow.get('dropped'):
+                self.overflowed(overflow)
             self.tidy()
             self.prune(time.time())
             now = time.time()
             for i in self._pending:  # Taken back before the restart: still held back until they land.
                 self.marked.setdefault(i, now)
         return self._pending
+
+    def overflowed(self, overflow):
+        """The reader let the oldest go past twice the queue's capacity, to bound memory (see read_record), as the queue
+        does past it (see prune), so the same holds (fri #329): every saved context is held back until nothing they named
+        can be kept, from now on, and written down. Until that's on disk, the record isn't replaced (see persist), so a
+        restart reads all of it again. Their own times count however the clock stands, one ahead of it too, and one
+        that says no time it was queued counts from now (Sol round 1 of #339)."""
+        now = math.ceil(time.time())
+        latest = max(overflow['latest'] or 0, now if overflow['unknown'] or overflow['latest'] is None else 0)
+        kept = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
+        self.closed_until = max(self.closed_until, latest+kept)
+        self.closed_for.add(CAPACITY_CAUSE)
+        self.unwritten = not self.mark_closed(self.closed_until)
+        LOG.warning('%s pending withdrawals on disk were past what the queue keeps, so every saved context is held back '
+                    'for %s days%s', overflow['dropped'], max(1, int((self.closed_until-now)//86400)),
+                    '; that could not be written down, so the record stays as it is' if self.unwritten else '')
 
     def fail_closed(self, path, exc):
         """A record that can't be trusted at all is never read as empty: what it held back would come back. Every saved
@@ -146,6 +189,7 @@ class SavedTurns:
         way. True once no queue write can replace it."""
         now = time.time()
         self.closed_until = max(self.closed_until, now+CLOSED_SECONDS)
+        self.closed_for.add(UNREADABLE_CAUSE)
         if not self.mark_closed(self.closed_until):
             return False
         for n in range(100):
@@ -171,45 +215,53 @@ class SavedTurns:
         return None if data is None else data/CLOSED_RECORD
 
     def mark_closed(self, until):
-        """Writes until when every saved context is held back. True if it's on disk."""
+        """Writes until when every saved context is held back, and why, as far as it's known (closed_for, for fri
+        health; main reads only the time). True if it's on disk."""
         path = self.marker()
         if path is None:
             return False
         try:
-            private_json(path, {'closed_until': until})
+            private_json(path, {'closed_until': until, 'why': sorted(self.closed_for)})
+            if until >= self.closed_until:
+                self.unwritten = False  # What the reader let go is held back on disk now too (see overflowed).
             return True
         except OSError as exc:
             LOG.warning('Until when saved context is held back could not be saved: %s', type(exc).__name__)
             return False
 
     def read_closed(self):
-        """Until when every saved context is held back, as written down (see fail_closed): never past the longest
-        horizon from now, so a clock set back since can't stretch it, and a deadline cut to that is written back, so
-        later starts keep it. One that can't be read closes for the whole horizon from now, written back too. One that's
-        over is removed. Removing it by hand ends it early (see docs/operations.md)."""
+        """Until when every saved context is held back, as written down (see fail_closed). A deadline once written down
+        is never cut short (Sol round 1 of #339): one past the longest horizon from now, from a clock set back since,
+        stands as it is, and every write after it is at least as late (see mark_closed's callers). One that can't be
+        read closes for the whole horizon from now, written back. One that's over is removed. Removing it by hand ends
+        it early (see docs/operations.md). Why it was closed is read with it (see mark_closed); one that can't be read
+        counts as an unreadable record."""
         path = self.marker()
         if path is None:
             return 0.0
         now = time.time()
         try:
             with path.open() as stream:
-                until = deadline(stream.read(256))
+                text = stream.read(256)
+            until, self.closed_for = deadline(text), causes(text)
         except FileNotFoundError:
             return 0.0
         except (OSError, ValueError):  # UnicodeDecodeError too.
             until = None
+        if until is None:
+            self.closed_for = {UNREADABLE_CAUSE}
         if until is not None and until <= now:
             try:
                 path.unlink()
             except OSError:
                 pass
             return 0.0
-        if until is None or until > now+CLOSED_SECONDS:
-            LOG.warning('Until when saved context is held back was unreadable or past %s days, so it is %s days from now',
-                        CLOSED_SECONDS//86400, CLOSED_SECONDS//86400)
+        if until is None:
+            LOG.warning('Until when saved context is held back was unreadable, so it is %s days from now',
+                        CLOSED_SECONDS//86400)
             until = now+CLOSED_SECONDS
             self.mark_closed(until)
-        return until
+        return until  # One past the longest horizon from now (a clock set back since) stands (Sol round 1 of #339).
 
     def tidy(self):
         """Unreadable records set aside, kept for someone to recover: the newest SET_ASIDE, none past CLOSED_SECONDS,
@@ -236,11 +288,15 @@ class SavedTurns:
         return time.time() < self.closed_until
 
     def status(self):
-        """For fri health and its file: until when every saved context is held back (None if it isn't), whether queued
-        withdrawals are saved to disk meanwhile, and how many wait. No IDs, nothing of the record."""
+        """For fri health and its file: until when every saved context is held back (None if it isn't), why, as far as
+        it's known ('unreadable', 'capacity'; none for a deadline an older Fri wrote), whether queued withdrawals are
+        saved to disk meanwhile, and if not, why ('unsaved_for', as closed_for), and how many wait. No IDs, nothing of
+        the record."""
         closed = self.closed()
-        return {'closed_until': self.closed_until if closed else None, 'saved_to_disk': not self.blocked,
-                'pending': len(self.pending)}
+        unsaved = UNREADABLE_CAUSE if self.blocked else CAPACITY_CAUSE if self.unwritten else None
+        return {'closed_until': self.closed_until if closed else None,
+                'closed_for': sorted(self.closed_for) if closed else [], 'saved_to_disk': unsaved is None,
+                'unsaved_for': unsaved, 'pending': len(self.pending)}
 
     def record(self):
         data = getattr(self.agent.fri, 'data', None)
@@ -253,21 +309,27 @@ class SavedTurns:
         save answered after one never records it (see kept). One by ID only as a hold, the message's ID and nothing else:
         Fri may not know whose it is, and a restart forgets any "forget me" before it, so it's never sent again from
         there (fri #224 round 3) and names no member; it holds the message back until nothing it names can be kept (see
-        prune). A hold stays one."""
+        prune). A hold stays one. Either keeps when it was queued (see entry), which names no one."""
         if 'scope' in entry:
             return {key: value for key, value in entry.items() if key not in ('gen', 'erasure', 'restored')}
-        return {'hold': True}
+        return {'hold': True, 'queued_at': entry['queued_at']}
 
     def persist(self):
         """The lasting withdrawals to disk (see lasting). Never over an unreadable record not yet set aside: it's set
         aside first, or nothing is written and every saved context stays held back for the longest horizon from now, so
-        what's queued only in memory is covered too (see fail_closed)."""
+        what's queued only in memory is covered too (see fail_closed). Nor over one whose oldest the reader let go
+        before what holds them back is written down: that's written first, or nothing is (see overflowed)."""
         if path := self.record():
             pending = self.pending  # Read first: reading is what finds a record unreadable.
             if self.blocked and not self.set_aside(path):
                 LOG.warning('Pending withdrawals were not saved: the unreadable record could not be set aside, so it '
                             'stays as it was and every saved context stays held back')
                 return
+            if self.unwritten and not self.mark_closed(self.closed_until):
+                LOG.warning('Pending withdrawals were not saved: holding back what the queue let go could not be '
+                            'written down, so the record stays as it was and every saved context stays held back')
+                return
+            self.unwritten = False
             try:
                 private_json(path, {'pending': {i: self.lasting(entry) for i, entry in pending.items()}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
@@ -325,7 +387,8 @@ class SavedTurns:
             if entry is not None:
                 if self.offered():
                     self.pending[str(i)] = self.entry(scope=entry[1], revision=entry[2], restored=known.get('restored'),
-                                                      deleted=deleted or known.get('deleted') is True)
+                                                      deleted=deleted or known.get('deleted') is True,
+                                                      since=known.get('queued_at'))
                     queued = True
             elif server is not None and sent_at(i) > now-horizon:
                 if self.offered() and self.capable(SAVED_CAPABILITY):
@@ -334,12 +397,14 @@ class SavedTurns:
                     elif 'scope' in known:  # Fri knows where it was saved: that one stands, deleted or not.
                         if deleted and not known.get('deleted'):
                             self.pending[str(i)] = self.entry(**{key: known[key] for key in ('scope', 'revision')},
-                                                              deleted=True, restored=known.get('restored'))
+                                                              deleted=True, restored=known.get('restored'),
+                                                              since=known.get('queued_at'))
                             queued = True
                     elif not known or (deleted and not known.get('deleted')) or (i in authors and 'user_id' not in known):
                         author = authors.get(i, known.get('user_id'))
                         self.pending[str(i)] = self.entry(server=str(server), deleted=deleted or known.get('deleted')
                                                           is True, restored=known.get('restored'),
+                                                          since=known.get('queued_at'),
                                                           **({'user_id': author} if author else {}))
                         queued = True
             else:
@@ -370,10 +435,10 @@ class SavedTurns:
         self.persist()
 
     def prune(self, now):
-        """Marks an hour, and queued withdrawals as long as anything they name can be kept (a week, or a note's 90 days
-        from a controller offering SOURCES), at most MOST of them. Past that, the oldest messages' go first, but never
-        released (fri #256): every saved context is held back instead, until nothing they name can be kept, written
-        down first (see mark_closed), so a restart keeps it too. If that can't be written, none goes."""
+        """Marks an hour, and queued withdrawals as long as anything they name can be kept (see lasts), at most MOST of
+        them. Past that, those whose names can be kept least long go first, but never released (fri #256): every saved
+        context is held back instead, until nothing they name can be kept, written down first (see mark_closed), so a
+        restart keeps it too. If that can't be written, none goes."""
         while self.marked and len(self.marked) > MOST*5:
             del self.marked[next(iter(self.marked))]
         for i, at in list(self.marked.items()):
@@ -383,24 +448,25 @@ class SavedTurns:
                 del self.marked[i]
         if self._pending is None:
             return
-        kept = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
-        horizon = now-kept
-        old = [i for i in self._pending if sent_at(int(i)) <= horizon]
-        for i in old:
-            del self._pending[i]
-        extra = sorted(self._pending, key=int)[:max(0, len(self._pending)-MOST)]
+        lasting = {i: self.lasts(i, entry) for i, entry in self._pending.items()}
+        for i in [i for i, until in lasting.items() if until <= now]:
+            del self._pending[i], lasting[i]
+        extra = sorted(lasting, key=lambda i: (lasting[i], int(i)))[:max(0, len(lasting)-MOST)]
         if not extra:
             return
-        until = max(self.closed_until, max(sent_at(int(i)) for i in extra)+kept)
+        until, causes_then = max(self.closed_until, max(lasting[i] for i in extra)), set(self.closed_for)
+        self.closed_for.add(CAPACITY_CAUSE)
         if not self.mark_closed(until):
+            self.closed_for = causes_then
             LOG.warning('More than %s withdrawals are queued, and holding saved context back could not be written down, '
                         'so none was dropped', MOST)
             return
         self.closed_until = until
         for i in extra:
             del self._pending[i]
-        LOG.warning('%s pending withdrawals dropped, the oldest messages first: more than %s queued, so every saved '
-                    'context is held back for %s days', len(extra), MOST, max(1, int((until-now)//86400)))
+        LOG.warning('%s pending withdrawals dropped, those whose names can be kept least long first: more than %s '
+                    'queued, so every saved context is held back for %s days', len(extra), MOST,
+                    max(1, int((until-now)//86400)))
 
     def withholding(self):
         """Whether anything is held back now, so a memory view should be screened (see screen)."""
@@ -856,13 +922,18 @@ class Reader:
             self.space()
 
 
-def read_record(record):
+def read_record(record, overflow=None):
     """The pending withdrawals a record holds (a stream, or its text): message ID -> its 'scope', 'revision' and
-    'deleted', or None for one whose message ID is readable but whose rest isn't an entry Fri could send. Accepted
-    where json.loads accepts it, and read as it reads (a key given twice counts as given last). Only those fields are
-    built; anything else is checked as JSON and passed over, so neither size nor nesting can fail the read or exhaust
-    memory. At most MOST*2 entries are held while it reads, the newest messages', as the queue keeps MOST (see prune).
-    Raises Unreadable if it isn't JSON, or isn't a record of pending withdrawals."""
+    'deleted', or None for one whose message ID is readable but whose rest isn't an entry Fri could send, each with
+    'queued_at' where it says one (see entry). Accepted where json.loads accepts it, and read as it reads (a key given
+    twice counts as given last). Only those fields are built; anything else is checked as JSON and passed over, so
+    neither size nor nesting can fail the read or exhaust memory. At most MOST*2 entries are held while it reads, the
+    newest messages', as the queue keeps MOST (see prune). overflow, a dict: gets how many it let go ('dropped'), the
+    latest time any of them was sent or queued ('latest', None if none), and whether any said no time it was queued
+    ('unknown'), for the queue to hold back what they named (fri #329, see SavedTurns.overflowed). Raises Unreadable if
+    it isn't JSON, or isn't a record of pending withdrawals."""
+    overflow = {} if overflow is None else overflow
+    overflow.update(dropped=0, latest=None, unknown=False)
     reader = Reader(io.StringIO(record) if isinstance(record, str) else record)
     reader.space()
     if reader.ahead() != '{':
@@ -870,7 +941,7 @@ def read_record(record):
     pending, nameless = None, 0
     for name in reader.members():
         if name == 'pending' and reader.ahead() == '{':
-            pending, nameless = entries(reader)
+            pending, nameless = entries(reader, overflow)
         else:
             reader.skip()
             if name == 'pending':
@@ -885,7 +956,7 @@ def read_record(record):
     return pending
 
 
-def entries(reader):
+def entries(reader, overflow):
     found, nameless = {}, 0
     for i in reader.members():
         facts = entry(reader) if reader.ahead() == '{' else reader.skip()
@@ -895,14 +966,18 @@ def entries(reader):
         found[i] = facts
         if len(found) > 2*MOST:
             for old in sorted(found, key=int)[:len(found)-MOST]:
-                del found[old]
+                queued = (found.pop(old) or {}).get('queued_at')
+                at = max(sent_at(int(old)), queued or 0)
+                overflow.update(dropped=overflow['dropped']+1, unknown=overflow['unknown'] or queued is None,
+                                latest=at if overflow['latest'] is None else max(overflow['latest'], at))
     return found, nameless
 
 
 def entry(reader):
     """An entry's scope, revision and whether it was a deletion; {'hold': True} for a hold (see SavedTurns.lasting);
-    None if neither, its scope not one /chat/turn/withdraw takes. Nothing else of it decides anything."""
-    scope, revision, deleted, hold = None, None, False, False
+    None if neither, its scope not one /chat/turn/withdraw takes. Either with 'queued_at', where it says a whole second
+    (see SavedTurns.entry). Nothing else of it decides anything."""
+    scope, revision, deleted, hold, stamp = None, None, False, False, {}
     for name in reader.members():
         if name == 'scope':
             scope = place(reader) if reader.ahead() == '{' else reader.skip()
@@ -913,11 +988,14 @@ def entry(reader):
             deleted = reader.value() is True
         elif name == 'hold':
             hold = reader.value() is True
+        elif name == 'queued_at':
+            value = reader.value()
+            stamp = {'queued_at': value} if queued(value) else {}
         else:
             reader.skip()
     if scope is None:
-        return {'hold': True} if hold else None
-    return {'scope': scope, 'revision': revision, 'deleted': deleted}
+        return {'hold': True, **stamp} if hold else None
+    return {'scope': scope, 'revision': revision, 'deleted': deleted, **stamp}
 
 
 def place(reader):
@@ -942,6 +1020,17 @@ def deadline(text):
     return float(value) if type(value) in (int, float) and math.isfinite(value) else None
 
 
+def causes(text):
+    """Why a closed marker says saved context is held back (see SavedTurns.mark_closed): those of UNREADABLE_CAUSE and
+    CAPACITY_CAUSE it names, none for one an older Fri wrote or one that can't be read."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return set()
+    why = value.get('why') if isinstance(value, dict) else None
+    return {cause for cause in why if cause in (UNREADABLE_CAUSE, CAPACITY_CAUSE)} if isinstance(why, list) else set()
+
+
 def stays(sources, evidence, gone, said):
     """Whether a note stays in view: none of the messages it came from is withheld, and, for a copy of unknown source
     (None among them), no withheld message's words hold its words, as the controller would judge it."""
@@ -956,6 +1045,11 @@ def failed(text, ids, exc):
     refused = isinstance(exc, ControllerRejected) and exc.status is not None
     LOG.warning(text+(f' (refused, HTTP {exc.status}; sent again later)' if refused else ' (sent again later)'), ids,
                 type(exc).__name__)
+
+
+def queued(value):
+    """Whether it's a time a withdrawal was queued, as Fri writes one down (see SavedTurns.entry): whole seconds."""
+    return type(value) is int and 0 <= value < 2**63
 
 
 def sent_at(message_id):

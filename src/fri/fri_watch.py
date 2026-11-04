@@ -361,11 +361,16 @@ class Watch:
             waiting = '?'
         lines.append(f'- usage receipts waiting: {waiting}')
         turns = getattr(agent, 'saved_turns', None) if agent else None
-        if turns is not None and (held := turns.status())['closed_until']:  # A withdrawals record couldn't be read.
-            until = int(held['closed_until'])
-            lines.append(f"- saved context: held back until <t:{until}:f> (<t:{until}:R>), a withdrawals record "
-                         "couldn't be read" + ('' if held['saved_to_disk'] else
-                                               "; it couldn't be set aside, so new withdrawals aren't saved to disk")
+        if turns is not None and (held := turns.status())['closed_until']:  # Every saved context is held back.
+            until, why = int(held['closed_until']), held.get('closed_for') or []
+            # Why, as far as it's known: a deadline an older Fri wrote doesn't say (fri #329).
+            causes = [text for cause, text in (('unreadable', "a withdrawals record couldn't be read"),
+                                               ('capacity', 'more withdrawals were queued than Fri keeps'))
+                      if cause in why] or ["withdrawals Gene hasn't taken may name any of it"]
+            unsaved = {'unreadable': "; it couldn't be set aside, so new withdrawals aren't saved to disk",
+                       'capacity': "; that couldn't be written down, so new withdrawals aren't saved to disk"}
+            lines.append(f"- saved context: held back until <t:{until}:f> (<t:{until}:R>), " + ' and '.join(causes)
+                         + ('' if held['saved_to_disk'] else unsaved.get(held.get('unsaved_for'), unsaved['unreadable']))
                          # A scheduled pass skipped for it asks for no batch until then (fri #335).
                          + ('; learning passes wait until then' if getattr(agent, 'learning_paused', False) else ''))
         if agent:
