@@ -27,6 +27,7 @@ from fri.fri_member_summary import build
 SAID = 'they planned the lavender bicycle thing'  # The kept summary, naming what one message said.
 WORDS = ('fri raid tonight?', 'fri which build for it', 'fri the lavender bicycle plan stays between us')
 RECHECKS = 'summary-rechecks'
+DUE = 13*3600  # Past the controller's recheck interval (12 hours) since the build checked it.
 
 
 def rechecks(w):
@@ -110,8 +111,26 @@ def test_the_repro_a_message_deleted_unheard_after_its_exchanges_aged_out_takes_
             if when == 'a day later':
                 agent.summaries_rechecked = True  # This process rechecked them already.
                 gene_later(monkeypatch, 13*3600)
+            else:
+                agent.summaries_rechecked = False  # Started again.
             await recheck(agent)
             assert await asked(w) is None
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_fri_uses_no_summary_before_its_first_recheck_claim_since_it_started(monkeypatch, tmp_path):
+    """The claim holds every summary back at the controller; until it has gone through, Fri holds them back itself."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await kept(monkeypatch, w)
+            agent = w.fri.agent
+            agent.summaries_rechecked = False  # Started again.
+            assert await asked(w) is None
+            await recheck(agent)  # Its messages all still there.
+            assert (await asked(w))['text'] == SAID
         finally:
             await w.fri.close()
     run(scenario)
@@ -130,6 +149,7 @@ def test_an_edit_takes_the_summary_only_once_it_came_after_the_save(monkeypatch,
             message.content = 'never mind'
             message.edited_at = (dt.datetime.now(dt.timezone.utc) if edit.startswith('after') else
                                  dt.datetime.fromtimestamp(saved_at-60, dt.timezone.utc))
+            gene_later(monkeypatch, DUE)
             await recheck(w.fri.agent)
             summary = await asked(w)
             assert (summary is None) if edit.startswith('after') else summary['text'] == SAID
@@ -145,10 +165,11 @@ def test_one_discord_cant_vouch_for_is_held_back_until_it_can(monkeypatch, tmp_p
             await kept(monkeypatch, w)
             agent = w.fri.agent
             undo = down(w)
+            gene_later(monkeypatch, DUE)
             await recheck(agent)
             assert await asked(w) is None
             undo()
-            gene_later(monkeypatch, 601)  # Past the claim it answered.
+            gene_later(monkeypatch, DUE+601)  # Past the claim it answered.
             await recheck(agent)
             assert (await asked(w))['text'] == SAID
         finally:
@@ -163,6 +184,7 @@ def test_one_whose_message_is_still_being_withdrawn_is_held_back(monkeypatch, tm
             events = await kept(monkeypatch, w)
             agent = w.fri.agent
             agent.saved_turns.marked[str(events[0].id)] = time.time()  # Taken back within the hour.
+            gene_later(monkeypatch, DUE)
             await recheck(agent)
             with w.store.connection() as db:
                 assert db.execute('SELECT held FROM fri_member_summary_rechecks').fetchone()[0] == 1

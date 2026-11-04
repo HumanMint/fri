@@ -2926,7 +2926,9 @@ class Agent:
             from .fri_fixes import check as check_fixes
             from .fri_fixes import settle as settle_notices
             from .fri_member_summary import CAPABILITY as SUMMARIES
+            from .fri_member_summary import RECHECKS
             from .fri_member_summary import build as build_summary
+            from .fri_member_summary import recheck as recheck_summaries
             from .fri_reply_checks import CAPABILITY
             from .fri_reply_checks import check as check_replies
             from .fri_social import deliver_one as deliver_reminder
@@ -2949,7 +2951,11 @@ class Agent:
                        await self.stage('reply_checks', lambda: check_replies(self), 'enabled', 'reply_check_enabled',
                                         when=lambda: CAPABILITY in self.fri.capabilities),
                        await self.stage('member_summaries', lambda: build_summary(self), 'enabled', 'learning_enabled',
-                                        when=lambda: SUMMARIES in getattr(self.fri, 'capabilities', ()))]
+                                        when=lambda: SUMMARIES in getattr(self.fri, 'capabilities', ())),
+                       # Kept summaries shown in requests whatever learning does, so rechecked whatever it does too
+                       # (fri #349): Discord reads, no model call.
+                       await self.stage('summary_rechecks', lambda: recheck_summaries(self),
+                                        when=lambda: {SUMMARIES, RECHECKS} <= set(getattr(self.fri, 'capabilities', ())))]
             self.heartbeat_status = 'ok' if all(results) else 'deferred'
         finally:
             PROGRESS.reset(marking)

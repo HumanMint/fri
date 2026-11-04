@@ -22,6 +22,10 @@ CAPABILITY = SUMMARIES
 # The controller names a claim's messages, and those its earlier summary drew on, so each is checked against Discord
 # before any of it is sent or carried on (fri #333). Without it a claim can't be checked, so none is made.
 SOURCES = 'summary-sources'
+# The controller offers kept summaries to be rechecked against those messages, rebuilt or not (fri #349, see recheck).
+# Without it a kept one may hold a message deleted where Fri never heard of it, so none is used (see Fri.member_summary)
+# and none is built.
+RECHECKS = 'summary-rechecks'
 SKEW = 5  # Seconds Discord's clock and the controller's may differ by, when an edit is placed against a save.
 SCHEMA = obj({'summary': STRING})
 INSTRUCTION = '''You keep a short running summary of what one member talked about with Fri lately, so Fri
@@ -77,10 +81,11 @@ async def changed(agent, messages):
 
 async def build(agent):
     """Build at most one claimed summary. The controller hears how it went either way: the call counts."""
-    # fri health says so while it waits for that (Sol round 1 of #348).
-    agent.summaries_wait_for_gene = SOURCES not in getattr(agent.fri, 'capabilities', ())
+    # fri health says so while it waits for that (Sol round 1 of #348), or for rechecks (fri #349).
+    capabilities = getattr(agent.fri, 'capabilities', ())
+    agent.summaries_wait_for_gene = SOURCES not in capabilities or RECHECKS not in capabilities
     if agent.summaries_wait_for_gene:
-        LOG.info('Member summaries wait for a controller that names their sources')
+        LOG.info('Member summaries wait for a controller that names their sources and rechecks them')
         return None
     # Claimed once the model is free and Fri is signed in, so nothing waits between reading the words
     # and sending them: anything erased before the claim is never sent.
@@ -160,3 +165,71 @@ async def build(agent):
     except commands.UserFeedbackCheckFailure:
         LOG.warning('Member summary %s was not kept', claim['id'][:8])
         return None
+
+
+async def recheck(agent):
+    """Kept summaries read again against what they drew on, rebuilt or not (fri #349): a rebuild checks them too, but
+    needs new exchanges, so a summary whose exchanges aged out was never checked again, and one of its messages deleted
+    where Fri never heard of it kept reaching other channels until it expired. Each heartbeat claims a few from the
+    controller, with their messages and no member named, and answers each (see sources). No model call. The first
+    claim since Fri started asks the controller to hold every summary back until it's rechecked: deletions Fri never
+    heard of happen while it's down. A controller rolled back past rechecks refuses; Fri then uses no summary (see
+    RECHECKS). Returns how each went."""
+    if RECHECKS not in getattr(agent.fri, 'capabilities', ()):
+        return None
+    try:
+        claim = await agent.fri.api('POST', '/agent/member-summary/recheck',
+                                    {'fresh': not getattr(agent, 'summaries_rechecked', False)})
+    except ControllerRejected:
+        agent.fri.capabilities = agent.fri.capabilities - {RECHECKS}
+        LOG.warning('The controller refused summary rechecks; no summary is used until Fri restarts')
+        return None
+    agent.summaries_rechecked = True
+    done = []
+    for item in (claim or {}).get('summaries') or ():
+        status = await sources(agent, item.get('messages'))
+        try:
+            await agent.fri.api('POST', f"/agent/member-summary/recheck/{item['id']}", {'status': status})
+        except commands.UserFeedbackCheckFailure:  # Replaced meanwhile, say: nothing of it stands to answer for.
+            LOG.warning('A summary recheck was not taken')
+        done.append(status)
+    return done
+
+
+async def sources(agent, messages):
+    """How a kept summary's messages ((ID, conversation, when its exchange was saved)) read now: 'changed' if one is
+    gone, or edited after its exchange was saved, each such one withdrawn as its event would have withdrawn it, as a
+    build does (see changed); 'unchecked' if any can't be read (Discord fails, its channel isn't one everyone can read
+    now) or its withdrawal is still in Fri's queue; else 'ok'. An edit that can't be placed after the save may be what
+    was summarized: that one is fine."""
+    if not isinstance(messages, list):
+        return 'unchecked'
+    try:
+        ids = [str(item['id']) for item in messages]
+    except (KeyError, TypeError):
+        return 'unchecked'
+    if agent.saved_turns.withheld(ids):
+        return 'unchecked'
+    status = 'ok'
+    for item in messages:
+        conversation, saved_at, message_id = item.get('conversation_id', ''), item.get('saved_at'), str(item['id'])
+        kind, _, channel_id = str(conversation).partition(':')
+        channel = agent.fri.get_channel(int(channel_id)) if kind == 'public' and channel_id.isdigit() else None
+        if (channel is None or not readable(agent, conversation) or not message_id.isdigit()
+                or type(saved_at) not in (int, float)):
+            status = 'unchecked' if status == 'ok' else status
+            continue
+        try:
+            message = await channel.fetch_message(int(message_id))
+        except discord.NotFound:
+            agent.unsend(channel.id, [int(message_id)], agent.fri.guild_id)
+            status = 'changed'
+            continue
+        except discord.DiscordException:
+            status = 'unchecked' if status == 'ok' else status
+            continue
+        edited = getattr(message, 'edited_at', None)
+        if edited is not None and edited.timestamp() > saved_at+SKEW:
+            agent.edit(channel.id, message, agent.fri.guild_id)
+            status = 'changed'
+    return status

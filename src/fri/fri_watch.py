@@ -382,9 +382,10 @@ class Watch:
                          + ('; learning passes wait until then' if getattr(agent, 'learning_paused', False) else '')
                          + ('; to end it early, remove withdrawals.closed.json once nothing it holds back matters (see '
                             'docs/operations.md)' if past else ''))
-        if getattr(agent, 'summaries_wait_for_gene', False):  # A build skipped for it (fri #333, #348 round 1).
-            lines.append("- member summaries: paused, the controller doesn't name a summary's messages "
-                         '(summary-sources), so none can be checked; they resume once it does')
+        if getattr(agent, 'summaries_wait_for_gene', False):  # A build skipped for it (fri #333, #348 r1, #349).
+            lines.append("- member summaries: paused and none used, the controller doesn't name a summary's messages "
+                         'and recheck kept ones (summary-sources, summary-rechecks), so none can be checked; they '
+                         'resume once it does')
         if getattr(agent, 'learning_waits_for_gene', False):  # A scheduled pass skipped for it (fri #346).
             lines.append("- learning: paused, the controller doesn't say which messages it knows were taken back "
                          "(learning-withdrawals); its contract is read again before each pass, and learning resumes "

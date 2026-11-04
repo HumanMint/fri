@@ -29,6 +29,7 @@ from .fri_errors import (
 from .fri_images import CHANGED as IMAGES_CHANGED
 from .fri_images import unchanged as images_unchanged
 from .fri_links import link_posts
+from .fri_member_summary import RECHECKS as SUMMARY_RECHECKS
 from .fri_memory import (
     DEPENDENCIES,
     GENERATIONS,
@@ -1072,7 +1073,13 @@ class Fri(discord.Client):
 
     def member_summary(self, summary, guild_id, shown):
         """Fri's own summary of the member where it may show, while every channel it came from is still readable.
-        From a controller offering summary generations, only with one a turn can carry (see summary_generation)."""
+        From a controller offering summary generations, only with one a turn can carry (see summary_generation). Only
+        from one that rechecks kept summaries against what they drew on (fri #349): otherwise one may hold a message
+        deleted where Fri never heard of it. Nor before this process's first recheck claim, which holds every summary
+        back until it's read again (see fri_member_summary.recheck): one deleted while Fri was down may be among them."""
+        if SUMMARY_RECHECKS not in self.capabilities or not getattr(getattr(self, 'agent', None),
+                                                                     'summaries_rechecked', False):
+            return None
         if not summary or not shown or not all(self.readable(origin, guild_id) for origin in summary.get('origins', [])):
             return None
         if GENERATIONS in self.capabilities and not (type(summary.get('generation')) is int and summary['generation'] >= 0):
