@@ -123,3 +123,44 @@ def test_a_post_is_held_to_its_authors_erasure_on_discords_clock(monkeypatch, tm
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('offset', [-2, 2])
+@pytest.mark.parametrize('delayed', [30, 600])
+def test_a_delayed_panel_erasure_never_moves_the_cutoff_earlier(monkeypatch, tmp_path, offset, delayed):
+    """Sol round 1 of HumanMint/gene#213, B1, through the /fri panel: the member's "forget me" from T-10 is carried
+    out, then an older one of theirs, from T-30 (or T-600, after an outage), arrives late, on the same panel. The
+    cutoff moved back to it, so their message from T-10.5 was answered once memory was on again. It goes unanswered:
+    the cutoff is the latest erasure's, whatever order they arrive in."""
+    import datetime as dt
+
+    import discord
+
+    from compat_tests.test_fri_panel_and_learning_fences import panel
+
+    async def scenario():
+        fri, agent, said, _ = world(monkeypatch, tmp_path, offset)
+        registry, now = None, REAL()
+
+        def asked(text, at):
+            nonlocal registry
+            interaction = panel(fri)
+            if registry is None:
+                registry = fri.private_panels
+            fri.private_panels = registry  # One panel registry for all three.
+            interaction.id = discord.utils.time_snowflake(dt.datetime.fromtimestamp(at, dt.timezone.utc))
+            return fri.chat_interaction(interaction, text)
+
+        try:
+            queued = said('fri remember '+MARKER, age=10.5)
+            await asked('forget me', now - 10)
+            await asked('forget me', now - delayed)
+            await asked('remember me again', now + 0.2)
+            time.sleep(0.01)
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(queued)
+            fri.chat_once.assert_not_awaited()
+            queued.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
