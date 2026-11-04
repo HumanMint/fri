@@ -92,11 +92,12 @@ def test_a_speakers_own_malformed_cutoff_doesnt_fail_their_reply(monkeypatch, tm
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('when', ['before the erasure', 'after it'])
+@pytest.mark.parametrize('when', ['before the erasure', 'after it', 'with memory still off'])
 def test_the_speakers_photo_from_before_their_erasure_isnt_paired_with_their_next_message(monkeypatch, tmp_path, when):
     """fri #337's round 1: member 20 posts an uncaptioned photo, turns memory off and on again, then replies to it
     within a minute. The photo left the reply target, but was still paired as their photo just before (see
-    select_source), so it reached the model. Posted after the erasure, it's paired as before."""
+    select_source), so it reached the model. Posted after the erasure, it's paired as before, and so it is while
+    their memory is still off: their own message then is answered with what it shows, as before."""
     async def scenario():
         fri, agent, store, *_, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
         uri = 'data:image/png;base64,aGVsbG8='
@@ -106,9 +107,10 @@ def test_the_speakers_photo_from_before_their_erasure_isnt_paired_with_their_nex
             store.personal_control('20', 'enable')
             time.sleep(0.01)
         photo = message('', user=20, age=0 if when == 'after it' else 20, attachments=[attachment(1)])
-        if when == 'before the erasure':
+        if when != 'after it':
             store.personal_control('20', 'disable')
-            store.personal_control('20', 'enable')
+            if when == 'before the erasure':
+                store.personal_control('20', 'enable')
             time.sleep(0.01)
         event = message('fri what is this?', user=20)
         event.reference = SimpleNamespace(message_id=photo.id, channel_id=1)
@@ -118,7 +120,7 @@ def test_the_speakers_photo_from_before_their_erasure_isnt_paired_with_their_nex
             with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
                 await agent.handle(event)
             fri.chat_once.assert_awaited_once()
-            assert (uri in str(fri.chat_once.await_args)) is (when == 'after it')
+            assert (uri in str(fri.chat_once.await_args)) is (when != 'before the erasure')
         finally:
             await fri.close()
     asyncio.run(scenario())
