@@ -56,16 +56,33 @@ Run the standalone development identity with `JPCALL_DEV_DISCORD_TOKEN` and
 uv run python -m fri.jpcall.devbot --fake-engine --allow-user MEMBER_ID
 ```
 
-Repeat `--allow-user` for each member who may start a call; the default allows nobody.
+In fake mode, repeat `--allow-user` for each member who may start a call; the default
+allows nobody. The brief is public in the voice channel's chat; only the requester can
+confirm or cancel it. Anyone currently in that voice channel may answer call questions.
 The bot needs guild and voice-state intents, the applications.commands scope, and view
 channel, send messages, embed links, connect and speak permissions in the test voice
 channel. It connects self-deafened and never receives or forwards member audio.
 The fake engine scripts Japanese/English lines, one group question, synthetic tones,
 an outcome and estimated component costs followed by a sample posted phone price.
-It uses no phone/model credentials. Real-engine construction is a later integration
-step; this milestone's runner requires `--fake-engine`.
+Fake mode uses no phone/model credentials and never imports engine configuration or
+transports. Fri's generated speech can arrive in bursts, so the audio source buffers up
+to 60 seconds for Fri and 2 seconds for the callee; barge-in clears the unplayed Fri backlog.
+
+To use the real engine, provide its settings and `JPCALL_ALLOWED_USER_IDS` in process env,
+then run `uv run python -m fri.jpcall.devbot`. No env files are loaded. Disabled configuration
+exits with setting names only. The runner lazily constructs `JpcallEngine(load_config())`,
+opens it before command registration, and closes it at shutdown. Real mode uses the engine's
+configured allowlist; `--allow-user` is only for fake mode.
 
 `register(tree, client, engine, guild_ids, limits=limits)` returns the Discord call
 manager; call its async `close()` on shutdown. Supply the configured `Limits` explicitly;
-the default is deny-all. This milestone does not change Fri's existing command tree or
-interaction filters; those need integration before `/jpcall` works in the main runtime.
+the default is deny-all. Main Fri enables voice-state intent and opens/registers the engine
+only when its configuration is enabled. `/jpcall` and `jpcall:` component/modal IDs pass the
+usual channel filter into their own allowlist, requester and voice membership checks. Call
+operations do not use the Gene controller. Disabled configuration keeps the existing command
+and channel behavior. The isolated Discord branch also treats an absent engine configuration
+module as unavailable; real mode requires the separately implemented engine modules.
+
+The cost summary lists units and USD per component/model, then sums input and output tokens
+across models. Cached modality counts are included once; explicit aggregate token counts take
+precedence over breakdowns. Prices retain `~` for estimates and `pending` until posted.

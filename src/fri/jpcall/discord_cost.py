@@ -11,21 +11,39 @@ from .discord_text import chunks
 LOG = logging.getLogger(__name__)
 
 
+def token_totals(units):
+    # Explicit aggregate counts already include their modality/cache breakdowns.
+    incoming = units.get('input_tokens')
+    if incoming is None:
+        incoming = sum(count for kind, count in units.items() if kind.endswith('_in_tokens')
+                       and kind != 'unknown_cached_in_tokens')
+    outgoing = units.get('output_tokens')
+    if outgoing is None:
+        outgoing = sum(count for kind, count in units.items() if kind.endswith('_out_tokens'))
+    # unknown_cached_in_tokens describes an overlapping, unsplit cache, not extra input.
+    return incoming, outgoing
+
+
 def render_usage(usage, usage_final):
     lines, total, estimate, pending = [], 0.0, False, False
+    incoming = outgoing = 0
     for row in usage:
         units = ', '.join(f'{key.replace("_", " ")} {value:g}'
                           for key, value in row.units.items()) or 'no units reported'
         price = 'pending' if row.usd is None else f'{"" if row.exact else "~"}${row.usd:.4f}'
         lines.append(f'{row.component} · {row.model} · {units} · {price}')
         total += row.usd or 0
+        row_in, row_out = token_totals(row.units)
+        incoming += row_in
+        outgoing += row_out
         estimate |= row.usd is not None and not row.exact
         pending |= row.usd is None
     if not usage:
         pending = True
         lines.append('usage pending')
     suffix = ' + pending' if pending or not usage_final else ''
-    lines.append(f'total · {"~" if estimate else ""}${total:.4f}{suffix}')
+    tokens = f'input {incoming:g} / output {outgoing:g} tokens' if usage else 'tokens pending'
+    lines.append(f'total · {tokens} · {"~" if estimate else ""}${total:.4f}{suffix}')
     return '\n'.join(lines)
 
 
