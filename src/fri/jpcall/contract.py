@@ -7,6 +7,9 @@ voice connection, the audio mixer, transcript pages, question prompts and the
 post-call summary. They meet only through the types below.
 
 Changing this file is a coordinated change: propose it, don't fork it.
+
+Fields ending in ``_ja`` hold text in the call language (``JPCALL_CALL_LANGUAGE``:
+Japanese for live calls, Korean for development testing).
 """
 
 from __future__ import annotations
