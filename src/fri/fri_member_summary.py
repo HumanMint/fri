@@ -22,7 +22,7 @@ CAPABILITY = SUMMARIES
 # The controller names a claim's messages, and those its earlier summary drew on, so each is checked against Discord
 # before any of it is sent or carried on (fri #333). Without it a claim can't be checked, so none is made.
 SOURCES = 'summary-sources'
-SKEW = 5  # Seconds an exchange's save may trail its message's last edit and still be the version it saved.
+SKEW = 5  # Seconds Discord's clock and the controller's may differ by, when an edit is placed against a save.
 SCHEMA = obj({'summary': STRING})
 INSTRUCTION = '''You keep a short running summary of what one member talked about with Fri lately, so Fri
 can pick a topic back up after it falls out of the recent exchanges. previous_summary is your earlier
@@ -45,10 +45,11 @@ def readable(agent, conversation):
 
 
 async def changed(agent, messages):
-    """Of these messages ((ID, conversation, when its exchange was saved)), the IDs of those deleted, or edited since
-    their exchange was saved, though Fri never heard of it (fri #333). Each is taken back as its event would have
-    taken it, so its withdrawal goes to the controller, and it's held back meanwhile. Raises discord.DiscordException
-    where Discord can't say: the build sends nothing, as for a failed read."""
+    """Of these messages ((ID, conversation, when its exchange was saved)), the IDs of those deleted or edited, though
+    Fri never heard of it (fri #333), which the build leaves out. One deleted, or edited after its exchange was saved,
+    is taken back as its event would have taken it, so its withdrawal goes to the controller, and it's held back
+    meanwhile; one edited that can't be placed after the save is only left out. Raises discord.DiscordException where
+    Discord can't say: the build sends nothing, as for a failed read."""
     found = set()
     for message_id, conversation, saved_at in messages:
         kind, _, channel_id = conversation.partition(':')
@@ -62,15 +63,23 @@ async def changed(agent, messages):
             found.add(str(message_id))
             continue
         edited = getattr(message, 'edited_at', None)
-        if edited is not None and edited.timestamp() > saved_at-SKEW:
+        if edited is None:
+            continue
+        found.add(str(message_id))  # Left out of this build either way.
+        # Withdrawn only once it was certainly edited after its exchange was saved, past any difference between
+        # Discord's clock and the controller's (SKEW). One edited before, or so close to the save that it can't be
+        # told which came first, may be the very version saved: left out, never withdrawn, so nothing of it is lost
+        # (Sol round 1 of #348).
+        if edited.timestamp() > saved_at+SKEW:
             agent.edit(channel.id, message, agent.fri.guild_id)
-            found.add(str(message_id))
     return found
 
 
 async def build(agent):
     """Build at most one claimed summary. The controller hears how it went either way: the call counts."""
-    if SOURCES not in getattr(agent.fri, 'capabilities', ()):
+    # fri health says so while it waits for that (Sol round 1 of #348).
+    agent.summaries_wait_for_gene = SOURCES not in getattr(agent.fri, 'capabilities', ())
+    if agent.summaries_wait_for_gene:
         LOG.info('Member summaries wait for a controller that names their sources')
         return None
     # Claimed once the model is free and Fri is signed in, so nothing waits between reading the words
@@ -118,6 +127,11 @@ async def build(agent):
             exchanges = [row for row in exchanges if not set(map(str, row['messages'])) & gone]
             if previous and {str(item['id']) for item in previous['messages']} & gone:
                 previous = None
+        # Readable by everyone still, once those reads are back: a channel restricted while they were out is left out,
+        # with an earlier summary that came from it (Sol round 1 of #348). Nothing is awaited from here to the request.
+        exchanges = [row for row in exchanges if readable(agent, row['conversation_id'])]
+        if previous and not all(readable(agent, origin) for origin in previous['origins']):
+            previous = None
         ids = [str(i) for row in exchanges for i in row['messages']] + [
             str(item['id']) for item in (previous or {}).get('messages', [])]
         # Again after the claim's and those reads' waits, with nothing awaited before the request: none of what it
