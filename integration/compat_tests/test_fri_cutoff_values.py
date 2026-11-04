@@ -20,12 +20,14 @@ VALUES = {'a string': 'invalid-cutoff', 'an object': {'at': 1}, 'a boolean': Tru
 
 
 def spoil(profile, value):
-    """The author's profile with its removed_at replaced, or dropped."""
+    """The author's profile with its removed_at replaced, or dropped, on both clocks: a controller that says it on
+    Discord's too (fri #337 items 4 and 5) has Fri read that one."""
     profile = dict(profile)
-    if value is MISSING:
-        profile.pop('removed_at', None)
-    else:
-        profile['removed_at'] = value
+    for key in ('removed_at', 'removed_at_discord'):
+        if value is MISSING:
+            profile.pop(key, None)
+        else:
+            profile[key] = value
     return profile
 
 

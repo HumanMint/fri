@@ -35,7 +35,7 @@ from .fri_errors import (
 )
 from .fri_images import forwarded, media, started_a_thread
 from .fri_ledger import COOLDOWN, Ledger, addressed, notice_reason
-from .fri_memory import before_erasure, before_removal, memory_intent, valid_time
+from .fri_memory import before_erasure, before_removal, erased_cutoff, memory_intent, valid_time
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
 from .fri_reports import report_message
@@ -929,7 +929,7 @@ class Agent:
         if not isinstance(current, int) or isinstance(current, bool):
             return current  # As the controller gave it, so callers check it as before.
         read = Revision(current)
-        read.erased_at = (valid_time(profile.get('erased_at')) or 0) if profile.get('enabled') else 0
+        read.erased_at = (valid_time(erased_cutoff(profile)) or 0) if profile.get('enabled') else 0
         return read
 
     async def erasure(self, user, forgotten, revision=None):
@@ -1698,7 +1698,7 @@ class Agent:
                                                               forgotten)) is not None:
                 if self.forgotten.get(message.author.id, 0) != forgotten:
                     return self.miss(message, 'author privacy changed')  # During that read, as below.
-                if profile.get('enabled') and before_erasure(message.id, profile.get('erased_at')):  # Never a control.
+                if profile.get('enabled') and before_erasure(message.id, erased_cutoff(profile)):  # Never a control.
                     return self.miss(message, PREDATES)
                 await self.respond(message, await addressed_text(message, self.fri.user.id), invitation=invitation, addressed=True,
                                    forgotten=forgotten, revision=invitation.revision)
@@ -1777,7 +1777,7 @@ class Agent:
             if not privacy and self.forgotten.get(message.author.id, 0) != forgotten:
                 return self.miss(message, 'author privacy changed')  # During that read: it may be from after.
             observed = profile.get('revision', 0)
-            if profile['enabled'] and not privacy and before_erasure(message.id, profile.get('erased_at')):
+            if profile['enabled'] and not privacy and before_erasure(message.id, erased_cutoff(profile)):
                 return self.miss(message, PREDATES)
             # Not if it was deleted or edited while its profile was read.
             if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
