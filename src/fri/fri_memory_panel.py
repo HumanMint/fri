@@ -7,6 +7,7 @@ import discord
 
 from . import feedback as commands
 from .fri_context import discord_source
+from .fri_member_summary import usable as summaries_usable
 from .fri_memory import MOVES, SOURCES, clip, note_place, profiled, units
 
 NO_MENTIONS = discord.AllowedMentions.none()
@@ -93,6 +94,8 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
         return
     state = state or await cog.api('POST', '/chat/memory/notes', scope)
     state = await screened(cog, scope, state)
+    if state.get('summary') and not summaries_usable(cog):  # As a request would use it (Sol round 1 of #354).
+        state = {**state, 'summary': None}
     screening = withdrawals(cog)  # As the screen just left them, with nothing awaited between (fri #322).
     profiles = getattr(cog, 'profiles', False)
     lines = [notice] if notice else []
@@ -135,7 +138,10 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
             return False
         # And no withdrawal taken in here since the screen (fri #322): one still on its way to Gene, which accepts
         # the summary's generation until it arrives, or just taken, may be of a message under the summary or a note,
-        # and only reading the listing again can tell. Held back until then; nothing listed rests on none.
+        # and only reading the listing again can tell. Held back until then; nothing listed rests on none. A summary
+        # listed only while one may be shown at all (Sol round 1 of #354).
+        if summary and not summaries_usable(cog):
+            return False
         return withdrawals(cog) == screening or not (summary or state['entries'])
 
     async def stands():

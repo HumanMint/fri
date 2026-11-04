@@ -232,4 +232,18 @@ async def sources(agent, messages):
         if edited is not None and edited.timestamp() > saved_at+SKEW:
             agent.edit(channel.id, message, agent.fri.guild_id)
             status = 'changed'
+    # Again once every read is back, with nothing awaited from here to the answer: a channel restricted, or a message
+    # taken back, while a read was out (Sol round 1 of #354).
+    if status == 'ok' and (agent.saved_turns.withheld(ids) or not all(
+            readable(agent, str(item.get('conversation_id', ''))) for item in messages)):
+        status = 'unchecked'
     return status
+
+
+def usable(fri):
+    """Whether any kept summary may be used or shown now (fri #349): only from a controller that rechecks them, and
+    only once this process's first recheck claim has gone through, which holds every one back until it's read again
+    (see recheck). A request (Fri.member_summary), the DM's "what do you remember" and My memory all ask, My memory
+    again in its last check (Sol round 1 of #354)."""
+    return RECHECKS in getattr(fri, 'capabilities', ()) and bool(getattr(getattr(fri, 'agent', None),
+                                                                          'summaries_rechecked', False))
