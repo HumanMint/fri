@@ -43,6 +43,9 @@ def test_rest_api_key_auth_twiml_hangup_and_posted_billing():
             assert form['To'] == ['+81312345678']
             assert not any('record' in key.lower() for key in form)
             assert form['TimeLimit'] == ['900']
+            assert form['MachineDetection'] == ['Enable'] and form['AsyncAmd'] == ['true']
+            assert form['AsyncAmdStatusCallbackMethod'] == ['POST']
+            assert form['AsyncAmdStatusCallback'] == form['StatusCallback']
             assert form['StatusCallbackEvent'] == ['initiated', 'ringing', 'answered', 'completed']
             root = fromstring(form['Twiml'][0])
             assert root.find('Connect/Stream').attrib['url'] == (

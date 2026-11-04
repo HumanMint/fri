@@ -73,6 +73,7 @@ class UsageMeter:
         self._twilio: UsageLine | None = None
         self._streams: UsageLine | None = None
         self._twilio_pending = False
+        self._amd: UsageLine | None = None
 
     def _add(self, component: str, model: str, units: dict[str, float],
              event_id: str = '', unknown: bool = False) -> None:
@@ -131,6 +132,10 @@ class UsageMeter:
                                   {'minutes': float(streams)},
                                   streams * self.prices.media_streams_per_minute)
 
+    def amd(self) -> None:
+        """One estimated AMD charge per answered call, independent of callback retries."""
+        self._amd = UsageLine('amd', 'twilio-amd', {'calls': 1.0}, self.prices.amd_per_call)
+
     def lines(self) -> tuple[UsageLine, ...]:
         lines = []
         for (component, model), units in sorted(self._units.items()):
@@ -141,7 +146,8 @@ class UsageMeter:
             if (component, model) in self._unknown:
                 cost = None
             lines.append(UsageLine(component, model, dict(units), cost))
-        return tuple(lines + [line for line in (self._twilio, self._streams) if line is not None])
+        return tuple(lines + [line for line in (self._twilio, self._streams, self._amd)
+                              if line is not None])
 
     @property
     def usage_final(self) -> bool:

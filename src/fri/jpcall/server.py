@@ -166,7 +166,7 @@ class JpcallServer:
         self.bind(call.routes, params['CallSid'])
         # A whitelist avoids passing member data/phone numbers into status consumers.
         safe = {key: params[key] for key in ('CallSid', 'CallStatus', 'CallDuration',
-                                            'SequenceNumber') if key in params}
+                                            'SequenceNumber', 'AnsweredBy') if key in params}
         try:
             await call.on_status(safe)
         except Exception:

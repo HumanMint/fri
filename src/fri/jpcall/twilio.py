@@ -93,6 +93,9 @@ class TwilioClient:
             'Twiml': tostring(root, encoding='unicode'),
             'StatusCallback': base + '/jpcall/status/' + status_token,
             'StatusCallbackMethod': 'POST',
+            'MachineDetection': 'Enable', 'AsyncAmd': 'true',
+            'AsyncAmdStatusCallback': base + '/jpcall/status/' + status_token,
+            'AsyncAmdStatusCallbackMethod': 'POST',
             'StatusCallbackEvent': ['initiated', 'ringing', 'answered', 'completed'],
             'TimeLimit': str(self.config.limits.max_call_s),
         })
