@@ -13,13 +13,21 @@ import datetime as dt
 import json
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import discord
 import pytest
 
 from compat_tests.test_fri_heartbeat import STATE
-from compat_tests.test_fri_member_profiles import GAMING, GENERAL, model_context, run, world
+from compat_tests.test_fri_member_profiles import (
+    DM,
+    GAMING,
+    GENERAL,
+    dm_control,
+    model_context,
+    run,
+    world,
+)
 from compat_tests.test_fri_member_summaries import settled, summarizer
 from fri.fri_agent import Agent
 from fri.fri_member_summary import build
@@ -275,3 +283,112 @@ def test_rechecks_run_as_their_own_stage_whether_or_not_learning_is_on(monkeypat
     asyncio.run(agent.heartbeat.coro(agent))
     passes.assert_awaited_once_with(agent)
     assert agent.stages['summary_rechecks']['error'] is None
+
+
+# Sol round 1 of #354.
+
+GATES = ['before the first recheck claim', 'without summary-rechecks']
+
+
+def gated(w, gate):
+    if gate.startswith('before'):
+        w.fri.agent.summaries_rechecked = False  # Started again.
+    else:
+        w.fri.capabilities = w.fri.capabilities - {RECHECKS}
+
+
+@pytest.mark.parametrize('gate', GATES)
+def test_b3_the_dm_answer_lists_no_summary_fri_wouldnt_use(monkeypatch, tmp_path, gate):
+    """B3: "what do you remember" in a DM listed the summary from the controller's listing, past the gate a request
+    goes through, so one whose message was deleted unheard showed before the first recheck claim, or without one."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await kept(monkeypatch, w)
+            gated(w, gate)
+            dm, _, _ = await w.say(DM, 'what do you remember about me')
+            assert SAID not in dm.reply and 'what we’ve talked about lately' not in dm.reply
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def panel(monkeypatch, w):
+    """My memory, opened in a DM; what it shows lands in the returned mock."""
+    from fri.fri_memory import profiled
+    shown = AsyncMock()
+    monkeypatch.setattr('fri.fri_panel.reply', shown)
+    monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+    scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                             'conversation_id': 'private:900'})
+    interaction = Mock(spec=discord.Interaction, id=int(dm_control()['id']), guild_id=None, channel_id=DM,
+                       user=SimpleNamespace(id=20, display_name='friend'))
+    return shown, scope, interaction
+
+
+@pytest.mark.parametrize('gate', GATES)
+def test_b3_my_memory_lists_no_summary_fri_wouldnt_use(monkeypatch, tmp_path, gate):
+    async def scenario():
+        from fri.fri_memory_panel import show
+        w = world(monkeypatch, tmp_path)
+        try:
+            await kept(monkeypatch, w)
+            shown, scope, interaction = panel(monkeypatch, w)
+            gated(w, gate)
+            await show(w.fri, interaction, scope)
+            body = shown.await_args.kwargs['embed'].description
+            assert SAID not in body and 'My summary' not in body
+            assert 'Edit summary' not in [item.label for item in shown.await_args.kwargs['view'].children]
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_b3_my_memorys_last_check_fails_once_rechecks_go_while_it_waits(monkeypatch, tmp_path):
+    """Its final check, right before the listing shows, is no laxer: a summary listed while rechecks stood, and they
+    went since (a controller rolled back), shows nothing."""
+    async def scenario():
+        from fri.fri_memory_panel import show
+        w = world(monkeypatch, tmp_path)
+        try:
+            await kept(monkeypatch, w)
+            shown, scope, interaction = panel(monkeypatch, w)
+            await show(w.fri, interaction, scope)
+            assert SAID in shown.await_args.kwargs['embed'].description
+            still = shown.await_args.kwargs['still']
+            gated(w, 'without summary-rechecks')
+            assert await still() is False
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('change', ['its channel restricted', 'one of its messages taken back'])
+def test_s1_a_change_during_the_last_read_holds_it_back(monkeypatch, tmp_path, change):
+    """S1: readability and the withdrawal queue were checked before the reads but not after, so a channel restricted,
+    or a message taken back, while the last read was out still answered ok and cleared the hold."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await kept(monkeypatch, w)
+            agent = w.fri.agent
+            channel = w.fri.get_channel(GENERAL)
+            real, reads = channel.fetch_message, []
+
+            async def reading(mid):
+                reads.append(mid)
+                if len(reads) == len(events):  # The last read.
+                    if change.startswith('its channel'):
+                        w.readable[GENERAL] = False
+                    else:
+                        agent.saved_turns.marked[str(events[0].id)] = time.time()
+                return await real(mid)
+            channel.fetch_message = reading
+            gene_later(monkeypatch, DUE)
+            await recheck(agent)
+            assert len(reads) == len(events)
+            with w.store.connection() as db:
+                assert db.execute('SELECT held FROM fri_member_summary_rechecks').fetchone()[0] == 1
+        finally:
+            await w.fri.close()
+    run(scenario)
