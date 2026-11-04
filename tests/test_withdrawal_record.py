@@ -203,6 +203,39 @@ def test_more_entries_than_the_queue_keeps_are_bounded_newest_first():
     assert newest == [str(10**18+n) for n in range(MOST*2, MOST*3)]
 
 
+def test_what_the_bound_lets_go_is_reported_for_the_queue_to_hold_back():
+    """fri #329: the reader keeps at most MOST*2 entries while it reads; what it lets go is counted, with the latest
+    time any of it was queued or sent, or that one of it says no time it was queued, for the queue to hold back what
+    those name before it accepts what's left (see SavedTurns.pending)."""
+    for timed in (True, False):
+        entries = {str(10**18+n): {'scope': GOOD, 'revision': 0, **({'queued_at': 1.6e9+n} if timed else {})}
+                   for n in range(MOST*3)}
+        overflow = {}
+        found = read_record(json.dumps({'pending': entries}), overflow)
+        gone = [i for i in entries if i not in found]
+        assert gone and overflow['dropped'] == len(gone) and overflow['unknown'] is not timed
+        assert overflow['latest'] == max(max(withdrawal.sent_at(int(i)), entries[i].get('queued_at', 0)) for i in gone)
+    overflow = {}
+    read_record(json.dumps({'pending': {'12': {'scope': GOOD, 'revision': 0}}}), overflow)
+    assert overflow == {'dropped': 0, 'latest': None, 'unknown': False}
+
+
+def test_when_each_was_queued_is_read_back_and_nothing_else_counts_as_one():
+    """fri #329: when a withdrawal was queued here goes to disk with it and is read back where it's a time, for a hold
+    too; anything else there reads as none, which the queue counts as the time it reads it (see SavedTurns.entry)."""
+    at = 1.7e9+0.5
+    bad = ['1.7e9', None, True, -1, [1], {'a': 1}, float('nan'), float('inf'), 10**30]
+    record = {'pending': {'12': {'scope': GOOD, 'revision': 3, 'queued_at': at}, '13': {'hold': True, 'queued_at': at},
+                          '14': {'hold': True, 'queued_at': 1700000000},
+                          **{str(20+n): {'scope': GOOD, 'revision': 0, 'queued_at': value} for n, value in enumerate(bad)},
+                          **{str(40+n): {'hold': True, 'queued_at': value} for n, value in enumerate(bad)}}}
+    found = read_record(json.dumps(record))
+    assert found['12'] == {'scope': GOOD, 'revision': 3, 'deleted': False, 'queued_at': at}
+    assert found['13'] == {'hold': True, 'queued_at': at} and found['14'] == {'hold': True, 'queued_at': 1700000000}
+    assert all(found[str(20+n)] == {'scope': GOOD, 'revision': 0, 'deleted': False} for n in range(len(bad)))
+    assert all(found[str(40+n)] == {'hold': True} for n in range(len(bad)))
+
+
 def record_of(tmp_path, size):
     """A valid record of about `size` characters: an entry, a long unused string, whitespace and deep junk."""
     entry = '"12": {"scope": '+json.dumps(GOOD)+', "revision": 3, "deleted": true}'

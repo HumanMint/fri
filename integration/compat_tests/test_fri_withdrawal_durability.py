@@ -1,12 +1,19 @@
 """A withdrawal Gene hasn't taken is never dropped or released: not by a restart (fri #252), not by the queue's
-capacity (fri #256). Against the real controller."""
+capacity (fri #256), not by its reader's own bound and not before what it names can't be kept (fri #329). Against the
+real controller."""
 
 import asyncio
+import datetime as dt
+import json
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import discord
 import pytest
 
-from compat_tests.test_fri_saved_withdrawal import SAVED, asked, restarted
-from compat_tests.test_fri_turn_withdrawal import MARKER, WITHDRAW, settled, world
+from compat_tests.test_fri_saved_withdrawal import SAVED, asked, long_after, restarted
+from compat_tests.test_fri_turn_withdrawal import MARKER, WITHDRAW, saved, settled, world
 from compat_tests.test_fri_withheld_history import delete, earlier_exchange, failing, on_disk
 from fri import fri_turn_withdrawal as withdrawal
 from fri.fri_turn_withdrawal import SavedTurns
@@ -76,6 +83,143 @@ def test_capacity_never_releases_a_withdrawal_gene_hasnt_taken(monkeypatch, tmp_
             w.agent.saved_turns = SavedTurns(w.agent)  # Started again: still held back.
             assert w.agent.saved_turns.withheld([earlier.id]) == {str(earlier.id)}
             assert MARKER not in await an_hour_later_asks(monkeypatch, w)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def closures_fail(monkeypatch):
+    """Writing until when saved context is held back fails, as a full disk would, while `state['down']`."""
+    state, real = {'down': True}, withdrawal.private_json
+    def writing(path, value):
+        if path.name == withdrawal.CLOSED_RECORD and state['down']:
+            raise OSError(28, 'injected')
+        return real(path, value)
+    monkeypatch.setattr(withdrawal, 'private_json', writing)
+    return state
+
+
+async def exchanges(w, count):
+    """`count` exchanges Fri saved, oldest first, the first holding the marker."""
+    first = await earlier_exchange(w)
+    later = [w.said(f'fri and then {n}') for n in range(count-1)]
+    for message in later:
+        await w.agent.handle(message)
+    return [first, *later]
+
+
+@pytest.mark.parametrize('recovered', [True, False], ids=['written at the restart', 'still not written'])
+def test_a_restart_past_twice_the_capacity_releases_nothing_its_reader_drops(monkeypatch, tmp_path, recovered):
+    """fri #329 item 1, the issue's repro: with a cap of two and holding saved context back failing to be written,
+    none of five failed withdrawals is dropped, and all five are on disk. Fri restarts once writes work again. Its
+    reader cut the five straight to two, so nothing held back what it dropped, and once the marks ran out the oldest's
+    words reached the next request. The reader's overflow is handled as the queue's is: every saved context is held
+    back until nothing it dropped can be kept, written down first. While that can't be written, it's held back all the
+    same and the record isn't replaced, so the next start reads all five again."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            messages = await exchanges(w, 5)
+            monkeypatch.setattr(withdrawal, 'MOST', 2)
+            failing(w, WITHDRAW)
+            closing = closures_fail(monkeypatch)
+            for message in messages:
+                await delete(w, message, guild=123)
+            await settled(w)
+            assert len(json.loads(on_disk(tmp_path))['pending']) == 5  # None dropped: nothing held back was written.
+            closing['down'] = not recovered
+            w.agent.saved_turns = SavedTurns(w.agent)  # Started again.
+            assert w.agent.saved_turns.closed()
+            assert MARKER not in await an_hour_later_asks(monkeypatch, w)
+            w.agent.saved_turns.persist()
+            if not recovered:  # Not replaced: the next start reads all five again.
+                assert len(json.loads(on_disk(tmp_path))['pending']) == 5
+            w.agent.saved_turns = SavedTurns(w.agent)  # And again.
+            assert w.agent.saved_turns.closed()
+            assert MARKER not in await an_hour_later_asks(monkeypatch, w)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def aged(w, text, seconds):
+    """A message of the member's sent `seconds` ago."""
+    event = w.said(text)
+    del w.rows[event.id]
+    event.id = discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(seconds=seconds))
+    w.rows[event.id] = event
+    event.reply.return_value = SimpleNamespace(id=event.id+100, content='okay', edit=AsyncMock())
+    return event
+
+
+def later(monkeypatch, seconds):
+    """The withdrawal queue's clock, `seconds` on; no one else's: the controller still keeps what it saved."""
+    monkeypatch.setattr(withdrawal, 'time', SimpleNamespace(time=lambda: time.time()+seconds,
+                                                            monotonic=time.monotonic))
+
+
+@pytest.mark.parametrize('how', ['expiry', 'capacity'])
+def test_a_withdrawal_lasts_as_long_as_what_it_names_from_when_it_was_saved(monkeypatch, tmp_path, how):
+    """fri #329 item 2, the issue's repro: the message was sent two minutes before Fri saved its exchange (and, from a
+    controller offering withdrawal-sources, a note from it), and its withdrawal stays pending. Fri restarts a minute
+    before what was saved can no longer be kept. The withdrawal counted from the message's own time, so it had expired,
+    or past the queue's capacity what held saved context back for it had ended, while the exchange lived on, and its
+    words reached the next request. It counts from when it was queued, after the save, kept on disk with it. Guard:
+    once that has passed too, it goes."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            horizon = withdrawal.NOTED_SECONDS if withdrawal.SOURCES in w.fri.capabilities else withdrawal.KEPT_SECONDS
+            earlier = aged(w, 'fri explain '+MARKER, 120)
+            await w.agent.handle(earlier)
+            assert MARKER in saved(w)
+            long_after(w)
+            others = [w.said(text) for text in ('fri what about lunch', 'fri and after that')] if how == 'capacity' else []
+            for other in others:  # Newer exchanges, so the earlier is the oldest the queue lets go.
+                await w.agent.handle(other)
+            if others:
+                monkeypatch.setattr(withdrawal, 'MOST', 2)
+            failing(w, WITHDRAW)
+            for message in (earlier, *others):
+                await delete(w, message, guild=123)
+            await settled(w)
+            later(monkeypatch, horizon-60)
+            w.agent.saved_turns = SavedTurns(w.agent)  # Started again a minute before the exchange can't be kept.
+            assert w.agent.saved_turns.withheld([earlier.id]) == {str(earlier.id)}
+            assert MARKER not in await an_hour_later_asks(monkeypatch, w)
+            later(monkeypatch, horizon+60)
+            w.agent.saved_turns = SavedTurns(w.agent)  # Past that too: nothing it names can be kept any more.
+            assert w.agent.saved_turns.withheld([earlier.id]) == set()
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('cause', ['capacity', 'unreadable'])
+def test_fri_health_says_why_saved_context_is_held_back(monkeypatch, tmp_path, cause):
+    """fri #329 item 4: after the queue's capacity held saved context back, `fri health` said a withdrawals record
+    couldn't be read. It says which, after a restart too, and nothing of the record."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            if cause == 'capacity':
+                messages = await exchanges(w, 3)
+                monkeypatch.setattr(withdrawal, 'MOST', 2)
+                failing(w, WITHDRAW)
+                for message in messages:
+                    await delete(w, message, guild=123)
+                await settled(w)
+            else:
+                (tmp_path/'withdrawals.json').write_text('{"pending": {"1": '+MARKER)
+            w.fri.get_guild = lambda _: None
+            for _ in range(2):
+                w.agent.saved_turns = SavedTurns(w.agent)  # Started again: from what was written down.
+                assert w.agent.saved_turns.closed()
+                report = await w.fri.watcher.report()
+                lines = [line for line in report.splitlines() if 'saved context' in line]
+                assert len(lines) == 1 and MARKER not in report
+                assert ("couldn't be read" in lines[0]) == (cause == 'unreadable')
+                assert ('more withdrawals were queued' in lines[0]) == (cause == 'capacity')
         finally:
             await w.fri.close()
     asyncio.run(scenario())
