@@ -35,9 +35,11 @@ jpcall is Fri-only. It does not use the Gene controller.
 - Only allowlisted members can start calls. Numbers must be Japanese (`+81`) unless listed as test numbers.
   Emergency and premium-rate prefixes are refused.
 - Fri never pays, gives card numbers, or accepts fees or cancellation terms on its own; those become questions.
-- Holds are app-timed: an apology about every 15 s and a call-back fallback after the hold limit.
-- Transcripts include third parties. They live only in the Discord messages; jpcall persists no call content.
-  The usage ledger stores counts and costs only.
+- Holds are app-timed: at most one check-in after 45 s of callee silence, with a call-back
+  fallback after the hold limit. Callee speech replaces that check-in with a natural answer.
+- Transcripts include third parties. By default they live only in Discord messages; jpcall
+  persists no call content. The optional development timeline below retains text when enabled.
+  Audio is never recorded or persisted. The usage ledger stores counts and costs only.
 - Costs: every model call and the Twilio leg is metered. One compact final message shows
   the outcome and total; `cost details` shows component tokens/minutes and USD ephemerally,
   marking estimates and pending Twilio prices.
@@ -135,3 +137,51 @@ The brief shows the short opener separately from the member's goal and share/nev
 The goal is context for the conversation, rather than a script to read aloud. The outcome
 renderer also preserves a callee's refusal to talk with an AI interpreter plainly. Discord
 UI references to the bot use `fri`; spoken-name pronunciation belongs to the engine.
+
+### Conversation settings
+
+The voice defaults are `JPCALL_REALTIME_MODEL=gpt-realtime-2.1`,
+`JPCALL_REALTIME_VOICE=coral`, and `JPCALL_REALTIME_SPEED=1.15` (valid range 0.25–1.5).
+The session receives the original member goal alongside the English plan, as data.
+Fri introduces itself once, waits for permission, then asks one concrete question at a time.
+Hold lines run out of band with only the short phone rules and the exact line to say.
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `JPCALL_HOLD_APOLOGY_EVERY_S` | `45` | Positive integer seconds; at most one proactive check-in per question |
+| `JPCALL_VAD_THRESHOLD` | `0.7` | Finite number from 0 to 1, inclusive |
+| `JPCALL_VAD_SILENCE_DURATION_MS` | `600` | Positive integer milliseconds |
+| `JPCALL_VAD_NOISE_REDUCTION` | `near_field` | `near_field`, `far_field`, `off` |
+| `JPCALL_REALTIME_REASONING` | unset | `minimal`, `low`, `medium`, `high`, `xhigh` |
+
+Server VAD remains enabled, with automatic responses and interruptions disabled.
+Higher activation threshold and near-field filtering reduce noise triggers. Replies and
+barge-in wait for a final non-echo transcript; this adds transcription latency to genuine
+interruptions, but keeps raw VAD noise and playback echo from cutting off Fri. Final input
+that resembles recent Fri speech is deleted from the model conversation and omitted from
+the public transcript. Matching uses normalized character overlap of at least 0.6 over a
+10-second window; answers under six characters are exempt. This is a heuristic, so a callee
+repeating a longer phrase can also be suppressed. Use headphones during development calls.
+
+`JPCALL_REALTIME_REASONING` is omitted from the session when unset, retaining the provider's
+documented `low` default. Greater effort can increase latency and output tokens; it does not
+change the per-token price. No fixed cost multiplier is available. The default model is unchanged.
+These fields were checked against the [GA client-event schema](https://developers.openai.com/api/reference/resources/realtime/client-events),
+[VAD guide](https://developers.openai.com/api/docs/guides/realtime-vad), and
+[Realtime 2.1 model documentation](https://developers.openai.com/api/docs/models/gpt-realtime-2.1).
+
+### Private development timeline
+
+`JPCALL_DEBUG_TIMELINE_PATH` is unset by default. Setting it to an operator-chosen JSONL
+file enables development-only text diagnostics. Parent directories are created as needed;
+the file is appended with mode `0600`, and symlinks at the file path are refused.
+Each call has an anonymous correlation ID, UTC timestamps and elapsed seconds. Multiple
+calls can append to the same file. Unsetting it disables writes for new sessions.
+
+Events include VAD starts/stops, response creation/completion/cancellation, truncation with
+played milliseconds, tool arguments/results, final transcripts, echo drops, and hold
+start/check-in/answer. No audio bytes or API credentials are written. This file contains
+private conversation text, including dropped echoes; keep it outside the checkout, restrict
+access and delete it after diagnosis. It has no automatic retention policy. It is separate
+from the counts/costs-only usage ledger. A write failure logs a fixed message and does not
+end the call. Normal logs never include timeline transcripts or paths.

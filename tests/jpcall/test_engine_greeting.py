@@ -67,7 +67,7 @@ def test_human_opener_waits_for_hello_to_finish(tmp_path, monkeypatch, transcrib
             assert brief.opener_ja in peer.responses[0]['instructions']
             assert call._status_sequence == 1  # An AMD delivery never consumes a progress sequence.
             latest = [e for e in peer.sent if e['type'] == EVENTS['session_update']][-1]
-            assert latest['session']['audio']['input']['turn_detection']['create_response'] is True
+            assert latest['session']['audio']['input']['turn_detection']['create_response'] is False
         finally:
             await engine.close()
             await http.aclose()

@@ -92,8 +92,8 @@ class ModelPeer(RealtimePeer):
             self.responses.append(response)
             instructions = response.get('instructions', '')
             prefix = self.language.say_prefix
-            text = (json.loads(instructions[len(prefix):])
-                    if instructions.startswith(prefix) else 'OK')
+            text = (json.loads(instructions.rsplit(prefix, 1)[1])
+                    if prefix in instructions else 'OK')
             self.counter += 1
             item_id = 'fri' + str(self.counter)
             resource = {'id': 'response' + str(self.counter), 'metadata': response['metadata'],
@@ -296,7 +296,7 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(
             await answer_phone(call)
             opener = peer.responses[0]['instructions']
             assert opener.count(language.opener) == 1
-            assert json.loads(opener[len(language.say_prefix):]) == language.opener
+            assert json.loads(opener.rsplit(language.say_prefix, 1)[1]) == language.opener
             assert 'Fri' not in opener
             await settled(lambda: call._rt._idle.is_set())
             assert len(peer.responses) == 1  # Wait for the callee; never append a purpose response.
@@ -307,7 +307,7 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(
             await settled(lambda: len(peer.responses) >= 2)
             assert peer.responses[1]['conversation'] == 'none'
             assert language.hold in peer.responses[1]['instructions']
-            clock.advance(15)
+            clock.advance(45)
             await settled(lambda: len(peer.responses) >= 3)
             assert language.apology in peer.responses[2]['instructions']
             assert peer.responses[2]['conversation'] == 'none'

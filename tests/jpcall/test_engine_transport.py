@@ -207,6 +207,9 @@ def test_barge_in_truncates_only_acknowledged_audio_and_ignores_clear_acks():
             await client.handle_event(delta)  # next 20 ms still queued
             await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'callee1',
                                        'audio_start_ms': 100})
+            assert not audio.cleared  # A raw VAD event cannot distinguish echo.
+            await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'callee1',
+                                       'transcript': '予約できますか。'})
             assert peer.sent[-1] == {'type': EVENTS['truncate'], 'item_id': 'fri1',
                                      'content_index': 0, 'audio_end_ms': 20}
             assert audio.cleared == ['fri'] and media.sent[-1] == ('clear',)
@@ -481,6 +484,8 @@ def test_barge_in_blocks_late_chunks_when_all_prior_chunks_were_played():
             await client.mark('1')
             await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'callee1',
                                        'audio_start_ms': 100})
+            await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'callee1',
+                                       'transcript': '予約できますか。'})
             assert peer.sent[-1]['audio_end_ms'] == 20
             count = len(audio.frames)
             await client.handle_event(delta)
@@ -626,7 +631,9 @@ def test_interrupted_transcript_is_marked_even_when_generation_finished_first():
             assert not events.items
             await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'callee1',
                                        'audio_start_ms': 20})
-            assert events.items[0].text_ja == '途中の文章 …'
+            await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'callee1',
+                                       'transcript': '予約できますか。'})
+            assert next(e for e in events.items if e.speaker == 'fri').text_ja == '途中の文章 …'
         finally:
             await client.stop()
     asyncio.run(run())

@@ -25,7 +25,7 @@ def test_hold_deadline_survives_a_stalled_apology():
         hold = HoldController('request1', Limits(), emit, say, result, state, clock=lambda: now[0])
         try:
             assert await hold.ask('tool1', 'Proceed?', ())
-            now[0] = 15
+            now[0] = 45
             await hold.tick()
             now[0] = 60
             await hold.tick()
