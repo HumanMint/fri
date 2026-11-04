@@ -41,12 +41,15 @@ def test_rest_api_key_auth_twiml_hangup_and_posted_billing():
             assert await api.create_call('03-1234-5678', 'm' * 43, 's' * 43) == SID
             form = parse_qs(requests[0].content.decode())
             assert form['To'] == ['+81312345678']
+            assert not any('record' in key.lower() for key in form)
             assert form['TimeLimit'] == ['900']
             assert form['StatusCallbackEvent'] == ['initiated', 'ringing', 'answered', 'completed']
             root = fromstring(form['Twiml'][0])
             assert root.find('Connect/Stream').attrib['url'] == (
                 'wss://calls.example.test/jpcall/media/' + 'm' * 43)
             assert root.find('Hangup') is not None
+            assert not any('record' in node.tag.lower() for node in root.iter())
+            assert not any('record' in key.lower() for node in root.iter() for key in node.attrib)
             assert form['StatusCallback'] == [
                 'https://calls.example.test/jpcall/status/' + 's' * 43]
             await api.hang_up(SID)

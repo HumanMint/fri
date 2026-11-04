@@ -14,7 +14,7 @@ from test_engine_transport import ULAW, Audio, Events, RealtimeHTTP, RealtimePee
 from test_engine_usage import realtime_usage
 
 import fri.jpcall.engine as engine_module
-from fri.jpcall.config import JpcallConfig
+from fri.jpcall.config import CALL_LANGUAGES, JpcallConfig
 from fri.jpcall.contract import (
     CallFinished,
     CallRejected,
@@ -28,7 +28,9 @@ from fri.jpcall.contract import (
     Utterance,
 )
 from fri.jpcall.engine import JpcallEngine
-from fri.jpcall.realtime import EVENTS, OPENING_NOTICES, RealtimeClient
+from fri.jpcall.realtime import EVENTS, RealtimeClient
+
+OPENING_NOTICES = CALL_LANGUAGES['ja'].opener
 
 SID = 'CA' + '3' * 32
 
@@ -75,18 +77,22 @@ class ModelPeer(RealtimePeer):
         self.order = order
         self.responses = []
         self.counter = 0
+        self.language = CALL_LANGUAGES['ja']
 
     async def send_json(self, event):
         self.sent.append(event)
         if event['type'] == EVENTS['session_update']:
+            code = event['session']['audio']['input']['transcription']['language']
+            self.language = CALL_LANGUAGES[code]
             self.feed({'type': 'rate_limits.updated', 'rate_limits': []})
             self.feed({'type': EVENTS['session_updated']})
         elif event['type'] == EVENTS['response_create']:
             response = event['response']
             self.responses.append(response)
             instructions = response.get('instructions', '')
-            text = (json.loads(instructions.split('文章：', 1)[1])
-                    if '文章：' in instructions else '承知しました。')
+            prefix = self.language.say_prefix
+            text = (json.loads(instructions[len(prefix):])
+                    if instructions.startswith(prefix) else 'OK')
             self.counter += 1
             item_id = 'fri' + str(self.counter)
             resource = {'id': 'response' + str(self.counter), 'metadata': response['metadata'],
@@ -129,8 +135,7 @@ class Provider:
                 self.order.append('brief')
                 if self.brief_gate is not None:
                     await self.brief_gate.wait()
-                text = json.dumps({'summary_en': 'Ask whether lunch is available.',
-                                   'purpose_ja': 'ランチの空席について伺いたくお電話しました。'})
+                text = json.dumps({'summary_en': 'Ask whether lunch is available.'})
             elif instructions.startswith('Translate'):
                 self.order.append('translation')
                 if self.bad_translation:
@@ -206,7 +211,7 @@ class PhoneMedia:
         self.closed = True
 
 
-async def make_engine(tmp_path, monkeypatch, provider=None):
+async def make_engine(tmp_path, monkeypatch, provider=None, *, call_language='ja'):
     provider = provider or Provider()
     peer = ModelPeer(provider.order)
     original = RealtimeClient
@@ -217,7 +222,8 @@ async def make_engine(tmp_path, monkeypatch, provider=None):
 
     monkeypatch.setattr(engine_module, 'RealtimeClient', realtime)
     config = JpcallConfig.from_env(environment() | {'FRI_DATA': str(tmp_path),
-                                                   'JPCALL_ALLOWED_USER_IDS': '12'})
+                                                   'JPCALL_ALLOWED_USER_IDS': '12',
+                                                   'JPCALL_CALL_LANGUAGE': call_language})
     http = httpx.AsyncClient(transport=httpx.MockTransport(provider.handle))
     engine = JpcallEngine(config, http_client=http)
     runner = Runner()
@@ -257,27 +263,41 @@ async def answer_phone(call):
     return media
 
 
-def test_whole_flow_plan_hold_answer_finish_and_late_price(tmp_path, monkeypatch):
+@pytest.mark.parametrize('call_language', ['ja', 'ko'])
+def test_whole_flow_plan_hold_answer_finish_and_late_price(
+        tmp_path, monkeypatch, call_language):
     async def run():
-        engine, provider, peer, http, clock, runner = await make_engine(tmp_path, monkeypatch)
+        engine, provider, peer, http, clock, runner = await make_engine(
+            tmp_path, monkeypatch, call_language=call_language)
         try:
             call, brief, audio, events = await dial(engine, provider)
-            assert brief.opener_ja.count(OPENING_NOTICES) == 1
+            language = engine.config.language
+            assert brief.opener_ja == language.opener
+            assert 'Fri' not in brief.opener_ja
             assert brief.share == request().share and brief.never == request().never
+            request_body = json.loads(provider.requests[0].content)
+            assert 'app supplies the fixed opener' in request_body['input'][0]['content']
+            assert set(request_body['text']['format']['schema']['properties']) == {'summary_en'}
             assert provider.order.index('realtime_connect') < provider.order.index('create')
             assert not peer.responses
             assert [line.component for line in call._meter.lines()] == ['brief']
             await answer_phone(call)
-            assert peer.responses[0]['instructions'].count(OPENING_NOTICES) == 1
+            opener = peer.responses[0]['instructions']
+            assert opener.count(language.opener) == 1
+            assert json.loads(opener[len(language.say_prefix):]) == language.opener
+            assert 'Fri' not in opener
+            await settled(lambda: call._rt._idle.is_set())
+            assert len(peer.responses) == 1  # Wait for the callee; never append a purpose response.
             peer.tool('ask_group', {'question_en': 'Which time?', 'options': ['noon', 'one']})
             await settled(lambda: any(isinstance(e, QuestionAsked) for e in events.items))
             question = next(e for e in events.items if isinstance(e, QuestionAsked))
             assert question.deadline_s == 60
             await settled(lambda: len(peer.responses) >= 2)
             assert peer.responses[1]['conversation'] == 'none'
+            assert language.hold in peer.responses[1]['instructions']
             clock.advance(15)
             await settled(lambda: len(peer.responses) >= 3)
-            assert '申し訳' in peer.responses[2]['instructions']
+            assert language.apology in peer.responses[2]['instructions']
             assert peer.responses[2]['conversation'] == 'none'
             answers = await asyncio.gather(call.answer(question.question_id, 'noon', 34),
                                            call.answer(question.question_id, 'one', 56))
@@ -294,7 +314,12 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(tmp_path, monkeypatch
             assert audio.closed and provider.hangups == 1 and not call._transcript
             assert call._rt is None and call._hold is None
             assert provider.order.index('CallFinished') < provider.order.index('audio_close')
+            assert language.farewell in peer.responses[-1]['instructions']
             assert any(isinstance(e, Translation) for e in events.items)
+            prompts = [json.loads(r.content)['input'][0]['content']
+                       for r in provider.requests if r.url.host == 'api.openai.com']
+            assert any(f'supplied {language.name} call utterance' in p for p in prompts)
+            assert any(f'The call transcript is {language.name}.' in p for p in prompts)
             assert any(isinstance(e, Utterance) for e in events.items)
             states = [e.state for e in events.items if isinstance(e, StatusChanged)]
             assert states[:4] == [CallState.DIALING, CallState.RINGING,
@@ -305,7 +330,10 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(tmp_path, monkeypatch
             update = next(e for e in events.items if isinstance(e, UsageUpdated))
             twilio = next(line for line in update.usage if line.component == 'twilio')
             assert twilio.exact and twilio.usd == .25 and update.usage_final
-            data = '\n'.join(path.read_text() for path in (tmp_path / 'jpcall').glob('*')
+            files = list((tmp_path / 'jpcall').glob('*'))
+            assert {path.name for path in files} == {
+                'daily-counts.lock', 'daily-counts.json', 'jpcall-usage.jsonl'}
+            data = '\n'.join(path.read_text() for path in files
                               if path.is_file())
             assert 'ランチ' not in data and request().goal not in data and '+8190' not in data
             assert request().request_id not in data and 'Which time' not in data
@@ -464,7 +492,7 @@ def test_time_limit_plays_goodbye_and_finishes(tmp_path, monkeypatch):
             await settled(lambda: bool(clock.sleepers))
             clock.advance(15)
             await asyncio.wait_for(call._finished.wait(), 1)
-            assert any('失礼いたします' in response.get('instructions', '')
+            assert any(engine.config.language.farewell in response.get('instructions', '')
                        for response in peer.responses)
             assert provider.hangups == 1 and audio.closed
             assert next(e for e in events.items if isinstance(e, CallFinished)).duration_s == 15
@@ -623,6 +651,37 @@ def test_explicit_hangup_interrupts_goodbye_waiting_for_playout(tmp_path, monkey
             assert not call._finished.is_set()
             await asyncio.wait_for(call.hang_up(), 1)
             assert audio.closed and provider.hangups == 1
+        finally:
+            await engine.close()
+            await http.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('call_language', ['ja', 'ko'])
+def test_model_cannot_change_the_fixed_opener(tmp_path, monkeypatch, call_language):
+    async def run():
+        provider = Provider()
+        original = provider.handle
+
+        async def extra_dialogue(request):
+            response = await original(request)
+            if request.url.host == 'api.openai.com':
+                body = response.json()
+                body['output'][0]['content'][0]['text'] = json.dumps({
+                    'summary_en': 'Full request details for approval, not for the opening turn.',
+                    'purpose_ja': 'Do not speak this extra purpose.',
+                    'opener_ja': 'Fri says an unauthorized introduction.'})
+                return httpx.Response(200, json=body)
+            return response
+
+        provider.handle = extra_dialogue
+        engine, provider, peer, http, clock, runner = await make_engine(
+            tmp_path, monkeypatch, provider, call_language=call_language)
+        try:
+            brief = await engine.plan(request())
+            assert brief.opener_ja == engine.config.language.opener
+            assert 'Full request' in brief.summary_en
+            assert 'create' not in provider.order
         finally:
             await engine.close()
             await http.aclose()
