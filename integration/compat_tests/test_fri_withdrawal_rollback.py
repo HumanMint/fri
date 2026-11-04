@@ -242,8 +242,11 @@ def test_a_restart_against_an_older_controller_keeps_a_valid_withdrawal_held_bac
                 await settled(w)
                 assert [payload.get('revision') for payload in calls(w, WITHDRAW)] == [0]
                 assert MARKER not in saved(w) and not w.agent.saved_turns.pending
-            else:
-                monkeypatch.setattr(withdrawal, 'KEPT_SECONDS', 0)  # Past the week an exchange lives: it can't matter.
+            else:  # Past the week an exchange lives, from when its withdrawal was queued (fri #329): it can't matter.
+                import time
+                from types import SimpleNamespace
+                monkeypatch.setattr(withdrawal, 'time', SimpleNamespace(
+                    time=lambda: time.time()+withdrawal.KEPT_SECONDS+60, monotonic=time.monotonic))
                 w.agent.saved_turns.retry()
                 await settled(w)
                 assert not w.agent.saved_turns.pending
@@ -939,11 +942,11 @@ def test_a_withdrawn_note_stays_held_back_past_a_week(monkeypatch, tmp_path, rec
     asyncio.run(scenario())
 
 
-def test_a_deadline_is_kept_once_normalized_whatever_the_clock_or_a_set_aside_name_says(monkeypatch, tmp_path):
+def test_a_deadline_is_kept_as_written_whatever_the_clock_or_a_set_aside_name_says(monkeypatch, tmp_path):
     """A record set aside under a name dated in the future (a clock set back since) closes for the longest horizon
-    from the first start that sees it, kept on disk: later starts don't push it on."""
+    from the start that found it unreadable, kept on disk: a clock set back a month doesn't cut it short (Sol round 1
+    of #339), and later starts don't push it on."""
     async def scenario():
-        import fri.fri_turn_withdrawal as withdrawal
         from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
         try:
@@ -951,13 +954,14 @@ def test_a_deadline_is_kept_once_normalized_whatever_the_clock_or_a_set_aside_na
             (tmp_path/'withdrawals.json').write_text('{"pending": {')
             w.agent.saved_turns = SavedTurns(w.agent)
             assert w.agent.saved_turns.closed()
+            written = w.agent.saved_turns.closed_until
             aside = next(tmp_path.glob('withdrawals.unreadable-*.json'))
             aside.rename(tmp_path/'withdrawals.unreadable-99999999999.json')  # Dated in the year 5138.
             module_clock(monkeypatch, -30*86400)  # The clock set back a month.
             w.agent.saved_turns = SavedTurns(w.agent)
             assert w.agent.saved_turns.closed()
             first = w.agent.saved_turns.closed_until
-            assert first <= withdrawal.time.time()+withdrawal.CLOSED_SECONDS
+            assert first == written
             module_clock(monkeypatch, 86400)  # A day later.
             w.agent.saved_turns = SavedTurns(w.agent)
             assert w.agent.saved_turns.closed() and w.agent.saved_turns.closed_until == first

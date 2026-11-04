@@ -540,6 +540,13 @@ def on_disk(tmp_path):
     return path.read_text() if path.exists() else ''
 
 
+def holds(tmp_path):
+    """Each entry on disk, and whether it's only a hold: its message's ID, never sent, naming no member (fri #252),
+    with when it was queued (fri #329)."""
+    found = json.loads(on_disk(tmp_path) or '{"pending": {}}')['pending']
+    return {i: entry.get('hold') is True and set(entry) <= {'hold', 'queued_at'} for i, entry in found.items()}
+
+
 def test_a_by_id_withdrawal_whose_author_is_unknown_reaches_disk_only_as_a_hold(monkeypatch, tmp_path):
     """F1: Fri can't name whose it is, so "forget me" couldn't find it there. It's retried in memory, and on disk it's
     only a hold, its message's ID and nothing else, never sent from there (fri #252: a restart mustn't release it)."""
@@ -553,7 +560,7 @@ def test_a_by_id_withdrawal_whose_author_is_unknown_reaches_disk_only_as_a_hold(
             failing(w, SAVED)
             await delete(w, earlier, guild=123)
             assert str(earlier.id) in w.agent.saved_turns.pending  # Still sent again while Fri runs.
-            assert json.loads(on_disk(tmp_path))['pending'] == {str(earlier.id): {'hold': True}}
+            assert holds(tmp_path) == {str(earlier.id): True}
             await w.agent.handle(w.said('fri forget me'))
             assert '"20"' not in on_disk(tmp_path)  # Nothing on disk names them.
         finally:
@@ -573,7 +580,7 @@ def test_a_by_id_withdrawal_whose_author_fri_knows_goes_with_their_forget_me(mon
             failing(w, SAVED)
             await delete(w, nearby, guild=123)
             assert w.agent.saved_turns.pending[str(nearby.id)].get('user_id') == '20'  # Theirs, in memory only.
-            assert json.loads(on_disk(tmp_path))['pending'] == {str(nearby.id): {'hold': True}}  # A hold (fri #252).
+            assert holds(tmp_path) == {str(nearby.id): True}  # A hold (fri #252).
             await w.agent.handle(w.said('fri forget me'))
             assert str(nearby.id) not in on_disk(tmp_path) and str(nearby.id) not in w.agent.saved_turns.pending
         finally:
@@ -602,9 +609,10 @@ def test_a_save_answered_after_forget_me_records_nothing_of_them(monkeypatch, tm
             w.fri.api = calling
             await w.agent.handle(earlier)
             await settled(w)
-            kept = on_disk(tmp_path)
-            # Asked about by ID, its author unknown by then: on disk only as a hold, naming no one (fri #252).
-            assert '"20"' not in kept and json.loads(kept)['pending'] == {str(earlier.id): {'hold': True}}
+            # Asked about by ID, its author unknown by then: on disk only as a hold, naming no one (fri #252), from a
+            # controller that offers asking by ID; one that doesn't is asked nothing, so nothing is queued (fri #329).
+            assert '"20"' not in on_disk(tmp_path)
+            assert holds(tmp_path) == ({str(earlier.id): True} if 'saved-turn-withdrawal' in w.fri.capabilities else {})
             assert not any((entry.get('scope') or {}).get('user_id') == '20' or entry.get('user_id') == '20'
                            for entry in w.agent.saved_turns.pending.values())
         finally:
@@ -659,7 +667,7 @@ def test_an_edit_after_forget_me_and_a_restart_writes_nothing_of_them_to_disk(mo
             await edit(w, edited(before))
             assert str(before.id) in w.agent.saved_turns.pending  # Sent again while Fri runs.
             assert '"20"' not in on_disk(tmp_path)
-            assert json.loads(on_disk(tmp_path))['pending'] == {str(before.id): {'hold': True}}
+            assert holds(tmp_path) == {str(before.id): True}
         finally:
             await w.fri.close()
     asyncio.run(scenario())
