@@ -139,7 +139,12 @@ def test_nontext_retention_restart_erasure_and_pending_race(store):
     assert not restarted.chat_context('123', 'public:456', '20')['turns']
     restarted.personal_control('20', 'enable')
     revision = restarted.chat_context('123', 'public:1', '20')['revision']
-    arm(restarted, origin(revision=revision))
+    # A request made once memory is on again: origin() dates its message a minute back, before the erasure, and one
+    # from then leaves no question pending now (fri #337, as in HumanMint/gene#208's copy).
+    time.sleep(0.01)  # Snowflakes count milliseconds.
+    asked = origin(revision=revision)
+    asked['source'] = {**asked['source'], 'id': str(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)))}
+    arm(restarted, asked)
     with pytest.raises(Conflict, match='outstanding'):
         restarted.save_chat('123', 'public:1', '20', revision, 'gotcha', '', 'model', 'high',
                             source=source(channel='1'), response_kind='quiet')

@@ -1,5 +1,6 @@
 """Bounded personal notes, never permissions, shared server facts, or worker input."""
 
+import math
 import re
 
 import discord
@@ -131,17 +132,35 @@ def open_to_everyone(channel):
     return True
 
 
+def valid_time(value):
+    """A cutoff the controller sent (removed_at, erased_at), as a time Fri can compare: a finite, non-negative number, 0
+    meaning the member never did. None for anything else (missing, a string, an object, a boolean, NaN, negative): Fri
+    can't tell from it, and each caller says what that means (fri #337's round 1)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def sent_by(message_id, at):
+    """The message was sent at or before `at`, a valid time (see valid_time)."""
+    return at > 0 and discord.utils.snowflake_time(int(message_id)).timestamp() <= at
+
+
 def before_removal(message_id, profile):
-    """Sent before the member last edited their memory, so Fri keeps it nowhere (the controller's removed_at)."""
-    return discord.utils.snowflake_time(int(message_id)).timestamp() <= (profile.get('removed_at') or 0)
+    """Sent at or before the member last turned memory off or edited it (the controller's removed_at), so Fri keeps it
+    nowhere and leaves it out of what it shows the model. A cutoff that can't be verified holds it back too (fri #337's
+    round 1): this is for what a reply or a pass draws on, never the member's own message, which is answered."""
+    at = valid_time(profile.get('removed_at')) if isinstance(profile, dict) else None
+    return at is None or sent_by(message_id, at)
 
 
 def before_erasure(message_id, at):
     """Sent at or before `at`, when the member last turned memory off (the controller's erased_at,
-    HumanMint/gene#206), so Fri doesn't answer it once memory is on again (fri #331). None or 0, from a controller
-    that doesn't say, holds nothing to it."""
-    return (isinstance(at, (int, float)) and at > 0 and
-            discord.utils.snowflake_time(int(message_id)).timestamp() <= at)
+    HumanMint/gene#206), so Fri doesn't answer it once memory is on again (fri #331). One that can't be verified, or
+    a controller that doesn't say, holds nothing to it: the member's own message is answered, and what it draws on is
+    held to before_removal."""
+    at = valid_time(at)
+    return at is not None and sent_by(message_id, at)
 
 
 def memory_intent(text):

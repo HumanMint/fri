@@ -35,7 +35,7 @@ from .fri_errors import (
 )
 from .fri_images import forwarded, media, started_a_thread
 from .fri_ledger import COOLDOWN, Ledger, addressed, notice_reason
-from .fri_memory import before_erasure, before_removal, memory_intent
+from .fri_memory import before_erasure, before_removal, memory_intent, valid_time
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
 from .fri_reports import report_message
@@ -927,7 +927,7 @@ class Agent:
         if not isinstance(current, int) or isinstance(current, bool):
             return current  # As the controller gave it, so callers check it as before.
         read = Revision(current)
-        read.erased_at = (profile.get('erased_at') or 0) if profile.get('enabled') else 0
+        read.erased_at = (valid_time(profile.get('erased_at')) or 0) if profile.get('enabled') else 0
         return read
 
     async def erasure(self, user, forgotten, revision=None):

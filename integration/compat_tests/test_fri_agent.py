@@ -426,7 +426,7 @@ def test_attention_skips_messages_the_direct_path_is_answering():
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
         agent = Agent(fri)
         agent.state['config']['enabled'] = True
-        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'removed_at': 0})  # See test_fri_actions.
         agent.respond = AsyncMock()
         agent.run = AsyncMock(return_value=({'action': 'quiet', 'source_id': '', 'reason': ''}, {}, 'completed'))
         def message(mid, content):
@@ -455,7 +455,7 @@ def test_attention_skips_followups_in_an_active_window():
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
         agent = Agent(fri)
         agent.state['config']['enabled'] = True
-        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'removed_at': 0})  # See test_fri_actions.
         agent.respond = AsyncMock()
         agent.run = AsyncMock()
         agent.active[(456, 11)] = time.time()+120
@@ -478,7 +478,7 @@ def test_attention_yields_when_the_direct_path_takes_its_pick_meanwhile():
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}), busy=set())
         agent = Agent(fri)
         agent.state['config'].update(enabled=True, proactive=True)
-        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'removed_at': 0})  # See test_fri_actions.
         agent.respond = AsyncMock()
         message = SimpleNamespace(id=100, guild=SimpleNamespace(id=123), channel=channel,
             content='anyone know why the build is broken?', author=SimpleNamespace(id=11, bot=False, display_name='friend'),
