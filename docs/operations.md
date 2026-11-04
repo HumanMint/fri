@@ -266,6 +266,14 @@ advertises it, so the controller must be released first.
   window, rebuilt from the live view. An unreachable controller fails the attention stage, as before.
   An older controller gets the per-author profile reads, which an erasure through Gene during them
   can still slip past.
+- **A learning pass's last check.** Signed in, before its summary request, a learning or exploration
+  pass reads its batch again from Discord: the same history, or each archived message by its ID (the
+  archive's search index can lag a deletion). A message that's gone, or reads otherwise now, is
+  dropped, so a deletion or edit whose event never reached Fri doesn't go (fri #335). Then a
+  controller offering `learning-withdrawals` says which of the messages it knows were withdrawn
+  (`/agent/learning/{batch}/withdrawn`, what the pass's finish would refuse), and those go too; the
+  planner's historical topics are checked the same way. A controller without it can't say, so nothing
+  is sent: the pass stops as a failed read does and keeps its progress, its batch read again.
 - **Withdrawn messages' saved exchanges.** When a member's message Fri saved an exchange with is
   edited, however long ago Fri last carried it (fri #174), or deleted, Fri asks a controller that
   offers `turn-withdrawal` to drop that exchange through `/chat/turn/withdraw`, so the old words stop

@@ -29,6 +29,30 @@ def assigned(scheduler, claim):
     return scheduler.exploration.target(claim['id'], [{'user_id': '11', 'name': 'friend', 'role_id': '90'}])
 
 
+def offered(client):
+    """What a pass's Fri, built by hand here, offers of the controller's: learning-withdrawals, which a pass needs
+    before it sends anything (fri #335). A test of a pass that sends skips against a controller without it."""
+    found = set(client.get('/fri/contract', headers=headers('fri')).json()['capabilities']) & {'learning-withdrawals'}
+    if not found:
+        pytest.skip('needs a controller offering learning-withdrawals')
+    return frozenset(found)
+
+
+def by_id(http, rows):
+    """An archive's Discord HTTP, `http`, that also reads a message by its ID, as a pass does right before it sends
+    it (fri #335): from `rows`, what Discord holds now; one not there is gone."""
+    import discord
+
+    async def request(route, params=None):
+        if '/channels/' in route.url and '/messages/' in route.url:
+            found = next((row for row in rows if row['id'] == route.url.rsplit('/', 1)[-1]), None)
+            if found is None:
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+            return found
+        return await http(route, params)
+    return request
+
+
 def row(at, user='11', text='played minecraft with everyone', channel='1', bot=False):
     return {'id': str(int(snowflake_floor(at))+1), 'channel_id': channel,
             'author': {'id': user, 'bot': bot}, 'content': text}
