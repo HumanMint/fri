@@ -3,7 +3,7 @@
 `/jpcall` lets a member in a Discord voice channel ask Fri to phone a Japanese
 business for the group. Fri speaks Japanese on the call, plays the call audio
 (the callee and Fri) into the voice channel, posts a live Japanese/English
-transcript in the voice channel's chat, asks the group when it needs an answer
+transcript in the invoking channel, asks the group when it needs an answer
 while politely holding the callee, and posts the outcome and a cost summary
 when the call ends. Members' voices never go into the call.
 
@@ -44,7 +44,11 @@ jpcall is Fri-only. It does not use the Gene controller.
 
 The runtime image needs libopus (for example, the `libopus0` system package on Debian).
 The pinned discord.py voice extra supplies PyNaCl and DAVE support; `davey` is also pinned
-explicitly. PCM sources use the normal `VoiceClient.play` path: the player encodes PCM
+to 0.1.7 explicitly: discord.py 2.7.1 does not implement davey 0.2's explicit MLS
+transition API. The incompatible pair leaves encryption keys inactive even after connection
+completes. See the [upstream compatibility update](https://github.com/Rapptz/discord.py/pull/10548).
+Playback waits for the negotiated DAVE session to become ready before consuming audio.
+PCM sources use the normal `VoiceClient.play` path: the player encodes PCM
 to Opus, then `_get_voice_packet` applies DAVE encryption before transport encryption.
 This path was checked against the installed discord.py 2.7.1 source; a live encrypted
 voice session still needs a manual development-guild check.
@@ -57,11 +61,12 @@ uv run python -m fri.jpcall.devbot --fake-engine --allow-user MEMBER_ID
 ```
 
 In fake mode, repeat `--allow-user` for each member who may start a call; the default
-allows nobody. The brief is public in the voice channel's chat; only the requester can
-confirm or cancel it. Anyone currently in that voice channel may answer call questions.
+allows nobody. The brief, transcript, questions, outcome and costs go in the channel where
+`/jpcall` was invoked (including a voice channel's own chat). Fri joins the requester's voice
+channel. Only the requester can confirm or cancel the brief. Anyone currently in that voice channel may answer call questions.
 The bot needs guild and voice-state intents, the applications.commands scope, and view
-channel, send messages, embed links, connect and speak permissions in the test voice
-channel. It connects self-deafened and never receives or forwards member audio.
+channel, send messages and embed links permissions in the invoking channel, plus connect
+and speak permissions in the test voice channel. It connects self-deafened and never receives or forwards member audio.
 The fake engine scripts Japanese/English lines, one group question, synthetic tones,
 an outcome and estimated component costs followed by a sample posted phone price.
 Fake mode uses no phone/model credentials and never imports engine configuration or
@@ -86,3 +91,25 @@ module as unavailable; real mode requires the separately implemented engine modu
 The cost summary lists units and USD per component/model, then sums input and output tokens
 across models. Cached modality counts are included once; explicit aggregate token counts take
 precedence over breakdowns. Prices retain `~` for estimates and `pending` until posted.
+
+### Audio diagnostic
+
+```sh
+uv run python -m fri.jpcall.devbot --fake-engine --audio-check --allow-user MEMBER_ID
+```
+
+Join a voice channel, invoke `/jpcall` in the desired text chat (any number and a goal
+such as `audio check`), then press `call`. This mode plays a five-second 440 Hz tone at
+about -12 dBFS peak, without calling a phone/model API or asking a group question. The
+script holds the source open for the 250 frames plus a short scheduling margin.
+
+Before starting the player, the console logs a `ready` state with zero frames read.
+The console then reports play calls, player state, frames read, non-silent frames, EOF reads, UDP packets sent/failed/blocked,
+speaking updates, mute/suppression flags, and DAVE protocol/readiness/encryption counts.
+It logs no packet contents, tokens, keys, privacy codes or channel/member identifiers. Expect
+250 non-silent frames and at least 250 sent packets, a speaking-on update and DAVE encryption
+successes when DAVE is negotiated. A connected voice transport alone does not establish MLS
+readiness. Opus must be installed and loadable by discord.py on the development machine.
+
+Offline tests drive the installed player and send path with a synthetic codec/socket; live
+audibility, the actual codec and the server's handshake still need a development-guild check.

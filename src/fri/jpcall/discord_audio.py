@@ -18,6 +18,7 @@ class CallAudioSource(discord.AudioSource):
         self._buffers = {speaker: bytearray() for speaker in ('callee', 'fri')}
         self._state = None
         self._closed = False
+        self._counts = dict(frames_read=0, non_silent_frames=0, eof_reads=0, peak=0)
 
     def push(self, speaker: Speaker, pcm16: bytes) -> None:
         if len(pcm16) % 2:
@@ -52,10 +53,16 @@ class CallAudioSource(discord.AudioSource):
     def cleanup(self) -> None:
         self.close()
 
+    def stats(self):
+        with self._lock:
+            return dict(self._counts)
+
     def read(self) -> bytes:
         with self._lock:
             if self._closed:
+                self._counts['eof_reads'] += 1
                 return b''
+            self._counts['frames_read'] += 1
             has_audio = any(self._buffers.values())
             frames = []
             for buffer in self._buffers.values():
@@ -69,4 +76,8 @@ class CallAudioSource(discord.AudioSource):
             mono = mono.rjust(OUTPUT_FRAME // 2, b'\0')
             if not has_audio:
                 return bytes(OUTPUT_FRAME)
-            return audioop.tostereo(mono, 2, 1, 1)
+            frame = audioop.tostereo(mono, 2, 1, 1)
+            peak = audioop.max(frame, 2)
+            self._counts['non_silent_frames'] += bool(peak)
+            self._counts['peak'] = max(self._counts['peak'], peak)
+            return frame

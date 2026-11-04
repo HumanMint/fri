@@ -31,6 +31,14 @@ from .contract import (
 from .discord_command import NO_MENTIONS, register
 from .discord_runtime import disabled_message, load_config
 
+TONE_PEAK = round(32767 * 10 ** (-12 / 20))
+
+
+def tone_pcm(seconds, frequency=440):
+    return struct.pack(f'<{round(8000 * seconds)}h', *(
+        round(TONE_PEAK * math.sin(2 * math.pi * frequency * sample / 8000))
+        for sample in range(round(8000 * seconds))))
+
 
 class FakeSession:
     def __init__(self, request, audio, events):
@@ -48,7 +56,7 @@ class FakeSession:
         await self.emit(Utterance, item_id, speaker, ja, 0.0)
         # Keep tone phase continuous across frames. Synthetic audio only.
         for frame in range(25):
-            pcm = struct.pack('<160h', *(int(2000 * math.sin(2 * math.pi * frequency *
+            pcm = struct.pack('<160h', *(int(TONE_PEAK * math.sin(2 * math.pi * frequency *
                                               (frame * 160 + sample) / 8000))
                                         for sample in range(160)))
             self.audio.push(speaker, pcm)
@@ -85,7 +93,7 @@ class FakeSession:
                       0.01 if phone_posted else None, exact=phone_posted),
         )
 
-    async def finish(self, outcome):
+    async def finish(self, outcome, *, duration_s=15.0, usage_final=False):
         async with self._finish_lock:
             if self.ended:
                 return
@@ -93,7 +101,7 @@ class FakeSession:
             if self.question_open:
                 self.question_open = False
                 await self.emit(QuestionClosed, 'time', 'call_ended')
-            await self.emit(CallFinished, outcome, 15.0, self.usage(), False)
+            await self.emit(CallFinished, outcome, duration_s, self.usage(), usage_final)
 
     async def run(self):
         try:
@@ -122,11 +130,28 @@ class FakeSession:
             raise
 
 
+class AudioCheckSession(FakeSession):
+    @staticmethod
+    def usage(phone_posted=False):
+        return (UsageLine('audio check', 'synthetic-tone', {'seconds': 5}, 0, True),)
+
+    async def finish(self, outcome):
+        await super().finish(outcome, duration_s=5.0, usage_final=True)
+
+    async def run(self):
+        self.audio.push('fri', tone_pcm(5))
+        # Playback is already gated on DAVE readiness. Allow the player its 250
+        # real-time frames plus a small scheduling margin before closing the source.
+        await asyncio.sleep(5.25)
+        await self.finish('audio check complete. counts are in the console.')
+
+
 class FakeEngine:
     """Implements only CallEngine's contract; all prices and speech are synthetic."""
 
-    def __init__(self):
+    def __init__(self, *, audio_check=False):
         self.sessions = []
+        self.audio_check = audio_check
 
     async def open(self):
         pass
@@ -134,12 +159,15 @@ class FakeEngine:
     async def plan(self, request):
         if not request.goal.strip():
             raise CallRejected('give me a goal for the call.')
-        return CallBrief(request.request_id, f'fake call · {request.goal}',
+        summary = ('audio check · five seconds of 440 hz tone. no phone call.'
+                   if self.audio_check else f'fake call · {request.goal}')
+        return CallBrief(request.request_id, summary,
                          'AIアシスタントです。グループが聞いており、通話は文字起こしされます。',
                          request.share, request.never)
 
     async def start(self, brief, request, audio, events):
-        session = FakeSession(request, audio, events)
+        session_type = AudioCheckSession if self.audio_check else FakeSession
+        session = session_type(request, audio, events)
         self.sessions.append(session)
         session.task = asyncio.create_task(session.run())
         return session
@@ -150,12 +178,13 @@ class FakeEngine:
 
 
 class DevBot(discord.Client):
-    def __init__(self, engine, guild_id, limits, *, config=None):
+    def __init__(self, engine, guild_id, limits, *, config=None, audio_check=False):
         intents = discord.Intents.none()
         intents.guilds = intents.voice_states = True
         super().__init__(intents=intents, allowed_mentions=NO_MENTIONS)
         self.engine, self.guild_id, self.limits = engine, guild_id, limits
         self.config = config
+        self.audio_check = audio_check
         self.tree = app_commands.CommandTree(self)
         self.calls = None
 
@@ -165,7 +194,8 @@ class DevBot(discord.Client):
             self.engine = JpcallEngine(self.config)
         try:
             await self.engine.open()
-            self.calls = register(self.tree, self, self.engine, [self.guild_id], limits=self.limits)
+            self.calls = register(self.tree, self, self.engine, [self.guild_id], limits=self.limits,
+                                  audio_check=self.audio_check)
             await self.tree.sync(guild=discord.Object(id=self.guild_id))
         except BaseException:
             await self.engine.close()
@@ -186,9 +216,13 @@ class DevBot(discord.Client):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fake-engine', action='store_true')
+    parser.add_argument('--audio-check', action='store_true',
+                        help='fake mode only: /jpcall plays a five-second tone and logs audio counts')
     parser.add_argument('--allow-user', type=int, action='append', default=[],
                         help='fake mode only: member allowed to start calls; repeat for more members')
     args = parser.parse_args()
+    if args.audio_check and not args.fake_engine:
+        parser.error('--audio-check requires --fake-engine.')
     if not args.fake_engine and args.allow_user:
         parser.error('--allow-user is for fake mode. real mode uses JPCALL_ALLOWED_USER_IDS.')
     token = os.environ.get('JPCALL_DEV_DISCORD_TOKEN')
@@ -197,7 +231,7 @@ def main():
         parser.error('set JPCALL_DEV_DISCORD_TOKEN and JPCALL_DEV_GUILD_ID')
     config = None
     if args.fake_engine:
-        engine = FakeEngine()
+        engine = FakeEngine(audio_check=args.audio_check)
         limits = Limits(allowed_user_ids=frozenset(args.allow_user))
     else:
         try:
@@ -210,7 +244,7 @@ def main():
             parser.error(disabled_message(config))
         engine, limits = None, config.limits
     logging.basicConfig(level=logging.INFO)
-    bot = DevBot(engine, int(guild), limits, config=config)
+    bot = DevBot(engine, int(guild), limits, config=config, audio_check=args.audio_check)
     bot.run(token, log_handler=None)
 
 
