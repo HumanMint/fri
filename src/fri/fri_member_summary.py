@@ -211,7 +211,7 @@ async def sources(agent, messages):
         return 'unchecked'
     if agent.saved_turns.withheld(ids):
         return 'unchecked'
-    status = 'ok'
+    status, failed = 'ok', []
     for item in messages:
         conversation, saved_at, message_id = item.get('conversation_id', ''), item.get('saved_at'), str(item['id'])
         kind, _, channel_id = str(conversation).partition(':')
@@ -228,8 +228,9 @@ async def sources(agent, messages):
             continue
         # Discord couldn't say, a refusal or the connection failing (a timeout, a reset) alike: this one is held back,
         # and the rest of the claim is still checked (HumanMint/fri#357).
-        except (discord.DiscordException, aiohttp.ClientError, OSError):
+        except (discord.DiscordException, aiohttp.ClientError, OSError) as exc:
             status = 'unchecked' if status == 'ok' else status
+            failed.append(type(exc).__name__)
             continue
         edited = getattr(message, 'edited_at', None)
         if edited is not None and edited.timestamp() > saved_at+SKEW:
@@ -240,6 +241,9 @@ async def sources(agent, messages):
     if status == 'ok' and (agent.saved_turns.withheld(ids) or not all(
             readable(agent, str(item.get('conversation_id', ''))) for item in messages)):
         status = 'unchecked'
+    if failed:  # One line for the summary, by each error's class only: never its text, a message or an ID (fri #360).
+        LOG.warning('A kept summary is held back: %s of its messages could not be read (%s)', len(failed),
+                    ', '.join(sorted(set(failed))))
     return status
 
 

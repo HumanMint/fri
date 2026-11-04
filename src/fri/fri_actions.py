@@ -482,8 +482,11 @@ class Actions:
                 if not set(self.agent.state['history_channels']) <= set(channels):
                     return {'blocked': 'Some configured learning channels are not currently readable.'}
                 if self.agent.saved_turns.closed():  # Its batch couldn't be sent anyway (see Agent.learn, fri #335).
-                    return {'blocked': 'Learning is paused while saved context is held back: a withdrawals record '
-                                       'could not be read. fri health says until when.'}
+                    # Why, as fri health says it, as far as it's known: not always an unreadable record (fri #361).
+                    from .fri_watch import held_for
+                    why = held_for(self.agent.saved_turns.status()['closed_for'])
+                    return {'blocked': 'Learning is paused while saved context is held back'
+                                       + (': ' + ' and '.join(why) if why else '') + '. fri health says until when.'}
                 if not await self.agent.learning_offered():  # Nor could it here (fri #346).
                     return {'blocked': "Learning is paused: the controller doesn't say which messages it knows were "
                                        'taken back (learning-withdrawals), so a pass could send nothing. It resumes '

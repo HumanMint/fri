@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -30,8 +31,17 @@ STALL = 900
 GENE = frozenset({'stale', 'offline', 'stopped'})
 NOT_TAKING = 'gene isn’t taking commands right now, so i didn’t send that.'
 NOT_OFFERED = 'gene isn’t offering that command right now, so i didn’t send it.'
+# Why every saved context is held back, as far as it's known (SavedTurns.status()'s closed_for): fri health and the
+# owner's paused learning run say the same (fri #329, #361).
+HELD_FOR = (('unreadable', "a withdrawals record couldn't be read"),
+            ('capacity', 'more withdrawals were queued than Fri keeps'))
 HEALTH = re.compile(r"(?:(?:show|check|run|give)\s+(?:me\s+)?)?(?:(?:your|fri'?s|system)\s+)?"
                     r"health(?:\s*check)?(?:\s+(?:report|status|rn|please|pls))*")
+
+
+def held_for(why):
+    """The reasons HELD_FOR gives for these causes, in its order; none for causes it doesn't know, or none at all."""
+    return [text for cause, text in HELD_FOR if cause in (why or ())]
 
 
 def health_requested(text):
@@ -365,15 +375,14 @@ class Watch:
             from .fri_turn_withdrawal import CLOSED_SECONDS
             until, why = held['closed_until'], held.get('closed_for') or []
             # Kept as written, never cut short (fri #339), but one later than any Fri sets from now isn't printed as a
-            # date: it's flagged, with the way to end it by hand (fri #343).
-            past = until > time.time()+CLOSED_SECONDS
+            # date: it's flagged, with the way to end it by hand (fri #343). Fri sets one from the time rounded up to
+            # a whole second, so that's what it's compared with (fri #347).
+            past = until > math.ceil(time.time())+CLOSED_SECONDS
             when = (f'past any date Fri sets (more than {CLOSED_SECONDS//86400} days from now: the clock was set back '
                     'since, or withdrawals.closed.json was edited)' if past else
                     f'until <t:{int(until)}:f> (<t:{int(until)}:R>)')
             # Why, as far as it's known: a deadline an older Fri wrote doesn't say (fri #329).
-            causes = [text for cause, text in (('unreadable', "a withdrawals record couldn't be read"),
-                                               ('capacity', 'more withdrawals were queued than Fri keeps'))
-                      if cause in why] or ["withdrawals Gene hasn't taken may name any of it"]
+            causes = held_for(why) or ["withdrawals Gene hasn't taken may name any of it"]
             unsaved = {'unreadable': "; it couldn't be set aside, so new withdrawals aren't saved to disk",
                        'capacity': "; that couldn't be written down, so new withdrawals aren't saved to disk"}
             lines.append(f"- saved context: held back {when}, " + ' and '.join(causes)
