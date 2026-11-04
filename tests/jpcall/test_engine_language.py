@@ -78,7 +78,7 @@ def test_session_selects_call_language_speed_and_phone_persona(code, script, pol
             await client.say(language.opener, out_of_band=True)
             sent = peer.sent[-1]['response']['instructions']
             assert 'Fri' not in sent and script in sent
-            assert json.loads(sent[len(language.say_prefix):]) == language.opener
+            assert json.loads(sent.rsplit(language.say_prefix, 1)[1]) == language.opener
         finally:
             await client.stop()
     asyncio.run(run())
@@ -97,8 +97,8 @@ def test_exact_openers_and_hold_phrases():
     assert ko.farewell == '감사해요. 좋은 하루 보내세요.'
     assert ja.hold == '少々お待ちください、確認します。'
     assert ja.apology == 'お待たせしてすみません、もう少々お待ちください。'
-    assert 'AI通訳' in ja.instructions and '人間だと名乗ったり装ったりしない' in ja.instructions
-    assert 'AI 통역으로만 소개' in ko.instructions and '사람인 척하지 마세요' in ko.instructions
+    assert 'AI通訳' in ja.instructions and '人間を装わない' in ja.instructions
+    assert 'AI 통역' in ko.instructions and '사람인 척하지 마세요' in ko.instructions
     for language in (ja, ko):
         for text in (language.instructions, language.opener, language.say_prefix,
                      language.hold, language.apology, language.farewell):
@@ -113,8 +113,8 @@ def test_korean_call_language_does_not_change_number_permissions():
 
 
 @pytest.mark.parametrize('code,phrases', [
-    ('ja', ('一、二文', '質問は一つずつ', 'はい', '相手の返事を待って', '棒読み')),
-    ('ko', ('한두 개', '질문은 하나씩', '해요체', '네 같은', '상대방의 답을 기다리', '읽는 말투')),
+    ('ja', ('一、二文', '一つずつ', '相づちは時々だけ', '棒読み')),
+    ('ko', ('한두 문장', '질문은 하나씩', '해요체', '맞장구는 가끔만', '읽는 말투')),
 ])
 def test_phone_rhythm_and_stop_after_opener(code, phrases):
     language = CALL_LANGUAGES[code]
@@ -127,10 +127,10 @@ def test_agreement_decline_and_recording_instructions(code):
     instructions = CALL_LANGUAGES[code].instructions
     assert 'end_call' in instructions and 'declined to talk with an AI interpreter' in instructions
     if code == 'ja':
-        assert '相手が了承したら' in instructions and '相手が断るか気乗りしない' in instructions
-        assert '音声の録音はしていない' in instructions and '文字で共有' in instructions
-        assert 'グループが通話を聞いている' in instructions
+        assert '了承後' in instructions and '断られたら' in instructions
+        assert '録音はせず' in instructions and '文字を共有' in instructions
+        assert 'グループも通話を聞きます' in instructions
     else:
-        assert '상대방이 동의하면' in instructions and '거절하거나 내키지 않아 하면' in instructions
-        assert '음성을 녹음하지 않으며' in instructions and '문자로 공유' in instructions
-        assert '손님 일행이 통화를 듣고 있다는' in instructions
+        assert '동의하면' in instructions and '거절하면' in instructions
+        assert '녹음 없이' in instructions and '문자로 공유' in instructions
+        assert '일행도 통화를 들어요' in instructions

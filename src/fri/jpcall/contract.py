@@ -185,7 +185,7 @@ class CallRejected(Exception):
 class Limits:
     max_call_s: int = 15 * 60
     max_hold_s: int = 60
-    hold_apology_every_s: int = 15
+    hold_apology_every_s: int = 45
     max_calls_per_user_per_day: int = 5
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)   # empty = nobody
     test_numbers: frozenset[str] = field(default_factory=frozenset)       # non-+81 numbers allowed for testing
