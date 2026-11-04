@@ -553,6 +553,23 @@ after its usage is recorded, a summary any of whose messages was taken back mean
 saved context is held back, isn't kept (fri #333). Without `summary-sources` (an older controller), Fri
 claims nothing, and `fri health` says summaries wait for it. What a summary drew on goes with it, by a
 trigger in the controller's database, however it goes, a rolled-back controller's deletes included.
+A kept summary is read again against what it drew on even when nothing rebuilds it (fri #349, controller
+capability `summary-rechecks`): a rebuild needs new exchanges, so one whose exchanges aged out was never
+checked again. Each heartbeat (whatever learning does) claims a few from the controller
+(`/agent/member-summary/recheck`), each due 12 hours after its last check, and reads their messages from
+Discord, with no model call. A claim names at most 50 messages past its first summary; that first one names
+up to 100 (the most a summary records), so one claim reads at most 100. One gone, or edited after its
+exchange was saved, is withdrawn as its event would have withdrawn it, and the summary goes. One that can't
+be read now (Discord fails, its channel isn't everyone's now, or its withdrawal is still queued), or that
+changes so while the reads are out, holds the summary back until a later recheck reads it; the controller
+looks again at what it knows was taken back as it takes the answer. The controller drops, as it claims, a
+summary whose sources aren't known (one built before they were recorded can never be checked) and one of
+whose messages it knows was taken back after its exchange was saved. A summary the member wrote in My memory
+draws on no message, so it's never dropped for that. Fri's first claim after it starts holds every summary
+back until it's rechecked, since deletions Fri never heard of happen while it's down. A build by a Fri that
+read its messages again counts as a check. Until that first claim, and without `summary-rechecks` (an older
+controller), Fri uses and shows no summary (requests, "what do you remember" and My memory alike) and builds
+none, and `fri health` says so for the latter.
 A summary lasts 30 days after its last update. "What do you remember"
 shows it in a DM and, in a public channel everyone can read, only says one exists. My memory shows it
 with Edit summary and Clear summary; either clears the member's saved chats across the server, like a
