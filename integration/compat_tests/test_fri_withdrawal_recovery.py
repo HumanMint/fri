@@ -17,8 +17,16 @@ import pytest
 
 from compat_tests.test_fri_saved_withdrawal import edit, edited
 from compat_tests.test_fri_turn_withdrawal import MARKER, WITHDRAW, saved, settled, world
-from compat_tests.test_fri_withdrawal_rollback import (CLOSED, SOURCES, calls, history, kept_pending, module_clock,
-                                                       next_request, pending_on_disk)
+from compat_tests.test_fri_withdrawal_rollback import (
+    CLOSED,
+    SOURCES,
+    calls,
+    history,
+    kept_pending,
+    module_clock,
+    next_request,
+    pending_on_disk,
+)
 from compat_tests.test_fri_withheld_history import delete, earlier_exchange, on_disk
 
 OTHER = 'other-synthetic-marker'  # What an exchange withdrawn during the outage holds.
@@ -247,6 +255,36 @@ def test_a_crash_at_any_step_of_the_recovery_loses_nothing(monkeypatch, tmp_path
             assert {str(earlier.id), str(more.id)} <= set(turns.pending)
             assert {str(earlier.id), str(more.id)} <= set(json.loads(on_disk(tmp_path))['pending'])
             assert not (tmp_path/JOURNAL).exists() and not (tmp_path/CLOSED).exists()
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_record_that_reads_again_but_cant_be_written_stays_held_back(monkeypatch, tmp_path):
+    """Put back together only once it's on disk: a write that fails (a full disk) keeps every saved context held back,
+    with everything queued, the record's too, in the journal meanwhile, and a restart loses none of it."""
+    async def scenario():
+        import fri.fri_turn_withdrawal as withdrawal
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            earlier, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            more = await withdrawn_meanwhile(w)
+            outage['down'] = False
+            recovering(monkeypatch)
+            real = withdrawal.private_json
+            def writing(path, data):
+                if path.name == RECORD:
+                    raise OSError(errno.ENOSPC, 'injected')
+                return real(path, data)
+            monkeypatch.setattr(withdrawal, 'private_json', writing)
+            assert turns.closed() and turns.closed()  # Read again each time, never written.
+            assert {str(earlier.id), str(more.id)} <= set(json.loads(raw(tmp_path, JOURNAL))['pending'])
+            monkeypatch.setattr(withdrawal, 'private_json', real)
+            turns = w.agent.saved_turns = SavedTurns(w.agent)  # Started again, the disk writable again.
+            request = await next_request(w)
+            assert OTHER not in request and MARKER not in request and history(w) > 0
+            assert {str(earlier.id), str(more.id)} <= set(json.loads(on_disk(tmp_path))['pending'])
         finally:
             await w.fri.close()
     asyncio.run(scenario())
