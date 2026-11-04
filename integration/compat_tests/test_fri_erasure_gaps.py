@@ -103,3 +103,34 @@ def test_a_post_from_before_its_authors_erasure_is_no_reply_target(monkeypatch, 
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_post_from_before_its_author_removed_a_note_is_no_reply_target_either(monkeypatch, tmp_path):
+    """The live view's rule, which targets now share: a post from at or before its author's last note removal is left
+    out too (the controller's removed_at counts both)."""
+    import datetime as dt
+
+    import discord
+    from gene.fri_memory_store import edit, entries, save
+
+    async def scenario():
+        fri, agent, store, *_, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        with store.connection() as db:
+            save(db, '123', 'server', '30', ('games', 'I like '+MARKER), time.time(), provenance=[])
+        post = message('I like '+MARKER, user=30, age=60)
+        control = {'kind': 'discord_interaction', 'user_id': '30', 'display_name': 'member 30', 'channel_id': '900',
+                   'guild_id': None, 'id': str(discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)))}
+        note = entries(store, '123', 'private:900', '30')['entries'][0]
+        edit(store, '123', 'private:900', '30', note['id'], 0, control, 'remove')
+        event = message('fri what do you make of that?', user=20)
+        event.reference = SimpleNamespace(message_id=post.id, channel_id=1)
+        event.reply.return_value = SimpleNamespace(id=event.id+1, content='hm')
+        fri.chat_once.return_value = ChatResult(status='completed', reply='hm')
+        try:
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_awaited_once()
+            assert MARKER not in str(fri.chat_once.await_args)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
