@@ -43,6 +43,10 @@ def settled(w, seconds=7200):
 
 
 def summarizer(monkeypatch, w, reply=SUMMARY, during=None):
+    """The summary model, replaced. A build checks the messages a claim names before it sends any (fri #333), so this
+    needs a controller that names them: against one that doesn't, nothing is claimed, and a test that builds skips."""
+    if 'summary-sources' not in w.fri.capabilities:
+        pytest.skip('needs a controller offering summary-sources')
     seen = []
 
     async def analyze(chat, instruction, data, name, effort, schema, headers):
