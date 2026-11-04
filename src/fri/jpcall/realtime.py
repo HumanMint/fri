@@ -32,6 +32,7 @@ EVENTS = {
     'session_update': 'session.update',
     'input_append': 'input_audio_buffer.append',
     'speech_started': 'input_audio_buffer.speech_started',
+    'speech_stopped': 'input_audio_buffer.speech_stopped',
     'input_transcript': 'conversation.item.input_audio_transcription.completed',
     'output_audio': 'response.output_audio.delta',
     'output_audio_done': 'response.output_audio.done',
@@ -39,6 +40,7 @@ EVENTS = {
     'response_created': 'response.created',
     'response_done': 'response.done',
     'response_create': 'response.create',
+    'response_cancel': 'response.cancel',
     'truncate': 'conversation.item.truncate',
     'item_create': 'conversation.item.create',
     'function_arguments_done': 'response.function_call_arguments.done',
@@ -86,7 +88,8 @@ class RealtimeClient:
                  events: EventSink, meter: UsageMeter, *,
                  session: aiohttp.ClientSession | None = None,
                  on_tool_call: ToolHook | None = None, tools: tuple[dict, ...] = (),
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 on_speech: Callable[[bool, str], None] | None = None):
         self.config, self.brief = config, brief
         self.audio_sink, self.events, self.meter = audio, events, meter
         self._session = session
@@ -97,6 +100,7 @@ class RealtimeClient:
         self._clock = clock
         self._answered_at = 0.0
         self._on_tool_call, self._tools = on_tool_call, tools
+        self._on_speech = on_speech
         self._playout: dict[tuple[str, int], _Playout] = {}
         self._generating: set[tuple[str, int]] = set()
         self._marks: dict[str, tuple[tuple[str, int], int]] = {}
@@ -121,6 +125,13 @@ class RealtimeClient:
         self._busy_unknown = False
         self._side_tasks: set[asyncio.Task] = set()
         self._transcripts: dict[tuple[str, int], str] = {}
+        self._opener_requested = False
+        self._conversation_open = False
+        self._silenced = False
+        self._allowed_responses: set[str] = set()
+        self._blocked_responses: set[str] = set()
+        self._blocked_commands: set[str] = set()
+        self.has_spoken = False
 
     def session_update(self) -> dict:
         language = self.config.language
@@ -134,8 +145,8 @@ class RealtimeClient:
                 'input': {'format': {'type': 'audio/pcmu'},
                           'transcription': {'model': self.config.transcribe_model,
                                             'language': self.config.call_language},
-                          'turn_detection': {'type': 'server_vad', 'create_response': True,
-                                             'interrupt_response': True}},
+                          'turn_detection': {'type': 'server_vad', 'create_response': False,
+                                             'interrupt_response': False}},
                 'output': {'format': {'type': 'audio/pcmu'},
                            'voice': self.config.realtime_voice,
                            'speed': self.config.realtime_speed},
@@ -190,7 +201,43 @@ class RealtimeClient:
         self._media = media
         self._answered_at = self._clock()
         await self.connect()
-        await self.say(self.brief.opener_ja)
+
+    async def _auto_responses(self, enabled: bool) -> None:
+        await self._send('session_update', session={'type': 'realtime', 'audio': {'input': {
+            'turn_detection': {'type': 'server_vad', 'create_response': enabled,
+                               'interrupt_response': enabled}}}})
+
+    async def open_conversation(self) -> None:
+        """Called by the engine only after its hello/AMD gate opens."""
+        if self._opener_requested or self._silenced or self._stopped or self._media is None:
+            return
+        self._opener_requested = True
+        generated = await self.say(self.brief.opener_ja)
+        if await generated != 'completed':
+            raise RealtimeError('The voice service could not speak the opening.')
+        if not self._silenced and not self._stopped:
+            self._conversation_open = True
+            await self._auto_responses(True)
+
+    def silence(self) -> None:
+        """Fence output synchronously before voicemail cleanup can await anything."""
+        self._silenced = True
+        self._conversation_open = False
+        self._blocked_commands.update(self._commands)
+        self._blocked_responses.update(self._active_responses)
+        self._allowed_responses.clear()
+
+    async def interrupt(self) -> None:
+        self.silence()
+        await self._auto_responses(False)
+        for response_id in tuple(self._active_responses):
+            await self._send('response_cancel', response_id=response_id)
+        await self._barge_in()
+
+    def _output_allowed(self, event: dict) -> bool:
+        response_id = event.get('response_id', '')
+        return (response_id not in self._blocked_responses
+                and (self._conversation_open or response_id in self._allowed_responses))
 
     async def _submit(self, command: _Command) -> None:
         async with self._response_lock:
@@ -353,28 +400,49 @@ class RealtimeClient:
             number = (response.get('metadata') or {}).get('jpcall_command')
             if self._pending and self._pending.number == number:
                 self._pending = None
+            explicit = (self._opener_requested and number in self._commands
+                        and number not in self._blocked_commands)
+            if self._conversation_open or explicit:
+                self._allowed_responses.add(response['id'])
+            else:
+                self._blocked_responses.add(response['id'])
+                await self._send('response_cancel', response_id=response['id'])
         elif kind == EVENTS['speech_started']:
             self._starts[event['item_id']] = max(0, event['audio_start_ms'] / 1000)
+            if self._on_speech:
+                self._on_speech(True, event['item_id'])
             await self._barge_in()
+        elif kind == EVENTS['speech_stopped']:
+            if self._on_speech:
+                self._on_speech(False, event['item_id'])
         elif kind == EVENTS['input_transcript']:
             item = event['item_id']
+            if self._on_speech:
+                self._on_speech(False, item)
             self.meter.transcription(event.get('usage'), self.config.transcribe_model, item)
             await self._utterance(item, 'callee', event['transcript'],
                                   self._starts.get(item, self._clock() - self._answered_at))
         elif kind == EVENTS['output_audio']:
+            if not self._output_allowed(event):
+                return
             item = event['item_id']
             if item in self._interrupted:
                 return
             ulaw = base64.b64decode(event['delta'], validate=True)
+            if not ulaw:
+                return
             key = item, event['content_index']
             self._generating.add(key)
             self._drained.clear()
             async with self._output_lock:
-                if item in self._interrupted or self._stopped:
+                if item in self._interrupted or self._stopped or not self._output_allowed(event):
                     return
                 part = self._playout.setdefault(key, _Playout(
                     item, key[1], started_at=self._clock() - self._answered_at))
+                self.has_spoken = True
                 await self._media.send_audio(ulaw)
+                if not self._output_allowed(event):
+                    return
                 self.audio_sink.push('fri', ulaw_to_pcm16(ulaw))
                 part.sent_bytes += len(ulaw)
                 self._mark_seq += 1
@@ -387,6 +455,8 @@ class RealtimeClient:
             await self._flush_transcript(key)
             self._update_idle()
         elif kind == EVENTS['output_transcript']:
+            if not self._output_allowed(event):
+                return
             key = event['item_id'], event['content_index']
             self._transcripts[key] = event['transcript']
             await self._flush_transcript(key)
@@ -401,9 +471,10 @@ class RealtimeClient:
                 if self._pending is command:
                     self._pending = None
                 if not command.done.done():
-                    command.done.set_result(None)
+                    command.done.set_result(response.get('status'))
             self._update_idle()
-            if response.get('status') == 'completed' and self._on_tool_call is not None:
+            if (self._conversation_open and response.get('id') not in self._blocked_responses
+                    and response.get('status') == 'completed' and self._on_tool_call is not None):
                 for item in response.get('output', []):
                     if item.get('type') != 'function_call' or item.get('status') != 'completed':
                         continue

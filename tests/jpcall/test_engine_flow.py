@@ -82,8 +82,9 @@ class ModelPeer(RealtimePeer):
     async def send_json(self, event):
         self.sent.append(event)
         if event['type'] == EVENTS['session_update']:
-            code = event['session']['audio']['input']['transcription']['language']
-            self.language = CALL_LANGUAGES[code]
+            transcription = event['session']['audio']['input'].get('transcription')
+            if transcription:
+                self.language = CALL_LANGUAGES[transcription['language']]
             self.feed({'type': 'rate_limits.updated', 'rate_limits': []})
             self.feed({'type': EVENTS['session_updated']})
         elif event['type'] == EVENTS['response_create']:
@@ -98,12 +99,18 @@ class ModelPeer(RealtimePeer):
             resource = {'id': 'response' + str(self.counter), 'metadata': response['metadata'],
                         'status': 'completed', 'output': [], 'usage': realtime_usage()}
             self.feed({'type': EVENTS['response_created'], 'response': resource})
-            self.feed({'type': EVENTS['output_audio'], 'item_id': item_id, 'content_index': 0,
+            self.feed({'type': EVENTS['output_audio'], 'response_id': resource['id'],
+                       'item_id': item_id, 'content_index': 0,
                        'delta': base64.b64encode(ULAW).decode()})
-            self.feed({'type': EVENTS['output_audio_done'], 'item_id': item_id, 'content_index': 0})
-            self.feed({'type': EVENTS['output_transcript'], 'item_id': item_id,
+            self.feed({'type': EVENTS['output_audio_done'], 'response_id': resource['id'],
+                       'item_id': item_id, 'content_index': 0})
+            self.feed({'type': EVENTS['output_transcript'], 'response_id': resource['id'],
+                       'item_id': item_id,
                        'content_index': 0, 'transcript': text})
             self.feed({'type': EVENTS['response_done'], 'response': resource})
+        elif event['type'] == EVENTS['response_cancel']:
+            self.feed({'type': EVENTS['response_done'], 'response': {
+                'id': event['response_id'], 'status': 'cancelled', 'usage': None, 'output': []}})
 
     def tool(self, name, arguments, call_id='tool1'):
         resource = {'id': 'tool-response-' + call_id, 'status': 'completed',
@@ -259,6 +266,11 @@ async def answer_phone(call):
     await call.status({'CallSid': SID, 'CallStatus': 'in-progress', 'SequenceNumber': '1'})
     media = PhoneMedia(call)
     await call.start(media)
+    await call.status({'CallSid': SID, 'AnsweredBy': 'human'})
+    await call._rt.handle_event({'type': EVENTS['speech_started'], 'item_id': 'hello',
+                                 'audio_start_ms': 0})
+    await call._rt.handle_event({'type': EVENTS['speech_stopped'], 'item_id': 'hello'})
+    await settled(lambda: call._rt._conversation_open)
     await settled(lambda: bool(call._transcript))
     return media
 

@@ -85,6 +85,9 @@ class RealtimePeer:
                         'usage': {'input_tokens': 0, 'output_tokens': 0}, 'status': 'completed'}
             self.feed({'type': EVENTS['response_created'], 'response': response})
             self.feed({'type': EVENTS['response_done'], 'response': response})
+        if event['type'] == EVENTS['response_cancel']:
+            self.feed({'type': EVENTS['response_done'], 'response': {
+                'id': event['response_id'], 'status': 'cancelled', 'output': [], 'usage': None}})
 
     async def receive(self):
         return await self.incoming.get()
@@ -124,6 +127,11 @@ class Media:
         self.closed = True
 
 
+async def attach_and_open(client, media):
+    await client.start(media)
+    await client.open_conversation()
+
+
 def bridge(**kwargs):
     config = JpcallConfig.from_env(environment())
     audio, events, meter, peer = Audio(), Events(), UsageMeter(), RealtimePeer()
@@ -137,7 +145,7 @@ def test_realtime_ga_session_input_output_and_final_transcripts():
     async def run():
         client, audio, events, meter, peer = bridge()
         media = Media()
-        await client.start(media)
+        await attach_and_open(client, media)
         try:
             session = peer.sent[0]['session']
             assert session['type'] == 'realtime' and session['model'] == 'gpt-realtime-2.1'
@@ -190,7 +198,7 @@ def test_barge_in_truncates_only_acknowledged_audio_and_ignores_clear_acks():
     async def run():
         client, audio, events, meter, peer = bridge()
         media = Media()
-        await client.start(media)
+        await attach_and_open(client, media)
         try:
             delta = {'type': EVENTS['output_audio'], 'item_id': 'fri1', 'content_index': 0,
                      'delta': base64.b64encode(ULAW).decode()}
@@ -224,7 +232,7 @@ def test_tools_wait_for_completed_response_and_run_once():
 
         client, audio, events, meter, peer = bridge(on_tool_call=tool)
         media = Media()
-        await client.start(media)
+        await attach_and_open(client, media)
         try:
             item = {'type': 'function_call', 'name': 'ask_group', 'call_id': 'tool1',
                     'status': 'completed', 'arguments': '{"question":"Which time?"}'}
@@ -250,7 +258,7 @@ def test_receive_failure_closes_media_and_exposes_only_safe_error():
     async def run():
         client, audio, events, meter, peer = bridge()
         media = Media()
-        await client.start(media)
+        await attach_and_open(client, media)
         peer.feed({'type': EVENTS['error'], 'error': {
             'code': 'session_expired', 'message': 'private-dialogue-secret'}})
         with pytest.raises(RealtimeError) as error:
@@ -455,7 +463,7 @@ def test_handshake_failure_closes_realtime_and_does_not_generate_opener():
         peer.incoming = asyncio.Queue()
         peer.feed({'type': EVENTS['error'], 'error': {'message': 'private-provider-error'}})
         with pytest.raises(RealtimeError) as error:
-            await client.start(Media())
+            await attach_and_open(client, Media())
         assert 'private' not in str(error.value) and peer.closed
         assert not any(e['type'] == EVENTS['response_create'] for e in peer.sent)
     asyncio.run(run())
@@ -465,7 +473,7 @@ def test_barge_in_blocks_late_chunks_when_all_prior_chunks_were_played():
     async def run():
         client, audio, events, meter, peer = bridge()
         media = Media()
-        await client.start(media)
+        await attach_and_open(client, media)
         try:
             delta = {'type': EVENTS['output_audio'], 'item_id': 'fri1', 'content_index': 0,
                      'delta': base64.b64encode(ULAW).decode()}
@@ -532,7 +540,12 @@ def test_full_twilio_realtime_bridge_with_in_memory_peers(monkeypatch):
         async def status(params):
             pass
 
-        routes = server.register(audio, client, status)
+        async def start(media):
+            await attach_and_open(client, media)
+
+        handler = SimpleNamespace(start=start, audio=client.audio,
+                                  mark=client.mark, stop=client.stop)
+        routes = server.register(audio, handler, status)
         server.bind(routes, SID)
 
         class ScriptedTwilio(TwilioSocket):
@@ -589,9 +602,11 @@ def test_setup_ignores_unrelated_events_and_prewarm_has_no_response():
         try:
             assert not any(e['type'] == EVENTS['response_create'] for e in peer.sent)
             assert not meter.lines()
-            await client.start(Media())
-            assert sum(e['type'] == EVENTS['session_update'] for e in peer.sent) == 1
-            assert peer.sent[-1]['response']['instructions'].count(OPENING_NOTICES) == 1
+            await attach_and_open(client, Media())
+            updates = [e for e in peer.sent if e['type'] == EVENTS['session_update']]
+            assert sum('instructions' in e['session'] for e in updates) == 1
+            opener = next(e for e in peer.sent if e['type'] == EVENTS['response_create'])
+            assert opener['response']['instructions'].count(OPENING_NOTICES) == 1
         finally:
             await client.stop()
     asyncio.run(run())
@@ -600,7 +615,7 @@ def test_setup_ignores_unrelated_events_and_prewarm_has_no_response():
 def test_interrupted_transcript_is_marked_even_when_generation_finished_first():
     async def run():
         client, audio, events, meter, peer = bridge()
-        await client.start(Media())
+        await attach_and_open(client, Media())
         try:
             await client.handle_event({'type': EVENTS['output_audio'], 'item_id': 'fri1',
                 'content_index': 0, 'delta': base64.b64encode(ULAW).decode()})
@@ -622,7 +637,7 @@ def test_invalid_tool_json_returns_tool_error_and_keeps_connection():
         async def tool(*args):
             raise AssertionError('Invalid JSON must not reach the tool')
         client, audio, events, meter, peer = bridge(on_tool_call=tool)
-        await client.start(Media())
+        await attach_and_open(client, Media())
         try:
             await client.handle_event({'type': EVENTS['response_done'], 'response': {
                 'id': 'tool-response', 'status': 'completed', 'usage': None, 'output': [{
@@ -642,13 +657,14 @@ def test_invalid_tool_json_returns_tool_error_and_keeps_connection():
 def test_app_response_waits_for_server_vad_response():
     async def run():
         client, audio, events, meter, peer = bridge()
-        await client.connect()
+        await attach_and_open(client, Media())
+        before = len(peer.sent)
         try:
             await client.handle_event({'type': EVENTS['response_created'],
                                        'response': {'id': 'vad1'}})
             task = asyncio.create_task(client.say('少々お待ちください。', out_of_band=True))
             await asyncio.sleep(0)
-            assert not task.done() and len(peer.sent) == 1
+            assert not task.done() and len(peer.sent) == before
             await client.handle_event({'type': EVENTS['response_done'], 'response': {
                 'id': 'vad1', 'status': 'completed', 'output': [], 'usage': None}})
             await task
@@ -661,7 +677,8 @@ def test_app_response_waits_for_server_vad_response():
 def test_busy_race_retries_app_response_only_after_active_response_finishes():
     async def run():
         client, audio, events, meter, peer = bridge()
-        await client.connect()
+        await attach_and_open(client, Media())
+        initial = sum(e['type'] == EVENTS['response_create'] for e in peer.sent)
         original = peer.send_json
         racing = [True]
 
@@ -681,12 +698,39 @@ def test_busy_race_retries_app_response_only_after_active_response_finishes():
             done = await client.say('少々お待ちください。', out_of_band=True)
             for _ in range(20):
                 await asyncio.sleep(0)
-            assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == 1
+            assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == initial + 1
             assert not done.done()
             peer.feed({'type': EVENTS['response_done'], 'response': {
                 'id': 'vad-race', 'status': 'completed', 'usage': None, 'output': []}})
             await asyncio.wait_for(done, 1)
-            assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == 2
+            assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == initial + 2
         finally:
             await client.stop()
+    asyncio.run(run())
+
+
+def test_amd_callback_uses_the_same_signature_and_call_binding_checks():
+    async def run():
+        config, server, audio, handler, statuses, routes = setup_server()
+        path = '/jpcall/status/' + routes.status_token
+        params = [('AccountSid', config.twilio_account_sid), ('CallSid', SID),
+                  ('AnsweredBy', 'machine_start'), ('MachineDetectionDuration', '1800'),
+                  ('From', '+81312345678')]
+        with pytest.raises(web.HTTPForbidden):
+            await server._status_callback(signed_request(config, path, routes.status_token,
+                                                         params, signature=False))
+        assert not statuses
+        response = await server._status_callback(signed_request(config, path, routes.status_token,
+                                                                params))
+        assert response.status == 204
+        assert statuses == [{'CallSid': SID, 'AnsweredBy': 'machine_start'}]
+        with pytest.raises(web.HTTPBadRequest):
+            await server._status_callback(signed_request(config, path, routes.status_token,
+                                                         params + [('AnsweredBy', 'human')]))
+        different = [(key, 'CA' + '9' * 32 if key == 'CallSid' else value)
+                     for key, value in params]
+        with pytest.raises(web.HTTPForbidden):
+            await server._status_callback(signed_request(
+                config, path, routes.status_token, different))
+        assert len(statuses) == 1
     asyncio.run(run())
