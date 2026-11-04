@@ -6,6 +6,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from .contract import CallRejected, Limits
@@ -29,6 +30,7 @@ class JpcallConfig:
     transcribe_model: str = 'gpt-realtime-whisper'
     text_model: str = 'gpt-6.1-terra'
     text_effort: str = 'low'
+    data_dir: Path = field(default=Path('/data'), repr=False)
     limits: Limits = field(default_factory=Limits, repr=False)
     disabled_reasons: tuple[str, ...] = ()
 
@@ -93,6 +95,7 @@ class JpcallConfig:
                               + (f' at most {maximum}' if maximum else ''))
                 return default
 
+        values['data_dir'] = Path(env.get('FRI_DATA', '/data'))
         values['listen_port'] = positive('JPCALL_LISTEN_PORT', 8790, 65535)
         try:
             ids = frozenset(int(x) for x in re.split(r'[,\s]+',
@@ -117,3 +120,8 @@ class JpcallConfig:
             allowed_user_ids=ids, test_numbers=tests,
         )
         return cls(**values, disabled_reasons=tuple(errors))
+
+
+def load_config() -> JpcallConfig:
+    """Explicit loader used before the Discord gateway chooses its intents."""
+    return JpcallConfig.from_env()
