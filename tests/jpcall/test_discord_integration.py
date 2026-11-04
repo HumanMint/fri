@@ -51,13 +51,13 @@ def engine_stub(monkeypatch, cfg, events):
     return engine
 
 
-def fri_bot(monkeypatch, tmp_path, cfg):
+def fri_bot(monkeypatch, tmp_path, cfg, *, load=None):
     monkeypatch.setattr(runtime.os, 'environ', {
         'GENE_GUILD_ID': '1', 'GENE_OWNER_ID': '99', 'GENE_WORKSHOP_CHANNEL_ID': '3',
         'GENE_FRI_TOKEN': 'synthetic-token', 'FRI_DATA': str(tmp_path / 'data'),
         'FRI_CHATGPT_AUTH': str(tmp_path / 'unused-auth.json'),
     })
-    module(monkeypatch, 'fri.jpcall.config', load_config=lambda: cfg)
+    module(monkeypatch, 'fri.jpcall.config', load_config=load or (lambda: cfg))
     bot = runtime.Fri()
     bot.api = AsyncMock(return_value=contract())
     bot.health = SimpleNamespace(start=MagicMock(), cancel=MagicMock())
@@ -183,17 +183,13 @@ def test_voice_command_uses_own_allowlist_and_engine_without_gene_calls(monkeypa
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('failure', ['open', 'sync'])
-def test_fri_closes_engine_on_setup_failure(monkeypatch, tmp_path, failure):
+def test_fri_closes_engine_on_sync_failure(monkeypatch, tmp_path):
     async def run():
         cfg, events = config(), []
         bot = fri_bot(monkeypatch, tmp_path, cfg)
         engine = engine_stub(monkeypatch, cfg, events)
         bot.tree.sync = AsyncMock()
-        if failure == 'open':
-            engine.open.side_effect = RuntimeError('synthetic failure')
-        else:
-            bot.tree.sync.side_effect = RuntimeError('synthetic failure')
+        bot.tree.sync.side_effect = RuntimeError('synthetic failure')
         with pytest.raises(RuntimeError):
             await bot.setup_hook()
         await bot.close()
@@ -341,4 +337,72 @@ def test_jpcall_command_errors_stay_private_and_do_not_open_legacy_panels(
             legacy_reply.assert_awaited_once()
         assert bot.api.await_count == 1
         await bot.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('value', ['private-invalid-user-id', 'private-invalid-port'])
+def test_malformed_jpcall_config_keeps_fri_starting(monkeypatch, tmp_path, caplog, value):
+    async def run():
+        def malformed_config():
+            int(value)  # The loader's exception includes the invalid value; the warning must not.
+
+        cfg, events = config(), []
+        bot = fri_bot(monkeypatch, tmp_path, cfg, load=malformed_config)
+        engine = engine_stub(monkeypatch, cfg, events)
+        bot.tree.sync = AsyncMock()
+        await bot.setup_hook()
+        assert bot.jpcall_config is bot.jpcall_engine is bot.jpcall_calls is None
+        assert not bot.intents.voice_states
+        assert not bot._connection.member_cache_flags.voice
+        assert {cmd.name for cmd in bot.tree.get_commands(guild=discord.Object(id=1))} == {'fri'}
+        bot.tree.sync.assert_awaited_once()
+        bot.agent.start.assert_awaited_once()
+        bot.health.start.assert_called_once()
+        bot.owner_reviews.start.assert_called_once()
+        assert bot.api.await_count == 1
+        assert await bot.tree.interaction_check(interaction(data={'name': 'fri'}, channel=3))
+        assert not await bot.tree.interaction_check(interaction())
+        engine.open.assert_not_awaited()
+        assert [record.getMessage() for record in caplog.records] == ['jpcall disabled: ValueError']
+        assert all(record.exc_info is None for record in caplog.records)
+        await bot.close()
+        engine.close.assert_not_awaited()
+        bot.session.close.assert_awaited_once()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('cleanup_fails', [False, True])
+def test_jpcall_open_failure_disables_only_jpcall(monkeypatch, tmp_path, caplog, cleanup_fails):
+    async def run():
+        cfg, events = config(), []
+        bot = fri_bot(monkeypatch, tmp_path, cfg)
+        engine = engine_stub(monkeypatch, cfg, events)
+        engine.open.side_effect = OSError('private-port-details')
+        if cleanup_fails:
+            engine.close.side_effect = RuntimeError('private-cleanup-details')
+
+        async def sync(**kwargs):
+            assert {cmd.name for cmd in bot.tree.get_commands(guild=kwargs['guild'])} == {'fri'}
+            assert bot.jpcall_engine is bot.jpcall_calls is None
+            assert not bot.intents.voice_states
+            assert not bot._connection.member_cache_flags.voice
+
+        bot.tree.sync = AsyncMock(side_effect=sync)
+        await bot.setup_hook()
+        engine.close.assert_awaited_once()
+        bot.tree.sync.assert_awaited_once()
+        bot.agent.start.assert_awaited_once()
+        bot.health.start.assert_called_once()
+        bot.owner_reviews.start.assert_called_once()
+        assert bot.api.await_count == 1
+        assert await bot.tree.interaction_check(interaction(data={'name': 'fri'}, channel=3))
+        assert not await bot.tree.interaction_check(interaction())
+        expected = ['jpcall disabled: OSError']
+        if cleanup_fails:
+            expected.insert(0, 'jpcall cleanup failed: RuntimeError')
+        assert [record.getMessage() for record in caplog.records] == expected
+        assert all(record.exc_info is None for record in caplog.records)
+        await bot.close()
+        engine.close.assert_awaited_once()
+        bot.session.close.assert_awaited_once()
     asyncio.run(run())

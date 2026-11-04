@@ -239,12 +239,17 @@ def persistent_buttons():
 
 class Fri(discord.Client):
     def __init__(self):
-        from .jpcall.discord_runtime import optional_config
-        self.jpcall_config = optional_config()
         self.jpcall_engine = self.jpcall_calls = None
+        try:
+            from .jpcall.discord_runtime import optional_config
+            self.jpcall_config = optional_config()
+            jpcall_enabled = self.jpcall_config is not None and self.jpcall_config.enabled
+        except Exception as exc:
+            LOG.warning('jpcall disabled: %s', type(exc).__name__)
+            self.jpcall_config = None
+            jpcall_enabled = False
         intents = discord.Intents.none()
-        if self.jpcall_config is not None and self.jpcall_config.enabled:
-            intents.voice_states = True
+        intents.voice_states = jpcall_enabled
         intents.guilds = intents.guild_messages = intents.dm_messages = True
         intents.message_content = True
         visibility = discord.Status.online if os.getenv('FRI_PRESENCE') == 'online' else discord.Status.invisible
@@ -322,17 +327,28 @@ class Fri(discord.Client):
                 view=HomeView(self, interaction.user.id))
 
         if self.jpcall_config is not None and self.jpcall_config.enabled:
-            from .jpcall.discord_command import register
-            from .jpcall.engine import JpcallEngine
-            self.jpcall_engine = JpcallEngine(self.jpcall_config)
             try:
+                from .jpcall.discord_command import register
+                from .jpcall.engine import JpcallEngine
+                self.jpcall_engine = JpcallEngine(self.jpcall_config)
                 await self.jpcall_engine.open()
                 self.jpcall_calls = register(self.tree, self, self.jpcall_engine,
                                              [self.guild_id], limits=self.jpcall_config.limits)
-            except BaseException:
-                await self.jpcall_engine.close()
-                self.jpcall_engine = None
-                raise
+            except BaseException as exc:
+                engine, self.jpcall_engine = self.jpcall_engine, None
+                self.jpcall_config = self.jpcall_calls = None
+                self.tree.remove_command('jpcall', guild=discord.Object(id=self.guild_id))
+                # setup_hook precedes gateway identification; Client.intents returns a copy.
+                self._connection._intents.voice_states = False
+                self._connection.member_cache_flags.voice = False
+                try:
+                    if engine is not None:
+                        await engine.close()
+                except Exception as cleanup_error:
+                    LOG.warning('jpcall cleanup failed: %s', type(cleanup_error).__name__)
+                if not isinstance(exc, Exception):
+                    raise
+                LOG.warning('jpcall disabled: %s', type(exc).__name__)
         await self.tree.sync(guild=discord.Object(id=self.guild_id))
         self.health.start()
         self.owner_reviews.start()
