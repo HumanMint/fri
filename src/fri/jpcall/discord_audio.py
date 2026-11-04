@@ -36,6 +36,11 @@ class CallAudioSource(discord.AudioSource):
             # ratecv retains a previous sample; don't leak a cleared speaker's tail.
             self._state = None
 
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
     def close(self) -> None:
         with self._lock:
             self._closed = True

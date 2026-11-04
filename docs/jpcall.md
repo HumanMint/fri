@@ -39,3 +39,33 @@ jpcall is Fri-only. It does not use the Gene controller.
   The usage ledger stores counts and costs only.
 - Costs: every model call and the Twilio leg is metered; the summary shows tokens/minutes and USD per component,
   marking estimates and pending Twilio prices.
+
+## Discord development
+
+The runtime image needs libopus (for example, the `libopus0` system package on Debian).
+The pinned discord.py voice extra supplies PyNaCl and DAVE support; `davey` is also pinned
+explicitly. PCM sources use the normal `VoiceClient.play` path: the player encodes PCM
+to Opus, then `_get_voice_packet` applies DAVE encryption before transport encryption.
+This path was checked against the installed discord.py 2.7.1 source; a live encrypted
+voice session still needs a manual development-guild check.
+
+Run the standalone development identity with `JPCALL_DEV_DISCORD_TOKEN` and
+`JPCALL_DEV_GUILD_ID` supplied by the environment:
+
+```sh
+uv run python -m fri.jpcall.devbot --fake-engine --allow-user MEMBER_ID
+```
+
+Repeat `--allow-user` for each member who may start a call; the default allows nobody.
+The bot needs guild and voice-state intents, the applications.commands scope, and view
+channel, send messages, embed links, connect and speak permissions in the test voice
+channel. It connects self-deafened and never receives or forwards member audio.
+The fake engine scripts Japanese/English lines, one group question, synthetic tones,
+an outcome and estimated component costs followed by a sample posted phone price.
+It uses no phone/model credentials. Real-engine construction is a later integration
+step; this milestone's runner requires `--fake-engine`.
+
+`register(tree, client, engine, guild_ids, limits=limits)` returns the Discord call
+manager; call its async `close()` on shutdown. Supply the configured `Limits` explicitly;
+the default is deny-all. This milestone does not change Fri's existing command tree or
+interaction filters; those need integration before `/jpcall` works in the main runtime.
