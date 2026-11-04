@@ -97,7 +97,7 @@ def test_a_scheduled_pass_asks_for_no_batch_where_gene_cant_say_what_was_withdra
     the day's allowance, read it and stopped at its request, so another claim was refused that day even once the
     controller could say. None is asked for while it can't."""
     async def scenario():
-        agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch)
+        agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch, older=True)
         paths = without_learning_withdrawals(agent)
         await agent.learn()
         await agent.learn()
@@ -133,7 +133,7 @@ def test_fri_health_says_learning_waits_for_the_controller(learning, monkeypatch
     from fri.fri_watch import Watch
 
     async def scenario():
-        agent, *_ = batch(learning, monkeypatch)
+        agent, *_ = batch(learning, monkeypatch, older=True)
         without_learning_withdrawals(agent)
         fri = agent.fri
         fri.data = tmp_path
@@ -168,6 +168,62 @@ def test_the_owners_learning_run_is_refused_with_why_where_gene_cant_say(monkeyp
             assert [c for c in fri.api.await_args_list if c.args[1] == '/fri/contract']  # Read again first.
         finally:
             await fri.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('extra', [{}, []], ids=['an object', 'a list'])
+def test_a_contract_read_again_with_a_capability_that_isnt_a_name_keeps_the_owners_run_refused(monkeypatch, tmp_path,
+                                                                                               extra):
+    """fri #350's Sol round 1: a contract read again that lists an object or a list among its capabilities passed
+    compatible(), and building Fri's capabilities from it raised TypeError, out of the owner's run. A capability that
+    isn't a name makes it a contract Fri doesn't run with: what Fri read before is kept, and the run is refused saying
+    why."""
+    from compat_tests.test_fri_actions import harness
+    from fri.fri_actions import Actions
+    from fri.fri_protocol import contract
+
+    async def scenario():
+        fri, agent, _, _ = harness(monkeypatch, tmp_path)
+        overview = {'history_channels': [], 'reports': [], 'summaries': [], 'historical_notes': []}
+        said = {**contract(), 'capabilities': [c for c in contract()['capabilities'] if c != 'learning-withdrawals']
+                + [extra]}
+
+        def answer(method, path, payload=None):
+            return overview if path.endswith('/overview') else said if path == '/fri/contract' else {}
+
+        fri.api = AsyncMock(side_effect=answer)
+        fri.capabilities = before = fri.capabilities - {'learning-withdrawals'}
+        try:
+            result = await Actions(agent, 10, 999, False).execute({'kind': 'run_learning', 'channel_id': ''})
+            assert 'learning-withdrawals' in result.get('blocked', '')
+            assert [c for c in fri.api.await_args_list if c.args[1] == '/fri/contract']  # Read again first.
+            assert fri.capabilities == before
+        finally:
+            await fri.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('extra', [{}, []], ids=['an object', 'a list'])
+def test_a_scheduled_pass_asks_for_no_batch_on_a_contract_with_a_capability_that_isnt_a_name(learning, monkeypatch,  # noqa: F811
+                                                                                             extra):
+    """The same contract read again before a scheduled pass: no TypeError, no batch asked for, Fri's capabilities as
+    they were."""
+    async def scenario():
+        agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch, older=True)
+        paths = without_learning_withdrawals(agent)
+        api = agent.fri.api
+
+        async def malformed(method, path, payload=None):
+            result = await api(method, path, payload)
+            return {**result, 'capabilities': [*result['capabilities'], extra]} if path == '/fri/contract' else result
+
+        agent.fri.api = malformed
+        before = agent.fri.capabilities
+        await agent.learn()
+        assert '/fri/contract' in paths and '/agent/learning/claim' not in paths
+        assert finishes == [] and asked == [] and agent.fri.capabilities == before
 
     asyncio.run(scenario())
 
