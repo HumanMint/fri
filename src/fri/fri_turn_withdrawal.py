@@ -86,21 +86,25 @@ class SavedTurns:
     def capable(self, name):
         return name in getattr(self.agent.fri, 'capabilities', ())
 
-    def entry(self, restored=False, queued_at=None, **what):
+    def entry(self, restored=False, queued_at=None, since=None, **what):
         """A queued withdrawal, with its own number and its member's erasure count now (see current). restored: loaded
         from what an earlier process left on disk, or rebuilt from one that was, which every entry rebuilt for that
         message keeps (see withdraw). Set only as it's read, never from what the file says, so one an earlier process
         left can't pass as this one's, and one queued here never as an earlier one's, whatever the clock does.
 
         queued_at: when it was queued, a whole second, rounded up (fri #329): after anything Fri saved with its message
-        before the message was taken back, so what that saved lasts at most a horizon from then (see lasts). Now, for
-        one queued here or again; for one read from disk, what it says, never later than now, or now where it says
-        nothing (main's record), so it's never earlier than the truth."""
+        before the message was taken back, so what that saved lasts at most a horizon from then (see lasts). One read
+        from disk keeps what it says, whatever the clock says now (Sol round 1 of #339): a clock set back since mustn't
+        end it early. Now where it says nothing (main's record), so it's never earlier than the truth, and for one queued
+        here; queued again (`since`, what the one it replaces said), now, but never earlier than before."""
         self.generation += 1
         user = (what.get('scope') or {}).get('user_id') or what.get('user_id')
         now = math.ceil(time.time())
-        queued_at = min(queued_at, now) if restored and type(queued_at) is int and queued_at >= 0 else now
-        return {**what, 'queued_at': queued_at, 'tries': 0, 'due': 0, 'gen': self.generation,
+        if restored and queued(queued_at):
+            stamped = queued_at
+        else:
+            stamped = max(since, now) if queued(since) else now
+        return {**what, 'queued_at': stamped, 'tries': 0, 'due': 0, 'gen': self.generation,
                 **({'restored': True} if restored else {}), **({'erasure': self.erasure(user)} if user else {})}
 
     def lasts(self, i, entry):
@@ -156,9 +160,10 @@ class SavedTurns:
         """The reader let the oldest go past twice the queue's capacity, to bound memory (see read_record), as the queue
         does past it (see prune), so the same holds (fri #329): every saved context is held back until nothing they named
         can be kept, from now on, and written down. Until that's on disk, the record isn't replaced (see persist), so a
-        restart reads all of it again."""
+        restart reads all of it again. Their own times count however the clock stands, one ahead of it too, and one
+        that says no time it was queued counts from now (Sol round 1 of #339)."""
         now = math.ceil(time.time())
-        latest = now if overflow['unknown'] or overflow['latest'] is None else min(overflow['latest'], now)
+        latest = max(overflow['latest'] or 0, now if overflow['unknown'] or overflow['latest'] is None else 0)
         kept = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
         self.closed_until = max(self.closed_until, latest+kept)
         self.closed_for.add(CAPACITY_CAUSE)
@@ -225,11 +230,12 @@ class SavedTurns:
             return False
 
     def read_closed(self):
-        """Until when every saved context is held back, as written down (see fail_closed): never past the longest
-        horizon from now, so a clock set back since can't stretch it, and a deadline cut to that is written back, so
-        later starts keep it. One that can't be read closes for the whole horizon from now, written back too. One that's
-        over is removed. Removing it by hand ends it early (see docs/operations.md). Why it was closed is read with it
-        (see mark_closed); one that can't be read counts as an unreadable record."""
+        """Until when every saved context is held back, as written down (see fail_closed). A deadline once written down
+        is never cut short (Sol round 1 of #339): one past the longest horizon from now, from a clock set back since,
+        stands as it is, and every write after it is at least as late (see mark_closed's callers). One that can't be
+        read closes for the whole horizon from now, written back. One that's over is removed. Removing it by hand ends
+        it early (see docs/operations.md). Why it was closed is read with it (see mark_closed); one that can't be read
+        counts as an unreadable record."""
         path = self.marker()
         if path is None:
             return 0.0
@@ -250,12 +256,12 @@ class SavedTurns:
             except OSError:
                 pass
             return 0.0
-        if until is None or until > now+CLOSED_SECONDS:
-            LOG.warning('Until when saved context is held back was unreadable or past %s days, so it is %s days from now',
-                        CLOSED_SECONDS//86400, CLOSED_SECONDS//86400)
+        if until is None:
+            LOG.warning('Until when saved context is held back was unreadable, so it is %s days from now',
+                        CLOSED_SECONDS//86400)
             until = now+CLOSED_SECONDS
             self.mark_closed(until)
-        return until
+        return until  # One past the longest horizon from now (a clock set back since) stands (Sol round 1 of #339).
 
     def tidy(self):
         """Unreadable records set aside, kept for someone to recover: the newest SET_ASIDE, none past CLOSED_SECONDS,
@@ -381,7 +387,8 @@ class SavedTurns:
             if entry is not None:
                 if self.offered():
                     self.pending[str(i)] = self.entry(scope=entry[1], revision=entry[2], restored=known.get('restored'),
-                                                      deleted=deleted or known.get('deleted') is True)
+                                                      deleted=deleted or known.get('deleted') is True,
+                                                      since=known.get('queued_at'))
                     queued = True
             elif server is not None and sent_at(i) > now-horizon:
                 if self.offered() and self.capable(SAVED_CAPABILITY):
@@ -390,12 +397,14 @@ class SavedTurns:
                     elif 'scope' in known:  # Fri knows where it was saved: that one stands, deleted or not.
                         if deleted and not known.get('deleted'):
                             self.pending[str(i)] = self.entry(**{key: known[key] for key in ('scope', 'revision')},
-                                                              deleted=True, restored=known.get('restored'))
+                                                              deleted=True, restored=known.get('restored'),
+                                                              since=known.get('queued_at'))
                             queued = True
                     elif not known or (deleted and not known.get('deleted')) or (i in authors and 'user_id' not in known):
                         author = authors.get(i, known.get('user_id'))
                         self.pending[str(i)] = self.entry(server=str(server), deleted=deleted or known.get('deleted')
                                                           is True, restored=known.get('restored'),
+                                                          since=known.get('queued_at'),
                                                           **({'user_id': author} if author else {}))
                         queued = True
             else:
@@ -968,7 +977,7 @@ def entry(reader):
     """An entry's scope, revision and whether it was a deletion; {'hold': True} for a hold (see SavedTurns.lasting);
     None if neither, its scope not one /chat/turn/withdraw takes. Either with 'queued_at', where it says a whole second
     (see SavedTurns.entry). Nothing else of it decides anything."""
-    scope, revision, deleted, hold, queued = None, None, False, False, {}
+    scope, revision, deleted, hold, stamp = None, None, False, False, {}
     for name in reader.members():
         if name == 'scope':
             scope = place(reader) if reader.ahead() == '{' else reader.skip()
@@ -981,12 +990,12 @@ def entry(reader):
             hold = reader.value() is True
         elif name == 'queued_at':
             value = reader.value()
-            queued = {'queued_at': value} if type(value) is int and 0 <= value < 2**63 else {}
+            stamp = {'queued_at': value} if queued(value) else {}
         else:
             reader.skip()
     if scope is None:
-        return {'hold': True, **queued} if hold else None
-    return {'scope': scope, 'revision': revision, 'deleted': deleted, **queued}
+        return {'hold': True, **stamp} if hold else None
+    return {'scope': scope, 'revision': revision, 'deleted': deleted, **stamp}
 
 
 def place(reader):
@@ -1036,6 +1045,11 @@ def failed(text, ids, exc):
     refused = isinstance(exc, ControllerRejected) and exc.status is not None
     LOG.warning(text+(f' (refused, HTTP {exc.status}; sent again later)' if refused else ' (sent again later)'), ids,
                 type(exc).__name__)
+
+
+def queued(value):
+    """Whether it's a time a withdrawal was queued, as Fri writes one down (see SavedTurns.entry): whole seconds."""
+    return type(value) is int and 0 <= value < 2**63
 
 
 def sent_at(message_id):

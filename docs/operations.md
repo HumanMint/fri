@@ -314,8 +314,9 @@ advertises it, so the controller must be released first.
   and answers. The deadline is written first, to `withdrawals.closed.json`; only then is the record set
   aside unread as `withdrawals.unreadable-<time>.json` (the newest three are kept, none past 90 days).
   Until both are done the record stays where it is and no write replaces it: queued withdrawals stay in
-  memory, and each attempt to save them moves the deadline to 90 days from then. A deadline past 90 days
-  from now (a clock set back since) is cut to that once and written back. `fri health` shows the end
+  memory, and each attempt to save them moves the deadline to 90 days from then. A deadline once written
+  down is never cut short, one past 90 days from now (a clock set back since) included, and nor is when a
+  withdrawal was queued (fri #339). `fri health` shows the end
   date while it lasts, and whether new withdrawals are being saved. To end it early, recover the
   entries by hand into `withdrawals.json` (or confirm nothing in the set-aside file matters; an
   unreadable record still in place as `withdrawals.json` has to be fixed or moved too), then remove
@@ -331,7 +332,9 @@ advertises it, so the controller must be released first.
   goes. The same holds where a start reads more than 40,000 from disk, more than it holds while reading:
   what it lets go is held back the same way, and until that's written down the record isn't replaced, so
   the next start reads all of it again. `withdrawals.closed.json` also says why (`why`: `unreadable`,
-  `capacity`), which `fri health` shows; one an older Fri wrote doesn't say.
+  `capacity`), which `fri health` shows; one an older Fri wrote doesn't say. Rolled back to a Fri from
+  before fri #329, the record reads as before, but that Fri counts each entry from its message's time
+  again and cuts a deadline past 90 days from now, as it always did.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the
   controller writes nothing for it, and a save whose answer comes after it records nothing. A withdrawal
