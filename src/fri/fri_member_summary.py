@@ -9,6 +9,7 @@ whose messages were taken back while the model wrote it isn't kept (fri #333).
 
 import logging
 
+import aiohttp
 import discord
 
 from . import feedback as commands
@@ -225,7 +226,9 @@ async def sources(agent, messages):
             agent.unsend(channel.id, [int(message_id)], agent.fri.guild_id)
             status = 'changed'
             continue
-        except discord.DiscordException:
+        # Discord couldn't say, a refusal or the connection failing (a timeout, a reset) alike: this one is held back,
+        # and the rest of the claim is still checked (HumanMint/fri#357).
+        except (discord.DiscordException, aiohttp.ClientError, OSError):
             status = 'unchecked' if status == 'ok' else status
             continue
         edited = getattr(message, 'edited_at', None)
