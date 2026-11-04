@@ -1,4 +1,4 @@
-"""The erasure cutoff on Discord's clock (fri #337 items 4 and 5, with the paired Gene change). Gene stamped a member's
+"""The erasure cutoff on Discord's clock (fri #337 items 4 and 5, with HumanMint/gene#213). Gene stamped a member's
 erasure with its own clock, and Fri compared it with a message's snowflake, on Discord's. With Gene's clock behind, a
 message sent just before the erasure counted as after it (item 4); ahead, one sent just after it counted as before
 (item 5). Fri sends the message or interaction that asked with the control, and compares with the cutoff Gene dates by
