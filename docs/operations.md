@@ -374,8 +374,13 @@ advertises it, so the controller must be released first.
   breadcrumb of the saved reply, and of one that carried Fri's reply to it; Fri's own echo of such a reply
   leaves the channel's live view at once, in memory, and so does the echo of its reply to the message
   itself. An edit leaves those replies and echoes, as before (gene #150). Since a note lasts 90 days,
-  such a controller is asked by ID about messages up to 90 days old. An older controller gets neither
-  field and is asked about a week back, as before.
+  such a controller is asked by ID about edits of messages up to 90 days old. An older controller gets
+  neither field and is asked about a week back, as before. A deletion is asked about whatever its
+  message's age (fri #342): what drew on a message can be saved long after it was sent, a note learned
+  from an old message quoted in a newer conversation say, and the entry lasts from when it was queued, as
+  every entry does. Usually the controller takes it at once; while it can't, it waits like any other, and
+  a burst past the queue's capacity closes as above. An edit keeps the message-age bound: an update of an
+  old message that was edited long ago (a pin, say) looks the same to the queue as a fresh edit.
 - **What a turn drawing on the member summary writes or keeps.** A turn whose model request had Fri's
   summary of the member carries its generation (gene #91). Before every tool step, Fri checks that
   generation with `/chat/turn/check`, whether or not typing had already started, so a step the model

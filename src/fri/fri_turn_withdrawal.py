@@ -379,11 +379,15 @@ class SavedTurns:
 
     def withdraw(self, ids, server=None, deleted=False, authors=None):
         """Messages taken back: each exchange Fri saved with one goes, asked for once. server: the one Fri saves
-        exchanges said where they were taken back under (see Agent.saved_in); any other one young enough to be in an
-        exchange still (or in a note, from a controller offering SOURCES) is then asked about by ID, ten at a time,
-        from a controller offering it. deleted: not edited, so what carried them goes too (gene #141, #150). authors:
-        message ID -> its author, where Fri knows it, so that one by ID can be kept on disk (see lasting). Each is
-        held back from requests from now on (see withhold). A change to a queued one is a new entry (see drain)."""
+        exchanges said where they were taken back under (see Agent.saved_in); any other one is then asked about by
+        ID, ten at a time, from a controller offering it: a deletion whatever its message's age, since what drew on it
+        can be saved long after it was sent (a note learned from an old message quoted in a newer conversation, fri
+        #342), and its entry lasts from when it was queued (see lasts); an edit while its message is young enough to be
+        in an exchange still (or in a note, from a controller offering SOURCES), as an update with no fresh edit, a
+        pin of one edited long ago say, looks the same here. deleted: not edited, so what carried them goes too (gene
+        #141, #150). authors: message ID -> its author, where Fri knows it, so that one by ID can be kept on disk (see
+        lasting). Each is held back from requests from now on (see withhold). A change to a queued one is a new entry
+        (see drain)."""
         authors = {int(i): str(user) for i, user in (authors or {}).items() if str(user).isdigit()}
         ids = [int(i) for i in ids]
         horizon = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
@@ -397,7 +401,7 @@ class SavedTurns:
                                                       deleted=deleted or known.get('deleted') is True,
                                                       since=known.get('queued_at'))
                     queued = True
-            elif server is not None and sent_at(i) > now-horizon:
+            elif server is not None and (deleted or sent_at(i) > now-horizon):
                 if self.offered() and self.capable(SAVED_CAPABILITY):
                     if known.get('hold'):  # Held from disk: it stays held, and on disk, whatever comes by ID.
                         pass
