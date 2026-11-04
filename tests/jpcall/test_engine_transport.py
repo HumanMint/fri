@@ -17,9 +17,9 @@ from multidict import MultiDict
 from test_engine_config import environment
 from test_engine_usage import realtime_usage
 
-from fri.jpcall.config import JpcallConfig
+from fri.jpcall.config import CALL_LANGUAGES, JpcallConfig
 from fri.jpcall.contract import CallBrief
-from fri.jpcall.realtime import EVENTS, OPENING_NOTICES, RealtimeClient, RealtimeError
+from fri.jpcall.realtime import EVENTS, RealtimeClient, RealtimeError
 from fri.jpcall.server import JpcallServer, pcm16_to_ulaw, ulaw_to_pcm16
 from fri.jpcall.usage import UsageMeter
 
@@ -30,6 +30,8 @@ def no_network(monkeypatch):
         raise AssertionError('Network connections are forbidden in engine tests')
     monkeypatch.setattr(socket.socket, 'connect', forbidden)
     monkeypatch.setattr(socket.socket, 'connect_ex', forbidden)
+
+OPENING_NOTICES = CALL_LANGUAGES['ja'].opener
 
 
 SID = 'CA' + '3' * 32

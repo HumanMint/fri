@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from .config import CALL_LANGUAGES, CallLanguage
 from .contract import Limits, QuestionAsked, QuestionClosed
 
 LOG = logging.getLogger(__name__)
@@ -25,10 +26,12 @@ class _Question:
 class HoldController:
     def __init__(self, request_id: str, limits: Limits, emit, say, tool_result, state,
                  *, clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep):
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+                 language: CallLanguage = CALL_LANGUAGES['ja']):
         self.request_id, self.limits = request_id, limits
         self.emit, self.say, self.tool_result, self.state = emit, say, tool_result, state
         self.clock, self.sleep = clock, sleep
+        self.language = language
         self.question: _Question | None = None
         self._timer: asyncio.Task | None = None
         self._ended = False
@@ -42,7 +45,7 @@ class HoldController:
         question = _Question(uuid.uuid4().hex, call_id, now + self.limits.max_hold_s,
                              now + self.limits.hold_apology_every_s)
         self.question = question
-        self._speak('少々お待ちください。')
+        self._speak(self.language.hold)
         if self.question is not question or self._ended:
             return False
         await self.state(True)
@@ -81,7 +84,7 @@ class HoldController:
                     'result': 'no answer from the group; offer to call back'})
         elif now >= question.next_apology:
             question.next_apology = now + self.limits.hold_apology_every_s
-            self._speak('お待たせして申し訳ございません。もう少々お待ちください。')
+            self._speak(self.language.apology)
 
     async def answer(self, question_id: str, answer: str, answered_by: int) -> bool:
         question = self.question
