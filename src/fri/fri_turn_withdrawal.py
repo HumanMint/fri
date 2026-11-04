@@ -19,8 +19,8 @@ again; one by ID is retried in memory, and kept on disk only as a hold of its me
 without sending it (fri #252, see lasting). Past the queue's capacity, the oldest go, but every saved context is held
 back until nothing they name can be kept (fri #256, see prune), past what a start reads from disk too, and each lasts
 from when it was queued, after anything saved from its message (fri #329, see lasts and overflowed). A record that
-can't be trusted holds every saved context back for 90 days (see fail_closed); one the disk failed to read, only until
-it reads again, with what's queued meanwhile kept in a journal beside it and merged back in (fri #317, see read and
+can't be read holds every saved context back for 90 days, across restarts (see fail_closed). One the disk failed to
+read, in the process that found it so, only until that process reads it after all and writes it back (fri #317, see
 recover).
 """
 
@@ -52,22 +52,18 @@ RETRY_SECONDS = (2, 15, 60, 300)  # After each failure, then every five minutes 
 REREAD_SECONDS = 60  # At most this often, the controller's contract read again for a refusal (see reread).
 RECORD = 'withdrawals.json'
 CLOSED_RECORD = 'withdrawals.closed.json'  # Until when every saved context is held back (see fail_closed).
-# What's queued while the record can't be read for an error that says nothing about it (fri #317), kept beside it
-# rather than over it, until it's put back together (see recover).
-JOURNAL = 'withdrawals.recovering.json'
 # Why, as the closed record says (see mark_closed): a record that couldn't be read, or more queued than the queue keeps.
 UNREADABLE_CAUSE, CAPACITY_CAUSE = 'unreadable', 'capacity'
-UNREAD_CAUSE = 'unread'  # And while the record can't be read, so the marker covers the journal (see cover_journal).
-RECOVER_SECONDS = 30  # At most this often, a record the disk failed to read is tried again (see recover).
-# A read error that says nothing about what's on disk: an I/O error, permissions, resources, a stale handle. Any other
-# error, or what's read not being a record Fri could have written, can't be told from a bad record (see fail_closed).
-TRANSIENT = frozenset(getattr(errno, name) for name in (
-    'EIO', 'EACCES', 'EPERM', 'EAGAIN', 'EBUSY', 'EINTR', 'ETIMEDOUT', 'ENOMEM', 'ENFILE', 'EMFILE', 'ESTALE', 'ENOLCK',
-    'ENOBUFS') if hasattr(errno, name))
 # How long saved context stays held back after a record that couldn't be read: as long as anything a withdrawal
 # protects can be kept, by any controller (an exchange, or a note).
 CLOSED_SECONDS = max(KEPT_SECONDS, NOTED_SECONDS)
 SET_ASIDE = 3  # At most this many unreadable records kept aside, the newest, none past CLOSED_SECONDS.
+RECOVER_SECONDS = 30  # At most this often, a record the disk failed to read is read again (see recover).
+# A read error that says nothing about what's on disk: an I/O error, permissions, resources, a stale handle. Any other
+# error, or what's read not being a record Fri could have written, can't be told from a bad record (fri #317).
+TRANSIENT = frozenset(getattr(errno, name) for name in (
+    'EIO', 'EACCES', 'EPERM', 'EAGAIN', 'EBUSY', 'EINTR', 'ETIMEDOUT', 'ENOMEM', 'ENFILE', 'EMFILE', 'ESTALE', 'ENOLCK',
+    'ENOBUFS') if hasattr(errno, name))
 UNREADABLE = re.compile(r'withdrawals\.unreadable-([0-9]{1,12})(?:-[0-9]{1,3})?\.json')
 CHUNK = 2**20  # Characters read at a time: a record of any size costs time to read, not memory (see read_record).
 LONGEST = 64  # Characters of a string kept, past any message ID, scope value or key a record uses.
@@ -90,17 +86,13 @@ class SavedTurns:
         self.reread_at = 0.0  # time.monotonic() as the contract was last read again (see reread).
         self.closed_until = 0.0  # time.time() until which every saved context is held back (see fail_closed).
         self.closed_for = set()  # Why (UNREADABLE_CAUSE, CAPACITY_CAUSE), as far as it's known (see mark_closed).
-        self.blocked = []  # Unreadable records (or journals) not yet set aside: no queue write replaces one (see persist).
+        self.blocked = False  # An unreadable record not yet set aside: no queue write replaces it (see persist).
         # What the reader let go held back, but not yet written down: no queue write replaces the record (see persist).
         self.unwritten = False
-        # The record couldn't be read, for an error that says nothing about it (fri #317, see read): every saved context
-        # is held back, and queue writes go to the journal beside it, until it reads again (see recover), or until
-        # unread_until, when nothing it held can matter any more. cover: until when the closed marker holds every saved
-        # context back for an older Fri, which reads neither the journal nor past the marker's time (see cover_journal).
-        self.unread = False
-        self.unread_at = 0.0  # time.monotonic() as it was last tried.
-        self.unread_until = 0.0
-        self.cover = 0.0
+        # The record this process found the disk failing to read, wherever it's set aside, while the closure for it is
+        # the only one, so it may end once that's read after all (see recover). None otherwise.
+        self.unread = None
+        self.unread_at = 0.0  # time.monotonic() as it was last read again.
 
     def offered(self):
         return CAPABILITY in getattr(self.agent.fri, 'capabilities', ())
@@ -144,200 +136,48 @@ class SavedTurns:
 
         The record is read in pieces, without recursion: any size main reads, in bounded memory, building only what an
         entry uses and checking the rest as JSON (see read_record). Each entry is checked on its own. A record that still
-        can't be trusted at all is never read as empty: every saved context is held back (see fail_closed); nor is one
-        the disk failed to read, until it reads again (fri #317, see read). A journal left beside it is read first and
-        the two put back together (see restore, settle). Nothing here stops Fri starting."""
+        can't be trusted at all is never read as empty: every saved context is held back (see fail_closed). Nothing
+        here stops Fri starting."""
         if self._pending is None:
             self._pending = {}
             self.closed_until = self.read_closed()
-            path, dated, overflow, journal = self.record(), 0, {}, None
+            path, found, overflow = self.record(), {}, {}
             if path is not None:
-                journal = self.read_journal()
-                if journal is not None:
-                    dated += self.restore(*journal)
-                found, overflow = self.read(path)
-                if found is not None:
-                    dated += self.restore(found, overflow)
+                try:
+                    with path.open() as stream:
+                        found = read_record(stream, overflow)
+                except FileNotFoundError:
+                    pass  # Nothing pending.
+                except (OSError, ValueError) as exc:  # Unreadable and UnicodeDecodeError are ValueErrors.
+                    overflow.clear()  # Nothing of it is read: all of it is held back (see fail_closed).
+                    if transient(exc) and time.time() >= self.closed_until:  # Nothing else closes (fri #317).
+                        self.unread, self.unread_at = path, time.monotonic()
+                    self.fail_closed(path, exc)
+            held, dated = 0, 0
+            for i, facts in found.items():
+                if facts is not None:
+                    # From an earlier process, whatever it says: replayed only where its revision is checked (sendable).
+                    self._pending[i] = self.entry(**facts, restored=True)
+                else:  # Its message is known, the rest isn't one Fri could send: held back, never released (round 4).
+                    held += 1
+                    self._pending[i] = self.entry(hold=True, restored=True)
+                dated += not queued((facts or {}).get('queued_at'))
+            if held:
+                LOG.warning('%s pending withdrawals on disk were malformed, so their messages are held back unsent', held)
+            if overflow.get('dropped'):
+                self.overflowed(overflow)
             self.tidy()
             self.prune(time.time())
             now = time.time()
             for i in self._pending:  # Taken back before the restart: still held back until they land.
                 self.marked.setdefault(i, now)
-            if self.unread:  # Tried again in RECOVER_SECONDS, or at once if nothing it held can matter any more.
-                self.unread_at = time.monotonic()-(RECOVER_SECONDS if now >= self.unread_until else 0)
-            elif journal is not None or self.unread_until or dated or overflow.get('dropped'):
+            if dated or overflow.get('dropped'):
                 # Dated by this start, or cut by the reader: saved now, not at the next withdrawal, so later starts keep
                 # those dates instead of dating them again, each later than the last (fri #343). As any save, never over
                 # a record whose cut isn't held back on disk yet (see persist): a failed write leaves the record as it
-                # was, read and dated again, never earlier, by the next start. A journal beside it, or a record that
-                # couldn't be read before, is put back together the same way (fri #317, see settle).
-                self.settle()
+                # was, read and dated again, never earlier, by the next start.
+                self.persist()
         return self._pending
-
-    def read(self, path):
-        """The record's entries (see read_record) and what the reader let go, or None for its entries if it couldn't be
-        read. An error that says nothing about it (TRANSIENT) leaves it where it is, unread and never replaced: every
-        saved context is held back, and queue writes go to the journal beside it, until it reads again (see recover).
-        That's never longer than #250's closure for it: from the first failure, written down so a restart doesn't move
-        it, nothing it held can matter past CLOSED_SECONDS. Any other error, or what it holds not being a record Fri
-        could have written, closes as fail_closed does (fri #317)."""
-        overflow = {}
-        try:
-            with path.open() as stream:
-                found = read_record(stream, overflow)
-        except FileNotFoundError:
-            found = {}  # Nothing pending.
-        except (OSError, ValueError) as exc:  # Unreadable and UnicodeDecodeError are ValueErrors.
-            if not transient(exc):  # Nothing of it is read: all of it is held back (see fail_closed).
-                self.unread = False
-                self.fail_closed(path, exc)
-                return None, {}
-            if not self.unread:
-                LOG.warning('Pending withdrawals could not be read (%s), so every saved context is held back until they '
-                            'can be', type(exc).__name__)
-            self.unread = True
-            if not self.unread_until:  # The first failure: no longer than #250 would have closed for it.
-                self.unread_until = time.time()+CLOSED_SECONDS
-                self.cover = max(self.cover, self.unread_until)
-                self.mark_closed(self.closed_until)
-            return None, {}
-        self.unread = False
-        return found, overflow
-
-    def read_journal(self):
-        """What the journal beside the record holds (see persist), with what the reader let go, or None without one. One
-        that can't be read, whatever the error, closes as an unreadable record does (see fail_closed): what it held can't
-        be known, and no queue write replaces it."""
-        path, overflow = self.journal(), {}
-        try:
-            with path.open() as stream:
-                return read_record(stream, overflow), overflow
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
-            self.fail_closed(path, exc)
-            return None
-
-    def restore(self, found, overflow):
-        """Entries read from disk into the queue, each as one an earlier process left (see entry). One whose message is
-        queued already (the journal's, or one queued here while the record couldn't be read) is merged with it (see
-        merge). One naming a member who said "forget me" here since goes, as forget takes theirs. What the reader let go
-        is held back (see overflowed). Returns how many said no time they were queued."""
-        held, dated = 0, 0
-        for i, facts in found.items():
-            user = ((facts or {}).get('scope') or {}).get('user_id')
-            if user and self.erasure(user):  # Queued before their "forget me" here, which takes it (see forget).
-                continue
-            held += facts is None
-            dated += not queued((facts or {}).get('queued_at'))
-            # From an earlier process, whatever it says: replayed only where its revision is checked (sendable). One whose
-            # message is known but whose rest isn't one Fri could send is a hold: held back, never released (round 4).
-            disk, known = facts if facts is not None else {'hold': True}, self._pending.get(i)
-            self._pending[i] = self.entry(**disk, restored=True) if known is None else self.merge(disk, known)
-        if held:
-            LOG.warning('%s pending withdrawals on disk were malformed, so their messages are held back unsent', held)
-        if overflow.get('dropped'):
-            self.overflowed(overflow)
-        return dated
-
-    def merge(self, disk, known):
-        """One entry for a message queued already (known) and read from disk too (disk, as read_record gives it): held
-        back at least as long as either would hold it (fri #317). A deletion stays one; one an earlier process queued
-        stays its (sent only with the revision guard, see sendable); it's queued at the later time, so it lasts as long
-        as either (see lasts); a hold stays one, whatever came by ID. Where its exchange was saved: as withdraw takes it,
-        a save here, else the record's; with the later revision either knows for that member (one only moves on, and
-        the controller writes nothing for one past). Built afresh, so a request on its way for the one queued here
-        doesn't settle it (see drain)."""
-        at = max(disk['queued_at'] if queued(disk.get('queued_at')) else math.ceil(time.time()), known['queued_at'])
-        placed = known if 'scope' in known else disk if 'scope' in disk else None
-        if placed is None:  # A hold, and a hold or one by ID.
-            return self.entry(hold=True, restored=True, queued_at=at)
-        user = placed['scope'].get('user_id')
-        revisions = [entry['revision'] for entry in (disk, known)
-                     if (entry.get('scope') or {}).get('user_id') == user and type(entry.get('revision')) is int]
-        return self.entry(scope=placed['scope'], revision=max(revisions, default=None), restored=True, queued_at=at,
-                          deleted=disk.get('deleted') is True or known.get('deleted') is True)
-
-    def recover(self):
-        """While the record can't be read (see read), it's tried again, at most every RECOVER_SECONDS. Once it reads,
-        what it holds is merged into what's queued (see restore), and all of it written back to it, before saved context
-        stops being held back for it and its withdrawals go out (see settle). Once nothing it held can matter any more
-        (unread_until), it's set aside unread, as an unreadable one is, and the same follows; one that reads but can't
-        be trusted closes as fail_closed does. True once it's over."""
-        if not self.unread:
-            return True
-        if time.monotonic()-self.unread_at < RECOVER_SECONDS:
-            return False
-        self.unread_at, path = time.monotonic(), self.record()
-        if time.time() >= self.unread_until:
-            if not self.move_aside(path):
-                return False
-            self.unread, found, overflow = False, {}, {}
-            done = 'Pending withdrawals still could not be read, but nothing they held can matter any more'
-        else:
-            found, overflow = self.read(path)
-            if self.unread:
-                return False
-            done = 'Pending withdrawals could be read again, so saved context is no longer held back for them'
-        if found is not None:
-            self.restore(found, overflow)
-        self.prune(time.time())
-        now = time.time()
-        for i in self._pending:
-            self.marked.setdefault(i, now)
-        if not self.settle() and found is not None:
-            # Not on disk yet: still held back, and everything queued, what the record held too, goes to the journal.
-            self.unread = True
-            self.persist()
-            return False
-        if found is not None:  # Otherwise it couldn't be trusted, and closes as fail_closed said.
-            LOG.warning(done)
-        self.kick()  # What the record held goes out now (#313 left it until something else woke the queue).
-        return True
-
-    def settle(self):
-        """Everything queued, the record's and the journal's merged (see restore), written to the record first. Only
-        then does the closed marker stop covering the journal for an older Fri, and the journal go (fri #317). True
-        once the record is written. A crash between any two steps leaves what the next start puts together the same
-        way."""
-        if not self.persist():
-            return False
-        if self.cover or self.unread_until:
-            self.cover = self.unread_until = 0.0
-            if self.closed_until > time.time():
-                self.mark_closed(self.closed_until)
-            else:
-                try:
-                    self.marker().unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    LOG.warning('The closed marker could not be removed: %s', type(exc).__name__)
-        journal = self.journal()
-        if journal not in self.blocked:
-            try:
-                journal.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:  # Read again and merged by the next start: nothing in it is lost.
-                LOG.warning('The withdrawals journal could not be removed: %s', type(exc).__name__)
-        return True
-
-    def cover_journal(self, pending):
-        """An older Fri reads neither the journal nor past the closed marker's time. Before the journal names a
-        withdrawal, the marker holds every saved context back, for that Fri, as long as any it names could matter, by
-        any controller (CLOSED_SECONDS). This Fri reads past it (see read_closed) and lifts it once the record holds
-        them all (see settle)."""
-        if not pending:
-            return
-        until = math.ceil(max(max(sent_at(int(i)), entry.get('queued_at', 0)) for i, entry in pending.items()))
-        if until+CLOSED_SECONDS > self.cover:
-            self.cover = until+CLOSED_SECONDS
-            self.mark_closed(self.closed_until)
-
-    def journal(self):
-        data = getattr(self.agent.fri, 'data', None)
-        return None if data is None else data/JOURNAL
 
     def overflowed(self, overflow):
         """The reader let the oldest go past twice the queue's capacity, to bound memory (see read_record), as the queue
@@ -350,6 +190,7 @@ class SavedTurns:
         kept = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
         self.closed_until = max(self.closed_until, latest+kept)
         self.closed_for.add(CAPACITY_CAUSE)
+        self.unread = None  # Closed for more than a record that couldn't be read: that never ends early (fri #317).
         self.unwritten = not self.mark_closed(self.closed_until)
         LOG.warning('%s pending withdrawals on disk were past what the queue keeps, so every saved context is held back '
                     'for %s days%s', overflow['dropped'], max(1, int((self.closed_until-now)//86400)),
@@ -362,27 +203,20 @@ class SavedTurns:
         unread (renamed, for someone to recover). Until both are done it stays where it is and no queue write replaces it
         (see persist), so the next start finds it unreadable again. Fri still starts and answers, without saved context.
         Logged without its contents."""
-        LOG.warning('Pending withdrawals could not be read (%s), so every saved context is held back for %s days',
-                    type(exc).__name__, CLOSED_SECONDS//86400)
-        if path not in self.blocked:
-            self.blocked.append(path)
+        LOG.warning('Pending withdrawals could not be read (%s), so every saved context is held back for %s days%s',
+                    type(exc).__name__, CLOSED_SECONDS//86400,
+                    ", or until they're read again here" if self.unread is not None else '')
+        self.blocked = True
         self.set_aside(path)
 
     def set_aside(self, path):
-        """Closed until the longest horizon from now, on disk first, and then the unreadable record (or journal) renamed
-        out of the way. True once no queue write can replace it."""
+        """Closed until the longest horizon from now, on disk first, and then the unreadable record renamed out of the
+        way. True once no queue write can replace it."""
         now = time.time()
         self.closed_until = max(self.closed_until, now+CLOSED_SECONDS)
         self.closed_for.add(UNREADABLE_CAUSE)
-        if not self.mark_closed(self.closed_until) or not self.move_aside(path):
+        if not self.mark_closed(self.closed_until):
             return False
-        if path in self.blocked:
-            self.blocked.remove(path)
-        return True
-
-    def move_aside(self, path):
-        """Renamed out of the way unread, for someone to recover. True once nothing written there can replace it."""
-        now = time.time()
         for n in range(100):
             aside = path.with_name(f'withdrawals.unreadable-{int(now)}{"" if n == 0 else f"-{n}"}.json')
             try:
@@ -396,6 +230,9 @@ class SavedTurns:
                 return False
             else:
                 LOG.warning('The unreadable withdrawals record was set aside as %s', aside.name)
+                if self.unread == path:  # Read again where it is now (see recover).
+                    self.unread = aside
+            self.blocked = False
             self.tidy()
             return True
         return False
@@ -406,17 +243,12 @@ class SavedTurns:
 
     def mark_closed(self, until):
         """Writes until when every saved context is held back, and why, as far as it's known (closed_for, for fri
-        health; main reads only the time). True if it's on disk. While a record couldn't be read (fri #317), the time
-        an older Fri reads covers the journal too (see cover_journal), and this Fri's own deadline, and until when that
-        record can matter, are written beside it (see read_closed)."""
+        health; main reads only the time). True if it's on disk."""
         path = self.marker()
         if path is None:
             return False
-        data = {'closed_until': max(until, self.cover), 'why': sorted(self.closed_for)}
-        if self.unread_until:
-            data.update(why=sorted(self.closed_for | {UNREAD_CAUSE}), held_until=until, unread_until=self.unread_until)
         try:
-            private_json(path, data)
+            private_json(path, {'closed_until': until, 'why': sorted(self.closed_for)})
             if until >= self.closed_until:
                 self.unwritten = False  # What the reader let go is held back on disk now too (see overflowed).
             return True
@@ -430,9 +262,7 @@ class SavedTurns:
         stands as it is, and every write after it is at least as late (see mark_closed's callers). One that can't be
         read closes for the whole horizon from now, written back. One that's over is removed. Removing it by hand ends
         it early (see docs/operations.md). Why it was closed is read with it (see mark_closed); one that can't be read
-        counts as an unreadable record. One written while a record couldn't be read (fri #317) gives this Fri its own
-        deadline and until when that record can matter; the time an older Fri reads stays on disk, covering the
-        journal, until the record is put back together (see settle)."""
+        counts as an unreadable record."""
         path = self.marker()
         if path is None:
             return 0.0
@@ -445,12 +275,6 @@ class SavedTurns:
             return 0.0
         except (OSError, ValueError):  # UnicodeDecodeError too.
             until = None
-        else:
-            unread = covering(text) if until is not None else None
-            if unread is not None:
-                self.cover, (until, self.unread_until) = until, unread
-                if until <= now:
-                    return 0.0  # Not removed: it still covers the journal.
         if until is None:
             self.closed_for = {UNREADABLE_CAUSE}
         if until is not None and until <= now:
@@ -486,24 +310,86 @@ class SavedTurns:
                 pass
 
     def closed(self):
-        """Whether every saved context is held back now: a record couldn't be read (see fail_closed), or can't be read
-        yet (see recover)."""
+        """Whether every saved context is held back now: a record couldn't be read (see fail_closed), and, if the disk
+        failed to read it here, still can't be (see recover)."""
         self.pending  # Read first: that's what can close it.
-        if self.unread and not self.recover():
-            return True
+        self.recover()
         return time.time() < self.closed_until
 
     def status(self):
         """For fri health and its file: until when every saved context is held back (None if it isn't), why, as far as
-        it's known ('unreadable', 'capacity'; none for a deadline an older Fri wrote), whether it's held back while the
-        record can't be read yet ('unread', fri #317), whether queued withdrawals are saved to disk meanwhile, and if
-        not, why ('unsaved_for', as closed_for), and how many wait. No IDs, nothing of the record."""
-        self.closed()
-        held = time.time() < self.closed_until
+        it's known ('unreadable', 'capacity'; none for a deadline an older Fri wrote), whether it ends once a record the
+        disk failed to read is read again ('unread', fri #317), whether queued withdrawals are saved to disk meanwhile,
+        and if not, why ('unsaved_for', as closed_for), and how many wait. No IDs, nothing of the record."""
+        closed = self.closed()
         unsaved = UNREADABLE_CAUSE if self.blocked else CAPACITY_CAUSE if self.unwritten else None
-        return {'closed_until': self.closed_until if held else None,
-                'closed_for': sorted(self.closed_for) if held else [], 'unread': self.unread,
+        return {'closed_until': self.closed_until if closed else None,
+                'closed_for': sorted(self.closed_for) if closed else [], 'unread': closed and self.unread is not None,
                 'saved_to_disk': unsaved is None, 'unsaved_for': unsaved, 'pending': len(self.pending)}
+
+    def recover(self):
+        """The closure for a record this process found the disk failing to read, and nothing else (see pending), ends
+        once this process reads it after all (fri #317). It's read again at most every RECOVER_SECONDS, wherever it was
+        set aside. Its entries join what's queued here, never weakening one (see merge), and all of it is written to the
+        record. Only once that's on disk does the closure go, then the marker, then the set-aside copy, and what it held
+        goes out. Every withdrawal queued meanwhile is in memory here, so nothing of them is lost. A restart meanwhile
+        keeps the closure, as main does: what an earlier process didn't write down can't be known. One that reads but
+        can't be trusted, or another closure meanwhile, keeps it too. True if it ended."""
+        if self.unread is None or time.monotonic()-self.unread_at < RECOVER_SECONDS:
+            return False
+        if time.time() >= self.closed_until:  # Over as main's would be: nothing it held can matter now.
+            self.unread = None
+            return False
+        self.unread_at, path, record, overflow = time.monotonic(), self.unread, self.record(), {}
+        try:
+            with path.open() as stream:
+                found = read_record(stream, overflow)
+        except (OSError, ValueError) as exc:  # Gone, or not a record Fri could write: the closure stands.
+            if not transient(exc):
+                self.unread = None
+            return False
+        if overflow.get('dropped'):  # More than the queue holds, which closes as it does (see overflowed).
+            self.unread = None
+            return False
+        if path == record:  # Read where it was, so writing over it loses nothing.
+            self.blocked = False
+        now = time.time()
+        for i, facts in found.items():
+            user = ((facts or {}).get('scope') or {}).get('user_id')
+            if user and self.erasure(user):  # Queued before their "forget me" here, which takes it (see forget).
+                continue
+            disk, known = facts if facts is not None else {'hold': True}, self._pending.get(i)
+            self._pending[i] = self.entry(**disk, restored=True) if known is None else self.merge(disk, known)
+            self.marked.setdefault(i, now)
+        self.prune(now)
+        written = self.persist()
+        if self.unread is None or not written:  # Closed for more meanwhile, or not on disk yet: tried again.
+            return False
+        self.unread, self.closed_until, self.closed_for = None, 0.0, set()
+        for gone in (self.marker(), path if path != record else None):
+            try:
+                if gone is not None:
+                    gone.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:  # The closure stays on disk for a later start, as main keeps it; nothing is lost.
+                LOG.warning('%s could not be removed: %s', gone.name, type(exc).__name__)
+        LOG.warning('Pending withdrawals could be read after all, so saved context is no longer held back')
+        self.kick()  # What it held goes out now.
+        return True
+
+    def merge(self, disk, known):
+        """One entry for a message queued here (known) and in the record read late (disk, as read_record gives it): as
+        withdraw makes one from what a start reads and what came since, never weaker (fri #317). A hold stays one, never
+        sent, whatever came here. A deletion stays one. One the record holds stays its (sent only with the revision
+        guard, see sendable), where a save here doesn't name it again. Queued at the later time, so it lasts as long as
+        either. Built afresh, so a request on its way for the one here doesn't settle it (see drain)."""
+        at = max(disk['queued_at'] if queued(disk.get('queued_at')) else math.ceil(time.time()), known['queued_at'])
+        if disk.get('hold') or known.get('hold'):
+            return self.entry(hold=True, restored=True, queued_at=at)
+        placed = known if 'scope' in known else disk
+        return self.entry(scope=placed['scope'], revision=placed.get('revision'), restored=True, queued_at=at,
+                          deleted=disk.get('deleted') is True or known.get('deleted') is True)
 
     def record(self):
         data = getattr(self.agent.fri, 'data', None)
@@ -525,24 +411,19 @@ class SavedTurns:
         """The lasting withdrawals to disk (see lasting). Never over an unreadable record not yet set aside: it's set
         aside first, or nothing is written and every saved context stays held back for the longest horizon from now, so
         what's queued only in memory is covered too (see fail_closed). Nor over one whose oldest the reader let go
-        before what holds them back is written down: that's written first, or nothing is (see overflowed). While the
-        record can't be read (fri #317), never over it either: all of it goes to the journal beside it instead, once
-        the closed marker covers what that names for an older Fri (see cover_journal). True once written."""
+        before what holds them back is written down: that's written first, or nothing is (see overflowed). True once
+        written."""
         if path := self.record():
             pending = self.pending  # Read first: reading is what finds a record unreadable.
-            for aside in list(self.blocked):
-                if not self.set_aside(aside):
-                    LOG.warning('Pending withdrawals were not saved: the unreadable record could not be set aside, so '
-                                'it stays as it was and every saved context stays held back')
-                    return False
+            if self.blocked and not self.set_aside(path):
+                LOG.warning('Pending withdrawals were not saved: the unreadable record could not be set aside, so it '
+                            'stays as it was and every saved context stays held back')
+                return False
             if self.unwritten and not self.mark_closed(self.closed_until):
                 LOG.warning('Pending withdrawals were not saved: holding back what the queue let go could not be '
                             'written down, so the record stays as it was and every saved context stays held back')
                 return False
             self.unwritten = False
-            if self.unread:
-                self.cover_journal(pending)
-                path = self.journal()
             try:
                 private_json(path, {'pending': {i: self.lasting(entry) for i, entry in pending.items()}})
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
@@ -678,6 +559,7 @@ class SavedTurns:
                         'so none was dropped', MOST)
             return
         self.closed_until = until
+        self.unread = None  # Closed for more than a record that couldn't be read: that never ends early (fri #317).
         for i in extra:
             del self._pending[i]
         LOG.warning('%s pending withdrawals dropped, those whose names can be kept least long first: more than %s '
@@ -1234,21 +1116,6 @@ def deadline(text):
         return None
     value = value.get('closed_until') if isinstance(value, dict) else None
     return float(value) if type(value) in (int, float) and math.isfinite(value) else None
-
-
-def covering(text):
-    """A closed marker's own deadline and until when a record that couldn't be read can matter, written beside the
-    time an older Fri reads while that covers a journal (see SavedTurns.mark_closed); None if it says neither."""
-    try:
-        value = json.loads(text)
-    except ValueError:
-        return None
-    if not isinstance(value, dict) or not isinstance(value.get('why'), list) or UNREAD_CAUSE not in value['why']:
-        return None
-    held, until = value.get('held_until'), value.get('unread_until')
-    if all(type(v) in (int, float) and math.isfinite(v) for v in (held, until)):
-        return float(held), float(until)
-    return None
 
 
 def transient(exc):

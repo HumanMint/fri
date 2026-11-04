@@ -329,28 +329,21 @@ advertises it, so the controller must be released first.
   Until both are done the record stays where it is and no write replaces it: queued withdrawals stay in
   memory, and each attempt to save them moves the deadline to 90 days from then. A deadline once written
   down is never cut short, one past 90 days from now (a clock set back since) included, and nor is when a
-  withdrawal was queued (fri #339). `fri health` shows the end
+  withdrawal was queued (fri #339). One exception (fri #317): when the read failed with an error that says
+  nothing about the record (an I/O error, permissions, resources, a stale handle: `EIO`, `EACCES` and the
+  like), and nothing else had closed, the process that found it reads the set-aside record again every
+  30 seconds. Once it reads, its entries join what's queued, never weaker (a deletion stays one, a hold
+  stays one, one an earlier process queued stays its), all of it is written to `withdrawals.json`, and
+  only once that's on disk is the closure lifted, the marker removed and the set-aside copy deleted. A
+  restart meanwhile keeps the closure, since what an earlier process never wrote down can't be known. So
+  does a set-aside record that reads but can't be trusted, any other error, and any other closure.
+  `fri health` says when the closure would end that way. `fri health` shows the end
   date while it lasts, and whether new withdrawals are being saved; one past any date Fri sets (more
   than 90 days from now) is flagged instead of shown, with this way to end it (fri #343). To end it
   early, recover the
   entries by hand into `withdrawals.json` (or confirm nothing in the set-aside file matters; an
   unreadable record still in place as `withdrawals.json` has to be fixed or moved too), then remove
-  `withdrawals.closed.json`; the next start reads normally.
-  A read that fails with an error that says nothing about the record (an I/O error, permissions,
-  resources, a stale handle: `EIO`, `EACCES` and the like) is handled differently (fri #317). The record
-  stays where it is as `withdrawals.json`, never moved or replaced, and every saved context is held back
-  while it can't be read, as above. Withdrawals queued meanwhile go to `withdrawals.recovering.json`
-  beside it, and `withdrawals.closed.json` covers them for an older Fri, which reads neither the journal
-  nor past the marker's time. The record is tried again at most every 30 seconds. Once it reads, its
-  entries and the journal's are merged toward holding back more, never less: a deletion stays one, one an
-  earlier process queued stays one, the later queued time and revision win, and a hold stays one whatever
-  came by ID. That's written to `withdrawals.json` first; only then is the marker's cover lifted, the
-  journal removed, saved context opened again and the record's withdrawals sent. A crash between any two
-  steps leaves what the next start puts together the same way. It never lasts longer than the closure
-  above: 90 days from the first failure, which the marker keeps across restarts, the record is set aside
-  unread and what's queued takes its place. A record that reads but can't be trusted, any other error, and
-  a journal that can't be read close for 90 days as above. `fri health` says when saved context waits for
-  the record to read again. The queue keeps an entry only as
+  `withdrawals.closed.json`; the next start reads normally. The queue keeps an entry only as
   long as what it names can
   be kept (a week, or a note's 90 days, below), counted from when it was queued, which each entry keeps on
   disk as `queued_at` (whole seconds), or from its message's time if that's later (fri #329): what a turn
@@ -744,9 +737,8 @@ Fri can't restart anything. It only notices and says so.
   whether deploys are paused) and `/controls/health`
   (4 s each, failures shown as "unreachable" or "rejected"), and the watch state. While a pending
   withdrawals record that couldn't be read holds every saved context back, it shows until when, and
-  whether new withdrawals are being saved to disk (no IDs or contents); while it waits for a record the
-  disk failed to read to read again, it says so instead (`unread` in the file, fri #317);
-  `fri-health.json` carries the same under `withdrawals`. Fri can't read a
+  whether new withdrawals are being saved to disk (no IDs or contents); `fri-health.json` carries the
+  same under `withdrawals`. Fri can't read a
   forwarded post yet, so it drops members' forwards: `fri health` and `fri-health.json` (under
   `outcomes.forwards`) count them since Fri started, by the gate that dropped them, and each drop is
   also logged as `Forward <channel or dm>/<message id> not read: <gate>` to count them across restarts.

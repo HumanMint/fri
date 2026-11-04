@@ -1,12 +1,13 @@
-"""A withdrawals record the disk fails to read (fri #317): saved context is held back only until it reads again.
+"""A withdrawals record the disk fails to read (fri #317): the closure for it ends once the same process reads it.
 
-#250 closed every saved context for 90 days after any error reading the record. An error that says nothing about the
-record (EIO, EACCES and the like) now leaves it where it is: every saved context stays held back while it can't be
-read, withdrawals queued meanwhile go to a journal beside it, and once it reads, the two are merged toward holding back
-more, never less, written back to the record, and only then is saved context opened again and the record's own
-withdrawals sent. Never longer than before: 90 days from the first failure, across restarts. A record that reads but
-can't be trusted, an error of any other kind, and a journal that can't be read close as before. #313's two blockers
-are regression tests here.
+#250 closes every saved context for 90 days after any error reading the record, and that stays as it was: the closure
+is written down first, the record is set aside unread, and every withdrawal from then on goes to the record as always,
+so an older Fri, or a restart, finds exactly what main leaves. What's new: for an error that says nothing about the
+record (EIO, EACCES and the like), the process that found it reads the set-aside record again. Once it reads, its entries
+join what's queued, never weaker, all of it is written to the record, and only then does the closure end. A restart
+meanwhile keeps the closure, as main does: what an earlier process never wrote down can't be known. So does a record
+that reads but can't be trusted, an error of any other kind, or any other closure. #313's blockers, and Sol round 1's
+of #352 (B1 to B3), are regression tests here.
 """
 import asyncio
 import errno
@@ -30,19 +31,21 @@ from compat_tests.test_fri_withdrawal_rollback import (
 from compat_tests.test_fri_withheld_history import delete, earlier_exchange, on_disk
 
 OTHER = 'other-synthetic-marker'  # What an exchange withdrawn during the outage holds.
+DERIVED = 'derived-synthetic-marker'  # Fri's saved reply to someone else, whose request carried the message.
 RECORD = 'withdrawals.json'
-JOURNAL = 'withdrawals.recovering.json'
+ASIDE = 'withdrawals.unreadable-*.json'
 DAY = 86400
 
 
-def disk_fails(monkeypatch, path, error=errno.EIO):
-    """Reading `path` fails as a disk error would, until state['down'] is False; state['tries'] counts the reads.
-    Writing it, and everything else, works."""
+def disk_fails(monkeypatch, tmp_path, error=errno.EIO):
+    """Reading the record fails as a disk error would, wherever it's set aside, until state['down'] is False;
+    state['tries'] counts those reads. Writing, and everything else, works."""
     import pathlib
     state, real = {'down': True, 'tries': 0}, pathlib.Path.open
     def opening(self, *args, **kwargs):
         mode = args[0] if args else kwargs.get('mode', 'r')
-        if self == path and state['down'] and not {'w', 'a', 'x'} & set(mode):
+        named = self == tmp_path/RECORD or (self.parent == tmp_path and self.match(ASIDE))
+        if named and state['down'] and not {'w', 'a', 'x'} & set(mode):
             state['tries'] += 1
             raise OSError(error, 'injected')
         return real(self, *args, **kwargs)
@@ -51,27 +54,33 @@ def disk_fails(monkeypatch, path, error=errno.EIO):
 
 
 def recovering(monkeypatch):
-    """The record is tried again at the next chance, not 30 seconds on."""
+    """The set-aside record is read again at the next chance, not 30 seconds on."""
     import fri.fri_turn_withdrawal as withdrawal
-    monkeypatch.setattr(withdrawal, 'RECOVER_SECONDS', 0)
+    monkeypatch.setattr(withdrawal, 'RECOVER_SECONDS', 0, raising=False)  # Absent on main.
 
 
-def raw(tmp_path, name=RECORD):
+def raw(path):
     """A file's text, read past any injected failure (as an older Fri, or a person, would read it)."""
-    with open(tmp_path/name) as stream:
+    with open(path) as stream:
         return stream.read()
 
 
-async def outage_start(w, tmp_path, monkeypatch):
+def aside(tmp_path):
+    found = sorted(tmp_path.glob(ASIDE))
+    return found[0] if len(found) == 1 else None
+
+
+async def outage_start(w, tmp_path, monkeypatch, error=errno.EIO):
     """A withdrawal left on disk that the controller won't take, another saved exchange, and a start whose read of the
-    record fails. Returns the earlier message, the outage's state and the new queue."""
+    record fails. Returns the earlier message, the record's text, the outage's state and the new queue."""
     from fri.fri_turn_withdrawal import SavedTurns
     earlier = await kept_pending(w, tmp_path, monkeypatch)
     await w.agent.handle(w.said('fri and lunch?'))  # Another saved exchange, nothing withdrawn.
-    outage = disk_fails(monkeypatch, tmp_path/RECORD)
+    text = raw(tmp_path/RECORD)
+    outage = disk_fails(monkeypatch, tmp_path, error)
     turns = w.agent.saved_turns = SavedTurns(w.agent)
     assert turns.closed()
-    return earlier, outage, turns
+    return earlier, text, outage, turns
 
 
 async def withdrawn_meanwhile(w):
@@ -82,23 +91,22 @@ async def withdrawn_meanwhile(w):
     return more
 
 
-def test_a_record_the_disk_failed_to_read_holds_back_only_until_it_reads_again(monkeypatch, tmp_path):
-    """The issue: one read error at start-up closed every saved context for 90 days. Now it's held back while the record
-    can't be read, and once it reads, only what it holds stays held back. The record is never moved or replaced."""
+def test_a_record_the_disk_failed_to_read_holds_back_only_until_this_process_reads_it(monkeypatch, tmp_path):
+    """The issue: one read error at start-up closed every saved context for 90 days. It still closes, as main does,
+    the record set aside unread; once this process reads it after all, only what it holds stays held back."""
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         try:
-            earlier, outage, turns = await outage_start(w, tmp_path, monkeypatch)
-            text = raw(tmp_path)
-            assert MARKER not in await next_request(w) and history(w) == 0  # Held back while it can't be read.
-            assert raw(tmp_path) == text and not list(tmp_path.glob('withdrawals.unreadable-*.json'))
+            earlier, text, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            assert MARKER not in await next_request(w) and history(w) == 0
+            assert raw(aside(tmp_path)) == text and (tmp_path/CLOSED).exists()  # As main leaves it.
             outage['down'] = False
             recovering(monkeypatch)
             request = await next_request(w)
             assert MARKER not in request and history(w) > 0  # Open again; what the record holds is still held back.
             assert str(earlier.id) in turns.pending and not turns.closed()
-            assert set(json.loads(on_disk(tmp_path))['pending']) == set(json.loads(text)['pending'])
-            assert not (tmp_path/JOURNAL).exists() and not (tmp_path/CLOSED).exists()
+            assert str(earlier.id) in json.loads(on_disk(tmp_path))['pending']
+            assert not (tmp_path/CLOSED).exists() and aside(tmp_path) is None
         finally:
             await w.fri.close()
     asyncio.run(scenario())
@@ -108,27 +116,24 @@ def test_a_record_the_disk_failed_to_read_holds_back_only_until_it_reads_again(m
 def test_the_313_repro_a_withdrawal_made_while_the_record_cant_be_read_outlasts_a_restart(monkeypatch, tmp_path,
                                                                                          restart):
     """#313's first blocker: with the record unread, queue writes were dropped, so after a restart a withdrawal made
-    meanwhile was gone, and its exchange reached the next request. It's kept in the journal beside the record."""
+    meanwhile was gone, and its exchange reached the next request. It goes to the record as main writes it, and a
+    restart keeps the closure."""
     async def scenario():
         from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
         try:
-            earlier, outage, _ = await outage_start(w, tmp_path, monkeypatch)
+            _, _, outage, _ = await outage_start(w, tmp_path, monkeypatch)
             more = await withdrawn_meanwhile(w)
+            assert str(more.id) in json.loads(raw(tmp_path/RECORD))['pending']
             if restart == 'once the record reads':
                 outage['down'] = False
             turns = w.agent.saved_turns = SavedTurns(w.agent)  # Restarted.
             recovering(monkeypatch)
+            outage['down'] = False
             request = await next_request(w)
-            assert OTHER not in request and MARKER not in request
-            if restart == 'while it still cant be read':
-                assert history(w) == 0 and str(more.id) in turns.pending
-                outage['down'] = False
-                request = await next_request(w)
-                assert OTHER not in request and MARKER not in request
-            assert history(w) > 0 and {str(earlier.id), str(more.id)} <= set(turns.pending)
-            assert {str(earlier.id), str(more.id)} <= set(json.loads(on_disk(tmp_path))['pending'])
-            assert not (tmp_path/JOURNAL).exists()
+            assert OTHER not in request and MARKER not in request and history(w) == 0 and turns.closed()
+            if restart == 'once the record reads':
+                assert str(more.id) in turns.pending
         finally:
             await w.fri.close()
     asyncio.run(scenario())
@@ -141,13 +146,13 @@ EVENTS = ['a late edit, by ID', 'a late edit of an exchange saved here', 'its ra
 def test_the_313_repro_what_the_record_holds_is_never_weakened_by_what_came_meanwhile(monkeypatch, tmp_path, event):
     """#313's second blocker: recovery skipped the record's entry whenever the same message was queued meanwhile, losing
     where it was saved, its revision, that an earlier process queued it and that it was a deletion; a late edit even
-    turned the deletion into an edit. The merged entry keeps all of that, the later revision, and the later time it was
-    queued, and it's on disk before saved context opens."""
+    turned the deletion into an edit. The merged entry keeps all of that, and the later time it was queued, and it's on
+    disk before saved context opens."""
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         try:
-            earlier, outage, turns = await outage_start(w, tmp_path, monkeypatch)
-            disk = json.loads(raw(tmp_path))['pending'][str(earlier.id)]
+            earlier, text, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            disk = json.loads(text)['pending'][str(earlier.id)]
             assert disk['deleted'] is True and 'scope' in disk and type(disk['revision']) is int
             revision = disk['revision']
             if event == 'a late edit of an exchange saved here':
@@ -175,9 +180,10 @@ def test_the_313_repro_what_the_record_holds_is_never_weakened_by_what_came_mean
     asyncio.run(scenario())
 
 
-def test_a_hold_on_disk_stays_one_whatever_came_by_id_meanwhile(monkeypatch, tmp_path):
-    """A hold in the record (never sent, held as long as what it names can be kept) met by a withdrawal by ID queued
-    while the record couldn't be read: it stays a hold, as it would had the record been read first."""
+@pytest.mark.parametrize('meanwhile', ['its raw delete, by ID', 'a save here and its edit'])
+def test_a_hold_on_disk_stays_one_whatever_came_meanwhile(monkeypatch, tmp_path, meanwhile):
+    """A hold in the record (never sent, held as long as what it names can be kept) met by anything queued while the
+    record couldn't be read stays a hold, here and after a restart."""
     async def scenario():
         from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
@@ -185,10 +191,16 @@ def test_a_hold_on_disk_stays_one_whatever_came_by_id_meanwhile(monkeypatch, tmp
             held_back = w.said('said and taken back')
             (tmp_path/RECORD).write_text(json.dumps({'pending': {str(held_back.id): {'hold': True,
                                                                                      'queued_at': int(time.time())}}}))
-            outage = disk_fails(monkeypatch, tmp_path/RECORD)
+            outage = disk_fails(monkeypatch, tmp_path)
             turns = w.agent.saved_turns = SavedTurns(w.agent)
             assert turns.closed()
-            await delete(w, held_back, guild=123)
+            if meanwhile == 'its raw delete, by ID':
+                await delete(w, held_back, guild=123)
+            else:
+                scope = {'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20'}
+                turns.kept({**scope, 'revision': 0, 'source': {'kind': 'discord_message', 'id': str(held_back.id)}},
+                           {'ok': True}, (time.time(), time.monotonic()))
+                await edit(w, edited(held_back))
             outage['down'] = False
             recovering(monkeypatch)
             assert not turns.closed() and turns.pending[str(held_back.id)].get('hold') is True
@@ -200,16 +212,16 @@ def test_a_hold_on_disk_stays_one_whatever_came_by_id_meanwhile(monkeypatch, tmp
     asyncio.run(scenario())
 
 
-class Crash(BaseException):
-    """The process dies here."""
+class Stop(BaseException):
+    """The process stops here."""
 
 
-STEPS = ['before the record is written', 'after the record, before the closed marker',
-         'after the closed marker, before the journal goes']
+STEPS = ['before the record is written', 'after the record, before the closed marker goes',
+         'after the closed marker, before the set-aside copy goes']
 
 
-def crash_at(monkeypatch, step):
-    """The process dies once, at this step of a recovery (see SavedTurns.settle)."""
+def stop_at(monkeypatch, tmp_path, step):
+    """The process stops once, at this step of ending the closure (see SavedTurns.recover)."""
     import pathlib
 
     import fri.fri_turn_withdrawal as withdrawal
@@ -219,72 +231,46 @@ def crash_at(monkeypatch, step):
         def writing(path, data):
             if path.name == RECORD and left[0]:
                 left[0] -= 1
-                raise Crash()
+                raise Stop()
             return real(path, data)
         monkeypatch.setattr(withdrawal, 'private_json', writing)
         return
-    name = CLOSED if 'before the closed marker' in step else JOURNAL
+    marker = 'before the closed marker' in step
     real_unlink = pathlib.Path.unlink
     def unlinking(self, *args, **kwargs):
-        if self.name == name and left[0]:
+        if (self.name == CLOSED if marker else self.match(ASIDE)) and left[0]:
             left[0] -= 1
-            raise Crash()
+            raise Stop()
         return real_unlink(self, *args, **kwargs)
     monkeypatch.setattr(pathlib.Path, 'unlink', unlinking)
 
 
 @pytest.mark.parametrize('step', STEPS)
-def test_a_crash_at_any_step_of_the_recovery_loses_nothing(monkeypatch, tmp_path, step):
-    """Fri dies part way through putting the record back together: the next start finds the record, the journal and
-    the closed marker in a state it reconciles, so both withdrawals stay held back and saved context opens."""
+def test_a_stop_at_any_step_of_ending_the_closure_loses_nothing(monkeypatch, tmp_path, step):
+    """Fri stops part way through: the next start finds what main would (closed, both withdrawals held), or, once the
+    marker is gone, the record written back whole."""
     async def scenario():
         from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
         try:
-            earlier, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            earlier, _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
             more = await withdrawn_meanwhile(w)
             outage['down'] = False
             recovering(monkeypatch)
-            crash_at(monkeypatch, step)
-            with pytest.raises(Crash):
+            stop_at(monkeypatch, tmp_path, step)
+            with pytest.raises(Stop):
                 turns.closed()
-            assert (tmp_path/JOURNAL).exists()
             turns = w.agent.saved_turns = SavedTurns(w.agent)  # Started again.
             request = await next_request(w)
-            assert OTHER not in request and MARKER not in request and history(w) > 0
-            assert {str(earlier.id), str(more.id)} <= set(turns.pending)
-            assert {str(earlier.id), str(more.id)} <= set(json.loads(on_disk(tmp_path))['pending'])
-            assert not (tmp_path/JOURNAL).exists() and not (tmp_path/CLOSED).exists()
-        finally:
-            await w.fri.close()
-    asyncio.run(scenario())
-
-
-def test_a_record_that_reads_again_but_cant_be_written_stays_held_back(monkeypatch, tmp_path):
-    """Put back together only once it's on disk: a write that fails (a full disk) keeps every saved context held back,
-    with everything queued, the record's too, in the journal meanwhile, and a restart loses none of it."""
-    async def scenario():
-        import fri.fri_turn_withdrawal as withdrawal
-        from fri.fri_turn_withdrawal import SavedTurns
-        w = await world(monkeypatch, tmp_path)
-        try:
-            earlier, outage, turns = await outage_start(w, tmp_path, monkeypatch)
-            more = await withdrawn_meanwhile(w)
-            outage['down'] = False
-            recovering(monkeypatch)
-            real = withdrawal.private_json
-            def writing(path, data):
-                if path.name == RECORD:
-                    raise OSError(errno.ENOSPC, 'injected')
-                return real(path, data)
-            monkeypatch.setattr(withdrawal, 'private_json', writing)
-            assert turns.closed() and turns.closed()  # Read again each time, never written.
-            assert {str(earlier.id), str(more.id)} <= set(json.loads(raw(tmp_path, JOURNAL))['pending'])
-            monkeypatch.setattr(withdrawal, 'private_json', real)
-            turns = w.agent.saved_turns = SavedTurns(w.agent)  # Started again, the disk writable again.
-            request = await next_request(w)
-            assert OTHER not in request and MARKER not in request and history(w) > 0
-            assert {str(earlier.id), str(more.id)} <= set(json.loads(on_disk(tmp_path))['pending'])
+            assert OTHER not in request and MARKER not in request
+            if step == 'before the record is written':
+                assert turns.closed() and history(w) == 0 and str(more.id) in turns.pending
+            elif 'before the closed marker' in step:
+                assert turns.closed() and history(w) == 0
+                assert {str(earlier.id), str(more.id)} <= set(turns.pending)
+            else:
+                assert not turns.closed() and history(w) > 0
+                assert {str(earlier.id), str(more.id)} <= set(turns.pending)
         finally:
             await w.fri.close()
     asyncio.run(scenario())
@@ -299,7 +285,7 @@ def test_what_the_record_holds_goes_out_once_it_reads_again(monkeypatch, tmp_pat
             pytest.skip('needs a controller offering '+SOURCES)  # A restored entry goes only with the revision guard.
         try:
             earlier = await pending_on_disk(w, tmp_path)  # The controller is back.
-            outage = disk_fails(monkeypatch, tmp_path/RECORD)
+            outage = disk_fails(monkeypatch, tmp_path)
             turns = w.agent.saved_turns = SavedTurns(w.agent)
             turns.retry()  # As a start does: nothing of the record's is known yet.
             await settled(w)
@@ -315,23 +301,20 @@ def test_what_the_record_holds_goes_out_once_it_reads_again(monkeypatch, tmp_pat
     asyncio.run(scenario())
 
 
-def test_a_record_that_reads_again_but_cant_be_trusted_closes_as_before(monkeypatch, tmp_path):
-    """The read error passes, but what it reads is cut off: it's closed for 90 days and set aside, as #250 closes it,
-    and what came meanwhile goes into the record in its place."""
+def test_a_record_that_reads_again_but_cant_be_trusted_keeps_the_closure(monkeypatch, tmp_path):
+    """The read error passes, but what it reads is cut off: closed for 90 days as main closes it, and not read again."""
     async def scenario():
-        from fri.fri_turn_withdrawal import CLOSED_SECONDS, SavedTurns
+        from fri.fri_turn_withdrawal import CLOSED_SECONDS
         w = await world(monkeypatch, tmp_path)
         try:
-            _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            _, text, outage, turns = await outage_start(w, tmp_path, monkeypatch)
             more = await withdrawn_meanwhile(w)
-            cut = raw(tmp_path)[:-5]
-            (tmp_path/RECORD).write_text(cut)
+            aside(tmp_path).write_text(text[:-5])
             outage['down'] = False
             recovering(monkeypatch)
             assert turns.closed() and turns.closed_until >= time.time()+CLOSED_SECONDS-60
-            assert [path.read_text() for path in tmp_path.glob('withdrawals.unreadable-*.json')] == [cut]
-            assert str(more.id) in json.loads(on_disk(tmp_path))['pending'] and not (tmp_path/JOURNAL).exists()
-            w.agent.saved_turns = SavedTurns(w.agent)
+            assert getattr(turns, 'unread', None) is None and raw(aside(tmp_path)) == text[:-5]
+            assert str(more.id) in json.loads(on_disk(tmp_path))['pending']
             assert OTHER not in await next_request(w) and history(w) == 0
         finally:
             await w.fri.close()
@@ -340,51 +323,66 @@ def test_a_record_that_reads_again_but_cant_be_trusted_closes_as_before(monkeypa
 
 @pytest.mark.parametrize('error', ['EISDIR', 'ELOOP', 'EINVAL'])
 def test_a_read_error_that_isnt_a_passing_one_closes_as_before(monkeypatch, tmp_path, error):
-    """Only an error that says nothing about the record gets the shorter path; any other closes for 90 days."""
+    """Only an error that says nothing about the record ends early; any other closes for 90 days, and isn't retried."""
     async def scenario():
-        from fri.fri_turn_withdrawal import CLOSED_SECONDS, SavedTurns
+        from fri.fri_turn_withdrawal import CLOSED_SECONDS
         w = await world(monkeypatch, tmp_path)
         try:
-            await kept_pending(w, tmp_path, monkeypatch)
-            disk_fails(monkeypatch, tmp_path/RECORD, getattr(errno, error))
-            turns = w.agent.saved_turns = SavedTurns(w.agent)
+            _, _, outage, turns = await outage_start(w, tmp_path, monkeypatch, getattr(errno, error))
+            outage['down'] = False
+            recovering(monkeypatch)
             assert turns.closed() and turns.closed_until >= time.time()+CLOSED_SECONDS-60
-            assert list(tmp_path.glob('withdrawals.unreadable-*.json'))
+            assert getattr(turns, 'unread', None) is None
+            assert aside(tmp_path) is not None
         finally:
             await w.fri.close()
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('journal', ['cut off', 'unreadable'])
-def test_a_journal_that_cant_be_read_closes_as_an_unreadable_record_does(monkeypatch, tmp_path, journal):
-    """What it held can't be known, whatever kept it from being read: every saved context is held back for 90 days,
-    and it's set aside unread. The record is read as usual."""
+def test_another_closure_keeps_the_closure_whatever_reads_again(monkeypatch, tmp_path):
+    """Closed for something else too (more queued than the queue keeps, here): that can't be told apart, so the
+    closure stands, as main keeps it."""
     async def scenario():
-        from fri.fri_turn_withdrawal import CLOSED_SECONDS, SavedTurns
+        import fri.fri_turn_withdrawal as withdrawal
         w = await world(monkeypatch, tmp_path)
         try:
-            earlier = await kept_pending(w, tmp_path, monkeypatch)
-            (tmp_path/JOURNAL).write_text('{"pending": {"1": ')
-            if journal == 'unreadable':
-                disk_fails(monkeypatch, tmp_path/JOURNAL)
+            _, _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            monkeypatch.setattr(withdrawal, 'MOST', 1)
+            await withdrawn_meanwhile(w)
+            await delete(w, w.said('fri one more'))
+            outage['down'] = False
+            recovering(monkeypatch)
+            assert turns.closed() and getattr(turns, 'unread', None) is None
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_closure_already_in_force_at_start_never_ends_early(monkeypatch, tmp_path):
+    async def scenario():
+        from fri.fri_turn_withdrawal import SavedTurns
+        w = await world(monkeypatch, tmp_path)
+        try:
+            await kept_pending(w, tmp_path, monkeypatch)
+            (tmp_path/CLOSED).write_text(json.dumps({'closed_until': time.time()+DAY, 'why': ['capacity']}))
+            outage = disk_fails(monkeypatch, tmp_path)
             turns = w.agent.saved_turns = SavedTurns(w.agent)
-            assert turns.closed() and turns.closed_until >= time.time()+CLOSED_SECONDS-60
-            assert str(earlier.id) in turns.pending
-            assert [raw(tmp_path, path.name) for path in tmp_path.glob('withdrawals.unreadable-*.json')] == [
-                '{"pending": {"1": ']
-            assert not (tmp_path/JOURNAL).exists()
+            assert turns.closed() and getattr(turns, 'unread', None) is None
+            outage['down'] = False
+            recovering(monkeypatch)
+            assert turns.closed()
         finally:
             await w.fri.close()
     asyncio.run(scenario())
 
 
 def test_forget_me_while_the_record_cant_be_read_takes_their_withdrawals_from_it_too(monkeypatch, tmp_path):
-    """A member's "forget me" takes their queued withdrawals off disk. One in the record can't go while it can't be
-    read, so it goes as the record is read back, never written back to it."""
+    """A member's "forget me" takes their queued withdrawals. One in the record can't go while it can't be read, so it
+    goes as the record is read back, never written back to it."""
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         try:
-            earlier, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            earlier, _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
             turns.forget('20')
             outage['down'] = False
             recovering(monkeypatch)
@@ -395,18 +393,18 @@ def test_forget_me_while_the_record_cant_be_read_takes_their_withdrawals_from_it
     asyncio.run(scenario())
 
 
-def test_fri_health_says_saved_context_waits_for_the_record_to_read_again(monkeypatch, tmp_path):
+def test_fri_health_says_the_closure_ends_once_the_record_reads(monkeypatch, tmp_path):
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         try:
-            _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            _, _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
             w.fri.get_guild = lambda _: None
             report = await w.fri.watcher.report()
             lines = [line for line in report.splitlines() if 'saved context' in line]
-            assert len(lines) == 1 and 'read again' in lines[0] and MARKER not in report
+            assert len(lines) == 2 and 'read again' in lines[0] and '<t:' in lines[1] and MARKER not in report
             await w.fri.health.coro(w.fri)
             health = json.loads((tmp_path/'fri-health.json').read_text())['withdrawals']
-            assert health['unread'] is True and health['closed_until'] is None and MARKER not in json.dumps(health)
+            assert health['unread'] is True and health['closed_until'] and MARKER not in json.dumps(health)
             outage['down'] = False
             recovering(monkeypatch)
             report = await w.fri.watcher.report()
@@ -416,13 +414,13 @@ def test_fri_health_says_saved_context_waits_for_the_record_to_read_again(monkey
     asyncio.run(scenario())
 
 
-def test_the_record_is_tried_again_at_most_every_thirty_seconds(monkeypatch, tmp_path):
+def test_the_record_is_read_again_at_most_every_thirty_seconds(monkeypatch, tmp_path):
     """Every request asks whether saved context is held back: that never reads the record each time."""
     async def scenario():
         import fri.fri_turn_withdrawal as withdrawal
         w = await world(monkeypatch, tmp_path)
         try:
-            _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            _, _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
             tries = outage['tries']
             for _ in range(5):
                 assert turns.closed()
@@ -434,22 +432,19 @@ def test_the_record_is_tried_again_at_most_every_thirty_seconds(monkeypatch, tmp
     asyncio.run(scenario())
 
 
-def test_a_read_error_that_never_passes_holds_back_no_longer_than_before(monkeypatch, tmp_path):
-    """Never worse than #250: 90 days from the first failure, which a restart doesn't move. Then nothing the record
-    held can matter, so it's set aside and what came meanwhile goes into the record in its place."""
+def test_a_read_error_that_never_passes_holds_back_as_main_does(monkeypatch, tmp_path):
+    """Never longer than before: read again all along, never readable, and still open 90 days on, as main."""
     async def scenario():
-        from fri.fri_turn_withdrawal import CLOSED_SECONDS, SavedTurns
+        from fri.fri_turn_withdrawal import CLOSED_SECONDS
         w = await world(monkeypatch, tmp_path)
         try:
-            _, outage, _ = await outage_start(w, tmp_path, monkeypatch)
-            more = await withdrawn_meanwhile(w)
+            _, _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            await withdrawn_meanwhile(w)
+            recovering(monkeypatch)
             module_clock(monkeypatch, 5*DAY)
-            turns = w.agent.saved_turns = SavedTurns(w.agent)  # A restart days on: the clock isn't reset.
-            assert turns.closed() and str(more.id) in turns.pending
+            assert turns.closed() and getattr(turns, 'unread', None) is not None
             module_clock(monkeypatch, CLOSED_SECONDS-5*DAY+60)
-            turns = w.agent.saved_turns = SavedTurns(w.agent)
-            assert not turns.closed() and outage['down']  # The record still can't be read.
-            assert list(tmp_path.glob('withdrawals.unreadable-*.json')) and not (tmp_path/JOURNAL).exists()
+            assert not turns.closed() and outage['down']
             await next_request(w)
             assert history(w) > 0
         finally:
@@ -457,40 +452,37 @@ def test_a_read_error_that_never_passes_holds_back_no_longer_than_before(monkeyp
     asyncio.run(scenario())
 
 
-def test_an_older_fri_started_during_the_outage_holds_back_what_the_journal_holds(monkeypatch, tmp_path):
-    """An older Fri reads only the record and the closed marker's time (its first 256 characters). Meanwhile the record
-    is never replaced, and the marker's time covers every withdrawal the journal holds, as long as any could be kept,
-    and the record's for as long as #250 would have closed."""
+def test_a_record_that_reads_again_but_cant_be_written_stays_held_back(monkeypatch, tmp_path):
+    """Sol round 1 of #352, S1: ended only once it's on disk. A write that fails (a full disk) keeps every saved context
+    held back and is tried again; a restart meanwhile finds the closure, as main does."""
     async def scenario():
-        from fri.fri_turn_withdrawal import CLOSED_SECONDS, sent_at
+        from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
         try:
-            first = time.time()
-            await outage_start(w, tmp_path, monkeypatch)
-            text = raw(tmp_path)
-            await withdrawn_meanwhile(w)
-            marker = raw(tmp_path, CLOSED)
-            assert len(marker) <= 256 and raw(tmp_path) == text
-            journal = json.loads(raw(tmp_path, JOURNAL))['pending']
-            needed = max(max(sent_at(int(i)), entry['queued_at']) for i, entry in journal.items())+CLOSED_SECONDS
-            assert json.loads(marker)['closed_until'] >= max(needed, first+CLOSED_SECONDS)
+            earlier, _, outage, turns = await outage_start(w, tmp_path, monkeypatch)
+            more = await withdrawn_meanwhile(w)
+            outage['down'] = False
+            recovering(monkeypatch)
+            restore = failing_writes(monkeypatch, OSError(errno.ENOSPC, 'injected'), names={RECORD})
+            assert turns.closed() and turns.closed()  # Read again each time, never written.
+            assert (tmp_path/CLOSED).exists() and aside(tmp_path) is not None
+            restore()
+            assert not turns.closed()  # Written now.
+            assert {str(earlier.id), str(more.id)} <= set(json.loads(on_disk(tmp_path))['pending'])
+            restore = failing_writes(monkeypatch, OSError(errno.ENOSPC, 'injected'), names={RECORD})
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert OTHER not in await next_request(w) and MARKER not in str(w.requests)
         finally:
             await w.fri.close()
     asyncio.run(scenario())
 
 
-# Sol round 1 of #352: three NEW blockers and a should.
-
-DERIVED = 'derived-synthetic-marker'  # Fri's saved reply to someone else, whose request carried the message.
-
-
-class Stop(BaseException):
-    """The process stops here."""
+# Sol round 1 of #352: three NEW blockers in the journal design, which this one has none of. Each stays a test.
 
 
 def failing_writes(monkeypatch, error, names=None, times=None):
-    """Fri's private writes to these files (any but the closed marker, for None) fail: `error` raised, an exception
-    class or instance; `times` of them (all, for None)."""
+    """Fri's private writes to these files (any but the closed marker, for None) fail: `error` raised; `times` of them
+    (all, for None). Returns what undoes it."""
     import fri.fri_turn_withdrawal as withdrawal
     real, left = withdrawal.private_json, [times]
     def writing(path, data):
@@ -512,7 +504,7 @@ def test_the_b1_repro_a_withdrawal_never_written_down_stays_held_back_after_a_re
         from fri.fri_turn_withdrawal import SavedTurns
         w = await world(monkeypatch, tmp_path)
         try:
-            earlier, outage, _ = await outage_start(w, tmp_path, monkeypatch)
+            _, _, outage, _ = await outage_start(w, tmp_path, monkeypatch)
             more = await earlier_exchange(w, 'fri explain '+OTHER)
             restore = failing_writes(monkeypatch, Stop() if failure.startswith('the process') else
                                      OSError(errno.ENOSPC, 'injected'))
@@ -534,6 +526,9 @@ def test_the_b1_repro_a_withdrawal_never_written_down_stays_held_back_after_a_re
 
 async def derived_reply(w, message):
     """Member 30's saved exchange, whose model request carried `message` and whose reply repeats it."""
+    import inspect
+    if 'drew_on' not in inspect.signature(w.store.save_chat).parameters:
+        pytest.skip('needs a controller that records what a reply drew on')
     asked = w.said('fri what did they mean', user=30)
     source = {'kind': 'discord_message', 'id': str(asked.id), 'user_id': '30', 'channel_id': '1', 'guild_id': '123',
               'display_name': 'member'}
@@ -566,7 +561,7 @@ def test_the_b2_repro_a_deletion_is_never_weakened_by_an_earlier_edit(monkeypatc
             assert json.loads(on_disk(tmp_path))['pending'][str(earlier.id)]['deleted'] is False
             await derived_reply(w, earlier)
             by_id = failing(w, SAVED)
-            outage = disk_fails(monkeypatch, tmp_path/RECORD)
+            outage = disk_fails(monkeypatch, tmp_path)
             turns = w.agent.saved_turns = SavedTurns(w.agent)
             assert turns.closed()
             await delete(w, earlier, guild=123)  # Its raw delete, by ID: the controller takes neither.
@@ -601,11 +596,11 @@ def test_the_b3_repro_an_older_fri_after_the_first_deadline_still_holds_a_later_
             await delete(w, more)
             restore()
             await delete(w, w.said('fri another one'))  # Later writes go as they would.
-            until = deadline(raw(tmp_path, CLOSED)) or 0
+            until = deadline(raw(tmp_path/CLOSED)) or 0
             later = first+CLOSED_SECONDS+60  # Past the first deadline, with the withdrawal still able to matter.
             queued_at = w.agent.saved_turns.pending[str(more.id)]['queued_at']  # A day in, by the queue's clock.
             assert max(sent_at(more.id), queued_at)+CLOSED_SECONDS > later
-            in_record = str(more.id) in read_record(raw(tmp_path))
+            in_record = str(more.id) in read_record(raw(tmp_path/RECORD))
             assert in_record or until >= later
         finally:
             await w.fri.close()

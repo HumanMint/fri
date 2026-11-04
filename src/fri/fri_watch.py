@@ -361,9 +361,9 @@ class Watch:
             waiting = '?'
         lines.append(f'- usage receipts waiting: {waiting}')
         turns = getattr(agent, 'saved_turns', None) if agent else None
-        if turns is not None and turns.status().get('unread'):  # Until the withdrawals record reads again (fri #317).
-            lines.append("- saved context: held back until the withdrawals record can be read again (reading it failed "
-                         "with an error that may pass; it's tried every 30 seconds); new withdrawals are kept beside it")
+        if turns is not None and turns.status().get('unread'):  # It ends once the record reads again (fri #317).
+            lines.append("- saved context: the withdrawals record the disk failed to read is read again every 30 "
+                         "seconds; the hold-back below ends once it reads and is written back")
         if turns is not None and (held := turns.status())['closed_until']:  # Every saved context is held back.
             from .fri_turn_withdrawal import CLOSED_SECONDS
             until, why = held['closed_until'], held.get('closed_for') or []
