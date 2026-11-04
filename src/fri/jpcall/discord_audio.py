@@ -9,7 +9,7 @@ from .contract import AUDIO_RATE, Speaker
 
 INPUT_FRAME = 160 * 2
 OUTPUT_FRAME = 960 * 2 * 2
-BUFFER_BYTES = AUDIO_RATE * 2 * 2  # Two seconds per speaker.
+BUFFER_LIMITS = {'callee': AUDIO_RATE * 2 * 2, 'fri': AUDIO_RATE * 2 * 60}
 
 
 class CallAudioSource(discord.AudioSource):
@@ -27,8 +27,9 @@ class CallAudioSource(discord.AudioSource):
             if self._closed:
                 return
             buffer = self._buffers[speaker]
-            buffer.extend(pcm16[-BUFFER_BYTES:])
-            del buffer[:max(0, len(buffer) - BUFFER_BYTES)]
+            limit = BUFFER_LIMITS[speaker]
+            buffer.extend(pcm16[-limit:])
+            del buffer[:max(0, len(buffer) - limit)]
 
     def clear(self, speaker: Speaker) -> None:
         with self._lock:

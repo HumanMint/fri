@@ -47,12 +47,14 @@ class Response:
         self.done = False
         self.texts = []
         self.modal = None
+        self.deferrals = []
 
     def is_done(self):
         return self.done
 
     async def defer(self, **kwargs):
         self.done = True
+        self.deferrals.append(kwargs)
 
     async def send_message(self, text, **kwargs):
         self.done = True
@@ -461,4 +463,26 @@ def test_engine_audio_close_does_not_cancel_terminal_event_path():
         await call.emit(CallFinished(call.request.request_id, 'done.', 10))
         assert not setup.calls.active
         setup.voice.disconnect.assert_awaited_once_with(force=True)
+    asyncio.run(run())
+
+
+def test_brief_is_public_in_voice_chat_but_errors_stay_private():
+    async def run():
+        setup = Setup()
+        call, interaction = await setup.plan()
+        assert call.brief_message in setup.messages
+        assert call.brief_message.kwargs['embed'].description.startswith('book dinner.')
+        assert call.brief_message.kwargs['view'] is call.brief_view
+        assert call.brief_message.kwargs['allowed_mentions'].everyone is False
+        assert 'ephemeral' not in call.brief_message.kwargs
+        assert interaction.original.content == 'brief is in the voice chat.'
+        assert interaction.response.deferrals == [{'ephemeral': True, 'thinking': True}]
+        assert not await call.brief_view.interaction_check(setup.interaction(11))
+        await setup.calls.close()
+        setup.messages.clear()
+        setup.engine.plan.side_effect = CallRejected('that number is blocked.')
+        interaction = setup.interaction()
+        await setup.calls.invoke(interaction, '+81', 'dinner')
+        assert not setup.messages
+        assert interaction.followups[-1].kwargs['ephemeral'] is True
     asyncio.run(run())

@@ -439,13 +439,13 @@ class DiscordCalls:
             pages = chunks(text)
             for index, content in enumerate(pages):
                 kwargs = dict(embed=discord.Embed(title='before i call', description=content),
-                              view=call.brief_view if index == len(pages) - 1 else None,
-                              allowed_mentions=NO_MENTIONS)
-                if index == 0:
-                    message = await interaction.edit_original_response(**kwargs)
-                else:
-                    message = await interaction.followup.send(**kwargs, ephemeral=True, wait=True)
+                              view=call.brief_view if index == len(pages) - 1 else None)
+                message = await call.send(None, **kwargs)
             call.brief_message = message
+            try:
+                await interaction.edit_original_response(content='brief is in the voice chat.')
+            except discord.HTTPException as exc:
+                LOG.warning('jpcall brief acknowledgment failed: HTTP %s', exc.status)
         except asyncio.CancelledError:
             await call.cleanup()
             raise
