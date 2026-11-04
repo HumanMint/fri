@@ -79,7 +79,7 @@ class BriefView(Controls):
             await call.cleanup()
             raise
         except Exception as exc:
-            await call.fail(exc)
+            await call.fail(exc, interaction)
         finally:
             call._operation = None
 
@@ -352,12 +352,14 @@ class DiscordCall:
             for view in self.questions.values():
                 await view.close()
 
-    async def fail(self, error):
+    async def fail(self, error, interaction):
         LOG.warning('jpcall start failed: %s', type(error).__name__)
         await self.stop('start_failed')
-        text = str(error) if isinstance(error, CallRejected) else 'could not connect that call.'
         try:
-            await self.send(text)
+            if isinstance(error, CallRejected):
+                await tell(interaction, str(error))
+            else:
+                await self.send('could not connect that call.')
         except discord.HTTPException:
             pass
 

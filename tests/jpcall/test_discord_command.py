@@ -517,3 +517,18 @@ def test_all_controls_and_modals_have_stable_prefixed_ids():
         modal.stop()
         await call.stop('test')
     asyncio.run(run())
+
+
+def test_start_validation_rejection_is_private_too():
+    async def run():
+        setup = Setup()
+        call, _ = await setup.plan()
+        setup.engine.start.side_effect = CallRejected('daily limit reached.')
+        interaction = setup.interaction()
+        await call.brief_view.dial.callback(interaction)
+        assert interaction.followups[-1].content == 'daily limit reached.'
+        assert interaction.followups[-1].kwargs['ephemeral'] is True
+        assert all('daily limit' not in (message.content or '') for message in setup.messages)
+        assert not setup.calls.active
+        setup.voice.disconnect.assert_awaited_once_with(force=True)
+    asyncio.run(run())
