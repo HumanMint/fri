@@ -392,3 +392,38 @@ def test_s1_a_change_during_the_last_read_holds_it_back(monkeypatch, tmp_path, c
         finally:
             await w.fri.close()
     run(scenario)
+
+
+# HumanMint/fri#357 item 2.
+
+@pytest.mark.parametrize('failure', ['a timeout', 'a connection error'])
+def test_357_one_summarys_transport_failure_holds_only_that_one_back(monkeypatch, tmp_path, failure):
+    """A raw timeout or connection error reading one member's messages escaped the pass and stopped it, so another
+    member's healthy summary in the same claim stayed held back for as long as the failure repeated. The one Discord
+    couldn't vouch for is held back, and the rest are checked as usual."""
+    async def scenario():
+        import aiohttp
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await kept(monkeypatch, w)
+            agent = w.fri.agent
+            for text in ('fri raid tonight?', 'fri which build for it'):
+                await w.say(GENERAL, text, user=30)
+            settled(w)
+            assert await build(agent) == {'kept': True}  # Member 30's.
+            channel = w.fri.get_channel(GENERAL)
+            real, theirs = channel.fetch_message, {event.id for event in events}
+
+            async def reading(mid):
+                if mid in theirs:  # Member 20's messages, offered first.
+                    raise TimeoutError() if failure == 'a timeout' else aiohttp.ClientConnectionError('reset')
+                return await real(mid)
+            channel.fetch_message = reading
+            agent.summaries_rechecked = False  # Started again: both are held back and offered.
+            assert await recheck(agent) == ['unchecked', 'ok']
+            await w.say(GAMING, 'fri what were we on about', user=30)
+            assert model_context(w)['member_summary']['text'] == SAID
+            assert await asked(w) is None  # Member 20's, still held back.
+        finally:
+            await w.fri.close()
+    run(scenario)
