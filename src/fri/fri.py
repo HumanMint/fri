@@ -35,6 +35,7 @@ from .fri_memory import (
     PROFILES,
     SOURCES,
     SUMMARIES,
+    before_erasure,
     describe_memory,
     describe_profile,
     drop_unheard,
@@ -1359,6 +1360,11 @@ class Fri(discord.Client):
         await reply(self, interaction, 'Thinking…', view=HomeView(self, user))
         try:
             revision = await self.agent.revision(user) if held else None
+            # Submitted before they last turned memory off, and read only once it's on again (say, during the edit
+            # above): what they said then is kept nowhere, so it isn't answered, as a DM isn't (fri #331, #337). An
+            # erasure after this read moves their revision, which the turn is held to from here (see talk).
+            if held and before_erasure(interaction.id, getattr(revision, 'erased_at', 0)):
+                raise AuthorErased()
             result = await self.talk(interaction.guild_id, interaction.channel_id, user, text, 'private',
                                      interaction.user.display_name, event=interaction, revision=revision,
                                      forgotten=forgotten)

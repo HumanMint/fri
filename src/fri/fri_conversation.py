@@ -583,8 +583,11 @@ async def target_row(agent, channel, message_id, guild_id, posts, gone=None):
         if target.author.id != agent.fri.user.id:
             if target.author.bot:
                 return []
+            from .fri_memory import before_removal
             profile = await agent.profile(getattr(channel, 'parent_id', None) or channel.id, target.author.id)
-            if not profile['enabled']:
+            # Nor one sent at or before its author last turned memory off or removed a note (the controller's
+            # removed_at): the live view leaves it out, so a reply or a link can't bring it back (fri #337).
+            if not profile['enabled'] or before_removal(target.id, profile):
                 return []
         row = {'source': source.model_dump(), 'text': clean(target.content, 1800),
                'privacy_revision': profile['revision'] if target.author.id != agent.fri.user.id else None}
