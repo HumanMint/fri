@@ -486,3 +486,34 @@ def test_brief_is_public_in_voice_chat_but_errors_stay_private():
         assert not setup.messages
         assert interaction.followups[-1].kwargs['ephemeral'] is True
     asyncio.run(run())
+
+
+def test_all_controls_and_modals_have_stable_prefixed_ids():
+    async def run():
+        from fri.jpcall.discord_command import QuestionView
+
+        setup = Setup()
+        call = await setup.start()
+        event = QuestionAsked(call.request.request_id, 'q' * 200, 'six?', ('yes', 'no'))
+        await call.emit(event)
+        view = call.questions[event.question_id]
+        duplicate = QuestionView(call, event)
+        assert [child.custom_id for child in view.children] == [
+            child.custom_id for child in duplicate.children]
+        modal = AnswerModal(view)
+        other_modal = AnswerModal(duplicate)
+        assert modal.custom_id != other_modal.custom_id
+        from discord.ui.view import ViewStore
+        store = ViewStore(None)
+        store.add_view(modal)
+        store.add_view(other_modal)
+        modal.stop()
+        assert store._modals[other_modal.custom_id] is other_modal
+        other_modal.stop()
+        ids = [child.custom_id for control in (call.brief_view, call.hangup, view, modal)
+               for child in control.children] + [modal.custom_id]
+        assert all(identifier.startswith('jpcall:') and len(identifier) <= 100 for identifier in ids)
+        duplicate.stop()
+        modal.stop()
+        await call.stop('test')
+    asyncio.run(run())

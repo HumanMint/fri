@@ -193,10 +193,18 @@ def turn_provenance(context, speaker, actions=None):
 
 class FriTree(app_commands.CommandTree):
     async def interaction_check(self, interaction):
+        calls = getattr(self.client, 'jpcall_calls', None)
+        if calls is not None and calls.accepts(interaction):
+            return True
         return await authorized(self.client, interaction)
 
     async def on_error(self, interaction, error):
         LOG.warning('Fri command failed: %s', type(error).__name__)
+        calls = getattr(self.client, 'jpcall_calls', None)
+        if calls is not None and calls.accepts(interaction):
+            from .jpcall.discord_command import tell
+            await tell(interaction, 'that call did not go through. try again.')
+            return
         await reply(self.client, interaction, 'That action did not complete. Please try again.')
 
 
@@ -231,7 +239,12 @@ def persistent_buttons():
 
 class Fri(discord.Client):
     def __init__(self):
+        from .jpcall.discord_runtime import optional_config
+        self.jpcall_config = optional_config()
+        self.jpcall_engine = self.jpcall_calls = None
         intents = discord.Intents.none()
+        if self.jpcall_config is not None and self.jpcall_config.enabled:
+            intents.voice_states = True
         intents.guilds = intents.guild_messages = intents.dm_messages = True
         intents.message_content = True
         visibility = discord.Status.online if os.getenv('FRI_PRESENCE') == 'online' else discord.Status.invisible
@@ -308,6 +321,18 @@ class Fri(discord.Client):
                 'I can keep small preferences you share; ask what I remember or tell me to forget you.'),
                 view=HomeView(self, interaction.user.id))
 
+        if self.jpcall_config is not None and self.jpcall_config.enabled:
+            from .jpcall.discord_command import register
+            from .jpcall.engine import JpcallEngine
+            self.jpcall_engine = JpcallEngine(self.jpcall_config)
+            try:
+                await self.jpcall_engine.open()
+                self.jpcall_calls = register(self.tree, self, self.jpcall_engine,
+                                             [self.guild_id], limits=self.jpcall_config.limits)
+            except BaseException:
+                await self.jpcall_engine.close()
+                self.jpcall_engine = None
+                raise
         await self.tree.sync(guild=discord.Object(id=self.guild_id))
         self.health.start()
         self.owner_reviews.start()
@@ -323,7 +348,8 @@ class Fri(discord.Client):
                 str((interaction.data or {}).get('custom_id', '')).startswith('fri:behavior:') and
                 getattr(getattr(interaction, 'message', None), 'author', None) and
                 interaction.message.author.id == getattr(self.user, 'id', None))
-            if behavior:
+            if behavior or (self.jpcall_calls is not None and
+                            self.jpcall_calls.accepts(interaction)):
                 allowed = True
             from .fri_memory_panel import memory_component
             from .fri_workspace import post_component
@@ -1567,18 +1593,26 @@ class Fri(discord.Client):
         await self.wait_until_ready()
 
     async def close(self):
-        if self.agent:
-            self.agent.close()
-        self.health.cancel()
-        self.owner_reviews.cancel()
-        if self.watching:
-            self.watching.cancel()
-        if self.sign_in_notice:
-            self.sign_in_notice.cancel()
-        await sessions(self).close_all()
-        if self.session:
-            await self.session.close()
-        await super().close()
+        try:
+            try:
+                if self.jpcall_calls is not None:
+                    await self.jpcall_calls.close()
+            finally:
+                if self.jpcall_engine is not None:
+                    await self.jpcall_engine.close()
+        finally:
+            if self.agent:
+                self.agent.close()
+            self.health.cancel()
+            self.owner_reviews.cancel()
+            if self.watching:
+                self.watching.cancel()
+            if self.sign_in_notice:
+                self.sign_in_notice.cancel()
+            await sessions(self).close_all()
+            if self.session:
+                await self.session.close()
+            await super().close()
 
 
 def main():

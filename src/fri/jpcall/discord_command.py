@@ -59,7 +59,7 @@ class BriefView(Controls):
             return False
         return True
 
-    @discord.ui.button(label='call', style=discord.ButtonStyle.primary)
+    @discord.ui.button(label='call', style=discord.ButtonStyle.primary, custom_id='jpcall:call')
     async def dial(self, interaction, button):
         call = self.call
         if call.phase != 'planned' or not call.requester(interaction):
@@ -83,7 +83,7 @@ class BriefView(Controls):
         finally:
             call._operation = None
 
-    @discord.ui.button(label='cancel')
+    @discord.ui.button(label='cancel', custom_id='jpcall:cancel')
     async def cancel(self, interaction, button):
         if self.call.phase != 'planned' or not self.call.requester(interaction):
             await tell(interaction, 'that brief is closed.')
@@ -106,7 +106,8 @@ class HangupView(Controls):
         super().__init__(timeout=None)
         self.call = call
 
-    @discord.ui.button(label='hang up', style=discord.ButtonStyle.danger)
+    @discord.ui.button(label='hang up', style=discord.ButtonStyle.danger,
+                       custom_id='jpcall:hang_up')
     async def hang_up(self, interaction, button):
         if not self.call.requester(interaction):
             await tell(interaction, 'the person who asked can hang up.')
@@ -120,10 +121,14 @@ class HangupView(Controls):
 
 
 class AnswerModal(discord.ui.Modal, title='answer for the call'):
-    answer = discord.ui.TextInput(label='your answer', max_length=1000)
+    answer = discord.ui.TextInput(label='your answer', max_length=1000,
+                                 custom_id='jpcall:answer_text')
 
     def __init__(self, view):
-        super().__init__(timeout=max(1, view.deadline - time.monotonic()))
+        # discord.py stores modals globally by custom_id. Each opening needs its
+        # own identity so one member's submission/timeout cannot remove another's.
+        super().__init__(timeout=max(1, view.deadline - time.monotonic()),
+                         custom_id=f'jpcall:submit:{uuid.uuid4().hex}')
         self.question_view = view
 
     async def on_submit(self, interaction):
@@ -141,17 +146,21 @@ class QuestionView(Controls):
         self.deadline = time.monotonic() + event.deadline_s
         self.message = None
         self.closed = False
+        self.token = uuid.uuid5(uuid.NAMESPACE_OID,
+                               f'{call.request.request_id}:{event.question_id}').hex
         self._lock = asyncio.Lock()
         # Discord allows 25 components in a view; reserve one for free text.
-        for option in event.options[:24]:
-            button = discord.ui.Button(label=chunks(option, 80)[0] if option else 'answer')
+        for index, option in enumerate(event.options[:24]):
+            button = discord.ui.Button(label=chunks(option, 80)[0] if option else 'answer',
+                                       custom_id=f'jpcall:answer:{self.token}:{index}')
 
             async def choose(interaction, answer=option):
                 await self.submit(interaction, answer)
 
             button.callback = choose
             self.add_item(button)
-        button = discord.ui.Button(label='write an answer', style=discord.ButtonStyle.primary)
+        button = discord.ui.Button(label='write an answer', style=discord.ButtonStyle.primary,
+                                   custom_id=f'jpcall:write:{self.token}')
         button.callback = self.free_text
         self.add_item(button)
 
@@ -403,6 +412,16 @@ class DiscordCalls:
         self.guild_ids = frozenset(guild_ids)
         self.limits = limits
         self.active = {}
+
+    def accepts(self, interaction):
+        if interaction.guild_id not in self.guild_ids:
+            return False
+        data = interaction.data or {}
+        if interaction.type == discord.InteractionType.application_command:
+            return data.get('name') == 'jpcall'
+        return (interaction.type in (discord.InteractionType.component,
+                                     discord.InteractionType.modal_submit)
+                and str(data.get('custom_id', '')).startswith('jpcall:'))
 
     async def invoke(self, interaction, number, goal, share=None, never=None):
         if (interaction.guild_id not in self.guild_ids

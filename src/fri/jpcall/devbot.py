@@ -1,7 +1,7 @@
 """Standalone Discord runner and a fully local scripted call engine.
 
-Run with --fake-engine and explicit --allow-user IDs. Only main() reads the two
-JPCALL_DEV_DISCORD_* settings; importing this module needs no environment or network.
+Fake mode uses --fake-engine and explicit --allow-user IDs. Real mode reads the
+engine configuration from process env. Importing needs no environment or network.
 """
 
 import argparse
@@ -29,6 +29,7 @@ from .contract import (
     Utterance,
 )
 from .discord_command import NO_MENTIONS, register
+from .discord_runtime import disabled_message, load_config
 
 
 class FakeSession:
@@ -127,6 +128,9 @@ class FakeEngine:
     def __init__(self):
         self.sessions = []
 
+    async def open(self):
+        pass
+
     async def plan(self, request):
         if not request.goal.strip():
             raise CallRejected('give me a goal for the call.')
@@ -146,41 +150,67 @@ class FakeEngine:
 
 
 class DevBot(discord.Client):
-    def __init__(self, engine, guild_id, limits):
+    def __init__(self, engine, guild_id, limits, *, config=None):
         intents = discord.Intents.none()
         intents.guilds = intents.voice_states = True
         super().__init__(intents=intents, allowed_mentions=NO_MENTIONS)
         self.engine, self.guild_id, self.limits = engine, guild_id, limits
+        self.config = config
         self.tree = app_commands.CommandTree(self)
         self.calls = None
 
     async def setup_hook(self):
-        self.calls = register(self.tree, self, self.engine, [self.guild_id], limits=self.limits)
-        await self.tree.sync(guild=discord.Object(id=self.guild_id))
+        if self.engine is None:
+            from .engine import JpcallEngine
+            self.engine = JpcallEngine(self.config)
+        try:
+            await self.engine.open()
+            self.calls = register(self.tree, self, self.engine, [self.guild_id], limits=self.limits)
+            await self.tree.sync(guild=discord.Object(id=self.guild_id))
+        except BaseException:
+            await self.engine.close()
+            raise
 
     async def close(self):
         try:
             if self.calls is not None:
                 await self.calls.close()
-            await self.engine.close()
         finally:
-            await super().close()
+            try:
+                if self.engine is not None:
+                    await self.engine.close()
+            finally:
+                await super().close()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fake-engine', action='store_true')
     parser.add_argument('--allow-user', type=int, action='append', default=[],
-                        help='member allowed to start calls; repeat for more members')
+                        help='fake mode only: member allowed to start calls; repeat for more members')
     args = parser.parse_args()
-    if not args.fake_engine:
-        parser.error('the real engine is not wired here yet. use --fake-engine.')
+    if not args.fake_engine and args.allow_user:
+        parser.error('--allow-user is for fake mode. real mode uses JPCALL_ALLOWED_USER_IDS.')
     token = os.environ.get('JPCALL_DEV_DISCORD_TOKEN')
     guild = os.environ.get('JPCALL_DEV_GUILD_ID', '')
     if not token or not guild.isdecimal() or int(guild) <= 0:
         parser.error('set JPCALL_DEV_DISCORD_TOKEN and JPCALL_DEV_GUILD_ID')
+    config = None
+    if args.fake_engine:
+        engine = FakeEngine()
+        limits = Limits(allowed_user_ids=frozenset(args.allow_user))
+    else:
+        try:
+            config = load_config()
+        except ModuleNotFoundError as exc:
+            if exc.name != 'fri.jpcall.config':
+                raise
+            parser.error('jpcall engine configuration is not installed.')
+        if not config.enabled:
+            parser.error(disabled_message(config))
+        engine, limits = None, config.limits
     logging.basicConfig(level=logging.INFO)
-    bot = DevBot(FakeEngine(), int(guild), Limits(allowed_user_ids=frozenset(args.allow_user)))
+    bot = DevBot(engine, int(guild), limits, config=config)
     bot.run(token, log_handler=None)
 
 
