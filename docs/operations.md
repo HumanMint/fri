@@ -525,7 +525,14 @@ Fri's replies, DMs, the panel or restricted channels, plus the earlier summary. 
 channel that isn't readable by everyone now, sends the rest to the summary model (`summary_model` /
 `summary_effort`, Luna at medium by default) and reports the result, recorded as `summary` usage. The
 controller allows one call per member a day and 50 a day in all, and keeps the result only if nobody's
-privacy changed since the claim. A summary lasts 30 days after its last update. "What do you remember"
+privacy changed since the claim. The claim names each exchange's Discord messages and when it was saved,
+and those the earlier summary drew on (`summary-sources`): Fri reads each again from Discord first, and
+one that's gone, or edited since its exchange was saved, is withdrawn as its event would have withdrawn
+it, though Fri never heard of it, and left out, with the earlier summary if it drew on one; an earlier
+summary whose messages aren't known isn't carried on. Once the model answers, and again after its usage
+is recorded, a summary any of whose messages was taken back meanwhile, or while every saved context is
+held back, isn't kept (fri #333). Without `summary-sources` (an older controller), Fri claims nothing.
+A summary lasts 30 days after its last update. "What do you remember"
 shows it in a DM and, in a public channel everyone can read, only says one exists. My memory shows it
 with Edit summary and Clear summary; either clears the member's saved chats across the server, like a
 server-wide note edit. "Forget me", memory off and Forget my chats wipe it.

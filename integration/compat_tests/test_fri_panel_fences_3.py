@@ -7,7 +7,6 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import discord
 import pytest
 
 from compat_tests.test_fri_actions import harness
@@ -131,7 +130,8 @@ def test_my_memorys_summary_waits_for_a_withdrawal_fri_took_in(monkeypatch, tmp_
     async def scenario():
         w = world(monkeypatch, tmp_path)
         try:
-            source = {'kind': 'discord_message', 'id': str(discord.utils.time_snowflake(discord.utils.utcnow())),
+            posted = w.message(GENERAL, 'ash says the raid is at nine')  # Discord holds it (fri #333).
+            source = {'kind': 'discord_message', 'id': str(posted.id),
                       'user_id': '20', 'display_name': 'friend', 'channel_id': str(GENERAL), 'guild_id': '123'}
             w.store.save_chat('123', 'public:1', '20', 0, 'ash says the raid is at nine', 'ok', 'm', 'high',
                               source=source, provenance=[ASH], audience='server')

@@ -78,7 +78,8 @@ def test_my_memorys_summary_is_held_to_the_erasures_of_whose_words_it_drew_on(mo
     async def scenario():
         w = world(monkeypatch, tmp_path)
         try:
-            source = {'kind': 'discord_message', 'id': str(discord.utils.time_snowflake(discord.utils.utcnow())),
+            posted = w.message(GENERAL, 'ash says the raid is at nine')  # Discord holds it (fri #333).
+            source = {'kind': 'discord_message', 'id': str(posted.id),
                       'user_id': '20', 'display_name': 'friend', 'channel_id': str(GENERAL), 'guild_id': '123'}
             w.store.save_chat('123', 'public:1', '20', 0, 'ash says the raid is at nine', 'ok', 'm', 'high',
                               source=source, provenance=[ASH], audience='server')
