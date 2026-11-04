@@ -321,10 +321,17 @@ advertises it, so the controller must be released first.
   unreadable record still in place as `withdrawals.json` has to be fixed or moved too), then remove
   `withdrawals.closed.json`; the next start reads normally. The queue keeps an entry only as
   long as what it names can
-  be kept (a week, or a note's 90 days, below), and at most 20,000. Past that the oldest messages' go
-  first, but none is released before the controller took it (fri #256): every saved context is held back
-  until nothing those name can be kept, that deadline written to `withdrawals.closed.json` first (as for an
-  unreadable record, above), and if it can't be written none goes.
+  be kept (a week, or a note's 90 days, below), counted from when it was queued, which each entry keeps on
+  disk as `queued_at` (whole seconds), or from its message's time if that's later (fri #329): what a turn
+  saved from a message lasts from the save, which is before the message was taken back. An entry an older
+  Fri wrote, without one, counts from the start that reads it. At most 20,000 are kept. Past that, those
+  whose names can be kept least long go first, but none is released before the controller took it (fri
+  #256): every saved context is held back until nothing those name can be kept, that deadline written to
+  `withdrawals.closed.json` first (as for an unreadable record, above), and if it can't be written none
+  goes. The same holds where a start reads more than 40,000 from disk, more than it holds while reading:
+  what it lets go is held back the same way, and until that's written down the record isn't replaced, so
+  the next start reads all of it again. `withdrawals.closed.json` also says why (`why`: `unreadable`,
+  `capacity`), which `fri health` shows; one an older Fri wrote doesn't say.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the
   controller writes nothing for it, and a save whose answer comes after it records nothing. A withdrawal

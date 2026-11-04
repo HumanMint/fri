@@ -208,7 +208,7 @@ def test_what_the_bound_lets_go_is_reported_for_the_queue_to_hold_back():
     time any of it was queued or sent, or that one of it says no time it was queued, for the queue to hold back what
     those name before it accepts what's left (see SavedTurns.pending)."""
     for timed in (True, False):
-        entries = {str(10**18+n): {'scope': GOOD, 'revision': 0, **({'queued_at': 1.6e9+n} if timed else {})}
+        entries = {str(10**18+n): {'scope': GOOD, 'revision': 0, **({'queued_at': 1600000000+n} if timed else {})}
                    for n in range(MOST*3)}
         overflow = {}
         found = read_record(json.dumps({'pending': entries}), overflow)
@@ -221,10 +221,10 @@ def test_what_the_bound_lets_go_is_reported_for_the_queue_to_hold_back():
 
 
 def test_when_each_was_queued_is_read_back_and_nothing_else_counts_as_one():
-    """fri #329: when a withdrawal was queued here goes to disk with it and is read back where it's a time, for a hold
+    """fri #329: when a withdrawal was queued here goes to disk with it, a whole second, and is read back, for a hold
     too; anything else there reads as none, which the queue counts as the time it reads it (see SavedTurns.entry)."""
-    at = 1.7e9+0.5
-    bad = ['1.7e9', None, True, -1, [1], {'a': 1}, float('nan'), float('inf'), 10**30]
+    at = 1700000001
+    bad = ['1.7e9', None, True, -1, [1], {'a': 1}, float('nan'), float('inf'), 10**30, 1.7e9+0.5, 2**63]
     record = {'pending': {'12': {'scope': GOOD, 'revision': 3, 'queued_at': at}, '13': {'hold': True, 'queued_at': at},
                           '14': {'hold': True, 'queued_at': 1700000000},
                           **{str(20+n): {'scope': GOOD, 'revision': 0, 'queued_at': value} for n, value in enumerate(bad)},
@@ -232,6 +232,7 @@ def test_when_each_was_queued_is_read_back_and_nothing_else_counts_as_one():
     found = read_record(json.dumps(record))
     assert found['12'] == {'scope': GOOD, 'revision': 3, 'deleted': False, 'queued_at': at}
     assert found['13'] == {'hold': True, 'queued_at': at} and found['14'] == {'hold': True, 'queued_at': 1700000000}
+    assert withdrawal.SavedTurns.lasting({'hold': True, 'queued_at': at, 'gen': 3, 'user_id': '20'}) == found['13']
     assert all(found[str(20+n)] == {'scope': GOOD, 'revision': 0, 'deleted': False} for n in range(len(bad)))
     assert all(found[str(40+n)] == {'hold': True} for n in range(len(bad)))
 

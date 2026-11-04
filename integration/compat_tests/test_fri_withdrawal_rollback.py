@@ -242,8 +242,11 @@ def test_a_restart_against_an_older_controller_keeps_a_valid_withdrawal_held_bac
                 await settled(w)
                 assert [payload.get('revision') for payload in calls(w, WITHDRAW)] == [0]
                 assert MARKER not in saved(w) and not w.agent.saved_turns.pending
-            else:
-                monkeypatch.setattr(withdrawal, 'KEPT_SECONDS', 0)  # Past the week an exchange lives: it can't matter.
+            else:  # Past the week an exchange lives, from when its withdrawal was queued (fri #329): it can't matter.
+                import time
+                from types import SimpleNamespace
+                monkeypatch.setattr(withdrawal, 'time', SimpleNamespace(
+                    time=lambda: time.time()+withdrawal.KEPT_SECONDS+60, monotonic=time.monotonic))
                 w.agent.saved_turns.retry()
                 await settled(w)
                 assert not w.agent.saved_turns.pending
