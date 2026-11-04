@@ -64,7 +64,7 @@ def test_reordered_translation_status_and_question():
         await pager.emit(QuestionClosed('r', 'q', 'answered', 'six'))
         await pager.close()
         text = ''.join(messages.contents)
-        assert 'fri · ja: こんにちは\nen: hello' in text
+        assert 'fri · こんにちは\n↳ hello' in text
         assert 'on hold' in text and 'six or seven?\nanswered · six' in text
     asyncio.run(run())
 
@@ -101,7 +101,7 @@ def test_failed_writes_preserve_pending_lines_without_spinning():
         assert not await pager.flush()
         messages.fail = False
         assert await pager.close()
-        assert 'retained\nen: also retained' in messages.contents[0]
+        assert 'retained\n↳ also retained' in messages.contents[0]
     asyncio.run(run())
 
 
@@ -124,4 +124,15 @@ def test_flush_does_not_cancel_or_duplicate_an_inflight_send():
         assert await closing
         assert len(messages.contents) == 1
         assert messages.contents[0].count('one line') == 1
+    asyncio.run(run())
+
+
+def test_call_language_original_and_english_have_neutral_labels():
+    async def run():
+        messages = Messages()
+        pager = TranscriptPager(messages.send, messages.edit)
+        await pager.emit(Utterance('r', 'ko', 'fri', '안녕하세요', 0))
+        await pager.emit(Translation('r', 'ko', 'hello'))
+        await pager.close()
+        assert messages.contents == ['fri · 안녕하세요\n↳ hello']
     asyncio.run(run())

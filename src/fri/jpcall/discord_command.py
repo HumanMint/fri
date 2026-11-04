@@ -25,6 +25,7 @@ from .discord_audio import CallAudioSource
 from .discord_cost import CostSummary
 from .discord_text import chunks
 from .discord_transcript import TranscriptPager
+from .discord_voice import CallVoiceClient, wait_audio_ready
 
 LOG = logging.getLogger(__name__)
 NO_MENTIONS = discord.AllowedMentions.none()
@@ -212,8 +213,9 @@ class QuestionView(Controls):
 
 
 class DiscordCall:
-    def __init__(self, owner, request, channel):
-        self.owner, self.request, self.channel = owner, request, channel
+    def __init__(self, owner, request, voice_channel, text_channel):
+        self.owner, self.request = owner, request
+        self.voice_channel, self.text_channel = voice_channel, text_channel
         self.brief = self.brief_message = self.brief_view = None
         self.voice = self.session = self.audio = None
         self.pager = self.cost = None
@@ -223,6 +225,7 @@ class DiscordCall:
         self._events_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._watchdog = None
+        self._audio_monitor = None
         self._operation = None
 
     def requester(self, interaction):
@@ -241,7 +244,7 @@ class DiscordCall:
             del self.owner.active[self.request.guild_id]
 
     async def send(self, content, **kwargs):
-        return await self.channel.send(content, allowed_mentions=NO_MENTIONS, **kwargs)
+        return await self.text_channel.send(content, allowed_mentions=NO_MENTIONS, **kwargs)
 
     async def edit(self, message, content):
         await message.edit(content=content, allowed_mentions=NO_MENTIONS)
@@ -263,10 +266,12 @@ class DiscordCall:
         self.cost = CostSummary(self.send, self.edit)
         def capture_voice(client, channel):
             # Keep the client even if the handshake raises or is cancelled.
-            self.voice = discord.VoiceClient(client, channel)
+            self.voice = CallVoiceClient(client, channel)
             return self.voice
 
-        self.voice = await self.channel.connect(cls=capture_voice, self_deaf=True)
+        self.voice = await self.voice_channel.connect(cls=capture_voice, self_deaf=True)
+        self.voice.track_speaking()
+        await wait_audio_ready(self.voice, diagnostic=self.audio if self.owner.audio_check else None)
         if not self.requester(interaction) or not self.in_channel(interaction):
             raise CallRejected('the requester left before i could call.')
         self.hangup = HangupView(self)
@@ -274,6 +279,8 @@ class DiscordCall:
         loop = asyncio.get_running_loop()
 
         def player_ended(error):
+            if error is not None:
+                LOG.warning('jpcall audio player failed: %s', type(error).__name__)
             # Engine-owned close can precede its terminal event. Don't cancel
             # that event path just because the player consumed the final frame.
             if error is None and self.audio.closed:
@@ -286,6 +293,8 @@ class DiscordCall:
                 or not self.in_channel(interaction)):
             raise CallRejected('the requester left before i could call.')
         self.voice.play(self.audio, after=player_ended)
+        if self.owner.audio_check:
+            self._audio_monitor = asyncio.create_task(self.voice.monitor_audio(self.audio))
         self._watchdog = asyncio.create_task(self.watchdog())
         session = await self.owner.engine.start(self.brief, self.request, self.audio, self)
         self.session = session
@@ -341,6 +350,15 @@ class DiscordCall:
             except Exception as exc:
                 LOG.warning('jpcall voice cleanup failed: %s', type(exc).__name__)
             finally:
+                if self._audio_monitor is not None:
+                    self._audio_monitor.cancel()
+                    try:
+                        await self._audio_monitor
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        LOG.warning('jpcall audio monitor failed: %s', type(exc).__name__)
+                    self._audio_monitor = None
                 if release:
                     self.release()
             if self.brief_view is not None:
@@ -409,8 +427,9 @@ class DiscordCall:
 
 
 class DiscordCalls:
-    def __init__(self, client, engine, guild_ids, limits):
+    def __init__(self, client, engine, guild_ids, limits, *, audio_check=False):
         self.client, self.engine = client, engine
+        self.audio_check = audio_check
         self.guild_ids = frozenset(guild_ids)
         self.limits = limits
         self.active = {}
@@ -441,7 +460,7 @@ class DiscordCalls:
                               interaction.user.id, number, goal,
                               tuple(line.strip() for line in (share or '').splitlines() if line.strip()),
                               tuple(line.strip() for line in (never or '').splitlines() if line.strip()))
-        call = DiscordCall(self, request, channel)
+        call = DiscordCall(self, request, channel, interaction.channel)
         self.active[interaction.guild_id] = call
         call._operation = asyncio.current_task()
         try:
@@ -454,9 +473,9 @@ class DiscordCalls:
             call.phase = 'planned'
             call.brief_view = BriefView(call)
             brief = call.brief
-            text = (f'{brief.summary_en}\n\nopener · {brief.opener_ja}\n\n'
-                    f'share · {"; ".join(brief.share) or "nothing extra"}\n'
-                    f'never · {"; ".join(brief.never) or "no extra limits"}')
+            text = (f'opener · {brief.opener_ja}\n\ngoal · {request.goal}\n\n'
+                    f'share · {"; ".join(request.share) or "nothing extra"}\n'
+                    f'never · {"; ".join(request.never) or "no extra limits"}')
             pages = chunks(text)
             for index, content in enumerate(pages):
                 kwargs = dict(embed=discord.Embed(title='before i call', description=content),
@@ -464,7 +483,7 @@ class DiscordCalls:
                 message = await call.send(None, **kwargs)
             call.brief_message = message
             try:
-                await interaction.edit_original_response(content='brief is in the voice chat.')
+                await interaction.edit_original_response(content='brief is in this chat.')
             except discord.HTTPException as exc:
                 LOG.warning('jpcall brief acknowledgment failed: HTTP %s', exc.status)
         except asyncio.CancelledError:
@@ -483,16 +502,17 @@ class DiscordCalls:
         await asyncio.gather(*(call.stop('shutdown') for call in list(self.active.values())))
 
 
-def register(tree, client, engine, guild_ids, *, limits: Limits | None = None):
+def register(tree, client, engine, guild_ids, *, limits: Limits | None = None, audio_check=False):
     """Register guild commands; callers supply Limits explicitly. Default is deny-all."""
     guild_ids = tuple(guild_ids)
     if not guild_ids:
         raise ValueError('at least one guild is required')
-    calls = DiscordCalls(client, engine, guild_ids, limits if limits is not None else Limits())
+    calls = DiscordCalls(client, engine, guild_ids, limits if limits is not None else Limits(),
+                         audio_check=audio_check)
 
-    @app_commands.command(name='jpcall', description='ask fri to phone a japanese business')
+    @app_commands.command(name='jpcall', description='ask fri to phone a business')
     @app_commands.guild_only()
-    @app_commands.describe(number='phone number, including +81', goal='what you want to find out',
+    @app_commands.describe(number='phone number, including country code', goal='what you want to find out',
                            share='facts i may share, one per line', never='limits, one per line')
     async def command(interaction: discord.Interaction, number: str, goal: str,
                       share: str | None = None, never: str | None = None):

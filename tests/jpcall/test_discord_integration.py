@@ -162,8 +162,9 @@ def test_voice_command_uses_own_allowlist_and_engine_without_gene_calls(monkeypa
         voice = MagicMock(spec=discord.VoiceChannel)
         voice.id = 2
         message = SimpleNamespace(edit=AsyncMock())
-        voice.send = AsyncMock(return_value=message)
+        text = SimpleNamespace(id=4, send=AsyncMock(return_value=message), parent_id=None)
         event = interaction()
+        event.channel = text
         event.user.voice = SimpleNamespace(channel=voice)
         event.response = SimpleNamespace(defer=AsyncMock(), is_done=lambda: True)
         event.edit_original_response = AsyncMock()
@@ -172,7 +173,8 @@ def test_voice_command_uses_own_allowlist_and_engine_without_gene_calls(monkeypa
         command = bot.tree.get_command('jpcall', guild=discord.Object(id=1))
         await command.callback(event, '+810000000000', 'dinner')
         engine.plan.assert_awaited_once()
-        voice.send.assert_awaited_once()
+        text.send.assert_awaited_once()
+        voice.send.assert_not_called()
         assert bot.api.await_count == 1
         event.user.id = 11
         await command.callback(event, '+810000000000', 'dinner')

@@ -45,14 +45,14 @@ class TranscriptPager:
         if isinstance(event, Utterance):
             if event.item_id in self._items:
                 return
-            row = [f'{event.speaker} · ja: {event.text_ja}', '']
+            row = [f'{event.speaker} · {event.text_ja}', '']
             self._items[event.item_id] = row
             if event.item_id in self._translations:
-                row[1] = f'\nen: {self._translations.pop(event.item_id)}'
+                row[1] = f'\n↳ {self._translations.pop(event.item_id)}'
             self._rows.append(row)
         elif isinstance(event, Translation):
             if event.item_id in self._items:
-                self._items[event.item_id][1] = f'\nen: {event.text_en}'
+                self._items[event.item_id][1] = f'\n↳ {event.text_en}'
             else:
                 self._translations[event.item_id] = event.text_en
                 return

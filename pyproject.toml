@@ -9,7 +9,7 @@ description = "Private Discord companion using a bounded Gene controller contrac
 license = "MIT"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    "discord.py[voice]==2.7.1", "davey==0.2.0", "aiohttp==3.9.5", "httpx==0.28.1",
+    "discord.py[voice]==2.7.1", "davey==0.1.7", "aiohttp==3.9.5", "httpx==0.28.1",
     "pydantic==2.11.10", "pyjwt[crypto]==2.15.1", "pillow==13.0.0", "idna==3.20",
 ]
 

@@ -70,6 +70,7 @@ class Response:
 class Interaction:
     def __init__(self, channel, guild, user_id=10):
         self.guild_id, self.guild = guild.id, guild
+        self.channel = channel
         self.user = SimpleNamespace(id=user_id, bot=False,
                                     voice=SimpleNamespace(channel=channel))
         self.response = Response()
@@ -95,7 +96,10 @@ class Setup:
         self.channel = MagicMock(spec=discord.VoiceChannel)
         self.channel.id = 2
         self.messages = []
-        self.voice = SimpleNamespace(play=MagicMock(), stop=MagicMock(), disconnect=AsyncMock())
+        self.voice = SimpleNamespace(play=MagicMock(), stop=MagicMock(), disconnect=AsyncMock(),
+                                     track_speaking=MagicMock(), is_connected=lambda: True,
+                                     _connection=SimpleNamespace(dave_protocol_version=0,
+                                                                 dave_session=None))
 
         async def connect(**kwargs):
             self.guild.voice_client = self.voice
@@ -135,6 +139,7 @@ def test_register_is_guild_only_and_default_deny_all():
         calls = register(tree, client, object(), [1])
         command = tree.get_command('jpcall', guild=discord.Object(id=1))
         assert command and command.guild_only
+        assert command.description == 'ask fri to phone a business'
         assert calls.limits.allowed_user_ids == frozenset()
         assert tree.get_commands() == []
         with pytest.raises(ValueError):
@@ -340,7 +345,8 @@ def test_cancelled_handshake_cleans_captured_voice(monkeypatch):
         setup = Setup()
         call, _ = await setup.plan()
         connected = asyncio.Event()
-        monkeypatch.setattr(discord, 'VoiceClient', lambda client, channel: setup.voice)
+        monkeypatch.setattr('fri.jpcall.discord_command.CallVoiceClient',
+                            lambda client, channel: setup.voice)
 
         async def connect(**kwargs):
             kwargs['cls'](None, setup.channel)
@@ -405,7 +411,7 @@ def test_late_translation_after_finish_updates_original_line():
         await call.emit(CallFinished(call.request.request_id, 'done.', 10))
         await call.emit(Translation(call.request.request_id, '1', 'yes'))
         await call.pager.flush()
-        assert 'callee · ja: はい\nen: yes' in call.pager.pages[0].message.content
+        assert 'callee · はい\n↳ yes' in call.pager.pages[0].message.content
         assert not setup.calls.active
     asyncio.run(run())
 
@@ -471,11 +477,11 @@ def test_brief_is_public_in_voice_chat_but_errors_stay_private():
         setup = Setup()
         call, interaction = await setup.plan()
         assert call.brief_message in setup.messages
-        assert call.brief_message.kwargs['embed'].description.startswith('book dinner.')
+        assert call.brief_message.kwargs['embed'].description.startswith('opener · AIです。')
         assert call.brief_message.kwargs['view'] is call.brief_view
         assert call.brief_message.kwargs['allowed_mentions'].everyone is False
         assert 'ephemeral' not in call.brief_message.kwargs
-        assert interaction.original.content == 'brief is in the voice chat.'
+        assert interaction.original.content == 'brief is in this chat.'
         assert interaction.response.deferrals == [{'ephemeral': True, 'thinking': True}]
         assert not await call.brief_view.interaction_check(setup.interaction(11))
         await setup.calls.close()
@@ -531,4 +537,78 @@ def test_start_validation_rejection_is_private_too():
         assert all('daily limit' not in (message.content or '') for message in setup.messages)
         assert not setup.calls.active
         setup.voice.disconnect.assert_awaited_once_with(force=True)
+    asyncio.run(run())
+
+
+def test_mls_readiness_precedes_player_and_engine_start():
+    async def run():
+        setup = Setup()
+        call, _ = await setup.plan()
+        state = setup.voice._connection
+        state.dave_protocol_version = 1
+        state.dave_session = SimpleNamespace(ready=False)
+        dialing = asyncio.create_task(call.brief_view.dial.callback(setup.interaction()))
+        await asyncio.sleep(0)
+        setup.voice.play.assert_not_called()
+        setup.engine.start.assert_not_awaited()
+        state.dave_session.ready = True
+        await dialing
+        setup.voice.play.assert_called_once()
+        setup.engine.start.assert_awaited_once()
+        await call.stop('test')
+    asyncio.run(run())
+
+
+def test_all_messages_use_invoking_text_channel_while_voice_and_answers_stay_in_voice():
+    from fri.jpcall.contract import Translation, Utterance
+
+    async def run():
+        setup = Setup()
+        text = MagicMock(spec=discord.TextChannel)
+        text.id = 40
+        text.send = AsyncMock(side_effect=setup.channel.send.side_effect)
+        invocation = setup.interaction()
+        invocation.channel = text
+        await setup.calls.invoke(invocation, '+81', 'dinner')
+        call = setup.calls.active[1]
+        assert call.voice_channel is setup.channel and call.text_channel is text
+        await call.brief_view.dial.callback(setup.interaction())
+        assert setup.channel.connect.await_count == 1
+        await call.emit(Utterance(call.request.request_id, '1', 'callee', 'はい', 0))
+        await call.emit(Translation(call.request.request_id, '1', 'yes'))
+        await call.emit(QuestionAsked(call.request.request_id, 'q', 'six?', ('yes', 'no')))
+        question = call.questions['q']
+        outsider = setup.interaction(11)
+        outsider.user.voice = None
+        await question.submit(outsider, 'yes')
+        setup.session.answer.assert_not_awaited()
+        await question.submit(setup.interaction(12), 'yes')
+        setup.session.answer.assert_awaited_once_with('q', 'yes', 12)
+        await call.emit(CallFinished(call.request.request_id, 'done.', 10,
+                                     (UsageLine('twilio', 'phone', {'minutes': 1}, None),)))
+        summary = call.cost.messages[0]
+        await call.emit(UsageUpdated(call.request.request_id,
+                                    (UsageLine('twilio', 'phone', {'minutes': 1}, .1, True),), True))
+        assert call.cost.messages[0] is summary
+        assert 'pending' not in summary.content
+        assert call.brief_message in setup.messages and question.message in setup.messages
+        assert call.pager.pages[0].message in setup.messages and summary in setup.messages
+        assert text.send.await_count >= 4
+        setup.channel.send.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_brief_shows_short_opener_and_request_fields_without_a_script_claim():
+    async def run():
+        setup = Setup()
+        setup.engine.plan.side_effect = lambda request: CallBrief(
+            request.request_id, 'i will read the whole request aloud.', '안녕하세요.',
+            ('rewritten share',), ('rewritten limits',))
+        goal = 'Ask for a table.\nThen ask about parking.'
+        await setup.calls.invoke(setup.interaction(), '+81', goal, 'Name: Alex', 'No payment')
+        call = setup.calls.active[1]
+        text = call.brief_message.kwargs['embed'].description
+        assert text == ('opener · 안녕하세요.\n\ngoal · ' + goal + '\n\n'
+                        'share · Name: Alex\nnever · No payment')
+        await setup.calls.close()
     asyncio.run(run())

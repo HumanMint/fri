@@ -64,3 +64,22 @@ def test_unsplit_cache_metadata_does_not_inflate_input_total():
                                                       'unknown_cached_in_tokens': 20}, None),), False)
     assert 'input 100 / output 0 tokens' in text
     assert 'pending' in text
+
+
+def test_declining_ai_interpreter_is_shown_plainly():
+    async def run():
+        messages = []
+
+        async def send(content):
+            messages.append(content)
+            return len(messages) - 1
+
+        async def edit(message, content):
+            messages[message] = content
+
+        summary = CostSummary(send, edit)
+        for outcome in ('declined to talk with an AI interpreter',
+                        'they declined to talk with an ai interpreter.'):
+            await summary.emit(CallFinished('r', outcome, 12))
+            assert messages[0].splitlines()[1] == outcome
+    asyncio.run(run())
