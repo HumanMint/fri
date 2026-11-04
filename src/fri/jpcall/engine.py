@@ -35,6 +35,7 @@ from .numbers import normalize_number
 from .pricing import PriceTable
 from .realtime import RealtimeClient, RealtimeError
 from .server import CallRoutes, JpcallServer, TwilioMedia
+from .timeline import DebugTimeline
 from .translate import TextClient, TextError
 from .twilio import TwilioClient, TwilioError
 from .usage import UsageMeter
@@ -327,13 +328,15 @@ class _Session:
         self.engine, self.request = engine, request
         self._brief, self._number = brief, number
         self._audio, self._events, self._meter = audio, events, meter
+        timeline = DebugTimeline(engine.config.debug_timeline_path, clock=engine._clock)
         self._rt = RealtimeClient(engine.config, brief, audio, self, meter,
                                   on_tool_call=self._tool, tools=TOOLS, clock=engine._clock,
-                                  on_speech=self._speech_event)
+                                  on_speech=self._speech_event, goal=request.goal,
+                                  timeline=timeline)
         self._hold = HoldController(request.request_id, engine.config.limits, self._emit,
                                      self._rt.say, self._rt.tool_result, self._hold_state,
                                      clock=engine._clock, sleep=engine._sleep,
-                                     language=engine.config.language)
+                                     language=engine.config.language, timeline=timeline)
         self._routes: CallRoutes | None = None
         self._sid = ''
         self._dial_task: asyncio.Task | None = None
@@ -515,6 +518,8 @@ class _Session:
         self._opening_changed.set()
 
     def _speech_event(self, started: bool, item_id: str) -> None:
+        if not self._ending:
+            self._hold.callee_speech(started, item_id)
         if self._ending or self._opener_started:
             return
         if started:

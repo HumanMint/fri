@@ -1,6 +1,6 @@
 """GA Realtime WebSocket bridge. No member microphone audio enters this client.
 
-Protocol references checked 2026-11-03:
+Protocol references checked 2026-11-04:
 https://developers.openai.com/api/reference/resources/realtime/client-events
 https://developers.openai.com/api/reference/resources/realtime/server-events
 https://www.twilio.com/docs/voice/media-streams/websocket-messages
@@ -14,15 +14,19 @@ import json
 import logging
 import re
 import time
+import unicodedata
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 import aiohttp
 
 from .config import JpcallConfig
 from .contract import AudioSink, CallBrief, EventSink, Utterance
 from .server import TwilioMedia, ulaw_to_pcm16
+from .timeline import DebugTimeline
 from .usage import UsageMeter
 
 # Every Realtime event type lives here, including client commands.
@@ -37,12 +41,14 @@ EVENTS = {
     'output_audio': 'response.output_audio.delta',
     'output_audio_done': 'response.output_audio.done',
     'output_transcript': 'response.output_audio_transcript.done',
+    'output_transcript_delta': 'response.output_audio_transcript.delta',
     'response_created': 'response.created',
     'response_done': 'response.done',
     'response_create': 'response.create',
     'response_cancel': 'response.cancel',
     'truncate': 'conversation.item.truncate',
     'item_create': 'conversation.item.create',
+    'item_delete': 'conversation.item.delete',
     'function_arguments_done': 'response.function_call_arguments.done',
     'error': 'error',
 }
@@ -66,6 +72,7 @@ class _Playout:
     sent_bytes: int = 0
     played_bytes: int = 0
     started_at: float = 0
+    response_id: str = ''
 
 
 @dataclass
@@ -89,7 +96,8 @@ class RealtimeClient:
                  session: aiohttp.ClientSession | None = None,
                  on_tool_call: ToolHook | None = None, tools: tuple[dict, ...] = (),
                  clock: Callable[[], float] = time.monotonic,
-                 on_speech: Callable[[bool, str], None] | None = None):
+                 on_speech: Callable[[bool, str], None] | None = None,
+                 goal: str = '', timeline: DebugTimeline | None = None):
         self.config, self.brief = config, brief
         self.audio_sink, self.events, self.meter = audio, events, meter
         self._session = session
@@ -101,6 +109,13 @@ class RealtimeClient:
         self._answered_at = 0.0
         self._on_tool_call, self._tools = on_tool_call, tools
         self._on_speech = on_speech
+        self._goal = goal
+        self.timeline = timeline or DebugTimeline(config.debug_timeline_path, clock=clock)
+        self._recent_speech: deque[tuple[float, str, str]] = deque(maxlen=64)
+        self._partial_transcripts: dict[str, str] = {}
+        self._input_seen: set[str] = set()
+        self._preopening_items: set[str] = set()
+        self._turn_pending = False
         self._playout: dict[tuple[str, int], _Playout] = {}
         self._generating: set[tuple[str, int]] = set()
         self._marks: dict[str, tuple[tuple[str, int], int]] = {}
@@ -135,29 +150,42 @@ class RealtimeClient:
 
     def session_update(self) -> dict:
         language = self.config.language
-        plan = json.dumps({'summary': self.brief.summary_en, 'share': self.brief.share,
+        plan = json.dumps({'goal': self._goal, 'summary_en': self.brief.summary_en,
+                           'share': self.brief.share,
                            'never': self.brief.never}, ensure_ascii=False)
-        return {'type': EVENTS['session_update'], 'session': {
+        session = {
             'type': 'realtime', 'model': self.config.realtime_model,
-            'instructions': language.instructions + language.plan_label + plan,
+            'instructions': language.plan_label + plan + '\n' + language.instructions,
             'output_modalities': ['audio'],
             'audio': {
                 'input': {'format': {'type': 'audio/pcmu'},
                           'transcription': {'model': self.config.transcribe_model,
                                             'language': self.config.call_language},
-                          'turn_detection': {'type': 'server_vad', 'create_response': False,
-                                             'interrupt_response': False}},
+                          'noise_reduction': (None if self.config.vad_noise_reduction == 'off'
+                                              else {'type': self.config.vad_noise_reduction}),
+                          'turn_detection': self._turn_detection()},
                 'output': {'format': {'type': 'audio/pcmu'},
                            'voice': self.config.realtime_voice,
                            'speed': self.config.realtime_speed},
             },
             'tools': list(self._tools),
-        }}
+        }
+        if self.config.realtime_reasoning is not None:
+            session['reasoning'] = {'effort': self.config.realtime_reasoning}
+        return {'type': EVENTS['session_update'], 'session': session}
+
+    def _turn_detection(self) -> dict:
+        # Transcription is asynchronous to VAD: release responses only after echo filtering.
+        return {'type': 'server_vad', 'threshold': self.config.vad_threshold,
+                'silence_duration_ms': self.config.vad_silence_duration_ms,
+                'create_response': False, 'interrupt_response': False}
 
     async def _send(self, key: str, **payload) -> None:
         if self._ws is None or self._stopped:
             raise RealtimeError('The voice connection is unavailable.')
         try:
+            if key == 'response_cancel':
+                self.timeline.record('response_cancel', **payload)
             await self._ws.send_json({'type': EVENTS[key], **payload})
         except Exception:
             raise RealtimeError('The voice connection ended.') from None
@@ -202,11 +230,6 @@ class RealtimeClient:
         self._answered_at = self._clock()
         await self.connect()
 
-    async def _auto_responses(self, enabled: bool) -> None:
-        await self._send('session_update', session={'type': 'realtime', 'audio': {'input': {
-            'turn_detection': {'type': 'server_vad', 'create_response': enabled,
-                               'interrupt_response': enabled}}}})
-
     async def open_conversation(self) -> None:
         """Called by the engine only after its hello/AMD gate opens."""
         if self._opener_requested or self._silenced or self._stopped or self._media is None:
@@ -217,7 +240,6 @@ class RealtimeClient:
             raise RealtimeError('The voice service could not speak the opening.')
         if not self._silenced and not self._stopped:
             self._conversation_open = True
-            await self._auto_responses(True)
 
     def silence(self) -> None:
         """Fence output synchronously before voicemail cleanup can await anything."""
@@ -229,7 +251,6 @@ class RealtimeClient:
 
     async def interrupt(self) -> None:
         self.silence()
-        await self._auto_responses(False)
         for response_id in tuple(self._active_responses):
             await self._send('response_cancel', response_id=response_id)
         await self._barge_in()
@@ -274,13 +295,16 @@ class RealtimeClient:
             await self._submit(command)
         except BaseException:
             self._commands.pop(number, None)
+            if self._pending is command:
+                self._pending = None
+                self._update_idle()
             command.done.cancel()
             raise
         return command.done
 
     async def say(self, text_ja: str, *, out_of_band: bool = False) -> asyncio.Future:
         return await self.respond(instructions=(
-            self.config.language.say_prefix
+            self.config.language.instructions + '\n' + self.config.language.say_prefix
             + json.dumps(text_ja, ensure_ascii=False)), out_of_band=out_of_band)
 
     async def drain(self, timeout_s: float = 8) -> None:
@@ -347,6 +371,10 @@ class RealtimeClient:
             part = self._playout.get(key)
             if part is not None and part.item_id not in self._interrupted:
                 part.played_bytes = max(part.played_bytes, end)
+                recent = next((text for _, item, text in self._recent_speech
+                               if item == part.item_id), self._transcripts.get(key))
+                if recent is not None:
+                    self._remember_speech(part.item_id, recent)
                 await self._flush_transcript(key)
         self._update_idle()
 
@@ -363,6 +391,9 @@ class RealtimeClient:
             if self._media is not None:
                 await self._media.clear()
             for part in pending:
+                self.timeline.record('truncate', item_id=part.item_id,
+                                     response_id=part.response_id,
+                                     audio_end_ms=part.played_bytes // 8)
                 await self._send('truncate', item_id=part.item_id,
                                  content_index=part.content_index,
                                  audio_end_ms=part.played_bytes // 8)
@@ -375,8 +406,42 @@ class RealtimeClient:
         if key in self._utterances:
             return
         self._utterances.add(key)
+        if speaker == 'fri':
+            self._remember_speech(item_id, text)
+        self.timeline.record('transcript', speaker=speaker, item_id=item_id, text=text)
         await self.events.emit(Utterance(self.brief.request_id, item_id, speaker,
                                          text, started_at))
+
+    @staticmethod
+    def _normalized(text: str) -> str:
+        return ''.join(c for c in unicodedata.normalize('NFKC', text).casefold() if c.isalnum())
+
+    def _is_echo(self, text: str) -> bool:
+        now = self._clock()
+        while self._recent_speech and now - self._recent_speech[0][0] > 10:
+            self._recent_speech.popleft()
+        normalized = self._normalized(text)
+        # Common short answers (はい / 네 / いいえ) are not evidence of an echo.
+        if len(normalized) < 6:
+            return False
+        for _, _, spoken in self._recent_speech:
+            match = SequenceMatcher(None, normalized, spoken, autojunk=False)
+            if match.ratio() >= 0.6:
+                return True
+        return False
+
+    def _remember_speech(self, item_id: str, text: str) -> None:
+        self._recent_speech = deque((entry for entry in self._recent_speech
+                                    if entry[1] != item_id and self._clock() - entry[0] <= 10),
+                                   maxlen=64)
+        self._recent_speech.append((self._clock(), item_id, self._normalized(text)))
+
+    async def _reply_to_callee(self) -> None:
+        try:
+            if not self._stopped and not self._silenced:
+                await self.respond()
+        finally:
+            self._turn_pending = False
 
     async def _flush_transcript(self, key: tuple[str, int]) -> None:
         if key not in self._transcripts:
@@ -394,6 +459,8 @@ class RealtimeClient:
         kind = event.get('type')
         if kind == EVENTS['response_created']:
             response = event['response']
+            self.timeline.record('response_created', response_id=response['id'],
+                                 status=response.get('status'))
             self._active_responses.add(response['id'])
             self._idle.clear()
             self._drained.clear()
@@ -408,20 +475,44 @@ class RealtimeClient:
                 self._blocked_responses.add(response['id'])
                 await self._send('response_cancel', response_id=response['id'])
         elif kind == EVENTS['speech_started']:
+            self.timeline.record('speech_started', item_id=event['item_id'],
+                                 audio_start_ms=event['audio_start_ms'])
             self._starts[event['item_id']] = max(0, event['audio_start_ms'] / 1000)
+            if not self._conversation_open:
+                self._preopening_items.add(event['item_id'])
             if self._on_speech:
                 self._on_speech(True, event['item_id'])
-            await self._barge_in()
         elif kind == EVENTS['speech_stopped']:
+            self.timeline.record('speech_stopped', item_id=event['item_id'],
+                                 audio_end_ms=event.get('audio_end_ms'))
             if self._on_speech:
                 self._on_speech(False, event['item_id'])
         elif kind == EVENTS['input_transcript']:
             item = event['item_id']
+            if item in self._input_seen:
+                return
+            self._input_seen.add(item)
+            was_open = self._conversation_open and item not in self._preopening_items
+            self._preopening_items.discard(item)
+            self.meter.transcription(event.get('usage'), self.config.transcribe_model, item)
+            text = event['transcript']
+            if self._is_echo(text):
+                self.timeline.record('echo_drop', item_id=item, text=text)
+                await self._send('item_delete', item_id=item)
+                return
             if self._on_speech:
                 self._on_speech(False, item)
-            self.meter.transcription(event.get('usage'), self.config.transcribe_model, item)
-            await self._utterance(item, 'callee', event['transcript'],
+            await self._utterance(item, 'callee', text,
                                   self._starts.get(item, self._clock() - self._answered_at))
+            if was_open and not self._silenced and text.strip():
+                # Confirmed speech interrupts; raw VAD noise/self-echo does not.
+                for response_id in tuple(self._active_responses):
+                    self._blocked_responses.add(response_id)
+                    await self._send('response_cancel', response_id=response_id)
+                await self._barge_in()
+                if not self._turn_pending:
+                    self._turn_pending = True
+                    self._background(self._reply_to_callee())
         elif kind == EVENTS['output_audio']:
             if not self._output_allowed(event):
                 return
@@ -438,7 +529,8 @@ class RealtimeClient:
                 if item in self._interrupted or self._stopped or not self._output_allowed(event):
                     return
                 part = self._playout.setdefault(key, _Playout(
-                    item, key[1], started_at=self._clock() - self._answered_at))
+                    item, key[1], started_at=self._clock() - self._answered_at,
+                    response_id=event.get('response_id', '')))
                 self.has_spoken = True
                 await self._media.send_audio(ulaw)
                 if not self._output_allowed(event):
@@ -454,15 +546,29 @@ class RealtimeClient:
             self._generating.discard(key)
             await self._flush_transcript(key)
             self._update_idle()
+        elif kind == EVENTS['output_transcript_delta']:
+            if self._output_allowed(event):
+                item = event['item_id']
+                text = self._partial_transcripts.get(item, '') + event['delta']
+                self._partial_transcripts[item] = text
+                self._remember_speech(item, text)
         elif kind == EVENTS['output_transcript']:
-            if not self._output_allowed(event):
-                return
             key = event['item_id'], event['content_index']
+            if (not self._output_allowed(event) and not (
+                    not self._silenced and key in self._playout and key[0] in self._interrupted)):
+                return
+            self._partial_transcripts.pop(key[0], None)
+            self._remember_speech(key[0], event['transcript'])
             self._transcripts[key] = event['transcript']
             await self._flush_transcript(key)
         elif kind == EVENTS['response_done']:
             self.meter.realtime(event, self.config.realtime_model)
             response = event.get('response') or {}
+            self.timeline.record('response_done', response_id=response.get('id'),
+                                 status=response.get('status'), truncated=any(
+                                     part.response_id == response.get('id')
+                                     and part.item_id in self._interrupted
+                                     for part in self._playout.values()))
             self._active_responses.discard(response.get('id', ''))
             self._busy_unknown = False
             number = (response.get('metadata') or {}).get('jpcall_command')
@@ -482,6 +588,8 @@ class RealtimeClient:
                     if call_id in self._tools_seen:
                         continue
                     self._tools_seen.add(call_id)
+                    self.timeline.record('tool_call', call_id=call_id, name=item['name'],
+                                         arguments=item.get('arguments'))
                     try:
                         arguments = json.loads(item['arguments'])
                         if not isinstance(arguments, dict):
@@ -511,6 +619,7 @@ class RealtimeClient:
             self._update_idle()
 
     async def tool_result(self, call_id: str, result: dict) -> None:
+        self.timeline.record('tool_result', call_id=call_id, result=result)
         await self._send('item_create', item={'type': 'function_call_output',
                                              'call_id': call_id, 'output': json.dumps(result)})
         await self.respond()
@@ -542,5 +651,8 @@ class RealtimeClient:
         self._playout.clear()
         self._marks.clear()
         self._starts.clear()
+        self._recent_speech.clear()
+        self._partial_transcripts.clear()
+        self.timeline.close()
         if self._owned and self._session is not None:
             await self._session.close()
