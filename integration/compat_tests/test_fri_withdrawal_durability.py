@@ -195,6 +195,89 @@ def test_a_withdrawal_lasts_as_long_as_what_it_names_from_when_it_was_saved(monk
     asyncio.run(scenario())
 
 
+def test_a_capacity_closure_set_while_the_clock_was_back_is_never_cut_short(monkeypatch, tmp_path):
+    """Sol round 1 of #339, B1: with a cap of two, messages A, B and C were sent 200, 90 and 80 seconds ago. A is
+    queued, the clock goes back an hour, and B and C are queued while withdrawals fail: B, whose names can be kept
+    least long, goes, and saved context is held back until B's horizon ends. Fri restarted a second later, the clock
+    still back, and cut that deadline to the longest horizon from then; once the clock was right again, half an hour
+    before B's horizon ended, B's message was let through. A deadline once written down is never cut short."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            horizon = withdrawal.NOTED_SECONDS if withdrawal.SOURCES in w.fri.capabilities else withdrawal.KEPT_SECONDS
+            a, b, c = (aged(w, f'fri remember {MARKER} {n}', age) for n, age in enumerate((200, 90, 80)))
+            for message in (a, b, c):
+                await w.agent.handle(message)
+            monkeypatch.setattr(withdrawal, 'MOST', 2)
+            failing(w, WITHDRAW)
+            await delete(w, a, guild=123)
+            later(monkeypatch, -3600)
+            for message in (b, c):
+                await delete(w, message, guild=123)
+            await settled(w)
+            assert str(b.id) not in w.agent.saved_turns.pending and w.agent.saved_turns.closed()
+            later(monkeypatch, -3599)
+            w.agent.saved_turns = SavedTurns(w.agent)  # Started again, the clock still back.
+            assert w.agent.saved_turns.closed()
+            later(monkeypatch, horizon-1800)
+            w.agent.saved_turns = SavedTurns(w.agent)  # The clock right again, half an hour before B's horizon ends.
+            assert w.agent.saved_turns.withheld([b.id]) == {str(b.id)}
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_when_a_withdrawal_was_queued_is_kept_whatever_the_clock_says_at_a_restart(monkeypatch, tmp_path):
+    """Sol round 1 of #339, B2: a hold queued at T for a message sent ten days before is on disk. Fri restarts with
+    the clock a day back and saves the queue again: it said T minus a day, so once the clock was right the hold ended
+    a day early, while what it named could still be kept. What's on disk is kept."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            horizon = withdrawal.NOTED_SECONDS if withdrawal.SOURCES in w.fri.capabilities else withdrawal.KEPT_SECONDS
+            now = int(time.time())
+            message = discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=10))
+            (tmp_path/'withdrawals.json').write_text(json.dumps({'pending': {str(message): {'hold': True,
+                                                                                             'queued_at': now}}}))
+            later(monkeypatch, -86400)
+            w.agent.saved_turns = SavedTurns(w.agent)  # Started again, the clock a day back.
+            w.agent.saved_turns.persist()
+            assert json.loads(on_disk(tmp_path))['pending'][str(message)]['queued_at'] == now
+            later(monkeypatch, horizon-43200)
+            w.agent.saved_turns = SavedTurns(w.agent)  # The clock right, half a day before the hold's horizon ends.
+            assert w.agent.saved_turns.withheld([message]) == {str(message)}
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_what_the_reader_lets_go_is_held_back_until_its_messages_own_horizon(monkeypatch, tmp_path):
+    """Sol round 1 of #339, B3: with a cap of two, five holds queued at T for messages whose time says a day after T
+    are on disk. The reader lets three go and held saved context back until T plus the horizon, earlier than those
+    messages' own: an hour past it, what they named was let through. Their own horizon counts, however the clock
+    stands."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            horizon = withdrawal.NOTED_SECONDS if withdrawal.SOURCES in w.fri.capabilities else withdrawal.KEPT_SECONDS
+            now = int(time.time())
+            ahead = discord.utils.time_snowflake(discord.utils.utcnow()+dt.timedelta(days=1))
+            holds = {str(ahead+n): {'hold': True, 'queued_at': now} for n in range(5)}
+            (tmp_path/'withdrawals.json').write_text(json.dumps({'pending': holds}))
+            monkeypatch.setattr(withdrawal, 'MOST', 2)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            gone = [i for i in holds if i not in w.agent.saved_turns.pending]
+            assert gone and w.agent.saved_turns.closed()
+            w.agent.saved_turns.persist()  # The queue saved again, as any withdrawal queued meanwhile does.
+            assert set(json.loads(on_disk(tmp_path))['pending']).isdisjoint(gone)
+            later(monkeypatch, horizon+3600)
+            w.agent.saved_turns = SavedTurns(w.agent)  # An hour past T plus the horizon, a day before theirs ends.
+            assert w.agent.saved_turns.withheld([int(i) for i in gone]) == set(gone)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('cause', ['capacity', 'unreadable'])
 def test_fri_health_says_why_saved_context_is_held_back(monkeypatch, tmp_path, cause):
     """fri #329 item 4: after the queue's capacity held saved context back, `fri health` said a withdrawals record
