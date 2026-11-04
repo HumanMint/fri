@@ -278,6 +278,57 @@ def test_what_the_reader_lets_go_is_held_back_until_its_messages_own_horizon(mon
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('count', [1, 5], ids=['within the cap', 'past what the reader holds'])
+def test_entries_an_older_fri_wrote_are_dated_once_not_at_every_restart(monkeypatch, tmp_path, count):
+    """fri #343 item 1: holds an older Fri wrote, with no time they were queued, count from the start that reads them,
+    but that was kept only once something saved the queue again. With nothing more withdrawn, every restart dated them
+    again, and past what the reader holds (a cap of two, five holds) each pushed what held saved context back on by
+    the time between restarts, while the record stayed as it was. The first start that reads them saves the queue, so
+    they're dated once: later starts keep that date, and so does what holds saved context back, which then ends."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            horizon = withdrawal.NOTED_SECONDS if withdrawal.SOURCES in w.fri.capabilities else withdrawal.KEPT_SECONDS
+            sent = discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=1))
+            (tmp_path/'withdrawals.json').write_text(json.dumps({'pending': {str(sent+n): {'hold': True}
+                                                                             for n in range(count)}}))
+            monkeypatch.setattr(withdrawal, 'MOST', 2)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert w.agent.saved_turns.withheld([sent]) == {str(sent)}
+            first, dated = w.agent.saved_turns.closed_until, json.loads(on_disk(tmp_path))['pending']
+            assert dated and all(isinstance(entry.get('queued_at'), int) for entry in dated.values())
+            later(monkeypatch, horizon-86400)
+            w.agent.saved_turns = SavedTurns(w.agent)  # A day before the horizon ends, from the first start.
+            assert w.agent.saved_turns.withheld([sent]) == {str(sent)}  # Read, and still held back,
+            assert w.agent.saved_turns.closed_until == first and json.loads(on_disk(tmp_path))['pending'] == dated
+            later(monkeypatch, 2*horizon-2*86400)
+            w.agent.saved_turns = SavedTurns(w.agent)  # Past it: nothing is held back for them any more.
+            assert not w.agent.saved_turns.closed() and w.agent.saved_turns.withheld([sent]) == set()
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_fri_health_flags_a_deadline_later_than_fri_sets(monkeypatch, tmp_path):
+    """fri #343 item 2: a closed marker saying 1e220 is kept (cutting it short could reopen what #339 round 1 closed),
+    but `fri health` printed it as a 220-digit date and said nothing was wrong. It says the date is past any Fri sets
+    and how to end it by hand; a deadline Fri sets reads as before."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            w.fri.get_guild = lambda _: None
+            for until, flagged in ((1e220, True), (time.time()+86400, False)):
+                (tmp_path/'withdrawals.closed.json').write_text(json.dumps({'closed_until': until}))
+                w.agent.saved_turns = SavedTurns(w.agent)
+                assert w.agent.saved_turns.closed() and w.agent.saved_turns.closed_until == until
+                [line] = [line for line in (await w.fri.watcher.report()).splitlines() if 'saved context' in line]
+                assert ('withdrawals.closed.json' in line) is flagged and ('<t:' in line) is not flagged
+                assert len(line) < 400
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('cause', ['capacity', 'unreadable'])
 def test_fri_health_says_why_saved_context_is_held_back(monkeypatch, tmp_path, cause):
     """fri #329 item 4: after the queue's capacity held saved context back, `fri health` said a withdrawals record
