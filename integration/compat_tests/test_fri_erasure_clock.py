@@ -5,11 +5,13 @@ message sent just before the erasure counted as after it (item 4); ahead, one se
 it."""
 
 import asyncio
+import datetime as dt
 import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import discord
 import pytest
 
 from compat_tests.test_fri_mentions import environment
@@ -58,6 +60,7 @@ def world(monkeypatch, tmp_path, offset, dm=False):
             await fri.talk(123, event.channel.id, user, text, 'private' if dm else 'public', event=event)
             time.sleep(0.01)  # Snowflakes count milliseconds: what follows is after it.
     fri.chat_once.return_value = ChatResult(status='completed', reply='sure')
+    said.store = store  # Gene's own, for what a member does through it directly (My memory, say).
     return fri, agent, said, erase_and_restore
 
 
@@ -161,6 +164,44 @@ def test_a_delayed_panel_erasure_never_moves_the_cutoff_earlier(monkeypatch, tmp
                 await agent.handle(queued)
             fri.chat_once.assert_not_awaited()
             queued.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('offset', [-2, 0, 2])
+def test_a_delayed_erasure_never_lets_a_post_from_before_a_note_removal_back(monkeypatch, tmp_path, offset):
+    """Sol round 2 of HumanMint/gene#213, B2, as Fri reads it: member 30 removed a note at T-10, so their post from
+    T-20 stays out of what a reply reads. Then an older "forget me" of theirs, from T-30, was carried out late, and
+    memory turned on again. The erasure dropped the removal's cutoff for its own earlier one, and the post came back
+    as the reply target. It stays out."""
+    from gene.fri_memory_store import edit, entries, save
+
+    async def scenario():
+        fri, agent, said, _ = world(monkeypatch, tmp_path, offset)
+        store, now = said.store, REAL()
+        try:
+            post = said('my answer is '+MARKER, user=30, age=20)
+            with store.connection() as db:
+                save(db, '123', 'server', '30', ('games', 'I like Minecraft'), REAL() - 60, provenance=[])
+            note = entries(store, '123', 'private:900', '30')['entries'][0]
+            asked = {'kind': 'discord_interaction', 'user_id': '30', 'display_name': 'member 30', 'channel_id': '900',
+                     'guild_id': None, 'id': str(discord.utils.time_snowflake(
+                         dt.datetime.fromtimestamp(now - 10, dt.timezone.utc)))}
+            with gene_clock(offset - 10):  # The removal, at T-10 on Discord's clock.
+                edit(store, '123', 'private:900', '30', note['id'],
+                     store.chat_context('123', 'private:900', '30')['revision'], asked, 'remove')
+            late = said('fri forget me', user=30, age=30)  # Asked for at T-30, carried out only now.
+            await fri.talk(123, 1, 30, 'fri forget me', 'public', event=late)
+            again = said('fri remember me again', user=30)
+            await fri.talk(123, 1, 30, 'fri remember me again', 'public', event=again)
+            time.sleep(0.01)
+            event = said('fri what do you make of that?')
+            event.reference = SimpleNamespace(message_id=post.id, channel_id=1)
+            with patch('fri.fri_agent.asyncio.sleep', new=AsyncMock()):
+                await agent.handle(event)
+            fri.chat_once.assert_awaited_once()
+            assert MARKER not in str(fri.chat_once.await_args)
         finally:
             await fri.close()
     asyncio.run(scenario())
