@@ -178,3 +178,24 @@ def test_audio_check_cli_requires_fake_engine_and_sets_both_modes(monkeypatch, c
     devbot.main()
     assert bots[0].audio_check and bots[0].engine.audio_check
     assert bots[0].limits.allowed_user_ids == frozenset({10})
+
+
+def test_korean_fake_mode_uses_the_same_process_language_setting(monkeypatch):
+    bots = []
+    monkeypatch.setattr(devbot.os, 'environ', {'JPCALL_DEV_DISCORD_TOKEN': 'synthetic-token',
+                                             'JPCALL_DEV_GUILD_ID': '1',
+                                             'JPCALL_CALL_LANGUAGE': 'ko'})
+    monkeypatch.setattr(devbot.DevBot, 'run', lambda self, *a, **k: bots.append(self))
+    monkeypatch.setattr('sys.argv', ['devbot', '--fake-engine', '--allow-user', '10'])
+    devbot.main()
+    assert bots[0].engine.originals == devbot.CALL_LINES['ko']
+
+    async def run():
+        brief = await bots[0].engine.plan(request())
+        assert brief.opener_ja == devbot.CALL_LINES['ko'][0]
+        session = await bots[0].engine.start(brief, request(), Audio(), SimpleNamespace())
+        assert session.originals == devbot.CALL_LINES['ko']
+        session.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await session.task
+    asyncio.run(run())

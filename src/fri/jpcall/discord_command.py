@@ -473,9 +473,9 @@ class DiscordCalls:
             call.phase = 'planned'
             call.brief_view = BriefView(call)
             brief = call.brief
-            text = (f'{brief.summary_en}\n\nopener · {brief.opener_ja}\n\n'
-                    f'share · {"; ".join(brief.share) or "nothing extra"}\n'
-                    f'never · {"; ".join(brief.never) or "no extra limits"}')
+            text = (f'opener · {brief.opener_ja}\n\ngoal · {request.goal}\n\n'
+                    f'share · {"; ".join(request.share) or "nothing extra"}\n'
+                    f'never · {"; ".join(request.never) or "no extra limits"}')
             pages = chunks(text)
             for index, content in enumerate(pages):
                 kwargs = dict(embed=discord.Embed(title='before i call', description=content),
@@ -510,9 +510,9 @@ def register(tree, client, engine, guild_ids, *, limits: Limits | None = None, a
     calls = DiscordCalls(client, engine, guild_ids, limits if limits is not None else Limits(),
                          audio_check=audio_check)
 
-    @app_commands.command(name='jpcall', description='ask fri to phone a japanese business')
+    @app_commands.command(name='jpcall', description='ask fri to phone a business')
     @app_commands.guild_only()
-    @app_commands.describe(number='phone number, including +81', goal='what you want to find out',
+    @app_commands.describe(number='phone number, including country code', goal='what you want to find out',
                            share='facts i may share, one per line', never='limits, one per line')
     async def command(interaction: discord.Interaction, number: str, goal: str,
                       share: str | None = None, never: str | None = None):

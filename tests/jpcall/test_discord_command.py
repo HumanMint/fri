@@ -139,6 +139,7 @@ def test_register_is_guild_only_and_default_deny_all():
         calls = register(tree, client, object(), [1])
         command = tree.get_command('jpcall', guild=discord.Object(id=1))
         assert command and command.guild_only
+        assert command.description == 'ask fri to phone a business'
         assert calls.limits.allowed_user_ids == frozenset()
         assert tree.get_commands() == []
         with pytest.raises(ValueError):
@@ -410,7 +411,7 @@ def test_late_translation_after_finish_updates_original_line():
         await call.emit(CallFinished(call.request.request_id, 'done.', 10))
         await call.emit(Translation(call.request.request_id, '1', 'yes'))
         await call.pager.flush()
-        assert 'callee · ja: はい\nen: yes' in call.pager.pages[0].message.content
+        assert 'callee · はい\n↳ yes' in call.pager.pages[0].message.content
         assert not setup.calls.active
     asyncio.run(run())
 
@@ -476,7 +477,7 @@ def test_brief_is_public_in_voice_chat_but_errors_stay_private():
         setup = Setup()
         call, interaction = await setup.plan()
         assert call.brief_message in setup.messages
-        assert call.brief_message.kwargs['embed'].description.startswith('book dinner.')
+        assert call.brief_message.kwargs['embed'].description.startswith('opener · AIです。')
         assert call.brief_message.kwargs['view'] is call.brief_view
         assert call.brief_message.kwargs['allowed_mentions'].everyone is False
         assert 'ephemeral' not in call.brief_message.kwargs
@@ -594,4 +595,20 @@ def test_all_messages_use_invoking_text_channel_while_voice_and_answers_stay_in_
         assert call.pager.pages[0].message in setup.messages and summary in setup.messages
         assert text.send.await_count >= 4
         setup.channel.send.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_brief_shows_short_opener_and_request_fields_without_a_script_claim():
+    async def run():
+        setup = Setup()
+        setup.engine.plan.side_effect = lambda request: CallBrief(
+            request.request_id, 'i will read the whole request aloud.', '안녕하세요.',
+            ('rewritten share',), ('rewritten limits',))
+        goal = 'Ask for a table.\nThen ask about parking.'
+        await setup.calls.invoke(setup.interaction(), '+81', goal, 'Name: Alex', 'No payment')
+        call = setup.calls.active[1]
+        text = call.brief_message.kwargs['embed'].description
+        assert text == ('opener · 안녕하세요.\n\ngoal · ' + goal + '\n\n'
+                        'share · Name: Alex\nnever · No payment')
+        await setup.calls.close()
     asyncio.run(run())
