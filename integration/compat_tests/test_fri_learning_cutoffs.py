@@ -54,12 +54,15 @@ def test_a_learning_pass_never_sends_words_from_before_a_removal_during_its_read
 
         async def reading(*args, **kwargs):
             rows = await logs(*args, **kwargs)
-            if moved == 'a removal':  # While the history request is out.
-                remove_a_preference(store, '11')
-            else:
-                store.personal_control('11', 'disable')
-                store.personal_control('11', 'enable')
+            if not reading.done:  # While the first history request is out; the pass reads it again (fri #335).
+                reading.done = True
+                if moved == 'a removal':
+                    remove_a_preference(store, '11')
+                else:
+                    store.personal_control('11', 'disable')
+                    store.personal_control('11', 'enable')
             return rows
+        reading.done = False
 
         channel._state.http.logs_from = reading
         await agent.learn()
@@ -73,9 +76,10 @@ def explored(learning, monkeypatch, moved):  # noqa: F811
     """Two exploration passes over member 11 in channel 1, as test_fri_exploration's: the first reads their history
     broadly, the second asks the planner with the topics the first noted. moved: what happens meanwhile. Returns the
     planner requests and the summary requests' records."""
-    from compat_tests.test_fri_exploration import archive, row
+    from compat_tests.test_fri_exploration import archive, by_id, offered, row
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
+    capabilities = offered(client)
     old, later = row(clock[0]-120*86400), row(clock[0]-160*86400, text='minecraft redstone was fun')
     channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()),
                               permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True))
@@ -130,7 +134,8 @@ def explored(learning, monkeypatch, moved):  # noqa: F811
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), http=SimpleNamespace(request=http),
+                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), capabilities=capabilities,
+                              http=SimpleNamespace(request=by_id(http, [old, later])),
                               chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri)
         agents.append(agent)

@@ -409,9 +409,10 @@ def test_an_exploration_passs_summary_request_carries_no_record_whose_author_era
     model the same way, and was checked the same way, not at all. It's held to the same fence (see Agent.unmoved): the
     member erasing during its sign-in, here or through Gene, or during the archive search (one baseline, taken before
     it, fri #290's round 1), leaves nothing to send, so nothing is: an empty batch, not a failed one."""
-    from compat_tests.test_fri_exploration import archive, row
+    from compat_tests.test_fri_exploration import archive, by_id, offered, row
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
+    capabilities = offered(client)
     old = row(clock[0]-120*86400)
     channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()),
                               permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True))
@@ -446,8 +447,8 @@ def test_an_exploration_passs_summary_request_carries_no_record_whose_author_era
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), http=SimpleNamespace(request=http),
-                              chat=SimpleNamespace(headers=sign_in))
+                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), capabilities=capabilities,
+                              http=SimpleNamespace(request=by_id(http, [old])), chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri)
         agents.append(agent)
         agent.state = scheduler.state()
