@@ -362,17 +362,26 @@ class Watch:
         lines.append(f'- usage receipts waiting: {waiting}')
         turns = getattr(agent, 'saved_turns', None) if agent else None
         if turns is not None and (held := turns.status())['closed_until']:  # Every saved context is held back.
-            until, why = int(held['closed_until']), held.get('closed_for') or []
+            from .fri_turn_withdrawal import CLOSED_SECONDS
+            until, why = held['closed_until'], held.get('closed_for') or []
+            # Kept as written, never cut short (fri #339), but one later than any Fri sets from now isn't printed as a
+            # date: it's flagged, with the way to end it by hand (fri #343).
+            past = until > time.time()+CLOSED_SECONDS
+            when = (f'past any date Fri sets (more than {CLOSED_SECONDS//86400} days from now: the clock was set back '
+                    'since, or withdrawals.closed.json was edited)' if past else
+                    f'until <t:{int(until)}:f> (<t:{int(until)}:R>)')
             # Why, as far as it's known: a deadline an older Fri wrote doesn't say (fri #329).
             causes = [text for cause, text in (('unreadable', "a withdrawals record couldn't be read"),
                                                ('capacity', 'more withdrawals were queued than Fri keeps'))
                       if cause in why] or ["withdrawals Gene hasn't taken may name any of it"]
             unsaved = {'unreadable': "; it couldn't be set aside, so new withdrawals aren't saved to disk",
                        'capacity': "; that couldn't be written down, so new withdrawals aren't saved to disk"}
-            lines.append(f"- saved context: held back until <t:{until}:f> (<t:{until}:R>), " + ' and '.join(causes)
+            lines.append(f"- saved context: held back {when}, " + ' and '.join(causes)
                          + ('' if held['saved_to_disk'] else unsaved.get(held.get('unsaved_for'), unsaved['unreadable']))
                          # A scheduled pass skipped for it asks for no batch until then (fri #335).
-                         + ('; learning passes wait until then' if getattr(agent, 'learning_paused', False) else ''))
+                         + ('; learning passes wait until then' if getattr(agent, 'learning_paused', False) else '')
+                         + ('; to end it early, remove withdrawals.closed.json once nothing it holds back matters (see '
+                            'docs/operations.md)' if past else ''))
         if agent:
             from .fri_ledger import describe, describe_forwards
             outcomes = agent.ledger.snapshot()

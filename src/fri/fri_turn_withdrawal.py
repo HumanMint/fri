@@ -137,7 +137,7 @@ class SavedTurns:
                 except (OSError, ValueError) as exc:  # Unreadable and UnicodeDecodeError are ValueErrors.
                     overflow.clear()  # Nothing of it is read: all of it is held back (see fail_closed).
                     self.fail_closed(path, exc)
-            held = 0
+            held, dated = 0, 0
             for i, facts in found.items():
                 if facts is not None:
                     # From an earlier process, whatever it says: replayed only where its revision is checked (sendable).
@@ -145,6 +145,7 @@ class SavedTurns:
                 else:  # Its message is known, the rest isn't one Fri could send: held back, never released (round 4).
                     held += 1
                     self._pending[i] = self.entry(hold=True, restored=True)
+                dated += not queued((facts or {}).get('queued_at'))
             if held:
                 LOG.warning('%s pending withdrawals on disk were malformed, so their messages are held back unsent', held)
             if overflow.get('dropped'):
@@ -154,6 +155,12 @@ class SavedTurns:
             now = time.time()
             for i in self._pending:  # Taken back before the restart: still held back until they land.
                 self.marked.setdefault(i, now)
+            if dated or overflow.get('dropped'):
+                # Dated by this start, or cut by the reader: saved now, not at the next withdrawal, so later starts keep
+                # those dates instead of dating them again, each later than the last (fri #343). As any save, never over
+                # a record whose cut isn't held back on disk yet (see persist): a failed write leaves the record as it
+                # was, read and dated again, never earlier, by the next start.
+                self.persist()
         return self._pending
 
     def overflowed(self, overflow):

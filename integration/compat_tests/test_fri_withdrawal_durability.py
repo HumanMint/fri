@@ -309,6 +309,41 @@ def test_entries_an_older_fri_wrote_are_dated_once_not_at_every_restart(monkeypa
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('fails', ['the record', 'what holds saved context back'])
+def test_dating_older_entries_never_moves_a_deadline_earlier_when_a_write_fails(monkeypatch, tmp_path, fails):
+    """fri #343: the start that dates holds an older Fri wrote saves them, but that save, or holding back what the
+    reader let go, fails (a full disk, or a crash between the two). Nothing is lost and no deadline moves earlier:
+    the record stays as it was, and the next start, a day later, reads and dates it again, no earlier than before."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            sent = discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=1))
+            legacy = {str(sent+n): {'hold': True} for n in range(5)}
+            (tmp_path/'withdrawals.json').write_text(json.dumps({'pending': legacy}))
+            monkeypatch.setattr(withdrawal, 'MOST', 2)
+            state, real = {'down': True}, withdrawal.private_json
+            name = withdrawal.RECORD if fails == 'the record' else withdrawal.CLOSED_RECORD
+
+            def writing(path, value):
+                if path.name == name and state['down']:
+                    raise OSError(28, 'injected')
+                return real(path, value)
+            monkeypatch.setattr(withdrawal, 'private_json', writing)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            assert w.agent.saved_turns.withheld([int(i) for i in legacy]) == set(legacy)
+            first, started = w.agent.saved_turns.closed_until, int(time.time())
+            assert json.loads(on_disk(tmp_path))['pending'] == legacy  # As it was.
+            state['down'] = False
+            later(monkeypatch, 86400)
+            w.agent.saved_turns = SavedTurns(w.agent)  # A day later, writes working again.
+            assert w.agent.saved_turns.withheld([int(i) for i in legacy]) == set(legacy)
+            assert w.agent.saved_turns.closed_until >= first
+            assert all(entry['queued_at'] >= started for entry in json.loads(on_disk(tmp_path))['pending'].values())
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
 def test_fri_health_flags_a_deadline_later_than_fri_sets(monkeypatch, tmp_path):
     """fri #343 item 2: a closed marker saying 1e220 is kept (cutting it short could reopen what #339 round 1 closed),
     but `fri health` printed it as a 220-digit date and said nothing was wrong. It says the date is past any Fri sets
