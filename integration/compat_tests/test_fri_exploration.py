@@ -80,6 +80,7 @@ def finish(scheduler, claim, items, observations=(), **changes):
 def test_real_learning_harness_explores_old_messages_and_deduplicates_cross_query(learning):
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
+    offered(client)  # A pass asks for no batch from a controller without learning-withdrawals (fri #346).
     old = row(clock[0]-120*86400)
     new = row(clock[0]-160*86400, text='minecraft redstone was fun')
     store.personal_control('13', 'disable')

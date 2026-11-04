@@ -385,6 +385,10 @@ class Watch:
                          + ('; learning passes wait until then' if getattr(agent, 'learning_paused', False) else '')
                          + ('; to end it early, remove withdrawals.closed.json once nothing it holds back matters (see '
                             'docs/operations.md)' if past else ''))
+        if getattr(agent, 'learning_waits_for_gene', False):  # A scheduled pass skipped for it (fri #346).
+            lines.append("- learning: paused, the controller doesn't say which messages it knows were taken back "
+                         "(learning-withdrawals); its contract is read again before each pass, and learning resumes "
+                         'once it does')
         if agent:
             from .fri_ledger import describe, describe_forwards
             outcomes = agent.ledger.snapshot()

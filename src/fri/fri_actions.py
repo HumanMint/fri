@@ -484,6 +484,10 @@ class Actions:
                 if self.agent.saved_turns.closed():  # Its batch couldn't be sent anyway (see Agent.learn, fri #335).
                     return {'blocked': 'Learning is paused while saved context is held back: a withdrawals record '
                                        'could not be read. fri health says until when.'}
+                if not await self.agent.learning_offered():  # Nor could it here (fri #346).
+                    return {'blocked': "Learning is paused: the controller doesn't say which messages it knows were "
+                                       'taken back (learning-withdrawals), so a pass could send nothing. It resumes '
+                                       'once the controller does.'}
                 claim = await self.fri.api('POST', '/agent/learning/request', self.agent.identity(self.user))
                 if 'blocked' in claim:
                     return claim

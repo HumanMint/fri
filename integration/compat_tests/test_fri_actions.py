@@ -88,7 +88,9 @@ def harness(monkeypatch, tmp_path):
     agent.state.update(channels=['1', '2', '3', '456'], history_channels=['1', '2'], started=time.time()-3600)
     agent.dedicated = 3
     agent.member = AsyncMock(return_value=SimpleNamespace(id=10))
-    agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'summary': ''})
+    # As the controller answers: removed_at 0, they never erased or removed a note. Without it, Fri can't tell and
+    # leaves their posts out of what it reads (fri #337's round 1).
+    agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'summary': '', 'removed_at': 0})
     reads = []
     ids = iter(range(1, 10**6))
     def message(user=20, text='I love trance', bot=False, age=60):

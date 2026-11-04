@@ -14,7 +14,7 @@ from gene.api import create_app
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import response_event
 from compat_tests.test_fri_heartbeat import heartbeat as heartbeat  # noqa: F401
-from compat_tests.test_fri_learning import HistoryChannel
+from compat_tests.test_fri_learning import HistoryChannel, needs_learning_withdrawals
 from compat_tests.test_fri_learning import learning as learning  # noqa: F401
 from compat_tests.test_fri_memes import attachment, build
 from fri.fri_agent import Agent
@@ -145,6 +145,7 @@ def test_a_long_learning_batch_keeps_the_tick_moving_message_by_message(learning
     wall, _, settings, scheduler = learning
     scheduler.update({'history_batch': 12}, 1, 'owner')
     client = TestClient(create_app(settings))
+    needs_learning_withdrawals(client)  # A pass asks for no batch from a controller without it (fri #346).
     channel = HistoryChannel()
     for i in range(12):
         channel.add(wall[0]-200+i)

@@ -35,6 +35,8 @@ from .fri_memory import (
     PROFILES,
     SOURCES,
     SUMMARIES,
+    before_erasure,
+    before_removal,
     describe_memory,
     describe_profile,
     drop_unheard,
@@ -685,6 +687,13 @@ class Fri(discord.Client):
                 context['acknowledgments_enabled'] = bool(self.agent and source.kind == 'discord_message' and not context['force_text_reply'])
                 from .fri_images import select_source
                 image_source = ((invitation.image if invitation else None) or await select_source(event)) if inspect_images else None
+                if image_source is not None and image_source is not event and self.agent and (
+                        not invitation or image_source is not invitation.image):
+                    # Their photo just before, paired with this message: from at or before their last erasure or
+                    # removal, with memory on, it's left out, as a reply target of it is (fri #337's round 1).
+                    profile = await self.agent.profile(source_channel, user_id)
+                    if profile.get('enabled') and before_removal(image_source.id, profile):
+                        image_source = None
                 if invitation and image_source:
                     invitation.image = image_source
                 if image_source is None and quick_closure(
@@ -1359,6 +1368,11 @@ class Fri(discord.Client):
         await reply(self, interaction, 'Thinking…', view=HomeView(self, user))
         try:
             revision = await self.agent.revision(user) if held else None
+            # Submitted before they last turned memory off, and read only once it's on again (say, during the edit
+            # above): what they said then is kept nowhere, so it isn't answered, as a DM isn't (fri #331, #337). An
+            # erasure after this read moves their revision, which the turn is held to from here (see talk).
+            if held and before_erasure(interaction.id, getattr(revision, 'erased_at', 0)):
+                raise AuthorErased()
             result = await self.talk(interaction.guild_id, interaction.channel_id, user, text, 'private',
                                      interaction.user.display_name, event=interaction, revision=revision,
                                      forgotten=forgotten)
