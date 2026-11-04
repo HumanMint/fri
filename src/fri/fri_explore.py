@@ -198,7 +198,8 @@ async def explore(agent, claim):
                               message_id=record['id'])
                 try:
                     found = await agent.fri.http.request(route)
-                except discord.NotFound:
+                except discord.NotFound:  # Deleted: taken back as its delete event would take it (fri #358).
+                    agent.unsend(channel.id, [int(record['id'])], agent.fri.guild_id)
                     found = None
                 if not (isinstance(found, dict) and str((found.get('author') or {}).get('id')) == record['user_id']
                         and clean(found.get('content') or '', 500) == record['text']):

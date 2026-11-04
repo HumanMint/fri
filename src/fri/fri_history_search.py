@@ -338,7 +338,8 @@ class HistorySearch:
                 continue
             try:
                 message = await channel.fetch_message(int(row['id']))
-            except discord.NotFound:
+            except discord.NotFound:  # Deleted, though the index still lists it: taken back as its event would (fri #358).
+                a.agent.unsend(channel.id, [int(row['id'])], a.guild)
                 continue
             carries = media(message)  # A meme with no caption is still a find.
             if (message.author.bot or message.webhook_id or started_a_thread(message) or
