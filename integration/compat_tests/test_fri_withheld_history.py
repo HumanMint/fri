@@ -19,7 +19,14 @@ from unittest.mock import AsyncMock
 import discord
 import pytest
 
-from compat_tests.test_fri_saved_withdrawal import SAVED, edit, edited, long_after, restarted
+from compat_tests.test_fri_saved_withdrawal import (
+    SAVED,
+    edit,
+    edited,
+    long_after,
+    restarted,
+    saved_before_the_edit,
+)
 from compat_tests.test_fri_turn_withdrawal import MARKER, WITHDRAW, saved, settled, world
 
 SOURCES = 'withdrawal-sources'
@@ -191,6 +198,7 @@ def test_a_failed_withdrawal_by_id_is_sent_again(monkeypatch, tmp_path):
         try:
             earlier = await earlier_exchange(w)
             restarted(w)
+            saved_before_the_edit(w)
             state = failing(w, SAVED)
             await edit(w, edited(earlier))
             state['down'] = False
@@ -250,6 +258,7 @@ def test_a_note_from_a_withdrawn_message_stays_out_while_its_withdrawal_is_pendi
             with w.store.connection() as db:  # Its exchange trimmed since: only the note holds the words.
                 db.execute('DELETE FROM chat_turns')
             restarted(w)
+            saved_before_the_edit(w)
             state = failing(w, SAVED)
             await edit(w, edited(said))
             state['down'] = False

@@ -20,6 +20,7 @@ from compat_tests.test_fri_turn_withdrawal import world as turn_world
 
 SAVED = '/chat/turn/withdraw/saved'
 SAVED_CAPABILITY = 'saved-turn-withdrawal'
+EDIT_TIMES = 'withdrawal-edit-times'
 
 
 async def world(monkeypatch, tmp_path, capable=True):
@@ -42,6 +43,23 @@ def edited(message, text='current safe caption'):
     current = copy.copy(message)
     current.content, current.edited_at = text, discord.utils.utcnow()
     return current
+
+
+def saved_before_the_edit(w, seconds=60):
+    """What the controller has saved so far, as if saved a minute before an edit made now. One within seconds of a save
+    can't be placed after it, so a controller offering edit times withdraws nothing of it, and Fri holds it back
+    instead (fri #358)."""
+    with w.store.connection() as db:
+        db.execute('UPDATE chat_turns SET at=at-?', (seconds,))
+        if 'sources_at' in {row[1] for row in db.execute('PRAGMA table_info(personal_notes)')}:
+            db.execute('UPDATE personal_notes SET at=at-?,sources_at=sources_at-?', (seconds, seconds))
+        else:
+            db.execute('UPDATE personal_notes SET at=at-?', (seconds,))
+
+
+def without_time(payloads):
+    """By-ID requests as main sends them: an edit's time, from a controller offering it (fri #358), aside."""
+    return [{key: value for key, value in payload.items() if key != 'edited_at'} for payload in payloads]
 
 
 async def edit(w, message, guild=123, channel=1):
@@ -94,6 +112,7 @@ def test_after_a_restart_it_is_found_by_id(monkeypatch, tmp_path, how):
             await w.agent.handle(earlier)
             await w.agent.handle(w.said('fri and lunch?'))
             restarted(w)
+            saved_before_the_edit(w)
             if how == 'edit':
                 await edit(w, edited(earlier))
             elif how == 'delete':
@@ -120,10 +139,12 @@ def test_a_dm_is_asked_about_under_fris_server(monkeypatch, tmp_path):
                       'display_name': 'friend'}
             w.store.save_chat('123', 'private:600', '20', 0, 'dm about '+MARKER, 'okay', 'model', 'high',
                               source=source, provenance=[])
+            saved_before_the_edit(w)
             dm = SimpleNamespace(id=int(mid), content='changed it', edited_at=discord.utils.utcnow(),
                                  author=SimpleNamespace(id=20, bot=False))
             await edit(w, dm, guild=None, channel=600)
-            assert asked(w) == [{'guild_id': '123', 'message_ids': [mid]}]
+            assert without_time(asked(w)) == [{'guild_id': '123', 'message_ids': [mid]}]
+            assert ('edited_at' in asked(w)[0]) is (EDIT_TIMES in w.fri.capabilities)
             assert MARKER not in str(w.store.chat_context('123', 'private:600', '20')['turns'])
         finally:
             await w.fri.close()
@@ -145,18 +166,20 @@ def test_what_fri_couldnt_have_saved_asks_nothing(monkeypatch, tmp_path):
             await edit(w, edited(unrelated), guild=456, channel=3)  # Another server.
             await edit(w, edited(unrelated), guild=456, channel=4)  # One whose channel Fri hasn't cached.
             # An edit of one older than any exchange the controller keeps, or any note, which one offering
-            # withdrawal-sources drops with its message too (gene #141).
+            # withdrawal-sources drops with its message too (gene #141). One offering edit times is asked about it, with
+            # its time, as a note may be newer (fri #358): that's test_fri_withdrawal_edit_times's.
             days = 91 if 'withdrawal-sources' in w.fri.capabilities else 8
             old = SimpleNamespace(id=discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=days)),
                                   content='x', edited_at=discord.utils.utcnow(), author=SimpleNamespace(id=20, bot=False))
-            await edit(w, old)
+            if EDIT_TIMES not in w.fri.capabilities:
+                await edit(w, old)
             card = copy.copy(unrelated)  # A link card or embed update: no edit of theirs.
             await edit(w, card)
             await w.fri.on_raw_message_edit(SimpleNamespace(channel_id=1, message=edited(unrelated)))  # Names no server.
             await settled(w)
             assert not asked(w)
             await edit(w, edited(unrelated))  # Where Fri chats: asked, and nothing holds it.
-            assert asked(w) == [{'guild_id': '123', 'message_ids': [str(unrelated.id)]}]
+            assert without_time(asked(w)) == [{'guild_id': '123', 'message_ids': [str(unrelated.id)]}]
             # Its deletion is asked about, whatever its age: a note learned from it may be newer (fri #342).
             await delete(w, old.id)
             assert asked(w)[1:] == [{'guild_id': '123', 'message_ids': [str(old.id)],

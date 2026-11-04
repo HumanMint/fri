@@ -39,6 +39,8 @@ SAVED_CAPABILITY = 'saved-turn-withdrawal'
 # The controller also drops notes learned from it and retires replies that carried it (gene #141), keeps the messages
 # a turn carried (drew_on), and names where notes and exchanges elsewhere came from when asked.
 SOURCES = 'withdrawal-sources'
+# The controller takes an edit's time by ID, and withdraws only what was saved before it (fri #358).
+EDIT_TIMES = 'withdrawal-edit-times'
 KEPT_SECONDS = 7*86400  # As long as the controller keeps a saved exchange.
 NOTED_SECONDS = 90*86400  # As long as it keeps a note, which a controller offering SOURCES drops with its message.
 MOST = 20000  # Bounds memory only: the controller keeps six exchanges per member and conversation.
@@ -377,7 +379,7 @@ class SavedTurns:
         self.withdraw(i for i in ids if i not in deleted and (agent.withdrawn.get(str(i), 0) >= wall or
                                                               agent.revised.get(i, 0) >= wall))
 
-    def withdraw(self, ids, server=None, deleted=False, authors=None):
+    def withdraw(self, ids, server=None, deleted=False, authors=None, edited_at=None):
         """Messages taken back: each exchange Fri saved with one goes, asked for once. server: the one Fri saves
         exchanges said where they were taken back under (see Agent.saved_in); any other one is then asked about by
         ID, ten at a time, from a controller offering it: a deletion whatever its message's age, since what drew on it
@@ -387,13 +389,26 @@ class SavedTurns:
         pin of one edited long ago say, looks the same here. deleted: not edited, so what carried them goes too (gene
         #141, #150). authors: message ID -> its author, where Fri knows it, so that one by ID can be kept on disk (see
         lasting). Each is held back from requests from now on (see withhold). A change to a queued one is a new entry
-        (see drain)."""
+        (see drain).
+
+        edited_at: when Discord says an edit was made (fri #358). From a controller offering EDIT_TIMES, an edit is
+        asked about by ID whatever its message's age, with that time, and the controller takes only what was saved
+        before it: a pin repeating an earlier edit's time takes nothing learned since. Of two edits queued for one
+        message, the later time stands; one with no time takes everything, so it stands over any time."""
         authors = {int(i): str(user) for i, user in (authors or {}).items() if str(user).isdigit()}
         ids = [int(i) for i in ids]
         horizon = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
         queued, now = False, time.time()
+        timed = not deleted and edited_at is not None and self.capable(EDIT_TIMES)
+
+        def edit_time(known):  # What an edit queued over `known` asks with (see above): None, everything.
+            if not known:
+                return edited_at if timed else None
+            return max(known['edited_at'], edited_at) if timed and 'edited_at' in known else None
         for i in ids:
             known = self.pending.get(str(i), {})
+            if known.get('hold') and deleted and known.get('server'):
+                known = {}  # Kept out of use for an edit it couldn't place (see drain): a deletion takes it all.
             entry = self.saved.pop(i, None)
             if entry is not None:
                 if self.offered():
@@ -401,7 +416,7 @@ class SavedTurns:
                                                       deleted=deleted or known.get('deleted') is True,
                                                       since=known.get('queued_at'))
                     queued = True
-            elif server is not None and (deleted or sent_at(i) > now-horizon):
+            elif server is not None and (deleted or timed or sent_at(i) > now-horizon):
                 if self.offered() and self.capable(SAVED_CAPABILITY):
                     if known.get('hold'):  # Held from disk: it stays held, and on disk, whatever comes by ID.
                         pass
@@ -411,12 +426,14 @@ class SavedTurns:
                                                               deleted=True, restored=known.get('restored'),
                                                               since=known.get('queued_at'))
                             queued = True
-                    elif not known or (deleted and not known.get('deleted')) or (i in authors and 'user_id' not in known):
-                        author = authors.get(i, known.get('user_id'))
-                        self.pending[str(i)] = self.entry(server=str(server), deleted=deleted or known.get('deleted')
-                                                          is True, restored=known.get('restored'),
-                                                          since=known.get('queued_at'),
-                                                          **({'user_id': author} if author else {}))
+                    elif (not known or (deleted and not known.get('deleted')) or (i in authors and 'user_id' not in known)
+                          or (not deleted and not known.get('deleted') and edit_time(known) != known.get('edited_at'))):
+                        author, gone = authors.get(i, known.get('user_id')), deleted or known.get('deleted') is True
+                        when = None if gone else edit_time(known)
+                        self.pending[str(i)] = self.entry(server=str(server), deleted=gone,
+                                                          restored=known.get('restored'), since=known.get('queued_at'),
+                                                          **({'user_id': author} if author else {}),
+                                                          **({'edited_at': when} if when is not None else {}))
                         queued = True
             else:
                 continue  # Nothing Fri saves could hold it.
@@ -607,13 +624,18 @@ class SavedTurns:
                 else:
                     first = self.pending[due[0]]
                     batch = [(i, self.pending[i]) for i in due if self.pending[i].get('server') == first['server']
-                             and self.pending[i].get('deleted') is first.get('deleted')][:BATCH]
+                             and self.pending[i].get('deleted') is first.get('deleted')
+                             and self.pending[i].get('edited_at') == first.get('edited_at')][:BATCH]
                 tried.update(entry['gen'] for _, entry in batch)
-                sent = await self.post(batch)
+                sent, unsure = await self.post(batch)
                 for i, entry in batch:
                     if self.pending.get(i) is not entry:
                         continue  # Replaced or forgotten while it was sent: the newer one stands, or none.
-                    if (i, entry['gen']) in sent:
+                    if (i, entry['gen']) in sent and i in unsure:
+                        # Saved too close to the edit to tell which came first, so nothing was withdrawn: held back
+                        # instead until nothing it names can be kept, its server kept for a deletion (fri #358).
+                        self.pending[i] = self.entry(hold=True, server=entry['server'], since=entry['queued_at'])
+                    elif (i, entry['gen']) in sent:
                         del self.pending[i]
                     else:
                         self.wait(entry)
@@ -641,6 +663,8 @@ class SavedTurns:
         guard (SOURCES), and only with the revision it was saved under, so a member erased since through another Fri
         gets nothing written."""
         if entry.get('hold') or not self.offered() or ('scope' not in entry and not self.capable(SAVED_CAPABILITY)):
+            return False
+        if 'edited_at' in entry and not self.capable(EDIT_TIMES):  # Never without its time, which takes everything.
             return False
         return not entry.get('restored') or (self.capable(SOURCES) and entry.get('revision') is not None)
 
@@ -694,37 +718,44 @@ class SavedTurns:
         if 'scope' in entry:
             return '/chat/turn/withdraw', {**entry['scope'], 'message_id': str(first), **self.extra(entry)}
         return '/chat/turn/withdraw/saved', {'guild_id': entry['server'], 'message_ids': ids,
-                                             **self.extra({'deleted': entry.get('deleted')})}
+                                             **self.extra({'deleted': entry.get('deleted')}),
+                                             **({'edited_at': entry['edited_at']} if 'edited_at' in entry else {})}
 
     async def post(self, batch):
         """Sent as the controller takes it. A refusal may come from a controller rolled back alone, which doesn't know a
         field or a request Fri learned at its start: Fri reads its contract again and, if the request it would make now
         differs, sends that once more right away. Before each request (the first and that one), only the entries still
         queued as they were, for members who haven't erased since, and safe to send as the controller now stands, go
-        (see current): any other waits, or was dropped meanwhile. Returns (message ID, generation) of those taken.
-        Logged without the words."""
+        (see current): any other waits, or was dropped meanwhile. Returns (message ID, generation) of those taken, and
+        of an edit sent with its time, the message IDs the controller couldn't place against it, so withdrew nothing of
+        (fri #358): all of them, if it doesn't say which. Logged without the words."""
         made = None
         for attempt in (1, 2):
             live = [(i, entry) for i, entry in batch if self.current(i, entry)]
             if not live:
-                return set()
+                return set(), set()
             path, payload = self.request(live)
             if (path, payload) == made:
-                return set()  # The same request again: nothing changed, so it waits.
+                return set(), set()  # The same request again: nothing changed, so it waits.
             made, ids = (path, payload), ', '.join(i for i, _ in live)
             text = (f'Withdrawn message{"s" if len(live) > 1 else ""} %s {"were" if len(live) > 1 else "was"} not '
                     'dropped from saved turns: %s')
             try:
-                await self.agent.fri.api('POST', path, payload)
-                return {(i, entry['gen']) for i, entry in live}
+                answer = await self.agent.fri.api('POST', path, payload)
+                unsure = answer.get('unsure') if isinstance(answer, dict) else None
+                if 'edited_at' not in payload:
+                    unsure = []
+                elif not (isinstance(unsure, list) and all(isinstance(i, str) for i in unsure)):
+                    unsure = [i for i, _ in live]
+                return {(i, entry['gen']) for i, entry in live}, set(unsure)
             except ControllerRejected as exc:
                 failed(text, ids, exc)
                 if attempt == 2 or exc.status is None or not await self.reread():
-                    return set()
+                    return set(), set()
             except Exception as exc:
                 failed(text, ids, exc)
-                return set()
-        return set()
+                return set(), set()
+        return set(), set()
 
 
 class Unreadable(ValueError):
