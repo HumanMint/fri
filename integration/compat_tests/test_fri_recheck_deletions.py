@@ -102,8 +102,8 @@ def sent_ids(asked):
     return [[record['id'] for record in data['messages']] for data in asked]
 
 
-def test_the_repro_a_learning_pass_that_finds_a_message_deleted_takes_back_the_note_saved_from_it(  # noqa: F811
-        learning, monkeypatch):
+def test_the_repro_a_learning_pass_that_finds_a_message_deleted_takes_back_the_note_saved_from_it(
+        learning, monkeypatch):  # noqa: F811
     """The issue: member 11's message is deleted in Discord while the summary request signs in, and its event never
     reaches Fri. Reading the batch again, the pass left it out, but queued nothing, so the note Fri learned from it
     earlier stayed in Gene. Read again by its ID, Discord says it's gone: it's withdrawn under the server, and Gene

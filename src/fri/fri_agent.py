@@ -2631,7 +2631,7 @@ class Agent:
                 there at all is taken back if Discord says by its ID that it's deleted (fri #358)."""
                 now = {str(m.id): m async for m in channel.history(**reading)}
                 gone = {record['id'] for record in kept if not unchanged(now.get(record['id']), record)}
-                await self.deleted(channel, sorted(gone-now.keys(), key=int), self.fri.guild_id)
+                await self.deleted(channel, sorted(gone-now.keys(), key=int), self.channel_guild(channel.id))
                 return gone | await self.gene_withdrawn(claim['id'], [(record['id'], record['user_id'])
                                                                       for record in kept if record['id'] not in gone])
             if records:
