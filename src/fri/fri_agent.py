@@ -32,10 +32,11 @@ from .fri_errors import (
     ControllerRejected,
     ControllerUnavailable,
     GateClosed,
+    message_gone,
 )
 from .fri_images import forwarded, media, started_a_thread
 from .fri_ledger import COOLDOWN, Ledger, addressed, notice_reason
-from .fri_memory import before_erasure, before_removal, memory_intent, valid_time
+from .fri_memory import before_erasure, before_removal, erased_cutoff, memory_intent, valid_time
 from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
 from .fri_reports import report_message
@@ -576,6 +577,21 @@ class Agent:
         if i not in self.unsent:
             self.unsent[i] = time.monotonic()
 
+    async def deleted(self, channel, ids, server):
+        """Messages a read again (a history window, the pins) no longer lists, each read from `channel` by its ID: one
+        Discord says is gone (Unknown Message, see message_gone) is taken back under `server` as its delete event, which
+        may never have come, would take it (see unsend), so what was saved from it earlier goes too (fri #358). One
+        still there (unpinned, out of the window), or one Discord won't say about (refused, failing, another 404), is
+        left as it is: nothing goes on a guess."""
+        for i in ids:
+            try:
+                await channel.fetch_message(int(i))
+            except discord.NotFound as exc:
+                if message_gone(exc):
+                    self.unsend(channel.id, [int(i)], server)
+            except (discord.DiscordException, aiohttp.ClientError, OSError):
+                pass
+
     def saw(self, ids, ours=()):
         """Messages a turn's model request carries, wherever they came from (the live view, a reply target, a
         read, a look): a delete is marked for an hour, past any reply still running, even once one leaves the
@@ -930,7 +946,7 @@ class Agent:
         if not isinstance(current, int) or isinstance(current, bool):
             return current  # As the controller gave it, so callers check it as before.
         read = Revision(current)
-        read.erased_at = (valid_time(profile.get('erased_at')) or 0) if profile.get('enabled') else 0
+        read.erased_at = (valid_time(erased_cutoff(profile)) or 0) if profile.get('enabled') else 0
         return read
 
     async def erasure(self, user, forgotten, revision=None):
@@ -1699,7 +1715,7 @@ class Agent:
                                                               forgotten)) is not None:
                 if self.forgotten.get(message.author.id, 0) != forgotten:
                     return self.miss(message, 'author privacy changed')  # During that read, as below.
-                if profile.get('enabled') and before_erasure(message.id, profile.get('erased_at')):  # Never a control.
+                if profile.get('enabled') and before_erasure(message.id, erased_cutoff(profile)):  # Never a control.
                     return self.miss(message, PREDATES)
                 await self.respond(message, await addressed_text(message, self.fri.user.id), invitation=invitation, addressed=True,
                                    forgotten=forgotten, revision=invitation.revision)
@@ -1778,7 +1794,7 @@ class Agent:
             if not privacy and self.forgotten.get(message.author.id, 0) != forgotten:
                 return self.miss(message, 'author privacy changed')  # During that read: it may be from after.
             observed = profile.get('revision', 0)
-            if profile['enabled'] and not privacy and before_erasure(message.id, profile.get('erased_at')):
+            if profile['enabled'] and not privacy and before_erasure(message.id, erased_cutoff(profile)):
                 return self.miss(message, PREDATES)
             # Not if it was deleted or edited while its profile was read.
             if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
@@ -2615,9 +2631,11 @@ class Agent:
 
             async def verify(kept):
                 """Signed in, the batch's history read again as it was read (fri #335): a message gone, or reading
-                otherwise now, was withdrawn whether or not its event reached Fri; then what Gene knows was."""
+                otherwise now, was withdrawn whether or not its event reached Fri; then what Gene knows was. One not
+                there at all is taken back if Discord says by its ID that it's deleted (fri #358)."""
                 now = {str(m.id): m async for m in channel.history(**reading)}
                 gone = {record['id'] for record in kept if not unchanged(now.get(record['id']), record)}
+                await self.deleted(channel, sorted(gone-now.keys(), key=int), self.channel_guild(channel.id))
                 return gone | await self.gene_withdrawn(claim['id'], [(record['id'], record['user_id'])
                                                                       for record in kept if record['id'] not in gone])
             if records:

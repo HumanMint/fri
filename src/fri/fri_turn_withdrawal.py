@@ -72,6 +72,8 @@ class SavedTurns:
         self.tasks = set()  # The worker sending withdrawals, while it runs.
         self.marked = {}  # Message ID (str) -> when it was taken back, oldest first.
         self._pending = None  # Message ID (str) -> what to send for it; read from disk on first use.
+        # When the first of those can no longer be kept, and the horizon that was worked out with (see expire).
+        self.expiry = (0.0, None)
         self.timer = None
         self.generation = 0  # Each queued entry's own number: a reply to an older one never settles a newer one.
         self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
@@ -109,12 +111,25 @@ class SavedTurns:
         return {**what, 'queued_at': stamped, 'tries': 0, 'due': 0, 'gen': self.generation,
                 **({'restored': True} if restored else {}), **({'erasure': self.erasure(user)} if user else {})}
 
+    def horizon(self):
+        """How long the controller, as it last said, keeps what a withdrawal names: a week, or a note's 90 days from one
+        offering SOURCES."""
+        return NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
+
     def lasts(self, i, entry):
-        """Until when what a queued withdrawal names can be kept: a horizon (a week, or a note's 90 days from a
-        controller offering SOURCES) from the later of its message's time and when it was queued (fri #329). Its
-        message's time alone isn't enough: an exchange or a note drawn from it is saved later, and kept from then."""
-        kept = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
-        return max(sent_at(int(i)), entry.get('queued_at', 0))+kept
+        """Until when what a queued withdrawal names can be kept: a horizon (see horizon) from the later of its message's
+        time and when it was queued (fri #329). Its message's time alone isn't enough: an exchange or a note drawn from
+        it is saved later, and kept from then."""
+        return max(sent_at(int(i)), entry.get('queued_at', 0))+self.horizon()
+
+    def expire(self):
+        """What can no longer be kept goes as soon as anything asks what's held back, not at the next withdrawal, save
+        or start (see prune): a hold, never sent, would otherwise go on holding its message back, and what waits on the
+        queue (a member's summary), past its time (fri #358). Only once the first of them is due, or the horizon has
+        changed with the controller, so a check stays cheap."""
+        pending, now = self.pending, time.time()  # Read first: a start's read prunes too.
+        if pending and (now >= self.expiry[0] or self.expiry[1] != self.horizon()):
+            self.prune(now)
 
     @property
     def pending(self):
@@ -301,8 +316,9 @@ class SavedTurns:
         it's known ('unreadable', 'capacity'; none for a deadline an older Fri wrote), whether queued withdrawals are
         saved to disk meanwhile, and if not, why ('unsaved_for', as closed_for), and how many wait. No IDs, nothing of
         the record."""
+        self.expire()
         closed = self.closed()
-        unsaved = UNREADABLE_CAUSE if self.blocked else CAPACITY_CAUSE if self.unwritten else None
+        unsaved =UNREADABLE_CAUSE if self.blocked else CAPACITY_CAUSE if self.unwritten else None
         return {'closed_until': self.closed_until if closed else None,
                 'closed_for': sorted(self.closed_for) if closed else [], 'saved_to_disk': unsaved is None,
                 'unsaved_for': unsaved, 'pending': len(self.pending)}
@@ -479,7 +495,8 @@ class SavedTurns:
         lasting = {i: self.lasts(i, entry) for i, entry in self._pending.items()}
         for i in [i for i, until in lasting.items() if until <= now]:
             del self._pending[i], lasting[i]
-        extra = sorted(lasting, key=lambda i: (lasting[i], int(i)))[:max(0, len(lasting)-MOST)]
+        self.expiry = (min(lasting.values(), default=math.inf), self.horizon())
+        extra =sorted(lasting, key=lambda i: (lasting[i], int(i)))[:max(0, len(lasting)-MOST)]
         if not extra:
             return
         until, causes_then = max(self.closed_until, max(lasting[i] for i in extra)), set(self.closed_for)
@@ -498,12 +515,14 @@ class SavedTurns:
 
     def withholding(self):
         """Whether anything is held back now, so a memory view should be screened (see screen)."""
+        self.expire()
         now = time.time()
         return self.closed() or bool(self.pending) or any(at >= now-MARKED_SECONDS for at in self.marked.values())
 
     def withheld(self, ids):
         """Of these message IDs, those taken back while a turn may still hold a copy, or whose withdrawal the
         controller hasn't taken yet; all of them while a record couldn't be read (see fail_closed)."""
+        self.expire()
         if self.closed():
             return {str(i) for i in ids}
         now = time.time()

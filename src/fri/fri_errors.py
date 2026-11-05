@@ -3,6 +3,13 @@
 from . import feedback as commands
 
 UNREACHABLE = 'can’t reach my memory rn, so i’m sitting this one out. try again in a few.'
+UNKNOWN_MESSAGE = 10008  # Discord's error code for a message that doesn't exist.
+
+
+def message_gone(exc):
+    """Whether Discord's 404 says the message itself is gone (Unknown Message). Any other 404, Unknown Channel say,
+    doesn't show that, so it's an unconfirmed read: left out, never withdrawn (fri #358, Sol round 1 of #362)."""
+    return getattr(exc, 'code', None) == UNKNOWN_MESSAGE
 
 
 class ControllerRejected(commands.UserFeedbackCheckFailure):

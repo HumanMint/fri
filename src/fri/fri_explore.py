@@ -7,6 +7,7 @@ from discord.http import Route
 
 from . import feedback as commands
 from .fri_agent_model import STRING, obj
+from .fri_errors import message_gone
 from .fri_memory import before_removal
 from .privacy import clean
 
@@ -198,7 +199,9 @@ async def explore(agent, claim):
                               message_id=record['id'])
                 try:
                     found = await agent.fri.http.request(route)
-                except discord.NotFound:
+                except discord.NotFound as exc:  # Left out either way.
+                    if message_gone(exc):  # Deleted: taken back as its delete event would take it (fri #358).
+                        agent.unsend(channel.id, [int(record['id'])], agent.channel_guild(channel.id))
                     found = None
                 if not (isinstance(found, dict) and str((found.get('author') or {}).get('id')) == record['user_id']
                         and clean(found.get('content') or '', 500) == record['text']):
