@@ -885,3 +885,32 @@ def test_my_memory_listed_before_its_channel_went_never_shows(monkeypatch, tmp_p
         finally:
             await w.fri.close()
     run(scenario)
+
+
+@pytest.mark.parametrize('went', [True, False])
+def test_a_panel_reply_written_while_its_channel_went_never_shows_or_is_saved(monkeypatch, tmp_path, went):
+    """Sol round 3 of #372, on the /fri panel: #general's note named no message, and #general is withdrawn while the
+    model answers. Nothing of the reply shows, and nothing is saved."""
+    async def scenario():
+        from compat_tests.test_fri_panel_and_learning_fences import panel, shown, skipped
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            with w.store.connection() as db:
+                db.execute(LEGACY)
+
+            async def respond(text, context):
+                assert remembered(context) == ['I like Minecraft']
+                if went:
+                    await deleted(w, GENERAL)
+                return ChatResult(status='completed', reply='you like minecraft, groundbreaking')
+            model(w, respond)
+            saves = len([path for path, _ in w.calls if path == '/chat/turn'])
+            interaction = panel(w.fri)
+            await w.fri.chat_interaction(interaction, 'what do i like')
+            assert ('minecraft' in shown(interaction)) is not went
+            assert (shown(interaction) == skipped()) is went
+            assert len([path for path, _ in w.calls if path == '/chat/turn']) == saves + (not went)
+        finally:
+            await w.fri.close()
+    run(scenario)
