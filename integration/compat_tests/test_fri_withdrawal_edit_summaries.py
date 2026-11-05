@@ -1,11 +1,12 @@
-"""An edit the controller can't place, against the member summary that drew on its message (fri #358 E1, Sol round 1 of
-#364, B1); and the versions a learning pass names for the notes it may teach.
+"""An edit against the member summary that drew on its message (fri #358 E1, Sol rounds 1 and 2 of #364, B1 and B2);
+and the versions a learning pass names for the notes it may teach.
 
-Built from member 20's messages, the summary names them as its sources. One of those messages is then answered again
-after an edit, and the edit's event, delivered after a restart, finds saves of both versions: the controller withdraws
-nothing and Fri holds the message back. Nothing in a later request elsewhere names that message any more, as its
-exchanges aged out of what other channels see, so the summary still carried what the edit took away. The controller
-holds it back too, until it's read again.
+Built from member 20's messages, the summary names them as its sources, with the version of each. One of those
+messages is then answered again after an edit, and the edit's event, delivered after a restart, finds the save of the
+edited version, and the one from before it too unless that was trimmed since: the controller keeps the new exchange
+(and, with both, withdraws nothing and Fri holds the message back). Nothing in a later request elsewhere names that
+message any more, as its exchanges aged out of what other channels see, so the summary still carried what the edit took
+away. The summary is placed by itself: it drew on the version before the edit, so it goes.
 """
 import asyncio
 import datetime as dt
@@ -28,7 +29,10 @@ async def recalls(text, context):
     return ChatResult(status='completed', reply=CONTINUATION)
 
 
-def test_b1_an_unsure_edit_holds_back_the_summary_that_drew_on_its_message(monkeypatch, tmp_path):
+@pytest.mark.parametrize('earlier', ['kept', 'trimmed'])
+def test_an_edit_takes_the_summary_that_drew_on_the_version_before_it(monkeypatch, tmp_path, earlier):
+    """B1 (round 1): with both exchanges, the edit can't be placed, and the summary was carried on. B2 (round 2): the
+    earlier exchange trimmed, the edited one vouched for the message, summary and all."""
     async def scenario():
         w = world(monkeypatch, tmp_path)
         try:
@@ -38,6 +42,10 @@ def test_b1_an_unsure_edit_holds_back_the_summary_that_drew_on_its_message(monke
             message, later = events[0], sent_at(events[0].id)+1  # Edited a second after it was sent.
             source = {'kind': 'discord_message', 'id': str(message.id), 'user_id': '20', 'channel_id': str(GENERAL),
                       'guild_id': '123', 'display_name': 'member'}
+            if earlier == 'trimmed':  # As six later saves would.
+                with w.store.connection() as db:
+                    db.execute("DELETE FROM chat_turns WHERE json_extract(NULLIF(source,''),'$.id')=?",
+                               (str(message.id),))
             # Answered again as edited, with a note kept in this conversation only, both from the edited version.
             w.store.save_chat('123', f'public:{GENERAL}', '20', 0, 'fri raid tonight? at nine', 'okay', 'model', 'high',
                               source=source, provenance=[], versions={str(message.id): later},
@@ -49,12 +57,13 @@ def test_b1_an_unsure_edit_holds_back_the_summary_that_drew_on_its_message(monke
                                      embeds=[])
             await w.fri.on_raw_message_edit(SimpleNamespace(channel_id=GENERAL, guild_id=123, message=edited))
             await asyncio.gather(*w.fri.agent.saved_turns.tasks)
-            assert w.fri.agent.saved_turns.pending[str(message.id)].get('hold') is True
+            held = w.fri.agent.saved_turns.pending.get(str(message.id), {}).get('hold')
+            assert held is (True if earlier == 'kept' else None)
             model(w, recalls)
             await w.say(GAMING, 'fri what were we on about')
             assert not model_context(w).get('member_summary')
-            with w.store.connection() as db:  # Held back, not dropped: a recheck brings it back if it stands.
-                assert db.execute('SELECT count(*) FROM fri_member_summaries').fetchone()[0] == 1
+            with w.store.connection() as db:
+                assert db.execute('SELECT count(*) FROM fri_member_summaries').fetchone()[0] == 0
         finally:
             await w.fri.close()
     run(scenario)
