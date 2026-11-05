@@ -341,7 +341,11 @@ def entry_of(channel, entry, now):
     if not (type(guild) is str and guild.isdigit() and type(threads) is list and type(queued) in (int, float) and
             all(type(thread) is str and thread.isdigit() for thread in threads)):
         return None
-    return {'guild_id': guild, 'queued_at': when(queued, now), 'threads': threads}
+    try:
+        queued = when(queued, now)
+    except OverflowError:  # An integer no float holds, 10**400 say (Sol round 4 of #372, B1).
+        return None
+    return {'guild_id': guild, 'queued_at': queued, 'threads': threads}
 
 
 def when(value, now):

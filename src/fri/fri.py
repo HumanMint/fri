@@ -411,8 +411,19 @@ class Fri(discord.Client):
         LOG.warning('Usage receipt set aside in usage/rejected: %s', cause)
 
     async def chat_once(self, text, context):
-        async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
+        async def ready(depth=0):  # Signed in by now, so nothing waits between these checks and the request they clear.
             fence = context.get('fence')
+
+            async def refreshed():
+                """A context read before a channel's withdrawal was accepted: what it held of the channel can't be told
+                from the rest, so it's dropped whole, read again, and every check here repeated on that, at most REREADS
+                times. Withdrawals still moving past each read, the member is told to ask again rather than answered
+                with nothing saved (Sol rounds 3 and 4 of #372)."""
+                self.agent.channel_withdrawals.drop(context)
+                if fence.get('reread') is None or depth >= REREADS:
+                    raise commands.UserFeedbackCheckFailure(CHANNELS_MOVED)
+                await fence['reread'](context)
+                return await ready(depth + 1)
             looked = [read['event'].id for read in context.get('image_reads', [])]
             if context.get('image_event') is not None:
                 looked.append(context['image_event'].id)
@@ -480,6 +491,11 @@ class Fri(discord.Client):
                 # With the summaries Fri's replies in view (and one it answers) drew on, as they stand now: refused
                 # if one went. They count for the save only once the request still carries them (see depend). Only
                 # what the request could still carry: a row taken back by now goes before it (fri #217).
+                # A context a channel's withdrawal moved past is read again before the turn's check, which it would
+                # otherwise decide: a reply it holds may have drawn on a summary that went with the channel (Sol round
+                # 4 of #372, S1). Its earlier requests' dependencies stay in the fence.
+                if self.agent and self.agent.channel_withdrawals.moved(fence.get('channels')):
+                    return await refreshed()
                 prospective = self.dependencies(self.standing(context))
                 try:
                     await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
@@ -509,15 +525,7 @@ class Fri(discord.Client):
             # And a context read before a channel's withdrawal was accepted, whole: what it held of the channel can't be
             # told from the rest, a note naming no message, say (fri #372 round 2, B3).
             if self.agent and fence and self.agent.channel_withdrawals.moved(fence.get('channels')):
-                self.agent.channel_withdrawals.drop(context)
-                # Read again, as the controller has it now, and every check above repeated on that: at most REREADS
-                # times. Withdrawals still moving past each read, the turn waits for them to ask again rather than
-                # answer with nothing saved (Sol round 3 of #372).
-                if fence.get('reread') is None or fence.get('rereads', 0) >= REREADS:
-                    raise commands.UserFeedbackCheckFailure(CHANNELS_MOVED)
-                fence['rereads'] = fence.get('rereads', 0) + 1
-                await fence['reread'](context)
-                return await ready()
+                return await refreshed()  # Accepted during the checks above (see refreshed).
             if self.agent:
                 seen.update(int(i) for i in self.agent.saved_turns.withhold(context))
             # One this turn quotes or replies to refuses it instead: the answer would be about words taken back,
@@ -697,7 +705,11 @@ class Fri(discord.Client):
                     fresh = self.shaped(place_notes(self.get_channel, attributed(await self.api(
                         'POST', '/chat/context', profiled(self, scope, True))), scope['conversation_id']),
                         guild_id, summarized)
-                    into.update({key: fresh.get(key) for key in REREAD})
+                    fresh = {key: fresh.get(key) for key in REREAD}
+                    # The turn's own context too, which a tool's follow-up request copies: a later one then reads what
+                    # this did, under the generation it records (Sol round 4 of #372, S2).
+                    context.update(fresh)
+                    into.update(fresh)
                     into['fence']['channels'] = generation
                 conversation, targets = {}, []
                 if self.agent and source.kind == 'discord_message':
