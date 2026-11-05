@@ -2343,9 +2343,29 @@ class Agent:
             # Neither outcome renews active attention or the ambient reply timer.
             await self.fri.waiting_notices.clear(message.author.id)
             return
+        # A preview (a settings preview's first page, a post's or a reminder's card) carries the words of everyone the
+        # turn drew on, and so does a reply drawing on someone else's after a read awaited past talk's fence (a DM's
+        # membership lookup, a ping's reads): held to the turn's whole fence too, as a preview's later pages and Apply
+        # are (fri #324 item 1). Their erasures here since the turn began, then Gene's check of the whole turn, then
+        # those erasures again, here, after the last awaited read. The send's own last check is the part that reads
+        # nothing; what was delivered is held to the whole fence again before it's recorded.
+        drew = {str(row.get('user_id')) for row in (result.turn or {}).get('provenance') or []}
+        whole = (turn_fence(self, result.turn, message.author.id, counts)
+                 if result.settings_preview or result.post_preview or result.social_preview
+                 or ((dm or invitation) and drew - {str(message.author.id)}) else None)
+        if whole and not await whole():
+            if self.forgotten.get(message.author.id, 0) != counts.get(str(message.author.id), 0):
+                return missed('author privacy changed')  # Their own erasure: nothing goes out, quietly.
+            from .fri import PANEL_SKIPPED
+            await message.reply(PANEL_SKIPPED, allowed_mentions=NO_MENTIONS, mention_author=False)
+            self.explained(events, 'source privacy changed')  # Nothing of what changed, or whose, is said.
+            await self.fri.waiting_notices.clear(message.author.id)
+            return
+
         async def delivered():  # A preview is answered once posted, even if binding it fails next.
             self.answered(events)
-            if not taken_back():  # Deleted while it posted: the card stays, but isn't saved.
+            # Deleted, or someone it drew on erased, while it posted: the card stays, but isn't saved.
+            if not taken_back() and (whole is None or await whole()):
                 await self.fri.record_turn(result)
 
         if result.post_preview:
@@ -2386,7 +2406,8 @@ class Agent:
         sent = None
         try:
             sent = await send_reply(message, result, view=view, mention_author=False, allowed_mentions=NO_MENTIONS,
-                                    suppress_embeds=True, still=lambda: taken_back() is None)
+                                    suppress_embeds=True,
+                                    still=lambda: taken_back() is None and (whole is None or whole.unmoved()))
             if invitation:
                 invitation.delivered()  # An outside answer's receipt lasts from here (see Invitation.answered).
             if sent is None:  # Nothing was delivered, so nothing is recorded as said.
@@ -2398,8 +2419,8 @@ class Agent:
             self.saving.add(getattr(sent, 'id', None))  # So a delete while it saves is noticed (see unsend).
             self.answered(events, told=COOLDOWN if result.status == 'cooldown' else None)  # Its one notice.
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
-            # Deleted while it was sent: the reply stays, but isn't saved or echoed.
-            saved = None if taken_back() else await self.fri.record_turn(result, sent)
+            # Deleted, or someone it drew on erased, while it was sent: the reply stays, but isn't saved or echoed.
+            saved = None if taken_back() or (whole and not await whole()) else await self.fri.record_turn(result, sent)
             # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory,
             # or a save that failed, whose reply may carry exactly what the controller would have refused.
             if (echo and saved is not None and saved.get('kept', True) and message.guild and
