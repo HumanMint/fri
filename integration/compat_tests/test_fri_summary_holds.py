@@ -1,7 +1,7 @@
 """A member summary held back until its messages are read again (fri #349) holds back what was made from it too (fri
 #355), against the real controller.
 
-The controller keeps it all out of use while the summary is held, without retiring any of it (HumanMint/gene#GENEPR,
+The controller keeps it all out of use while the summary is held, without retiring any of it (HumanMint/gene#224,
 summary-holds): a turn that copied the summary is refused at its checks, and a saved reply that drew on it reads as
 withheld. From a controller that can't do that, Fri uses no summary at all, so nothing is made from one it may have to
 hold back.
