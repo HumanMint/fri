@@ -300,6 +300,8 @@ class Agent:
         self.windows = {}
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
         self.saved_turns = SavedTurns(self)  # Members' messages Fri saved exchanges with, dropped if taken back.
+        from .fri_channel_withdrawal import ChannelWithdrawals
+        self.channel_withdrawals = ChannelWithdrawals(self)  # Channels and threads deleted, until Gene took them.
         from .fri_mentions import Receipts
         self.receipts = Receipts()  # Fri's answers to outside pings a direct reply may read (see Invitation.answer).
 
@@ -2972,6 +2974,8 @@ class Agent:
             except Exception as exc:  # Never at the cost of the stages below.
                 LOG.warning('Meme notes not verified this tick: %s', type(exc).__name__)
             results = [await self.stage('presence', self.check_presence),
+                       # Whatever learning or memory does: a deleted channel's saves go (fri #358).
+                       await self.stage('channel_withdrawals', self.channel_withdrawals.settle),
                        await self.stage('posts', lambda: deliver_post(self.fri)),
                        await self.stage('reminders', lambda: deliver_reminder(self.fri)),
                        await self.stage('reports', self.send_reports),

@@ -1463,6 +1463,18 @@ class Fri(discord.Client):
         if self.agent:
             self.agent.unsend(payload.channel_id, payload.message_ids, self.agent.saved_in(payload))
 
+    # A channel or thread deleted takes every message in it, with no event for each (fri #358): what was saved from it
+    # goes by the channel, with the threads under it the cache still holds. discord.py sends a thread event only for
+    # those; the controller knows the others from the turns saved in them. A permission change withdraws nothing.
+    async def on_guild_channel_delete(self, channel):
+        if self.agent and channel.guild:
+            self.agent.channel_withdrawals.withdraw(channel.guild.id, channel.id,
+                                                    [thread.id for thread in getattr(channel, 'threads', ())])
+
+    async def on_raw_thread_delete(self, payload):
+        if self.agent:
+            self.agent.channel_withdrawals.withdraw(payload.guild_id, payload.thread_id)
+
     async def on_raw_message_edit(self, payload):
         if self.agent:
             self.agent.edit(payload.channel_id, payload.message, self.agent.saved_in(payload))
@@ -1577,6 +1589,7 @@ class Fri(discord.Client):
                 'current': self.agent.heartbeat_current} if self.agent else None,
             'outcomes': self.agent.ledger.snapshot() if self.agent else None,
             'withdrawals': self.agent.saved_turns.status() if self.agent else None,
+            'channel_withdrawals': self.agent.channel_withdrawals.status() if self.agent else None,
             'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,
