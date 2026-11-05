@@ -311,7 +311,13 @@ class SavedTurns:
                 pass
 
     def closed(self):
-        """Whether every saved context is held back now: a record couldn't be read (see fail_closed)."""
+        """Whether every saved context is held back now: a record couldn't be read (see fail_closed), or a channel or
+        thread deleted in Discord isn't withdrawn yet (fri #358; see fri_channel_withdrawal)."""
+        channels = getattr(self.agent, 'channel_withdrawals', None)
+        return self.closed_by_record() or bool(channels and channels.holding())
+
+    def closed_by_record(self):
+        """Whether a record couldn't be read (see fail_closed): the hold status reports."""
         self.pending  # Read first: that's what can close it.
         return time.time() < self.closed_until
 
@@ -321,7 +327,7 @@ class SavedTurns:
         saved to disk meanwhile, and if not, why ('unsaved_for', as closed_for), and how many wait. No IDs, nothing of
         the record."""
         self.expire()
-        closed = self.closed()
+        closed = self.closed_by_record()
         unsaved =UNREADABLE_CAUSE if self.blocked else CAPACITY_CAUSE if self.unwritten else None
         return {'closed_until': self.closed_until if closed else None,
                 'closed_for': sorted(self.closed_for) if closed else [], 'saved_to_disk': unsaved is None,

@@ -540,6 +540,9 @@ class ChatResult:
     turn: dict | None = None  # Staged /chat/turn record, saved only after Discord accepts delivery.
     echo: dict | None = None  # Delivered reply text and provenance for the shared channel view.
     shown: set = field(default_factory=set)  # Live-view message IDs the model saw; a delete withholds it.
+    # The channel withdrawals' generation its saved context was read at: one accepted since withholds it (see
+    # ChannelWithdrawals.moved, Sol round 3 of #372). None: nothing saved was read for it.
+    channels: int | None = None
 
 
 OUTPUT_EVENTS = ('response.output_', 'response.content_part.', 'response.reasoning', 'response.refusal.',
