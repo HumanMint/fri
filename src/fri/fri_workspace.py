@@ -10,7 +10,7 @@ import httpx
 
 from . import feedback as commands
 from .fri_context import discord_source
-from .fri_errors import ControllerRejected
+from .fri_errors import HELD, ControllerRejected
 from .privacy import clean
 from .subscription import private_json
 
@@ -220,7 +220,12 @@ async def deliver_one(fri):
         original = await dm.fetch_message(int(source['id']))
         if original.author.id != fri.owner_id or original.edited_at is not None:
             raise ValueError('Original request changed')
-        await fri.api('POST', f"/workspace/posts/{post['id']}/sending", {'lease': post['lease']})
+        try:
+            await fri.api('POST', f"/workspace/posts/{post['id']}/sending", {'lease': post['lease']})
+        except ControllerRejected as exc:
+            if getattr(exc, 'status', None) == HELD:  # Put back unsent until its draft's summary checks out:
+                return  # it's claimed and sent then, so nothing is recorded (fri #355).
+            raise
         sending = True
         result = await send_once(fri, post)
         message_id, state = str(int(result['id'])), 'sent'

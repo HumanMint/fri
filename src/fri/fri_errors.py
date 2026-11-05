@@ -3,6 +3,9 @@
 from . import feedback as commands
 
 UNREACHABLE = 'can’t reach my memory rn, so i’m sitting this one out. try again in a few.'
+# The controller's answer for something held back while a member summary it depends on is read again: refused for now,
+# not for good (fri #355). A delivery it puts back this way isn't recorded as failed.
+HELD = 423
 UNKNOWN_MESSAGE = 10008  # Discord's error code for a message that doesn't exist.
 
 
