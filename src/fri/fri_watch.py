@@ -406,9 +406,14 @@ class Watch:
                 parts.append("the controller doesn't take channels yet, so it stays until one that does is back")
             lines.append('- saved context: held back for deleted channels: ' + '; '.join(parts))
         if getattr(agent, 'summaries_wait_for_gene', False):  # A build skipped for it (fri #333, #348 r1, #349).
-            lines.append("- member summaries: paused and none used, the controller doesn't name a summary's messages "
-                         'and recheck kept ones (summary-sources, summary-rechecks), so none can be checked; they '
-                         'resume once it does')
+            from .fri_member_summary import HOLDS, RECHECKS, SOURCES
+            needs = {SOURCES: "name a summary's messages", RECHECKS: 'recheck kept ones',
+                     HOLDS: "hold back what was made from one while it's checked"}
+            # Only what the controller lacks, as its contract says now (fri #381).
+            missing = [name for name in needs if name not in getattr(fri, 'capabilities', ())] or list(needs)
+            lines.append("- member summaries: paused and none used, the controller doesn't "
+                         + ' or '.join(needs[name] for name in missing)
+                         + f" ({', '.join(missing)}), so none can be checked; they resume once it does")
         if getattr(agent, 'learning_waits_for_gene', False):  # A scheduled pass skipped for it (fri #346).
             lines.append("- learning: paused, the controller doesn't say which messages it knows were taken back "
                          "(learning-withdrawals); its contract is read again before each pass, and learning resumes "

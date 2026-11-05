@@ -100,10 +100,11 @@ class Watch:
     """The messages deleted or edited while one learning or exploration pass runs, any and anywhere, as the gateway
     reports them, so the pass leaves out what it holds of them before each model request (fri #325). Its own, and
     gone with it: nothing else reads it, so unlike unsend's marks it needn't be what Fri has in hand. Past PASS_WATCH,
-    it's full and can't tell any more (see Agent.retracted)."""
+    it's full and can't tell any more (see Agent.retracted). `channels`: the channel withdrawals' generation as the pass
+    began, before it read anything (see ChannelWithdrawals.moved, fri #378)."""
 
-    def __init__(self):
-        self.ids, self.full = set(), False
+    def __init__(self, channels=None):
+        self.ids, self.full, self.channels = set(), False, channels
 
     def taken(self, ids):
         if not self.full:
@@ -2523,16 +2524,31 @@ class Agent:
             await self._send_reports()
 
     async def _send_reports(self):
+        """The pending learning report, to the owner. The owner is found first, so no wait comes between the report's
+        fetch and its send but the fetch itself: one withdrawn while Fri looked them up goes as the controller holds it
+        now (fri #373). A channel's withdrawal accepted, or a message's queued here, during that fetch leaves it for the
+        next round, when the controller has it (fri #378). Nothing pending, nobody is looked up."""
+        owner = self.fri.get_user(self.fri.owner_id)
+        if owner is None:
+            if not await self.fri.api('GET', '/agent/reports'):
+                return
+            owner = await self.fri.fetch_user(self.fri.owner_id)
+        before = self.taken_back_mark()
         for report in await self.fri.api('GET', '/agent/reports'):
-            owner = self.fri.get_user(self.fri.owner_id) or await self.fri.fetch_user(self.fri.owner_id)
+            if self.taken_back_mark() != before:
+                return
             content, view = report_message(report)
             await owner.send(content, view=view, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
             await self.fri.api('POST', '/agent/reports/'+report['id']+'/delivered')
 
+    def taken_back_mark(self):
+        """Where withdrawals stand here: a channel's accepted, or a message's queued, moves it (fri #378)."""
+        return self.channel_withdrawals.generation, self.saved_turns.generation
+
 
     def watching(self):
         """A new pass's Watch, kept while the pass holds it (fri #325)."""
-        window = Watch()
+        window = Watch(self.channel_withdrawals.generation)
         self.passes.add(window)
         return window
 
@@ -2540,9 +2556,13 @@ class Agent:
         """Of these message IDs, those a pass mustn't send: deleted or edited since it began (see Watch), or held back
         anyway, marked deleted (see unsend) or withdrawn (see withdraw), or in the withdrawal queue (see
         SavedTurns.withheld). Raises ValueError when Fri can't tell: the queue's record unreadable, or the window
-        full. The pass then stops as a failed read does, and its batch is read again (fri #325)."""
+        full. The pass then stops as a failed read does, and its batch is read again (fri #325). So it does once a
+        channel's withdrawal was accepted since the pass began: it names no message the pass read, so what the pass
+        holds of the channel can't be told from the rest (fri #378)."""
         if window.full or self.saved_turns.closed():
             raise ValueError("Messages taken back meanwhile can't be told apart; this pass waits")
+        if self.channel_withdrawals.moved(window.channels):
+            raise ValueError("A channel was taken back while this pass read; it waits, and its batch is read again")
         ids = {str(i) for i in ids if str(i).isdigit()}
         return ({i for i in ids if int(i) in window.ids or int(i) in self.unsent} | (ids & self.withdrawn.keys())
                 | self.saved_turns.withheld(ids))
