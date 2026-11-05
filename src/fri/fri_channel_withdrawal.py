@@ -72,14 +72,17 @@ class ChannelWithdrawals:
         """The queue as written down. One that can't be read, says it's recovering, or wasn't written down in full
         (see marker) is never read as all there is: what it named would come back. Every saved context is held back
         instead, until a sweep has found, and the controller withdrawn, whatever is gone (see settle). A queue never
-        written, with no marker either, is a first start: written down now, empty. Logged without its contents."""
+        written, with no marker either, is a first start: written down now, empty, if it can be (a disk full from the
+        very first start, before anything could be written, can't be told from one). Logged without its contents."""
         path, marker = self.record(), self.marker()
         if path is None:
             return {}
         if not path.exists():
             self.loaded = {}
-            if marker.exists() or not self.persist():  # Removed since it was written, or not written now.
+            if marker.exists():  # Removed since it was written.
                 self.recover('was not written down')
+            else:  # A first start: nothing was queued to lose, whether or not it can be written now.
+                self.persist()
             return self.loaded
         try:
             data = json.loads(path.read_text())
