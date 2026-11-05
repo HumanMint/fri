@@ -243,9 +243,12 @@ def test_332_a_panel_reply_drawing_on_the_summary_is_held_to_its_sources(monkeyp
             turns.kick = lambda: None
             interaction = panel(w.fri)
 
+            responded = []
+
             async def respond(text, context, ready):
                 await ready()
                 assert SUMMARY in str(context.get('member_summary'))  # The request carried the summary.
+                responded.append(text)
                 return ChatResult(status='completed', reply='you plan raids, '+MARKER)
             model(w.fri, tmp_path, respond)
             api, saved, deleting = w.fri.api, [], []
@@ -254,7 +257,8 @@ def test_332_a_panel_reply_drawing_on_the_summary_is_held_to_its_sources(monkeyp
                 if path == '/chat/turn':
                     saved.append(payload)
                 answer = await api(method, path, payload)
-                if path == '/chat/turn/check' and deleted and not deleting:
+                # Gene's last check, after the model answered.
+                if path == '/chat/turn/check' and deleted and responded and not deleting:
                     deleting.append(path)
                     await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=GENERAL, guild_id=123,
                                                                       message_id=under))
