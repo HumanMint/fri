@@ -486,3 +486,47 @@ def test_a_controller_that_offers_channels_again_is_found_while_the_queue_holds(
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_my_memory_reads_again_though_the_controller_names_no_message(monkeypatch, tmp_path):
+    """Sol round 1 of #372, F1: a note learned in #general before notes named their messages, so the withdrawal can
+    name none. My memory still reads again: the withdrawal moves the marks' generation itself."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            with w.store.connection() as db:
+                db.execute("INSERT INTO personal_notes(guild_id,channel_id,user_id,category,evidence,at,origin,provenance) "
+                           "VALUES ('123','server','20','games','I like Minecraft',strftime('%s','now'),'public:1','[]')")
+            from fri.fri_memory_panel import withdrawals as screening
+            before = screening(w.fri)
+            await deleted(w, GENERAL)
+            assert withdrawals(w) and screening(w.fri) != before
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_recovery_never_trusts_an_empty_channel_list_or_an_unanswered_read(monkeypatch, tmp_path):
+    """Sol round 1 of #372, F3, each alone: recovering, a server channel list that comes back empty while the cache
+    holds channels says nothing, even with Discord answering Missing Access for the one channel read; and with a list,
+    a read that times out is no answer. Everything stays held back either way."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            w.channels.pop(GAMING)
+            guild = w.fri.get_guild(123)
+            for listed, answer in (([], discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'),
+                                                          {'code': 50001, 'message': 'Missing Access'})),
+                                   ([w.channels[GENERAL]], TimeoutError())):
+                (tmp_path/'channel-withdrawals.json').write_text('{"pending": {')
+                agent = restarted(w)
+                guild.fetch_channels = AsyncMock(return_value=listed)
+                guild.fetch_channel = AsyncMock(side_effect=answer)
+                await landed(w)
+                assert agent.channel_withdrawals.holding() and withdrawals(w) == [], listed
+        finally:
+            await w.fri.close()
+    run(scenario)
