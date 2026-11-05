@@ -141,12 +141,8 @@ class ChannelWithdrawals:
             self.written += 1
             private_json(path, {'pending': pending, 'recovering': self.recovering, 'written': self.written})
             private_json(marker, {'written': self.written})
-        except OSError as exc:  # Still queued, and held back, in memory; a start finds it unwritten.
+        except OSError as exc:  # Still queued, and held back, in memory; a start finds it unwritten (no marker).
             LOG.warning('Pending channel withdrawals could not be saved: %s', type(exc).__name__)
-            try:
-                marker.unlink(missing_ok=True)
-            except OSError:
-                pass
             return False
         return True
 

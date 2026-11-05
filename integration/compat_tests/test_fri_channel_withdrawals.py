@@ -7,6 +7,7 @@ withdraw, with everything saved from it and from its threads, and every saved co
 deletion Fri missed is found by a later read of what the controller holds: one Discord says is gone, not one Fri can no
 longer see.
 """
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -687,6 +688,50 @@ def test_fri_health_says_when_saved_context_waits_for_deleted_channels(monkeypat
             report = await Watch(w.fri).report()
             line = next(line for line in report.splitlines() if 'deleted channel' in line)
             assert 'recovering' in line
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_marker_naming_another_write_is_no_marker(monkeypatch, tmp_path):
+    """Sol round 2 of #372, B4: the queue on disk isn't the write its marker names (an older copy of it put back, say),
+    so it may not be all there is: a start holds everything back until a sweep has found what's gone."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            assert not queue(w).holding()  # Its queue and marker written once.
+            record = json.loads((tmp_path/'channel-withdrawals.json').read_text())
+            (tmp_path/'channel-withdrawals.json').write_text(json.dumps({**record, 'written': record['written'] + 1}))
+            assert restarted(w).channel_withdrawals.holding()
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_copy_read_before_a_threads_channel_was_named_never_reaches_the_reply_model(monkeypatch, tmp_path):
+    """Sol round 2 of #372, B3: a thread saved by an older controller, its channel unknown there, under #general,
+    which was withdrawn. A sweep names the thread's channel, and the controller withdraws the thread with it: that's a
+    withdrawal accepted too, so a private request's context read before it is dropped whole."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            await w.say(THREAD, 'fri I like osu', 'cool', note('I like osu'))
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            with w.store.connection() as db:
+                db.execute('DELETE FROM chat_thread_parents')  # As an older controller saved it.
+            general = w.channels.pop(GENERAL)
+            await w.fri.on_guild_channel_delete(general)  # No event for the thread: the cache's copy stays.
+            await queue(w).sending
+            assert await asked(w) == ['I like chess', 'I like osu']
+
+            async def swept():
+                queue(w).swept = 0
+                await landed(w)  # Names thread 70's channel: the controller withdraws it there.
+            paused_private_context(w, swept)
+            assert await asked(w) == []
+            assert await asked(w) == ['I like chess']
         finally:
             await w.fri.close()
     run(scenario)
