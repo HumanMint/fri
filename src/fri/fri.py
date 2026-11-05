@@ -1238,11 +1238,14 @@ class Fri(discord.Client):
                                                             'revision': context['revision']}],
                 **({'summarized': True} if summarized else {}), 'drew_on': sorted(drew_on)}
 
-    async def record_turn(self, result, sent=None):
-        """Save a staged turn once delivered. Delivery is the evidence Fri actually said it."""
+    async def record_turn(self, result, sent=None, still=None):
+        """Save a staged turn once delivered. Delivery is the evidence Fri actually said it. `still()`, awaited: whether
+        the turn still stands, for the first-memory notice's edit, which sends the reply's words again (fri #375's
+        round 1, B2). Without one, Gene's check of the turn."""
         payload, result.turn = result.turn, None
         if not payload:
             return None
+        staged = payload
         if isinstance(getattr(sent, 'id', None), int) and payload.get('response_kind', 'reply') == 'reply':
             payload = {**payload, 'reply_message_id': str(sent.id)}  # Later references resolve to its sources.
             delivered = getattr(sent, 'content', None)
@@ -1266,6 +1269,10 @@ class Fri(discord.Client):
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
             notice = self.first_memory(saved)
             content = (sent.content or '')+notice
+            # As the panel's redisplay (see chat_interaction): only while the turn stands, nothing awaited after.
+            if not await (still or (lambda: self.stands(staged)))():
+                LOG.info('First-memory notice left out: the turn moved')
+                return saved
             try:
                 if len(content.encode('utf-16-le'))//2 <= 2000:
                     await sent.edit(content=content)
@@ -1274,6 +1281,14 @@ class Fri(discord.Client):
             except discord.HTTPException:
                 LOG.info('First-memory notice was not added')
         return saved
+
+    async def stands(self, turn):
+        """Gene's check of a whole turn, for a caller with nothing of its own to hold it to: True while it stands."""
+        try:
+            await self.api('POST', '/chat/turn/check', turn)
+        except commands.UserFeedbackCheckFailure:
+            return False
+        return True
 
     @staticmethod
     def mention_cooldown(admission):

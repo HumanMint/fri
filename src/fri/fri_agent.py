@@ -2298,29 +2298,37 @@ class Agent:
             # Fri's earlier answer a ping read, taken back or out of date since (see Invitation.standing).
             return 'nearby message deleted' if changed(result.shown) or (invitation and not invitation.standing()) else None
 
-        if any(taken(event) for event in events):  # Taken back while Fri composed.
-            if again():
-                pass
-            elif edited() and not ambient:
-                # Edited, so maybe taken back, and not answered again: say so rather than go quiet.
-                from .fri import WITHDRAWN
-                await message.reply(notice_text(WITHDRAWN), allowed_mentions=NO_MENTIONS, mention_author=False)
-                self.answered(events, told='message withdrawn')
-            else:
-                missed('message deleted')
-            await self.fri.waiting_notices.clear(message.author.id)
-            return
-        if changed(result.shown) or (invitation and not invitation.standing()):
-            # Someone took back a message the model was shown: the reply may repeat it, and a reaction or a quiet
-            # decision answers it. None goes out or is saved; only a reply's words are worth saying why.
-            if ambient:
-                return missed('nearby message deleted')
-            if result.response_kind in ('react', 'quiet'):
-                missed('nearby message deleted')
+        async def gone():
+            """Handled, and True, once something was taken back here: while Fri composed, or while the whole turn's
+            fence waited below (fri #375's round 1). Nothing goes out then. It reads nothing before it decides."""
+            if any(taken(event) for event in events):  # Taken back while Fri composed.
+                if again():
+                    pass
+                elif edited() and not ambient:
+                    # Edited, so maybe taken back, and not answered again: say so rather than go quiet.
+                    from .fri import WITHDRAWN
+                    await message.reply(notice_text(WITHDRAWN), allowed_mentions=NO_MENTIONS, mention_author=False)
+                    self.answered(events, told='message withdrawn')
+                else:
+                    missed('message deleted')
                 await self.fri.waiting_notices.clear(message.author.id)
-                return
-            return await self.withheld(message, events, 'nearby message changed', invitation,
-                                       fenced=since is not None, control=since is None, logged='nearby message deleted')
+                return True
+            if changed(result.shown) or (invitation and not invitation.standing()):
+                # Someone took back a message the model was shown: the reply may repeat it, and a reaction or a quiet
+                # decision answers it. None goes out or is saved; only a reply's words are worth saying why.
+                if ambient:
+                    missed('nearby message deleted')
+                elif result.response_kind in ('react', 'quiet'):
+                    missed('nearby message deleted')
+                    await self.fri.waiting_notices.clear(message.author.id)
+                else:
+                    await self.withheld(message, events, 'nearby message changed', invitation, fenced=since is not None,
+                                        control=since is None, logged='nearby message deleted')
+                return True
+            return False
+
+        if await gone():
+            return
         if result.response_kind in ('react', 'quiet'):
             async def stop():  # Last before the reaction, after its wait for its turn.
                 return bool(since and await self.erasure(message.author.id, *since)) or taken_back() is not None
@@ -2343,28 +2351,45 @@ class Agent:
             # Neither outcome renews active attention or the ambient reply timer.
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        # A DM's reply drawing on someone else's words, after its membership lookup, a read awaited past talk's fence:
-        # held to the turn's whole fence too, as a preview's later pages and Apply are (fri #324 item 1). That's a
-        # settings preview's first page, a post's or a reminder's card, or any reply. Their erasures here since the
-        # turn began, then Gene's check of the whole turn, then those erasures again, here, after the last awaited
-        # read. The send's own last check is the part that reads nothing; what was delivered is held to the whole
-        # fence again before it's recorded. A public reply awaits nothing past talk's fence, and a ping's turn names
-        # no one (its grant and its own reads fence it).
+        # A DM's reply drawing on someone else's words, or on a summary, after its membership lookup, a read awaited
+        # past talk's fence: held to the turn's whole fence too, as a preview's later pages and Apply are (fri #324
+        # item 1). That's a settings preview's first page, a post's or a reminder's card, or any reply. Their erasures
+        # here since the turn began, then Gene's check of the whole turn (a summary's generation included: fri #375's
+        # round 1, S1), then those erasures again, here, after the last awaited read. Then what was taken back here
+        # while Gene answered: from there to the send, nothing is awaited (round 1, B1). What was delivered is held to
+        # all of it again before it's recorded. A public reply awaits nothing past talk's fence, and a ping's turn
+        # names no one (its grant and its own reads fence it). A DM drawing only on its requester's own words, with no
+        # summary, keeps its hot path: their erasure, or a note of theirs removed, moves their revision, which the
+        # read above (erasure) takes after the lookup.
+        from .fri import PANEL_SKIPPED, draws_on_summary
+        author = str(message.author.id)
         drew = {str(row.get('user_id')) for row in (result.turn or {}).get('provenance') or []}
-        whole = turn_fence(self, result.turn, message.author.id, counts) if dm and drew - {str(message.author.id)} else None
-        if whole and not await whole():
-            if self.forgotten.get(message.author.id, 0) != counts.get(str(message.author.id), 0):
-                return missed('author privacy changed')  # Their own erasure: nothing goes out, quietly.
-            from .fri import PANEL_SKIPPED
-            await message.reply(PANEL_SKIPPED, allowed_mentions=NO_MENTIONS, mention_author=False)
-            self.explained(events, 'source privacy changed')  # Nothing of what changed, or whose, is said.
-            await self.fri.waiting_notices.clear(message.author.id)
-            return
+        fenced = turn_fence(self, result.turn, message.author.id, counts)  # Kept apart: saving clears result.turn.
+        whole = fenced if dm and (drew - {author} or draws_on_summary(result.turn or {})) else None
+        if whole:
+            if not await whole():
+                # Their own erasure, here or through Gene (round 1, S2): nothing goes out, quietly. A failed read
+                # of it counts as one.
+                if (self.forgotten.get(message.author.id, 0) != counts.get(author, 0) or
+                        (fence and fence[1] is not None and await self.erasure(message.author.id, *fence))):
+                    return missed('author privacy changed')
+                await message.reply(PANEL_SKIPPED, allowed_mentions=NO_MENTIONS, mention_author=False)
+                self.explained(events, 'source privacy changed')  # Nothing of what changed, or whose, is said.
+                await self.fri.waiting_notices.clear(message.author.id)
+                return
+            if await gone():  # Taken back here while Gene answered.
+                return
+
+        async def standing():
+            """The whole turn, then what was taken back here, with nothing awaited after: right before an image goes
+            out, after its own check reads (round 1, B3), and before the first-memory notice sends the reply's words
+            again in an edit (B2)."""
+            return await fenced() and taken_back() is None
 
         async def delivered():  # A preview is answered once posted, even if binding it fails next.
             self.answered(events)
             # Deleted, or someone it drew on erased, while it posted: the card stays, but isn't saved.
-            if not taken_back() and (whole is None or await whole()):
+            if not taken_back() and (whole is None or (await whole() and not taken_back())):
                 await self.fri.record_turn(result)
 
         if result.post_preview:
@@ -2405,8 +2430,7 @@ class Agent:
         sent = None
         try:
             sent = await send_reply(message, result, view=view, mention_author=False, allowed_mentions=NO_MENTIONS,
-                                    suppress_embeds=True,
-                                    still=lambda: taken_back() is None and (whole is None or whole.unmoved()))
+                                    suppress_embeds=True, still=standing)
             if invitation:
                 invitation.delivered()  # An outside answer's receipt lasts from here (see Invitation.answered).
             if sent is None:  # Nothing was delivered, so nothing is recorded as said.
@@ -2419,7 +2443,8 @@ class Agent:
             self.answered(events, told=COOLDOWN if result.status == 'cooldown' else None)  # Its one notice.
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
             # Deleted, or someone it drew on erased, while it was sent: the reply stays, but isn't saved or echoed.
-            saved = None if taken_back() or (whole and not await whole()) else await self.fri.record_turn(result, sent)
+            saved = (None if taken_back() or (whole and not (await whole() and not taken_back()))
+                     else await self.fri.record_turn(result, sent, still=standing))
             # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory,
             # or a save that failed, whose reply may carry exactly what the controller would have refused.
             if (echo and saved is not None and saved.get('kept', True) and message.guild and
