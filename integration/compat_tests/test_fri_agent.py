@@ -405,8 +405,8 @@ def test_failed_report_delivery_keeps_outbox_pending():
             api=AsyncMock(return_value=[{'id': 'a'*32, 'body': 'Learning pass'}]), get_user=lambda _: owner)
         with pytest.raises(RuntimeError):
             await Agent(fri).send_reports()
-        assert fri.api.await_count == 1
-        assert fri.api.await_args.args == ('GET', '/agent/reports')
+        # Looked at, then fetched again once the owner is found (fri #373); never marked delivered.
+        assert [call.args for call in fri.api.await_args_list] == [('GET', '/agent/reports')]*2
     asyncio.run(scenario())
 
 
