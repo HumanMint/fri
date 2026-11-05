@@ -19,6 +19,7 @@ from compat_tests.test_fri_member_profiles import (
     DM,
     GAMING,
     GENERAL,
+    STAFF,
     THREAD,
     model,
     note,
@@ -745,8 +746,9 @@ def test_a_copy_read_before_a_threads_channel_was_named_never_reaches_the_reply_
     {'5': {'guild_id': '123', 'threads': [True], 'queued_at': 'NOW'}},
     {'5': {'guild_id': '123', 'threads': '70', 'queued_at': 'NOW'}},
     {'5': ['123']},
+    {'5': {'guild_id': '123', 'threads': [], 'queued_at': 10**400}},
 ], ids=['a boolean time', 'a channel that is no ID', 'a boolean server', 'a thread that is no ID', 'a boolean thread',
-        'threads that are no list', 'an entry that is no record'])
+        'threads that are no list', 'an entry that is no record', 'a time no float holds'])
 def test_a_queue_entry_that_cant_be_accounted_for_holds_everything_back(monkeypatch, tmp_path, entry):
     """Sol round 3 of #372: the queue as written, its marker naming that write, but one entry in it can't be read as
     this writes them. A boolean time read as 1.0 expired at once, without the controller ever asked; a channel or thread
@@ -1020,6 +1022,70 @@ def test_a_panel_reply_whose_channel_went_while_it_showed_is_not_saved(monkeypat
             await w.fri.chat_interaction(interaction, 'what do i like')
             assert went and 'minecraft' in shown(interaction)
             assert len([path for path, _ in w.calls if path == '/chat/turn']) == saves
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_summary_whose_channel_went_after_its_read_is_read_again_before_the_turn_check(monkeypatch, tmp_path):
+    """Sol round 4 of #372, S1: the member's summary came from #general, and an earlier DM reply drew on it. #general is
+    deleted and withdrawn after their next DM's context was read. That copy, still naming the earlier reply as drawing
+    on the summary, reached the controller's turn check, which refused it before the context was read again, so the
+    member was asked to retry. It's read again before that check: the turn goes on, without the summary."""
+    async def scenario():
+        from compat_tests.test_fri_summary_generations import summarized_from
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            await summarized_from(monkeypatch, w)
+            seen = []
+
+            async def respond(text, context):
+                seen.append(context)
+                return ChatResult(status='completed', reply='bold of you')
+            model(w, respond)
+            await w.say(DM, 'fri what was i on about')
+            assert seen[-1]['member_summary']  # That reply drew on it.
+
+            async def gone_now():
+                await deleted(w, GENERAL)
+            paused_private_context(w, gone_now)
+            await w.say(DM, 'fri and now')
+            assert len(seen) == 2 and seen[-1]['member_summary'] is None
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_later_request_reads_the_context_read_again_after_a_channel_went(monkeypatch, tmp_path):
+    """Sol round 4 of #372, S2: a turn lists the member's work, then reads it, and an empty channel is deleted between
+    its first and second model requests. The second read the context again, but only into its own copy, while the
+    third copied the turn's own, emptied by the drop, under a fence that said it was current: it saw no notes. Read
+    again, it's the turn's own context that's renewed."""
+    async def scenario():
+        from compat_tests.test_fri_summary_generation_tools import asked as stepped
+        from compat_tests.test_fri_summary_generation_tools import dm_channel
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        dm_channel(w)
+        try:
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            seen = []
+
+            async def listing(context):
+                seen.append(remembered(context))
+                await deleted(w, STAFF)  # Holds nothing: only the generation moves.
+                return ChatResult(status='completed', action={'kind': 'work_list', 'work_id': ''})
+
+            async def reading(context):
+                seen.append(remembered(context))
+                return ChatResult(status='completed', action={'kind': 'work_read', 'work_id': ''})
+
+            async def answer(context):
+                seen.append(remembered(context))
+                return ChatResult(status='completed', reply='bold of you')
+            await stepped(w, 'fri what am i working on', [listing, reading, answer])
+            assert seen == [['I like chess']] * 3
         finally:
             await w.fri.close()
     run(scenario)
