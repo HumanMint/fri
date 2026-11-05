@@ -18,7 +18,7 @@ import pytest
 from compat_tests.test_api import headers
 from compat_tests.test_fri_edit_reanswer import model as respond_with
 from compat_tests.test_fri_endings import source
-from compat_tests.test_fri_member_profiles import DM, model, run, world
+from compat_tests.test_fri_member_profiles import DM, GENERAL, model, run, world
 from compat_tests.test_fri_member_summaries import ASH, CONTINUATION
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_panel_erasure_sources import MARKER
@@ -28,6 +28,7 @@ from fri.fri import PANEL_SKIPPED
 from fri.fri_chat import ChatResult
 
 NOTE = [{'category': 'games', 'evidence': 'i like chess'}]
+NOTE_MINECRAFT = [{'category': 'games', 'evidence': 'I like Minecraft'}]
 
 
 def results(kind):
@@ -291,6 +292,28 @@ def test_a_dm_reply_on_the_requesters_own_summary_is_held_to_the_whole_turn(monk
             await agent.handle(dm)
             assert (CONTINUATION in str(dm.reply.await_args_list)) is not withdrawn
             assert answered[-1] == ('withdrawn' if withdrawn else True)
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('who', ['through gene', 'nothing'])
+def test_a_first_memory_notice_with_nothing_else_to_hold_it_to_is_held_to_genes_check(monkeypatch, tmp_path, who):
+    """B2 for a save with no fence of its own (without the agent, say): the member erases through Gene as the save
+    returns, and the notice's edit is left out on Gene's check of the turn."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        real = w.fri.api
+
+        async def api(method, path, payload=None):
+            answer = await real(method, path, payload)
+            if path == '/chat/turn' and who != 'nothing':
+                w.store.personal_control('20', 'disable')
+            return answer
+        w.fri.api = api
+        try:
+            _, saved, sent = await w.say(GENERAL, 'fri I like Minecraft', 'cubes, groundbreaking', NOTE_MINECRAFT)
+            assert saved['first_memory'] and sent.edit.await_count == (who == 'nothing')
         finally:
             await w.fri.close()
     run(scenario)
