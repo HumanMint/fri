@@ -427,3 +427,45 @@ def test_357_one_summarys_transport_failure_holds_only_that_one_back(monkeypatch
         finally:
             await w.fri.close()
     run(scenario)
+
+
+# HumanMint/fri#360.
+
+@pytest.mark.parametrize('failure', ['a permanent error', 'a timeout'])
+def test_360_a_fetch_counted_as_unchecked_is_logged_by_its_class_only(monkeypatch, tmp_path, caplog, failure):
+    """A permanent error reading a member's messages (aiohttp.InvalidURL, say) held their summary back with no trace,
+    pass after pass, where main reported it. Each summary held back so says why, by the error's class only: nothing
+    of the error's text, the messages or their IDs. The other member's summary in the claim is checked as usual."""
+    async def scenario():
+        import logging
+
+        import aiohttp
+        w = world(monkeypatch, tmp_path)
+        try:
+            events = await kept(monkeypatch, w)
+            agent = w.fri.agent
+            for text in ('fri raid tonight?', 'fri which build for it'):
+                await w.say(GENERAL, text, user=30)
+            settled(w)
+            assert await build(agent) == {'kept': True}  # Member 30's.
+            channel = w.fri.get_channel(GENERAL)
+            real, theirs = channel.fetch_message, {event.id for event in events}
+            spoken = 'https://example.invalid/the-larch-marker'
+
+            async def reading(mid):
+                if mid in theirs:  # Member 20's messages, offered first.
+                    raise aiohttp.InvalidURL(spoken) if failure == 'a permanent error' else TimeoutError(spoken)
+                return await real(mid)
+            channel.fetch_message = reading
+            agent.summaries_rechecked = False  # Started again: both are held back and offered.
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger='fri'):
+                assert await recheck(agent) == ['unchecked', 'ok']
+            logged = [record.getMessage() for record in caplog.records if record.name == 'fri.member_summary']
+            name = 'InvalidURL' if failure == 'a permanent error' else 'TimeoutError'
+            assert len(logged) == 1 and name in logged[0], logged  # Once for the summary, not per message.
+            assert all(spoken not in line and str(event.id) not in line and event.content not in line
+                       for line in logged for event in events)
+        finally:
+            await w.fri.close()
+    run(scenario)
