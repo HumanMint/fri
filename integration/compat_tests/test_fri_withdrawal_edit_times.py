@@ -270,10 +270,12 @@ def test_a_turn_names_the_version_of_the_message_it_answered(monkeypatch, tmp_pa
 def test_p1_an_edit_no_later_than_the_version_fri_answered_leaves_its_exchange(monkeypatch, tmp_path):
     """Sol round 1's P1 (pre-existing): an exchange Fri saved itself was withdrawn by its scope on any edit event, so a
     pin repeating the time of the version it answered deleted a valid exchange. That one leaves it; a later edit takes
-    it, as before."""
+    it, as before. Only with a controller offering edit times, which places the rest by ID (see round 2's B1 below);
+    one without them takes everything, as before."""
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         try:
+            edit_times(w)
             said = w.said('fri explain '+MARKER)
             await w.agent.handle(said)
             assert MARKER in saved(w)
@@ -281,6 +283,47 @@ def test_p1_an_edit_no_later_than_the_version_fri_answered_leaves_its_exchange(m
             assert not asked(w, WITHDRAW) and MARKER in saved(w)
             await edit(w, edit_of(said, sent_at(said.id)+60))
             assert asked(w, WITHDRAW) and MARKER not in saved(w)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def exchange_from(w, message, version):
+    """Member 20's exchange answering the message as it read at `version`, saved by the controller and tracked by Fri
+    as its own (see SavedTurns.kept)."""
+    source = {'kind': 'discord_message', 'id': str(message.id), 'user_id': '20', 'channel_id': '1', 'guild_id': '123',
+              'display_name': 'member'}
+    began = time.time(), time.monotonic()
+    w.store.save_chat('123', 'public:1', '20', 0, 'what about dinner', 'okay', 'model', 'high', source=source,
+                      provenance=[], versions={str(message.id): version})
+    payload = {'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20', 'revision': 0,
+               'source': source}
+    w.agent.saved_turns.kept(payload, {}, began, None, {str(message.id): version})
+
+
+@pytest.mark.parametrize('age', ['a 100-day-old message', 'a 60-second-old message'])
+def test_r2_b1_fris_own_exchange_vouches_only_for_itself(monkeypatch, tmp_path, age):
+    """Sol round 2's B1: a note learned from the message as it first read, its exchange trimmed since, and an exchange
+    Fri saved itself, and tracks, from a later edit. A pin repeating that edit's time matched Fri's exchange, so nothing
+    was asked, and the note from before the edit reached the next request. Fri's exchange stays, and the rest is asked
+    about by ID with the edit's time: the controller can't keep the note, so the message is held back."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            edit_times(w)
+            message = old_message(100 if age.startswith('a 100') else 60/DAY)
+            first = sent_at(message.id)
+            later = first+(DAY if age.startswith('a 100') else 30)
+            noted(w, message, first)
+            exchange_from(w, message, later)
+            only_queued(monkeypatch)
+            assert LIKE in await requested(w)
+            await edit(w, edit_of(message, later))
+            assert [(payload['message_ids'], payload.get('edited_at')) for payload in calls(w, SAVED)] == [
+                ([str(message.id)], pytest.approx(later, abs=1))]
+            assert not asked(w, WITHDRAW)  # Fri's own exchange isn't taken by its scope.
+            assert LIKE not in await requested(w)
+            assert w.agent.saved_turns.pending[str(message.id)].get('hold') is True
         finally:
             await w.fri.close()
     asyncio.run(scenario())
