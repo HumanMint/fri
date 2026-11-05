@@ -43,6 +43,7 @@ KEPT_SECONDS = 7*86400  # As long as the controller keeps a saved exchange.
 NOTED_SECONDS = 90*86400  # As long as it keeps a note, which a controller offering SOURCES drops with its message.
 MOST = 20000  # Bounds memory only: the controller keeps six exchanges per member and conversation.
 MARKED_SECONDS = 3600  # As Agent.withdrawn: longer than any turn that could still hold a copy runs.
+FRI = 'fri'  # The author marked for one of Fri's own replies (see marked_by): never a member's.
 # Seconds before Fri's clock an edit's own time (Discord's) still counts as just made: clock skew and gateway delay.
 FRESH = 15*60
 BATCH = 10  # As many IDs as /chat/turn/withdraw/saved takes at once.
@@ -75,6 +76,10 @@ class SavedTurns:
         self.drawn = {}
         self.tasks = set()  # The worker sending withdrawals, while it runs.
         self.marked = {}  # Message ID (str) -> when it was taken back, oldest first.
+        # Message ID (str) -> its author (str; FRI for one of Fri's own replies), where known, as long as it's marked,
+        # after its withdrawal has left the queue too: so a mark of someone else's message never holds a member's
+        # summary back (see summary_sources; fri #382's round 1, S2). Gone with their "forget me".
+        self.marked_by = {}
         self._pending = None  # Message ID (str) -> what to send for it; read from disk on first use.
         # When the first of those can no longer be kept, and the horizon that was worked out with (see expire).
         self.expiry = (0.0, None)
@@ -174,8 +179,10 @@ class SavedTurns:
             self.tidy()
             self.prune(time.time())
             now = time.time()
-            for i in self._pending:  # Taken back before the restart: still held back until they land.
+            for i, entry in self._pending.items():  # Taken back before the restart: still held back until they land.
                 self.marked.setdefault(i, now)
+                if author := (entry.get('scope') or {}).get('user_id') or entry.get('user_id'):
+                    self.marked_by.setdefault(i, str(author))
             if dated or overflow.get('dropped'):
                 # Dated by this start, or cut by the reader: saved now, not at the next withdrawal, so later starts keep
                 # those dates instead of dating them again, each later than the last (fri #343). As any save, never over
@@ -388,8 +395,8 @@ class SavedTurns:
         scope = {key: str(payload.get(key) or '') for key in ('guild_id', 'channel_id', 'conversation_id', 'user_id')}
         if not all(scope.values()):  # Not a turn this could name again; the save it follows still stands.
             return
-        ids = {int(item['id']) for item in [payload.get('source') or {}, *(
-            row.get('source') or {} for row in payload.get('burst') or ())]  # A burst's earlier messages too.
+        sources = [payload.get('source') or {}, *(row.get('source') or {} for row in payload.get('burst') or ())]
+        ids = {int(item['id']) for item in sources  # A burst's earlier messages too.
                if item.get('kind') == 'discord_message' and str(item.get('id', '')).isdigit()}
         revision = payload.get('revision') if type(payload.get('revision')) is int else None
         now = time.time()
@@ -398,11 +405,14 @@ class SavedTurns:
             self.saved[i] = (now, scope, revision)
         while self.saved and (next(iter(self.saved.values()))[0] < now-KEPT_SECONDS or len(self.saved) > MOST):
             del self.saved[next(iter(self.saved))]
-        # What its reply drew on, for its messages and its reply's, as the save named it (see dependencies).
+        # What its reply drew on, as the save named it (see dependencies), by each of its sources and its reply's
+        # message: an interaction's too, a /fri panel turn's, which saved context names it by, though only a Discord
+        # message is ever withdrawn, so only those are kept above (fri #382's round 1, S1).
         drew = payload.get('drew_on')
         if isinstance(drew, list):
             reply = str(payload.get('reply_message_id') or '')
-            for i in [*ids, *([int(reply)] if reply.isdigit() else [])]:
+            own = {int(item['id']) for item in sources if str(item.get('id', '')).isdigit()}
+            for i in [*own, *([int(reply)] if reply.isdigit() else [])]:
                 self.drawn.pop(i, None)
                 self.drawn[i] = (now, scope['user_id'], frozenset(str(item) for item in drew if str(item).isdigit()))
             while self.drawn and (next(iter(self.drawn.values()))[0] < now-KEPT_SECONDS or len(self.drawn) > MOST):
@@ -463,10 +473,15 @@ class SavedTurns:
                 continue  # Nothing Fri saves could hold it.
             self.marked.pop(str(i), None)
             self.marked[str(i)] = now
+            # Its author, where known: named, the member whose exchange it was, or as it was queued before.
+            if author := (authors.get(i) or (entry[1].get('user_id') if entry is not None else None)
+                          or (known.get('scope') or {}).get('user_id') or known.get('user_id')):
+                self.marked_by[str(i)] = str(author)
         if deleted:  # Fri's replies in view that carried them go too (gene #141), and count as taken back.
             for mid in getattr(self.agent, 'withdrawn_from', lambda ids: ())(ids):
                 self.marked.pop(mid, None)
                 self.marked[mid] = now
+                self.marked_by[mid] = FRI
         self.prune(now)
         if queued:
             self.persist()
@@ -514,10 +529,12 @@ class SavedTurns:
             return False
         made = summary.get('refreshed') if isinstance(summary, dict) else None
         now = time.time()
-        authors = {i: (entry.get('scope') or {}).get('user_id') or entry.get('user_id')
-                   for i, entry in self.pending.items()}
+        authors = dict(self.marked_by)  # Kept with the mark once the withdrawal has left the queue (see marked_by).
+        for i, entry in self.pending.items():
+            if author := (entry.get('scope') or {}).get('user_id') or entry.get('user_id'):
+                authors[i] = str(author)
         if taken is None:
-            taken = set(authors) | {i for i, at in self.marked.items() if at >= now-MARKED_SECONDS}
+            taken = set(self.pending) | {i for i, at in self.marked.items() if at >= now-MARKED_SECONDS}
         taken = {str(i) for i in taken}
         return any(i.isdigit() and (type(made) not in (int, float) or sent_at(int(i)) <= made)  # Not known: any.
                    and (member is None or authors.get(i) in (None, str(member))) for i in taken)
@@ -546,6 +563,8 @@ class SavedTurns:
             del self.saved[i]
         for i in [i for i, entry in self.drawn.items() if entry[1] == user]:
             del self.drawn[i]
+        for i in [i for i, author in self.marked_by.items() if author == user]:
+            del self.marked_by[i]
         mine = [i for i, entry in self.pending.items()
                 if (entry.get('scope') or {}).get('user_id') == user or entry.get('user_id') == user]
         for i in mine:
@@ -564,6 +583,8 @@ class SavedTurns:
                 break  # The rest are newer.
             if self._pending is None or i not in self._pending:
                 del self.marked[i]
+        for i in [i for i in self.marked_by if i not in self.marked]:  # An author lasts as long as its mark.
+            del self.marked_by[i]
         if self._pending is None:
             return
         lasting = {i: self.lasts(i, entry) for i, entry in self._pending.items()}

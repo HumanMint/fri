@@ -1083,7 +1083,7 @@ class Fri(discord.Client):
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
             **(self.summary_generation(context) if derived else {}),
-            **(self.drawn_on(context) if derived else {}),
+            **self.drawn_on(context, derived),
             **({'audience': audience(context)} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
             result.echo = self.echo(scope, context, provenance, reply, draws_on_summary(result.turn), carried(context))
@@ -1198,11 +1198,17 @@ class Fri(discord.Client):
         if found := self.dependencies(context):
             context['fence'].setdefault('summary_dependencies', set()).update(found)
 
-    def drawn_on(self, context):
+    def drawn_on(self, context, derived=True):
         """For a controller offering withdrawal-sources: the messages the turn's model requests carried besides its own
-        (see chat_once), so a withdrawal of one retires its saved reply, or refuses it before then (gene #141). Never
+        (see chat_once), so a withdrawal of one retires its saved reply, or refuses it before then (gene #141). An empty
+        list where they carried nothing else, or for a reply Fri made itself (not derived), as the controller's default
+        is: said, so this Fri knows the reply drew on nothing (see SavedTurns.kept; fri #382's round 1, S1). Never
         dropped to fit: too many refuse it, as too many people do. Nothing for an older controller."""
-        if SOURCES not in self.capabilities or not context.get('fence'):
+        if SOURCES not in self.capabilities:
+            return {}
+        if not derived:
+            return {'drew_on': []}
+        if not context.get('fence'):
             return {}
         own = {str((context['fence'].get('turn') or {}).get('source', {}).get('id', '')),
                *(str(row['source']['id']) for row in context.get('message_burst', []))}
@@ -1210,7 +1216,7 @@ class Fri(discord.Client):
         if len(ids) > MAX_DRAWN:
             raise commands.UserFeedbackCheckFailure('that drew on too many messages for me to keep track of safely. '
                                                     'ask again in a bit.')
-        return {'drew_on': ids} if ids else {}
+        return {'drew_on': ids}
 
     async def memory_overview(self, scope, context, private):
         """Everything for the member's own eyes in private; in public, only what that channel can see. Neither shows
