@@ -282,3 +282,120 @@ def test_withholding_a_reply_that_quoted_a_held_summary(monkeypatch, tmp_path, c
         turns.withhold(context, member='20')
         assert context['turns'] == []
     asyncio.run(fri.close())
+
+
+# The final fence's other records of what was taken back, each the only one that knows.
+
+@pytest.mark.parametrize('how', ['deleted', 'edited'])
+def test_a_dm_reply_is_held_to_a_post_elsewhere_its_saved_reply_drew_on(monkeypatch, tmp_path, how):
+    """B quoted A, a post in a channel Fri doesn't chat in, which a member linked and an earlier turn read. A is deleted
+    or edited during the DM's last check: nothing of Fri's saved exchanges holds it, so only Fri's record of posts its
+    requests read knows (a deletion's mark, an edit's revision). The reply doesn't go out."""
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        _, message = direct(fri, agent, rows)
+        elsewhere = SimpleNamespace(id=5, guild=SimpleNamespace(id=123), parent_id=None, name='announcements')
+        get_channel = fri.get_channel
+        fri.get_channel = lambda cid: elsewhere if cid == 5 else get_channel(cid)
+        assert not agent.allowed(elsewhere)
+        quoted = int(source(age=1200, channel='5')['id'])
+        agent.saw([quoted])  # An earlier turn's request read it.
+        said = source(age=600, channel='555')
+        store.save_chat('123', 'private:555', '20', 0, 'what did they post', REPLY, 'model', 'high', source=said,
+                        provenance=[], drew_on=[str(quoted)])
+        agent.saved_turns.kept({'guild_id': '123', 'channel_id': '555', 'conversation_id': 'private:555',
+                                'user_id': '20', 'revision': 0, 'source': said, 'drew_on': [str(quoted)]}, {},
+                               (time.time(), time.monotonic()))
+        answered = []
+
+        async def respond(text, context, ready):
+            await ready()
+            answered.append(True)
+            return ChatResult(status='completed', reply=REPLY)
+        model(fri, tmp_path, respond)
+        api, taken = fri.api, []
+
+        async def recording(method, path, payload=None):
+            if path.startswith('/chat/turn/withdraw'):
+                raise TimeoutError()
+            answer = await api(method, path, payload)
+            if path == '/chat/turn/check' and answered and not taken:
+                taken.append(path)
+                if how == 'deleted':
+                    await fri.on_raw_message_delete(SimpleNamespace(channel_id=5, guild_id=123, message_id=quoted))
+                else:
+                    import discord
+                    await fri.on_raw_message_edit(SimpleNamespace(channel_id=5, guild_id=123, message=SimpleNamespace(
+                        id=quoted, edited_at=discord.utils.utcnow(), content='changed',
+                        author=SimpleNamespace(id=30, bot=False))))
+                assert str(quoted) not in agent.saved_turns.marked  # Only the other record knows.
+            return answer
+        fri.api = recording
+        asked = message('fri say what they posted again')
+        asked.reply.return_value = SimpleNamespace(id=asked.id+100, content='okay', edit=None)
+        try:
+            await agent.handle(asked)
+            assert taken and MARKER not in str(asked.reply.await_args_list)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_reply_quoting_the_summary_where_it_no_longer_shows_is_held_to_its_sources(monkeypatch, tmp_path):
+    """B, a saved reply in #general, quoted member 20's summary; then #general stopped being readable by everyone, so
+    the summary no longer shows there, but B still does. A source of the summary is deleted during the last check of
+    member 20's next reply there, which read B: the reply doesn't go out, though when the summary was made isn't known
+    here (any of theirs counts)."""
+    async def scenario():
+        from unittest.mock import AsyncMock
+
+        from compat_tests.test_fri_member_profiles import GENERAL, world
+        w = world(monkeypatch, tmp_path)
+        try:
+            under, go = summary_from(w, monkeypatch)
+            await go()
+            newer_exchanges(w)
+            generation = w.store.chat_context('123', 'public:1', '20', True, True)['member_summary']['generation']
+            posted = w.message(GENERAL, 'fri what was the plan again')
+            w.store.save_chat('123', 'public:1', '20', 0, 'fri what was the plan again', 'you plan raids, '+MARKER, 'm',
+                              'high', audience='server', provenance=[], summary_generation=generation,
+                              source={'kind': 'discord_message', 'id': str(posted.id), 'user_id': '20',
+                                      'display_name': 'friend', 'channel_id': str(GENERAL), 'guild_id': '123'})
+            w.readable[GENERAL] = False
+            agent = w.fri.agent
+            agent.saved_turns.kick = lambda: None
+            # Every exchange there saved by this Fri, drawing on no message: only the summary B quoted can hold a reply
+            # that read them back.
+            with w.store.connection() as db:
+                saved_here = [row[0] for row in db.execute(
+                    "SELECT json_extract(source,'$.id') FROM chat_turns WHERE channel_id='public:1' AND user_id='20'")]
+            for i in saved_here:
+                agent.saved_turns.kept({'guild_id': '123', 'channel_id': str(GENERAL), 'conversation_id': 'public:1',
+                                        'user_id': '20', 'revision': 0, 'drew_on': [],
+                                        'source': {'kind': 'discord_message', 'id': str(i)}}, {},
+                                       (time.time(), time.monotonic()))
+            carried = []
+
+            async def respond(text, context, ready):
+                await ready()
+                carried.append(context)
+                return ChatResult(status='completed', reply='you plan raids, '+MARKER)
+            model(w.fri, tmp_path, respond)
+            api, deleting = w.fri.api, []
+
+            async def recording(method, path, payload=None):
+                answer = await api(method, path, payload)
+                if path == '/chat/turn/check' and carried and not deleting:
+                    deleting.append(path)
+                    await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=GENERAL, guild_id=123, message_id=under))
+                return answer
+            w.fri.api = recording
+            asked = w.message(GENERAL, 'fri and the time?')
+            asked.reply = AsyncMock(return_value=SimpleNamespace(id=asked.id+1, content='okay', edit=AsyncMock()))
+            await agent.handle(asked)
+            assert carried and carried[0].get('member_summary') is None and MARKER in str(carried[0].get('turns'))
+            assert deleting and MARKER not in str(asked.reply.await_args_list)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
