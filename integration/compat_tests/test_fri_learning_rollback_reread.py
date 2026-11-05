@@ -37,3 +37,19 @@ def test_a_controller_dropping_learning_withdrawals_under_fri_stops_claims(learn
         await agent.learn()
         assert paths.count('/agent/learning/claim') == 2 and not agent.learning_waits_for_gene
     asyncio.run(scenario())
+
+
+def test_any_other_refusal_keeps_the_capability(learning, monkeypatch):  # noqa: F811
+    """A claim expired, say (409): the controller still offers it, so nothing is dropped and the next pass claims."""
+    async def scenario():
+        agent, store, (first, second), finishes, asked, signing = batch(learning, monkeypatch)
+        api = agent.fri.api
+
+        async def expired(method, path, payload=None):
+            if path.endswith('/withdrawn'):
+                raise ControllerRejected('{"detail":"Learning claim expired or already completed"}', 409)
+            return await api(method, path, payload)
+        agent.fri.api = expired
+        await agent.learn()
+        assert 'learning-withdrawals' in agent.fri.capabilities and asked == []
+    asyncio.run(scenario())

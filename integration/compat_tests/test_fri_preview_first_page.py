@@ -151,3 +151,76 @@ def test_a_dm_reply_drawing_on_someone_else_is_held_to_its_fence(monkeypatch, tm
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_post_card_whose_source_erased_while_it_went_out_is_not_recorded(monkeypatch, tmp_path):
+    """The card is out, but isn't recorded as said once member 30 erased here while it posted."""
+    async def scenario():
+        fri, agent, store, dm = owner_dm(monkeypatch, tmp_path, ChatResult(
+            status='completed', reply='here it is', post_preview={'id': 'p1', 'body': 'member thirty says ' + MARKER}),
+            'local', during='send')
+        recorded = []
+
+        async def recording(result, sent=None):
+            recorded.append(result)
+        fri.record_turn = recording
+
+        async def show(fri, message, item, delivered=None):
+            await message.reply('card: ' + item['body'])
+            await delivered()
+        monkeypatch.setattr('fri.fri_workspace.show_preview', show)
+        try:
+            await agent.handle(dm)
+            assert MARKER in said(dm) and recorded == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_requesters_own_erasure_during_the_fence_says_nothing(monkeypatch, tmp_path):
+    """The owner erases here while Gene checks the turn's fence: nothing of it goes out, and nothing is said, as for
+    any message of theirs answered after they erased."""
+    async def scenario():
+        fri, agent, store, dm = owner_dm(monkeypatch, tmp_path, ChatResult(
+            status='completed', action={'kind': 'preview_voice', 'voice_notes': FIRST}), 'nothing')
+        real, looked = fri.api, []
+        lookup = agent.member.side_effect
+
+        async def member(*args, **kwargs):
+            looked.append(kwargs)
+            return await lookup(*args, **kwargs)
+        agent.member = AsyncMock(side_effect=member)
+
+        async def api(method, path, payload=None):
+            if path == '/chat/turn/check' and {'fresh': True} in looked[1:]:  # The fence's, past the last lookup.
+                agent.forget(10, erased=True)
+            return await real(method, path, payload)
+        fri.api = api
+        try:
+            await agent.handle(dm)
+            assert MARKER not in said(dm) and PANEL_SKIPPED not in said(dm)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_image_reply_whose_source_erased_while_its_image_was_checked_never_goes_out(monkeypatch, tmp_path):
+    """A reply with an image waits for the image's own check before it sends: member 30 erasing here then holds it
+    back, by the fence's part that reads nothing, checked last."""
+    async def scenario():
+        holder = {}
+
+        async def current():
+            holder['agent'].forget(30, erased=True)
+            return True
+        media = SimpleNamespace(guard=SimpleNamespace(current=current), attribution=lambda: 'via a test',
+                                body=b'png', filename='a.png')
+        fri, agent, store, dm = owner_dm(monkeypatch, tmp_path, ChatResult(
+            status='completed', reply='member thirty says ' + MARKER, media=media), 'nothing')
+        holder['agent'] = agent
+        try:
+            await agent.handle(dm)
+            assert MARKER not in said(dm)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
