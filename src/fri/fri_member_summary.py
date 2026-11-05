@@ -14,7 +14,7 @@ import discord
 
 from . import feedback as commands
 from .fri_agent_model import STRING, analyze, obj
-from .fri_errors import ControllerRejected
+from .fri_errors import ControllerRejected, message_gone
 from .fri_memory import SUMMARIES, server_wide
 from .subscription import SubscriptionError
 
@@ -67,7 +67,9 @@ async def changed(agent, messages):
             raise discord.ClientException('a summary source can no longer be read')
         try:
             message = await channel.fetch_message(int(message_id))
-        except discord.NotFound:
+        except discord.NotFound as exc:
+            if not message_gone(exc):  # Another 404, Unknown Channel say: Discord can't say it's gone (fri #365).
+                raise
             agent.unsend(channel.id, [int(message_id)], agent.fri.guild_id)
             found.add(str(message_id))
             continue
@@ -216,7 +218,7 @@ async def sources(agent, messages):
         return 'unchecked'
     if agent.saved_turns.withheld(ids):
         return 'unchecked'
-    status = 'ok'
+    status, failed = 'ok', []
     for item in messages:
         conversation, saved_at, message_id = item.get('conversation_id', ''), item.get('saved_at'), str(item['id'])
         kind, _, channel_id = str(conversation).partition(':')
@@ -227,14 +229,18 @@ async def sources(agent, messages):
             continue
         try:
             message = await channel.fetch_message(int(message_id))
-        except discord.NotFound:
-            agent.unsend(channel.id, [int(message_id)], agent.fri.guild_id)
-            status = 'changed'
+        except discord.NotFound as exc:
+            if message_gone(exc):
+                agent.unsend(channel.id, [int(message_id)], agent.fri.guild_id)
+                status = 'changed'
+            else:  # Another 404, Unknown Channel say: Discord can't say it's gone, so it's unchecked (fri #365).
+                status = 'unchecked' if status == 'ok' else status
             continue
         # Discord couldn't say, a refusal or the connection failing (a timeout, a reset) alike: this one is held back,
         # and the rest of the claim is still checked (HumanMint/fri#357).
-        except (discord.DiscordException, aiohttp.ClientError, OSError):
+        except (discord.DiscordException, aiohttp.ClientError, OSError) as exc:
             status = 'unchecked' if status == 'ok' else status
+            failed.append(type(exc).__name__)
             continue
         edited = getattr(message, 'edited_at', None)
         if edited is not None and edited.timestamp() > saved_at+SKEW:
@@ -245,6 +251,9 @@ async def sources(agent, messages):
     if status == 'ok' and (agent.saved_turns.withheld(ids) or not all(
             readable(agent, str(item.get('conversation_id', ''))) for item in messages)):
         status = 'unchecked'
+    if failed:  # One line for the summary, by each error's class only: never its text, a message or an ID (fri #360).
+        LOG.warning('A kept summary is held back: %s of its messages could not be read (%s)', len(failed),
+                    ', '.join(sorted(set(failed))))
     return status
 
 

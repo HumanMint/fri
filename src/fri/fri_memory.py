@@ -149,9 +149,23 @@ def sent_by(message_id, at):
 def before_removal(message_id, profile):
     """Sent at or before the member last turned memory off or edited it (the controller's removed_at), so Fri keeps it
     nowhere and leaves it out of what it shows the model. A cutoff that can't be verified holds it back too (fri #337's
-    round 1): this is for what a reply or a pass draws on, never the member's own message, which is answered."""
-    at = valid_time(profile.get('removed_at')) if isinstance(profile, dict) else None
+    round 1): this is for what a reply or a pass draws on, never the member's own message, which is answered. On
+    Discord's clock, which the message's snowflake is on, when the controller says it (removed_at_discord, fri #337
+    items 4 and 5); a controller that doesn't keeps its own clock's, as before."""
+    if not isinstance(profile, dict):
+        return True
+    at = valid_time(profile['removed_at_discord'] if 'removed_at_discord' in profile else profile.get('removed_at'))
     return at is None or sent_by(message_id, at)
+
+
+def erased_cutoff(profile):
+    """When the member last turned memory off, to hold their own message to (see before_erasure): on Discord's clock,
+    which its snowflake is on, when the controller says it (erased_at_discord, fri #337 items 4 and 5), else the
+    controller's own, as before. One it says malformed never holds back less than before: the other is used."""
+    if not isinstance(profile, dict):
+        return None
+    on_discord = valid_time(profile.get('erased_at_discord'))
+    return on_discord if on_discord is not None else profile.get('erased_at')
 
 
 def before_erasure(message_id, at):

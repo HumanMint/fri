@@ -64,8 +64,9 @@ def world(monkeypatch, tmp_path):
 
     def fetching(cid):
         async def fetch_message(mid):
-            if mid not in posted or posted[mid].channel.id != cid:
-                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+            if mid not in posted or posted[mid].channel.id != cid:  # As Discord answers it (fri #365).
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'),
+                                       {'code': 10008, 'message': 'Unknown Message'})
             return posted[mid]
         return fetch_message
 

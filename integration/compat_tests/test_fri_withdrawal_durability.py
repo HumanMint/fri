@@ -16,6 +16,7 @@ from compat_tests.test_fri_saved_withdrawal import SAVED, asked, long_after, res
 from compat_tests.test_fri_turn_withdrawal import MARKER, WITHDRAW, saved, settled, world
 from compat_tests.test_fri_withheld_history import delete, earlier_exchange, failing, on_disk
 from fri import fri_turn_withdrawal as withdrawal
+from fri import fri_watch as watch
 from fri.fri_turn_withdrawal import SavedTurns
 
 
@@ -359,6 +360,36 @@ def test_fri_health_flags_a_deadline_later_than_fri_sets(monkeypatch, tmp_path):
                 [line] = [line for line in (await w.fri.watcher.report()).splitlines() if 'saved context' in line]
                 assert ('withdrawals.closed.json' in line) is flagged and ('<t:' in line) is not flagged
                 assert len(line) < 400
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_fri_health_reads_a_deadline_fri_just_set_as_a_date_whatever_the_fraction_of_a_second(monkeypatch, tmp_path):
+    """fri #347, the issue's repro: the queue rounds a deadline it sets up to whole seconds, and `fri health` compared
+    it with the time unrounded. At 1800000000.25, five holds an older Fri wrote, past what the reader holds (a cap of
+    two), held saved context back until 1807776001, a deadline Fri sets: health said the clock was set back or the
+    marker edited. It prints the date, and still flags one a second later than any Fri sets."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            w.fri.get_guild = lambda _: None
+            frozen = SimpleNamespace(time=lambda: 1800000000.25, monotonic=time.monotonic)
+            monkeypatch.setattr(withdrawal, 'time', frozen)
+            monkeypatch.setattr(watch, 'time', frozen)
+            sent = discord.utils.time_snowflake(dt.datetime.fromtimestamp(1800000000 - 86400, dt.timezone.utc))
+            (tmp_path/'withdrawals.json').write_text(json.dumps({'pending': {str(sent+n): {'hold': True}
+                                                                             for n in range(5)}}))
+            monkeypatch.setattr(withdrawal, 'MOST', 2)
+            w.agent.saved_turns = SavedTurns(w.agent)
+            fri_sets = 1800000001 + withdrawal.CLOSED_SECONDS
+            assert w.agent.saved_turns.closed() and w.agent.saved_turns.closed_until <= fri_sets
+            for until, flagged in ((w.agent.saved_turns.closed_until, False), (fri_sets, False),
+                                   (fri_sets + 1, True)):
+                (tmp_path/'withdrawals.closed.json').write_text(json.dumps({'closed_until': until}))
+                w.agent.saved_turns = SavedTurns(w.agent)
+                [line] = [line for line in (await w.fri.watcher.report()).splitlines() if 'saved context' in line]
+                assert ('withdrawals.closed.json' in line) is flagged and ('<t:' in line) is not flagged, (until, line)
         finally:
             await w.fri.close()
     asyncio.run(scenario())
