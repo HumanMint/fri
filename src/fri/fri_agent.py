@@ -2524,15 +2524,14 @@ class Agent:
             await self._send_reports()
 
     async def _send_reports(self):
-        """The pending learning report, to the owner. The owner is found first, so no wait comes between the report's
-        fetch and its send but the fetch itself: one withdrawn while Fri looked them up goes as the controller holds it
-        now (fri #373). A channel's withdrawal accepted, or a message's queued here, during that fetch leaves it for the
-        next round, when the controller has it (fri #378). Nothing pending, nobody is looked up."""
-        owner = self.fri.get_user(self.fri.owner_id)
-        if owner is None:
-            if not await self.fri.api('GET', '/agent/reports'):
-                return
-            owner = await self.fri.fetch_user(self.fri.owner_id)
+        """The pending learning report, to the owner. Nothing pending, nobody is looked up. The owner is found before
+        the report is fetched again, so no wait comes between its fetch and its send but the fetch itself: one
+        withdrawn while Fri looked them up goes as the controller holds it now (fri #373). A channel's withdrawal
+        accepted, or a message's queued here, during that fetch leaves it for the next round, when the controller has
+        it (fri #378)."""
+        if not await self.fri.api('GET', '/agent/reports'):
+            return
+        owner = self.fri.get_user(self.fri.owner_id) or await self.fri.fetch_user(self.fri.owner_id)
         before = self.taken_back_mark()
         for report in await self.fri.api('GET', '/agent/reports'):
             if self.taken_back_mark() != before:
