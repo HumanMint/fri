@@ -210,6 +210,9 @@ class Rechecks:
     def __init__(self):
         self.retired, self.spent, self.failed = set(), 0.0, False
         self.summaries = {}  # One Gene still holds as said: the summaries it drew on, from its answer (fri #193).
+        # Of those retired for the turn, the ones Gene only holds back while a summary they drew on is read again: kept
+        # in the live view for when it checks out (fri #355).
+        self.held = set()
 
 
 class Agent:
@@ -425,9 +428,11 @@ class Agent:
                 accepted.append(row)
             else:
                 self.uncache(int(user))
-        # And one that drew on a member's summary only while Gene still holds it as said (fri #187).
-        if recheck and (retired := await self.retired(accepted, channel=parent)):
-            stale |= retired
+        # And one that drew on a member's summary only while Gene still holds it as said (fri #187). One held back for
+        # now leaves this context but stays in the live view (fri #355).
+        turn = Rechecks()
+        if recheck and (retired := await self.retired(accepted, channel=parent, turn=turn)):
+            stale |= retired-turn.held
             accepted = [row for row in accepted if row['id'] not in retired]
         if stale:  # Drop invalidated Fri replies from the raw cache too, not just from this context.
             self.recent[channel] = deque((r for r in self.recent[channel] if r['id'] not in stale), maxlen=30)
@@ -496,11 +501,15 @@ class Agent:
         finally:
             turn.spent += time.monotonic()-began
         gone = {mid for mid in asked if not (found.get(mid) or {}).get('verbatim')}
+        # Held back while a summary it drew on is read again (fri #355): left out of this turn like the rest, but kept
+        # in the live view, as it shows again once that checks out.
+        held = {mid for mid in gone if (found.get(mid) or {}).get('held') is True}
         turn.retired |= gone
+        turn.held |= held
         turn.summaries.update((mid, found[mid].get('summaries', [])) for mid in asked if mid not in gone)
-        if gone:  # For good: out of the live view too, so later turns don't ask again.
+        if gone-held:  # For good: out of the live view too, so later turns don't ask again.
             for key, kept in self.recent.items():
-                self.recent[key] = deque((r for r in kept if r['id'] not in gone), maxlen=30)
+                self.recent[key] = deque((r for r in kept if r['id'] not in gone-held), maxlen=30)
         return known | gone
 
     def saved_in(self, event):
