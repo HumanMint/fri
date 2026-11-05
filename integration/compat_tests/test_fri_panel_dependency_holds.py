@@ -474,7 +474,8 @@ def test_382_r1_s1_a_turn_that_carried_nothing_else_names_an_empty_list(monkeypa
         assert {key: turn[key] for key in turn if key == 'drew_on'} == named
 
 
-S2 = ["someone else's message", "a reply of Fri's that carried it", 'its own source',
+S2 = ["someone else's message", "a reply of Fri's that carried it", "someone else's exchange this Fri saved",
+      "someone else's exchange, queued before a restart", 'its own source',
       "someone else's message, and they said forget me"]
 
 
@@ -500,7 +501,9 @@ def test_382_r1_s2_a_withdrawal_the_controller_took_keeps_its_author_for_my_memo
             monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
             interaction = dm_panel(w.fri)
             await show(w.fri, interaction, profiled(w.fri, dict(DM_SCOPE)))
-            assert (listed(interaction, SUMMARY) > 0) is (taken in S2[:2])
+            assert (listed(interaction, SUMMARY) > 0) is (taken in S2[:4])
+            turns.prune(time.time()+3601)  # Its hour past: the author goes with the mark.
+            assert not {str(i) for i in gone} & (set(turns.marked) | set(turns.marked_by))
         finally:
             await w.fri.close()
     asyncio.run(scenario())
@@ -522,9 +525,27 @@ def taken_by_the_controller(monkeypatch, tmp_path, taken):
         if taken == 'its own source':
             gone = [under]
             turns.withdraw(gone, 123, deleted=True, authors={under: 20})
+        elif 'exchange' in taken:
+            # An exchange of member 30's this Fri saved, its author named by it, no one saying so. Its withdrawal names
+            # them on disk too (one by ID alone never does: see SavedTurns.lasting): for a restart, it's queued when
+            # Fri stops.
+            from compat_tests.test_fri_member_profiles import GENERAL
+            gone = [under-1]
+            said = {'kind': 'discord_message', 'id': str(under-1), 'user_id': '30', 'channel_id': str(GENERAL),
+                    'guild_id': '123', 'display_name': 'other'}
+            turns.kept({'guild_id': '123', 'channel_id': str(GENERAL), 'conversation_id': f'public:{GENERAL}',
+                        'user_id': '30', 'revision': 0, 'source': said}, {}, (time.time(), time.monotonic()))
+            if taken.endswith('before a restart'):
+                turns.kick = lambda: None
+            turns.withdraw(gone, 123, deleted=True)
         else:
             gone = [under-1]
             turns.withdraw(gone, 123, deleted=True, authors={under-1: 30})
+        if taken.endswith('before a restart'):  # Fri starts again, and sends it.
+            from fri.fri_turn_withdrawal import SavedTurns
+            w.fri.agent.saved_turns = turns = SavedTurns(w.fri.agent)
+            assert turns.pending
+            turns.kick()
         await asyncio.gather(*list(turns.tasks))
         assert not turns.pending and all(str(i) in turns.marked for i in gone)  # Taken, still marked.
         if taken == "a reply of Fri's that carried it":
