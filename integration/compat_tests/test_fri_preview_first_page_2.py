@@ -91,15 +91,18 @@ def test_a_saved_exchange_taken_back_while_the_fence_waits_is_held_back(monkeypa
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('who', ['30 through gene', '30 here', 'requester through gene', 'requester here', 'nothing'])
+@pytest.mark.parametrize('who', ['30 through gene', '30 here', 'requester through gene', 'requester here', 'deleted',
+                                 'nothing'])
 def test_a_dms_first_memory_notice_is_held_to_the_whole_turn(monkeypatch, tmp_path, who):
     """B2's repro: the owner's DM repeats member 30's marker and saves their first note. Member 30, or the owner,
-    erases as the save returns: the notice's edit, which would send the reply's words again, is left out."""
+    erases as the save returns, or the saved exchange it drew on is deleted then (its withdrawal still on its way):
+    the notice's edit, which would send the reply's words again, is left out."""
     async def scenario():
+        earlier = source(age=60, user='10', channel='555')
         fri, agent, store, dm = owner_dm(monkeypatch, tmp_path, ChatResult(
             status='completed', reply='member thirty says ' + MARKER, notes=NOTE), 'nothing',
-            text='i like chess. what did they say')
-        erase(fri, agent, store, who, 10)
+            text='i like chess. what did they say', source=earlier)
+        erase(fri, agent, store, who, 10, earlier)
         try:
             await agent.handle(dm)
             assert MARKER in said(dm)
@@ -109,13 +112,18 @@ def test_a_dms_first_memory_notice_is_held_to_the_whole_turn(monkeypatch, tmp_pa
     asyncio.run(scenario())
 
 
-def erase(fri, agent, store, who, requester):
-    """Runs `who`'s erasure as the save returns (after Gene kept it, before Fri reads the answer)."""
+def erase(fri, agent, store, who, requester, earlier=None):
+    """Runs `who`'s erasure as the save returns (after Gene kept it, before Fri reads the answer), or deletes the saved
+    exchange `earlier` then, its withdrawal timing out."""
     real = fri.api
 
     async def api(method, path, payload=None):
+        if path.startswith('/chat/turn/withdraw'):
+            raise TimeoutError()
         answer = await real(method, path, payload)
-        if path == '/chat/turn' and answer.get('first_memory'):
+        if path == '/chat/turn' and answer.get('first_memory') and who == 'deleted':
+            await fri.on_raw_message_delete(SimpleNamespace(channel_id=555, guild_id=None, message_id=int(earlier['id'])))
+        elif path == '/chat/turn' and answer.get('first_memory'):
             member = 30 if who.startswith('30') else requester
             if who.endswith('through gene'):
                 store.personal_control(str(member), 'disable')
@@ -230,6 +238,35 @@ def test_a_public_image_reply_is_held_to_the_whole_turn_after_its_own_check(monk
                 assert calls == (2 if retry else 1) and 'via a test' in said(event)
             else:
                 assert calls == (1 if retry else 0)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_dm_image_reply_whose_saved_exchange_is_deleted_during_its_check_never_goes_out(monkeypatch, tmp_path):
+    """B3, for what was taken back here: the saved exchange it drew on is deleted while the image's own check reads,
+    its withdrawal still on its way, so Gene's check of the turn passes. It's checked last: nothing goes out."""
+    async def scenario():
+        holder, earlier = {}, source(age=60, user='10', channel='555')
+
+        async def current():
+            await holder['fri'].on_raw_message_delete(SimpleNamespace(channel_id=555, guild_id=None,
+                                                                      message_id=int(earlier['id'])))
+            return True
+        media = SimpleNamespace(guard=SimpleNamespace(current=current), attribution=lambda: 'via a test', body=b'png',
+                                filename='a.png')
+        fri, agent, store, dm = owner_dm(monkeypatch, tmp_path, ChatResult(
+            status='completed', reply='member thirty says ' + MARKER, media=media), 'nothing', source=earlier)
+        holder['fri'], real = fri, fri.api
+
+        async def api(method, path, payload=None):
+            if path.startswith('/chat/turn/withdraw'):
+                raise TimeoutError()
+            return await real(method, path, payload)
+        fri.api = api
+        try:
+            await agent.handle(dm)
+            assert not dm.reply.await_count
         finally:
             await fri.close()
     asyncio.run(scenario())
