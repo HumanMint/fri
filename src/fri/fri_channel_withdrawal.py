@@ -310,7 +310,7 @@ class ChannelWithdrawals:
     def drop(context):
         """Every saved context of a request read before a channel's withdrawal (see moved): what it held of the
         channel can't be told from the rest, so none of it goes to the model, as when a withdrawals record can't be
-        read (SavedTurns.withhold)."""
+        read (SavedTurns.withhold). The request reads it again where it can (see Fri.chat_once)."""
         context['turns'], context['pending'], context['elsewhere'] = [], None, []
         if context.get('personal_memory'):
             context['personal_memory']['notes'] = []
@@ -318,6 +318,9 @@ class ChannelWithdrawals:
             if context.get(key) is not None:
                 context[key] = {}
         context['member_summary'] = None
+        # And what a tool read for its follow-up request (an owner's report, say): it can hold the channel's words as
+        # well, and can't be read again (Sol round 3 of #372).
+        context['action_result'], context['action_results'] = None, []
 
 
 def synced(directory):

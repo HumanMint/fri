@@ -73,6 +73,12 @@ def forgets(agent):
     return {str(member): count for member, count in counts.items()} if isinstance(counts, dict) else {}
 
 
+def channel_generation(cog):
+    """Where channel withdrawals stand (see ChannelWithdrawals.generation): one accepted since moves it, and a listing
+    read before it may hold the channel's words. None without them."""
+    return getattr(getattr(getattr(cog, 'agent', None), 'channel_withdrawals', None), 'generation', None)
+
+
 def withdrawals(cog):
     """Where the withdrawals Fri holds stand (see SavedTurns): one queued or taken back since, or their record
     failing to read, moves it. None without them."""
@@ -84,12 +90,15 @@ def withdrawals(cog):
     return getattr(turns, 'generation', None), newest, bool(turns.closed())
 
 
-async def show(cog, interaction, scope=None, *, state=None, selected=None, notice='', confirm=False, erased=None):
+async def show(cog, interaction, scope=None, *, state=None, selected=None, notice='', confirm=False, erased=None,
+               channels=None):
     """My memory, as Gene lists it. `state`: the listing as an earlier answer read it, with `erased`, every member's
-    "forget me"s here (see forgets) from before that read, so one taken in since still counts (fri #315)."""
+    "forget me"s here (see forgets), and `channels`, where channel withdrawals stood (see channel_generation), from
+    before that read, so one taken in since still counts (fri #315; Sol round 3 of #372)."""
     scope = profiled(cog, scope or scope_for(cog, interaction))
     # Taken before anything here waits, the membership lookup included (fri #315), unless the listing came with its own.
     baselines = dict(erased) if state is not None and erased is not None else forgets(getattr(cog, 'agent', None))
+    before = channels if state is not None else channel_generation(cog)
     if not await allowed(cog, interaction, scope, message=False, tell=True):
         return
     state = state or await cog.api('POST', '/chat/memory/notes', scope)
@@ -142,7 +151,7 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
         # listed only while one may be shown at all (Sol round 1 of #354).
         if summary and not summaries_usable(cog):
             return False
-        return withdrawals(cog) == screening or not (summary or state['entries'])
+        return (withdrawals(cog) == screening and channel_generation(cog) == before) or not (summary or state['entries'])
 
     async def stands():
         """Gene's word that the listing still stands: their revision as it was read under. With a summary, Gene's
@@ -297,12 +306,12 @@ class MemoryView(discord.ui.View):
         if not await self.interaction_check(interaction):
             return
         try:
-            erased = forgets(self.cog.agent)  # Before the answer's listing is read (fri #315).
+            erased, channels = forgets(self.cog.agent), channel_generation(self.cog)  # Before it's read (fri #315).
             state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
                 **self.scope, 'source': discord_source(interaction).model_dump(), 'revision': self.state['revision'],
                 'action': 'remove'})
             self.cog.agent.forget(interaction.user.id)
-            await show(self.cog, interaction, self.scope, state=state, notice='Removed that preference.', erased=erased)
+            await show(self.cog, interaction, self.scope, state=state, notice='Removed that preference.', erased=erased, channels=channels)
         except commands.UserFeedbackCheckFailure as exc:
             await show(self.cog, interaction, self.scope, notice=str(exc))
 
@@ -322,13 +331,13 @@ class MemoryView(discord.ui.View):
         if not await self.interaction_check(interaction):
             return
         try:
-            erased = forgets(self.cog.agent)  # Before the answer's listing is read (fri #315).
+            erased, channels = forgets(self.cog.agent), channel_generation(self.cog)  # Before it's read (fri #315).
             state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
                 **self.scope, 'source': discord_source(interaction).model_dump(), 'revision': self.state['revision'],
                 'action': action})
             if action == 'keep':  # It no longer shows in the server, so nothing Fri holds there may keep it.
                 self.cog.agent.forget(interaction.user.id)
-            await show(self.cog, interaction, self.scope, state=state, notice=notice, erased=erased)
+            await show(self.cog, interaction, self.scope, state=state, notice=notice, erased=erased, channels=channels)
         except commands.UserFeedbackCheckFailure as exc:
             await show(self.cog, interaction, self.scope, notice=str(exc))
 
@@ -348,12 +357,12 @@ class MemoryView(discord.ui.View):
 async def summarized(view, interaction, action, text, notice):
     """The member's edit or clear of Fri's summary; like a server-wide note's, it clears their saved chats."""
     try:
-        erased = forgets(view.cog.agent)  # Before the answer's listing is read (fri #315).
+        erased, channels = forgets(view.cog.agent), channel_generation(view.cog)  # Before it's read (fri #315).
         state = await view.cog.api('POST', '/chat/memory/summary', {
             **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
             'action': action, 'text': text})
         view.cog.agent.forget(interaction.user.id)
-        await show(view.cog, interaction, view.scope, state=state, notice=notice, erased=erased)
+        await show(view.cog, interaction, view.scope, state=state, notice=notice, erased=erased, channels=channels)
     except commands.UserFeedbackCheckFailure as exc:
         await show(view.cog, interaction, view.scope, notice=str(exc))
 
@@ -391,11 +400,11 @@ class EditMemory(discord.ui.Modal):
             return
         view = self.view
         try:
-            erased = forgets(view.cog.agent)  # Before the answer's listing is read (fri #315).
+            erased, channels = forgets(view.cog.agent), channel_generation(view.cog)  # Before it's read (fri #315).
             state = await view.cog.api('POST', '/chat/memory/notes/'+str(view.selected['id']), {
                 **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
                 'action': 'replace', 'evidence': self.preference.value})
             view.cog.agent.forget(interaction.user.id)
-            await show(view.cog, interaction, view.scope, state=state, notice='Updated that preference.', erased=erased)
+            await show(view.cog, interaction, view.scope, state=state, notice='Updated that preference.', erased=erased, channels=channels)
         except commands.UserFeedbackCheckFailure as exc:
             await show(view.cog, interaction, view.scope, notice=str(exc))

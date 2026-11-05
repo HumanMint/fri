@@ -2300,7 +2300,7 @@ class Agent:
             if any(taken(event) for event in events):
                 return 'message deleted'
             # Fri's earlier answer a ping read, taken back or out of date since (see Invitation.standing).
-            return 'nearby message deleted' if changed(result.shown) or (invitation and not invitation.standing()) else None
+            return 'nearby message deleted' if stale() or (invitation and not invitation.standing()) else None
 
         if any(taken(event) for event in events):  # Taken back while Fri composed.
             if again():
@@ -2314,7 +2314,13 @@ class Agent:
                 missed('message deleted')
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        if changed(result.shown) or (invitation and not invitation.standing()):
+
+        def stale():
+            """A message the model was shown taken back here, or a channel's withdrawal accepted past the read its
+            saved context came from (Sol round 3 of #372): it may hold the channel's words, a note naming no message."""
+            return bool(changed(result.shown)) or self.channel_withdrawals.moved(result.channels)
+
+        if stale() or (invitation and not invitation.standing()):
             # Someone took back a message the model was shown: the reply may repeat it, and a reaction or a quiet
             # decision answers it. None goes out or is saved; only a reply's words are worth saying why.
             if ambient:
