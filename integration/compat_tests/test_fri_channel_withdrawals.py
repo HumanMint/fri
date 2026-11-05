@@ -25,6 +25,7 @@ from compat_tests.test_fri_member_profiles import (
     run,
     world,
 )
+from fri import feedback as commands
 from fri.fri_agent import Agent
 from fri.fri_chat import ChatResult
 
@@ -347,9 +348,9 @@ def test_a_copy_read_before_the_channel_went_never_reaches_the_reply_model(monke
                         await deleted(w, GENERAL)  # While this copy waits to be used.
                 return answer
             w.fri.api = api
-            # That copy is dropped whole (round 2, B3: a copy can't always be told from what was withdrawn), and the
-            # next request reads it again, as the controller has it now.
-            assert await asked(w) == [] and paused
+            # That copy is dropped whole (round 2, B3: a copy can't always be told from what was withdrawn), and read
+            # again, as the controller has it now, its fences repeated (round 3).
+            assert await asked(w) == ['I like chess'] and paused
             assert screening(w.fri) != before
             assert await asked(w) == ['I like chess']
         finally:
@@ -602,8 +603,8 @@ def test_a_copy_of_a_note_with_no_message_named_never_reaches_the_reply_model(mo
             async def gone_now():
                 await deleted(w, GENERAL)
             paused = paused_private_context(w, gone_now)
-            assert await asked(w) == [] and paused  # Every saved context of that copy goes.
-            assert await asked(w) == ['I like chess']  # Read again after: as the controller has it now.
+            assert await asked(w) == ['I like chess'] and paused  # That copy goes; it's read again (round 3).
+            assert await asked(w) == ['I like chess']
         finally:
             await w.fri.close()
     run(scenario)
@@ -633,7 +634,7 @@ def test_a_copy_read_before_a_withdrawal_whose_first_answer_was_lost_never_reach
             async def gone_now():
                 await deleted(w, GENERAL)
             paused_private_context(w, gone_now)
-            assert await asked(w) == [] and lost and len(withdrawals_sent(lost)) == 1
+            assert await asked(w) == ['I like chess'] and lost and len(withdrawals_sent(lost)) == 1
         finally:
             await w.fri.close()
     run(scenario)
@@ -730,8 +731,7 @@ def test_a_copy_read_before_a_threads_channel_was_named_never_reaches_the_reply_
                 queue(w).swept = 0
                 await landed(w)  # Names thread 70's channel: the controller withdraws it there.
             paused_private_context(w, swept)
-            assert await asked(w) == []
-            assert await asked(w) == ['I like chess']
+            assert await asked(w) == ['I like chess']  # Read again after the thread went (round 3).
         finally:
             await w.fri.close()
     run(scenario)
@@ -763,6 +763,125 @@ def test_a_queue_entry_that_cant_be_accounted_for_holds_everything_back(monkeypa
             channels = restarted(w).channel_withdrawals
             assert channels.holding() and channels.recovering
             assert channels.pending['6'] == {'guild_id': '123', 'threads': ['70'], 'queued_at': now}
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+LEGACY = ("INSERT INTO personal_notes(guild_id,channel_id,user_id,category,evidence,at,origin,provenance) "
+          "VALUES ('123','server','20','games','I like Minecraft',strftime('%s','now'),'public:1','[]')")
+
+
+def test_a_context_whose_channels_keep_going_is_deferred_not_answered_empty(monkeypatch, tmp_path):
+    """Sol round 3 of #372: a context read before a channel's withdrawal is read again, its fences repeated, but only so
+    often. While withdrawals keep being accepted under every read, the turn goes unanswered and the member is told to
+    ask again, rather than answered with no saved context at all."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            real, reads, seen = w.fri.api, [], []
+
+            async def api(method, path, payload=None):
+                answer = await real(method, path, payload)
+                if path == '/chat/context' and str((payload or {}).get('conversation_id', '')).startswith('private'):
+                    reads.append(path)
+                    queue(w).taken(())  # Another withdrawal accepted while each copy waits.
+                return answer
+            w.fri.api = api
+
+            async def respond(text, context):
+                seen.append(context)
+                return ChatResult(status='completed', reply='bold of you')
+            model(w, respond)
+            with pytest.raises(commands.UserFeedbackCheckFailure, match='ask again'):
+                await w.say(DM, 'fri what should i play tonight')
+            assert seen == [] and len(reads) == 3  # Its read, and two more.
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_dropped_context_takes_what_an_owner_tool_read_too():
+    """Sol round 3 of #372: a tool's follow-up request carries what the tool read (an owner's report, say), which can
+    hold a withdrawn channel's words as well. Dropped with the rest."""
+    from fri.fri_channel_withdrawal import ChannelWithdrawals
+    context = {'turns': [{'input': 'x'}], 'action_result': {'output': 'I like Minecraft'},
+               'action_results': [{'output': 'I like Minecraft'}]}
+    ChannelWithdrawals.drop(context)
+    assert context['action_result'] is None and context['action_results'] == []
+
+
+@pytest.mark.parametrize('went', [True, False])
+def test_a_dm_reply_written_while_its_channel_went_never_goes_out_or_is_saved(monkeypatch, tmp_path, went):
+    """Sol round 3 of #372: a note learned in #general before notes named their messages reaches the model, and #general
+    is deleted and withdrawn while the model answers. The reply may repeat it: it doesn't go out, and nothing is saved."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            with w.store.connection() as db:
+                db.execute(LEGACY)
+            agent = w.fri.agent
+            agent.config['support_dms'] = True
+            w.channels[DM].fetch_message = AsyncMock(side_effect=lambda mid: w.posted[mid])
+            agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+
+            async def respond(text, context):
+                assert remembered(context) == ['I like Minecraft']
+                if went:
+                    await deleted(w, GENERAL)
+                return ChatResult(status='completed', reply='you like minecraft, groundbreaking')
+            model(w, respond)
+            saves = len([path for path, _ in w.calls if path == '/chat/turn'])
+            dm = w.message(DM, 'what do i like')
+            dm.reply = AsyncMock(return_value=SimpleNamespace(id=dm.id+1, content='okay', edit=AsyncMock()))
+            await agent.handle(dm)
+            assert ('minecraft' in str(dm.reply.await_args_list)) is not went
+            assert len([path for path, _ in w.calls if path == '/chat/turn']) == saves + (not went)
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+@pytest.mark.parametrize('went', [True, False])
+def test_my_memory_listed_before_its_channel_went_never_shows(monkeypatch, tmp_path, went):
+    """Sol round 3 of #372: My memory's listing is read, and #general's withdrawal is accepted before its answer comes
+    back. What moved is compared against where things stood before the read, so that listing, with #general's note, is
+    never shown."""
+    async def scenario():
+        from unittest.mock import Mock
+
+        from fri.fri import PANEL_SKIPPED
+        from fri.fri_memory import profiled
+        from fri.fri_memory_panel import show
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            with w.store.connection() as db:
+                db.execute(LEGACY)
+            shown = []
+
+            async def reply(cog, interaction, content=None, *, embed=None, still=None, **kwargs):
+                if still is None or await still():
+                    shown.append(embed.description if embed else content)
+            monkeypatch.setattr('fri.fri_panel.reply', reply)
+            monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+            real, read = w.fri.api, []
+
+            async def api(method, path, payload=None):
+                answer = await real(method, path, payload)
+                if path == '/chat/memory/notes' and went and not read:
+                    read.append(path)
+                    await deleted(w, GENERAL)  # Accepted before the listing's answer comes back.
+                return answer
+            w.fri.api = api
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            interaction = Mock(spec=discord.Interaction, guild_id=None, channel_id=DM, user=SimpleNamespace(id=20))
+            await show(w.fri, interaction, scope)
+            assert ('I like Minecraft' in ' '.join(shown)) is not went
+            assert (PANEL_SKIPPED in shown) is went
         finally:
             await w.fri.close()
     run(scenario)
