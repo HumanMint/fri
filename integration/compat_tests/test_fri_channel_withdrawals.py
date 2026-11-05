@@ -735,3 +735,34 @@ def test_a_copy_read_before_a_threads_channel_was_named_never_reaches_the_reply_
         finally:
             await w.fri.close()
     run(scenario)
+
+
+@pytest.mark.parametrize('entry', [
+    {'5': {'guild_id': '123', 'threads': [], 'queued_at': True}},
+    {'general': {'guild_id': '123', 'threads': [], 'queued_at': 'NOW'}},
+    {'5': {'guild_id': True, 'threads': [], 'queued_at': 'NOW'}},
+    {'5': {'guild_id': '123', 'threads': ['abc'], 'queued_at': 'NOW'}},
+    {'5': {'guild_id': '123', 'threads': [True], 'queued_at': 'NOW'}},
+    {'5': {'guild_id': '123', 'threads': '70', 'queued_at': 'NOW'}},
+    {'5': ['123']},
+], ids=['a boolean time', 'a channel that is no ID', 'a boolean server', 'a thread that is no ID', 'a boolean thread',
+        'threads that are no list', 'an entry that is no record'])
+def test_a_queue_entry_that_cant_be_accounted_for_holds_everything_back(monkeypatch, tmp_path, entry):
+    """Sol round 3 of #372: the queue as written, its marker naming that write, but one entry in it can't be read as
+    this writes them. A boolean time read as 1.0 expired at once, without the controller ever asked; a channel or thread
+    that isn't an ID was dropped. Now it's recovering, so everything is held back until a sweep has found what's gone;
+    the entries beside it stay queued."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            now = time.time()
+            pending = json.loads(json.dumps(entry).replace('"NOW"', str(now)))
+            pending['6'] = {'guild_id': '123', 'threads': ['70'], 'queued_at': now}
+            (tmp_path/'channel-withdrawals.json').write_text(json.dumps({'pending': pending, 'written': 1}))
+            (tmp_path/'channel-withdrawals.saved').write_text(json.dumps({'written': 1}))
+            channels = restarted(w).channel_withdrawals
+            assert channels.holding() and channels.recovering
+            assert channels.pending['6'] == {'guild_id': '123', 'threads': ['70'], 'queued_at': now}
+        finally:
+            await w.fri.close()
+    run(scenario)
