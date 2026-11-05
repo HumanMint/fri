@@ -32,6 +32,7 @@ from .fri_errors import (
     ControllerRejected,
     ControllerUnavailable,
     GateClosed,
+    message_gone,
 )
 from .fri_images import forwarded, media, started_a_thread
 from .fri_ledger import COOLDOWN, Ledger, addressed, notice_reason
@@ -578,14 +579,16 @@ class Agent:
 
     async def deleted(self, channel, ids, server):
         """Messages a read again (a history window, the pins) no longer lists, each read from `channel` by its ID: one
-        Discord says is gone (a 404) is taken back under `server` as its delete event, which may never have come, would
-        take it (see unsend), so what was saved from it earlier goes too (fri #358). One still there (unpinned, out of
-        the window), or one Discord won't say about (refused, failing), is left as it is: nothing goes on a guess."""
+        Discord says is gone (Unknown Message, see message_gone) is taken back under `server` as its delete event, which
+        may never have come, would take it (see unsend), so what was saved from it earlier goes too (fri #358). One
+        still there (unpinned, out of the window), or one Discord won't say about (refused, failing, another 404), is
+        left as it is: nothing goes on a guess."""
         for i in ids:
             try:
                 await channel.fetch_message(int(i))
-            except discord.NotFound:
-                self.unsend(channel.id, [int(i)], server)
+            except discord.NotFound as exc:
+                if message_gone(exc):
+                    self.unsend(channel.id, [int(i)], server)
             except (discord.DiscordException, aiohttp.ClientError, OSError):
                 pass
 
