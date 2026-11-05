@@ -990,3 +990,36 @@ def test_a_context_read_again_is_held_to_every_check_again(monkeypatch, tmp_path
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_panel_reply_whose_channel_went_while_it_showed_is_not_saved(monkeypatch, tmp_path):
+    """Sol round 3 of #372, on the /fri panel: #general is withdrawn while the panel's edit showing the reply is on its
+    way. It's out, but it isn't saved."""
+    async def scenario():
+        from compat_tests.test_fri_panel_and_learning_fences import panel, shown
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            with w.store.connection() as db:
+                db.execute(LEGACY)
+
+            async def respond(text, context):
+                return ChatResult(status='completed', reply='you like minecraft, groundbreaking')
+            model(w, respond)
+            saves = len([path for path, _ in w.calls if path == '/chat/turn'])
+            interaction = panel(w.fri)
+            went = []
+
+            async def edit(*args, **kwargs):
+                text = (kwargs.get('content') or '') + ' '.join(e.description or '' for e in kwargs.get('embeds') or [])
+                if 'minecraft' in text and not went:
+                    went.append(True)
+                    await deleted(w, GENERAL)
+                return SimpleNamespace(id=1234)
+            interaction.edit_original_response = AsyncMock(side_effect=edit)
+            await w.fri.chat_interaction(interaction, 'what do i like')
+            assert went and 'minecraft' in shown(interaction)
+            assert len([path for path, _ in w.calls if path == '/chat/turn']) == saves
+        finally:
+            await w.fri.close()
+    run(scenario)
