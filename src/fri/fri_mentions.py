@@ -177,7 +177,7 @@ class Invitation:
                 current = await post.channel.fetch_message(mid)  # A linked post's from its own channel.
             except discord.NotFound:
                 return False
-            if current.id != mid or unsigned(stills(current)[0]) != urls:
+            if current.id != mid or unsigned(stills(current, len(urls))[0]) != urls:  # As many as it showed.
                 return False
         return True
 
@@ -414,11 +414,14 @@ class Invitation:
         if len(accepted+drawn) > MAX_EVIDENCE or len(authors) > MAX_AUTHORS+1:
             answer, drawn = None, []  # More than one privacy read can carry: it's read as before, never cut short.
         profiles = await self.profile_sources(accepted+drawn)
+        from .fri_memory import before_removal
         notes, stale = self.agent.ensure_memes().notes(), []
         for item in sorted(accepted, key=lambda m: m.id):
             user = str(item.author.id)
             profile = profiles.get(user)
-            if not profile or not profile['enabled']:
+            # Nor a post from at or before its author's last erasure or removal, as the live view and a reply target
+            # leave it out (fri #337).
+            if not profile or not profile['enabled'] or before_removal(item.id, profile):
                 continue
             self.profiles[user] = profile
             self.events[item.id] = item
@@ -454,7 +457,7 @@ class Invitation:
         self.images = [] if self.image else [m for m in self.events.values() if lookable(m)]
         # Contextual images use attachments, a GIF link's Discord-made preview or a link card's picture (see
         # fri_images.stills). Never a page a link points at.
-        if self.image and sources(self.image) != [str(a.url) for a in self.image.attachments]:
+        if self.image and sources(self.image, cards=True) != [str(a.url) for a in self.image.attachments]:
             self.image = None
         await self.require_current()
 

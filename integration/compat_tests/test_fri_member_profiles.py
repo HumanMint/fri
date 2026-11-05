@@ -34,10 +34,10 @@ from fri.subscription import SubscriptionError
 GENERAL, GAMING, STAFF, SPICY, DM, THREAD, SECRET = 1, 2, 5, 6, 900, 70, 71
 
 
-def world(monkeypatch, tmp_path):
+def world(monkeypatch, tmp_path, *, agent_channels='1,2,5,6', history_channels=''):
     settings = Settings(tmp_path/'profiles.db', '123', '10', 'runtime-'+'x'*32, 'worker-'+'x'*32,
                         'deploy-'+'x'*32, fri_token='fri-'+'x'*32, workshop_channel_id='456',
-                        agent_channels='1,2,5,6')
+                        agent_channels=agent_channels, agent_history_channels=history_channels)
     client = TestClient(create_app(settings))
     store = client.app.state.store
     AgentStore(store, settings).update({'enabled': True}, 0, '10')
@@ -60,8 +60,19 @@ def world(monkeypatch, tmp_path):
         return
         yield
 
+    posted = {}  # What Discord holds, by message ID: what a channel's fetch_message reads (fri #333).
+
+    def fetching(cid):
+        async def fetch_message(mid):
+            if mid not in posted or posted[mid].channel.id != cid:  # As Discord answers it (fri #365).
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'),
+                                       {'code': 10008, 'message': 'Unknown Message'})
+            return posted[mid]
+        return fetch_message
+
     def text_channel(cid, name, nsfw=False):
-        item = SimpleNamespace(id=cid, guild=guild, parent_id=None, name=name, typing=typing, history=history)
+        item = SimpleNamespace(id=cid, guild=guild, parent_id=None, name=name, typing=typing, history=history,
+                               fetch_message=fetching(cid))
         item.is_nsfw = lambda: nsfw
         item.permissions_for = lambda who: (discord.Permissions(view_channel=readable[cid], read_message_history=True)
                                             if who is everyone else discord.Permissions.all())
@@ -74,6 +85,7 @@ def world(monkeypatch, tmp_path):
         thread = Mock(spec=discord.Thread, id=cid, guild=guild, parent_id=GENERAL, type=kind, typing=typing,
                       history=history)
         thread.name, thread.parent = 'thread-'+str(cid), channels[GENERAL]  # Mock(parent=...) means something else.
+        thread.fetch_message = fetching(cid)
         thread.is_nsfw = lambda: False
         thread.permissions_for = lambda who: discord.Permissions.all()
         channels[cid] = thread
@@ -100,9 +112,10 @@ def world(monkeypatch, tmp_path):
     def message(cid, text, user=20, age=0):
         mid = discord.utils.time_snowflake(dt.datetime.now(dt.timezone.utc)-dt.timedelta(seconds=age)) + next(ids)
         channel = channels[cid]
-        return Mock(spec=discord.Message, id=mid, content=text, channel=channel, guild=channel.guild,
-                    author=SimpleNamespace(id=user, display_name=f'member {user}', bot=False), webhook_id=None,
-                    mentions=[], reference=None, attachments=[], embeds=[], edited_at=None)
+        posted[mid] = Mock(spec=discord.Message, id=mid, content=text, channel=channel, guild=channel.guild,
+                           author=SimpleNamespace(id=user, display_name=f'member {user}', bot=False), webhook_id=None,
+                           mentions=[], reference=None, attachments=[], embeds=[], edited_at=None)
+        return posted[mid]
 
     async def say(cid, text, reply='bold of you', notes=(), user=20, age=0, event=None):
         fri.chat_once.return_value = ChatResult(status='completed', reply=reply, notes=list(notes))
@@ -112,7 +125,7 @@ def world(monkeypatch, tmp_path):
         saved = await fri.record_turn(result, sent) if result.turn else None
         return result, saved, sent
     return SimpleNamespace(fri=fri, store=store, channels=channels, readable=readable, calls=calls, say=say,
-                           client=client, message=message)
+                           client=client, message=message, posted=posted)
 
 
 def model(w, respond):

@@ -603,10 +603,10 @@ def test_deleted_messages_never_come_back_into_the_live_view(monkeypatch, tmp_pa
         sent = SimpleNamespace(id=trigger.id+100, content='that meme is doing a lot of work')
         trigger.reply = AsyncMock(return_value=sent)
         record_turn = fri.record_turn
-        async def record(result, delivered=None):  # Fri's reply deleted, e.g. by a mod, while it saves.
+        async def record(result, delivered=None, **kwargs):  # Fri's reply deleted, e.g. by a mod, while it saves.
             if delivered is sent:
                 await fri.on_raw_message_delete(SimpleNamespace(channel_id=1, message_id=sent.id))
-            return await record_turn(result, delivered)
+            return await record_turn(result, delivered, **kwargs)
         monkeypatch.setattr(fri, 'record_turn', record)
         try:
             await agent.handle(regret)

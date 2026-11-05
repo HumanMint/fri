@@ -4,7 +4,41 @@ import asyncio
 
 import discord
 
+from . import feedback as commands
+
 NO_MENTIONS = discord.AllowedMentions.none()
+
+
+def erasures(agent):
+    """Every member's privacy controls taken in here so far, by ID as text (see Agent.forget)."""
+    counts = getattr(agent, 'forgotten', None)
+    return {str(member): count for member, count in counts.items()} if isinstance(counts, dict) else {}
+
+
+def turn_fence(agent, turn, user, baselines=None):
+    """The privacy fence of a turn a draft or a preview shows (fri #316): the erasures here of its requester and of
+    everyone its words came from (its provenance), against `baselines` (every member's, as the turn came in, or else
+    as this is made), then Gene's check of the whole turn, then those erasures here again, with nothing awaited after.
+    An async callable: True while all of it stands. `unmoved` is the part that reads nothing."""
+    turn = dict(turn) if turn else None
+    baselines = dict(baselines) if baselines is not None else erasures(agent)
+    authors = {str(user), *(str(row['user_id']) for row in (turn or {}).get('provenance') or [])}
+
+    def unmoved():
+        now = erasures(agent)
+        return all(now.get(member, 0) == baselines.get(member, 0) for member in authors)
+
+    async def still():
+        if not unmoved():
+            return False
+        if turn:
+            try:
+                await agent.fri.api('POST', '/chat/turn/check', turn)
+            except commands.UserFeedbackCheckFailure:
+                return False
+        return unmoved()
+    still.unmoved = unmoved
+    return still
 
 
 def pages(text):
@@ -31,6 +65,8 @@ async def strip(message):
 
 
 class PagedPreview(discord.ui.View):
+    still = None  # The privacy fence of the turn that made it, when it has one (fri #303): see move().
+
     def __init__(self, title, body, note, label, prefix, confirm):
         super().__init__(timeout=600)
         self.message = None  # The message it went out on, when its sender knows it (see Agent.reply_once).
@@ -78,6 +114,17 @@ class PagedPreview(discord.ui.View):
             if self.finished:
                 return
             await self.recheck()
+            # Last before another page shows, with nothing awaited after it: the whole privacy fence of the turn that
+            # made it, its members' erasures here and Gene's check (fri #303). Moved, the preview ends, no more of it
+            # shown.
+            if self.still is not None and not await self.still():
+                from .fri import PANEL_SKIPPED
+                from .fri_notices import notice_text
+                self.finished = True
+                self.stop()
+                await interaction.response.edit_message(content=notice_text(PANEL_SKIPPED), embed=None, attachments=[],
+                                                         view=None, allowed_mentions=NO_MENTIONS)
+                return
             old_page, old_seen = self.page, self.seen.copy()
             self.page = max(0, min(len(self.pages)-1, self.page+offset))
             self.seen.add(self.page)

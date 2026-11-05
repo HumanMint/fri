@@ -1,6 +1,7 @@
 """Still images a turn may look at: the speaker's own, or ones a read turned up. Never ambient collection or tool authority."""
 
 import asyncio
+import itertools
 import re
 
 import discord
@@ -139,7 +140,7 @@ async def look(context, posts, *, invitation=None):
         if post.id in seen:
             continue
         seen.add(post.id)
-        urls = stills(post)[0]
+        urls = stills(post, budget)[0]  # Its uploads first, a thumbnail only in what they leave (fri #308).
         if not urls or len(urls) > budget:
             skipped += 1
             continue
@@ -168,9 +169,11 @@ async def look(context, posts, *, invitation=None):
                 skipped += 1
                 continue
             size += sum(map(len, loaded))
-            still = stills(post)[1]
-            inspected.append({'images': list(range(len(images)+1, len(images)+len(loaded)+1)),
-                              'source': discord_source(post).evidence(), **({'still': still} if still else {})})
+            first, source = len(images)+1, discord_source(post).evidence()
+            # One entry per kind of picture, in order: a video card's thumbnail beside a still is marked apart.
+            for still, numbered in itertools.groupby(enumerate(stills(post, len(urls))[1], first), key=lambda pair: pair[1]):
+                inspected.append({'images': [number for number, _ in numbered], 'source': source,
+                                  **({'still': still} if still else {})})
             images += loaded
             if invitation is not None:  # Its own check covers what it looked at (see Invitation.current).
                 invitation.inspected(post, urls)
@@ -229,7 +232,7 @@ async def attach(context, event, text, *, source=None, invitation=None):
     # external embeds, referenced posts, or images from recent channel context.
     if not isinstance(getattr(source, 'embeds', None), (list, tuple)):
         return
-    urls = sources(source)
+    urls = sources(source, cards=True)  # A video link's card beside a still voids nothing (see own_links).
     attachment_urls = [str(a.url) for a in attachments]
     if urls is None or urls != attachment_urls:
         return decline(context, event, source, declined(source), text, invitation)
@@ -334,7 +337,10 @@ def decline(context, event, source, reason, text, invitation):
         context['image_invitation'] = invitation
 
 
-async def unchanged(context, event):
+async def unchanged(context, event, turn=None):
+    """The images a turn looked at, or the media it declined, as Discord shows them now. `turn`: the context its
+    request reads, given before a request (see Fri.chat_once): a video link's card that unfurled beside the still it
+    looked at since Fri's fetch for its own links is said there to be unwatched, as own_links says it (fri #307)."""
     if not await looked_unchanged(context):
         return False
     if not context.get('image_sources') and not context.get('image_declined'):
@@ -349,14 +355,21 @@ async def unchanged(context, event):
             return False
         source = context.get('image_event', event)
         image = current if source.id == event.id else await event.channel.fetch_message(source.id)
-        return ((image.author.id == event.author.id or
+        same = ((image.author.id == event.author.id or
                  (invitation and image.author.id == source.author.id)) and not getattr(image.author, 'bot', False) and not image.webhook_id and
                 image.channel.id == event.channel.id and image.content == source.content and
                 image.edited_at == source.edited_at and
-                (unsigned(sources(image)) == unsigned(context['image_sources']) if context.get('image_sources') else
+                (unsigned(sources(image, cards=True)) == unsigned(context['image_sources']) if context.get('image_sources') else
                  unsigned([str(a.url) for a in image.attachments]) == context['image_declined']))
     except discord.HTTPException:
         return False
+    if same and turn is not None and context.get('image_sources') and source.id == event.id:
+        unwatched = [kind for kind in media(image) if kind == 'linked video']
+        if unwatched and not turn.get('own_media_not_inspected'):
+            turn['own_media_not_inspected'] = {'attachments': unwatched, 'reason': 'video'}
+            if cards := link_cards(image):
+                turn['message_link_cards'] = cards
+    return same
 
 
 async def looked_unchanged(context):
@@ -378,7 +391,7 @@ async def looked_unchanged(context):
             if (current.id != post.id or current.author.id != post.author.id or
                     current.webhook_id or current.channel.id != post.channel.id or current.content != post.content or
                     current.edited_at != post.edited_at or
-                    unsigned(stills(current)[0]) != unsigned(read['sources'])):
+                    unsigned(stills(current, len(read['sources']))[0]) != unsigned(read['sources'])):
                 return False
         return True
     except discord.HTTPException:
@@ -392,7 +405,7 @@ async def still_there(message):
     except discord.HTTPException:
         return False
     return (current.edited_at == message.edited_at and current.content == message.content and
-            unsigned(sources(current)) == unsigned(sources(message)))
+            unsigned(sources(current, cards=True)) == unsigned(sources(message, cards=True)))
 
 
 async def require_current(context, event):
@@ -400,18 +413,26 @@ async def require_current(context, event):
         raise commands.UserFeedbackCheckFailure(CHANGED)
 
 
-def stills(post):
-    """What look() can see of a post, and as what: its attachments with any GIF link's still preview, or, on a
-    member's post with neither, the pictures Discord's proxy made of its link cards. (None, None) when there's
-    nothing it can see whole; a post with both kinds keeps today's rule and isn't looked at."""
-    from .fri_meme_media import link_previews
-    urls = sources(post, MAX_IMAGES, gifs=True)
-    if urls and urls == [str(a.url) for a in post.attachments]+gif_previews(post):
-        return urls, 'gif preview' if gif_previews(post) else None
+def stills(post, room=MAX_IMAGES):
+    """What look() can see of a post, and as what, picture by picture: its attachments with any GIF link's still
+    preview ('gif preview' when it has one), then on a member's post the thumbnail of each video link's card beside
+    its uploads, in what's left of `room` ('link preview', N2a); or, on a member's post with neither, the
+    pictures Discord's proxy made of its link cards. (None, None) when there's nothing it can see whole; a post
+    with another card's picture beside its uploads keeps today's rule and isn't looked at. `room`: the images a
+    turn has left for it, so its uploads come first and its thumbnails only fill the rest (fri #308); a check of
+    what was shown asks for as many as it showed."""
+    from .fri_meme_media import link_previews, video_previews
     author = getattr(post, 'author', None)
-    if (not post.attachments and not gif_previews(post) and getattr(author, 'bot', True) is False and
-            not getattr(post, 'webhook_id', None) and (urls := link_previews(post))):
-        return urls, 'link preview'
+    member = getattr(author, 'bot', True) is False and not getattr(post, 'webhook_id', None)
+    urls = sources(post, MAX_IMAGES, gifs=True, cards=True)
+    if urls and urls == [str(a.url) for a in post.attachments]+gif_previews(post):
+        thumbnails = video_previews(post) if member and post.attachments else []
+        # The uploads come first; a video whose thumbnail doesn't fit goes unseen, as it would anyway.
+        thumbnails = thumbnails[:max(0, min(room, MAX_IMAGES)-len(urls))]
+        label = 'gif preview' if gif_previews(post) else None
+        return urls+thumbnails, [label]*len(urls)+['link preview']*len(thumbnails)
+    if not post.attachments and not gif_previews(post) and member and (urls := link_previews(post)):
+        return urls, ['link preview']*len(urls)
     return None, None
 
 
@@ -428,13 +449,17 @@ async def own_links(context, event, *, invitation=None):
     event that arrived usually has none yet. Their text goes beside the message (message_link_cards), and a
     card's picture or a GIF link's preview is looked at like a nearby post's, checked again as Discord has it
     before each request and before delivery: by a ping's `invitation`, else on its own refetch. Never their
-    attachments: attach() has those. Only a turn that may look."""
+    attachments: attach() has those. Beside a still attach() looked at, a video link's card is only said to be
+    unwatched, with its text (own_media_not_inspected; N2a), never shown. Only a turn that may look."""
     from .fri_conversation import LINK
     content = LINK.sub('', str(getattr(event, 'content', '') or ''))  # Discord unfurls no message link.
-    if (not isinstance(event, discord.Message) or has_attachments(event) or
+    if (not isinstance(event, discord.Message) or
             not ('https://' in content or 'http://' in content) or
             not callable(getattr(getattr(event, 'channel', None), 'fetch_message', None))):
         return
+    beside = has_attachments(event)
+    if beside and not (context.get('image_event') is event and context.get('image_sources')):
+        return  # Uploads it didn't look at: as before.
     try:
         current = await event.channel.fetch_message(event.id)
     except discord.HTTPException:
@@ -442,6 +467,13 @@ async def own_links(context, event, *, invitation=None):
     if (current.id != event.id or current.author.id != event.author.id or current.author.bot or
             current.webhook_id or current.content != event.content or current.edited_at != event.edited_at):
         return  # Changed since it came in, which the turn's own checks refuse.
+    if beside:
+        unwatched = [kind for kind in media(current) if kind == 'linked video']
+        if unwatched and not context.get('own_media_not_inspected'):
+            context['own_media_not_inspected'] = {'attachments': unwatched, 'reason': 'video'}
+            if cards := link_cards(current):
+                context['message_link_cards'] = cards
+        return
     if cards := link_cards(current):
         context['message_link_cards'] = cards
     if lookable(current):

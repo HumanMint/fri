@@ -89,7 +89,7 @@ def test_a_gif_links_preview_size_must_be_positive_integers(width, height, looke
     link = SimpleNamespace(attachments=[], content='https://tenor.com/view/dance-123', embeds=[embed],
                            author=SimpleNamespace(bot=False), webhook_id=None)
     assert sources(link, gifs=True) == ([PREVIEW] if looked else None)
-    assert stills(link) == (([PREVIEW], 'gif preview') if looked else (None, None))
+    assert stills(link) == (([PREVIEW], ['gif preview']) if looked else (None, None))  # A label per picture.
 
 
 @pytest.mark.parametrize('fmt,mime', [('GIF', 'image/gif'), ('PNG', 'image/png'), ('WEBP', 'image/webp')])

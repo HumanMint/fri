@@ -43,6 +43,13 @@ def settled(w, seconds=7200):
 
 
 def summarizer(monkeypatch, w, reply=SUMMARY, during=None):
+    """The summary model, replaced. A build checks the messages a claim names before it sends any (fri #333), so this
+    needs a controller that names them: against one that doesn't, nothing is claimed, and a test that builds skips.
+    So does one against a controller that doesn't recheck kept summaries, or hold back what was made from one, where
+    none is built or used (fri #349, #355)."""
+    if not {'summary-sources', 'summary-rechecks', 'summary-holds'} <= set(w.fri.capabilities):
+        pytest.skip('needs a controller offering summary-sources, summary-rechecks and summary-holds')
+    w.fri.agent.summaries_rechecked = True  # As after the first recheck claim since Fri started.
     seen = []
 
     async def analyze(chat, instruction, data, name, effort, schema, headers):

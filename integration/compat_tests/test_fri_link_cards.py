@@ -291,12 +291,15 @@ def test_a_link_cards_picture_is_looked_at_within_the_image_limits(monkeypatch, 
         actions = reader(agent)
         try:
             receipt = await read(actions)
-            # Only the video's thumbnail, through Discord's preview proxy: the oversized one, an attachment
-            # path from another channel and a post that also has an attachment aren't, and one with no proxy
-            # copy is never even a candidate.
-            assert receipt['images_inspected'] == 1 and receipt['images_not_inspected'] == 3
-            assert [(call.args[0], call.kwargs) for call in loader.await_args_list] == [(THUMB, {'previews': True})]
-            seen, = actions.turn_context['inspected_images']
+            # The video's thumbnail through Discord's preview proxy, and a post's still beside its video card with
+            # that card's thumbnail (N2a): the oversized one and an attachment path from another channel aren't,
+            # and one with no proxy copy is never even a candidate.
+            assert receipt['images_inspected'] == 2 and receipt['images_not_inspected'] == 2
+            assert [(call.args[0], call.kwargs) for call in loader.await_args_list] == [
+                (str(both.attachments[0].url), {'previews': True}), (THUMB.replace('xyz', 'both'), {'previews': True}),
+                (THUMB, {'previews': True})]
+            *beside, seen = actions.turn_context['inspected_images']
+            assert [entry.get('still') for entry in beside] == [None, 'link preview']
             assert seen['source']['id'] == str(video.id) and seen['still'] == 'link preview'
         finally:
             await fri.close()

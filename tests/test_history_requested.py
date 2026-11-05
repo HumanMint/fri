@@ -19,6 +19,41 @@ def test_a_long_repetitive_message_is_checked_quickly(unit):
     assert time.perf_counter()-started < 0.25  # Generous: unbounded scans took seconds.
 
 
+@pytest.mark.parametrize('text,expected', [
+    # fri #239, item 1: after "are", an adjective that ends in "s" isn't the plural thing a name follows.
+    ('what are the wireless routers recommended?', False), ('what are the glass bottles recommended?', False),
+    ('what are the various cables recommended?', False), ('what are the famous dishes recommended?', False),
+    ('what are the songs kev recommended?', True), ('what are the tracks mo recommended?', True),
+    ('what are the various songs kev recommended?', True), ('what are the boss fights kev recommended?', True),
+    ('what are the songs chris recommended?', True), ('what are the emojis kev sent?', True),
+    # Item 2: a name spelled as one is a name, even when it's also a listed property word, as a mention is.
+    ('what was the song Price mentioned?', True), ('what was the clip Law sent?', True),
+    ('what are the songs Price recommended?', True), ('whats the link Mode dropped', True),
+    # Not a property word in lowercase, nor one in a title-cased question.
+    ('what was the song price mentioned?', False), ('what is the Max File Size shared on Discord?', False),
+    ('what is the file Size shared on discord?', False), ('WHAT WAS THE SONG PRICE MENTIONED?', False),
+    # Sol round 1 of #294: real plurals ending in "us" or "ss" are still plurals before a name, as on main.
+    ('what are the menus Ross shared?', True), ('what are the emus Gus mentioned?', True),
+    ('what are the haikus 芽依 shared?', True), ('what are the bass jo recommended?', True),
+    ('what are the menus Ross shared here?', True), ('what are the gurus kev recommended?', True),
+    # And the adjectives and modifiers item 1 excludes still are.
+    ('what are the stainless pans recommended?', False), ('what are the nervous habits mentioned?', False),
+    ('what are the chess openings recommended?', False), ('what are the class notes shared?', False),
+    ('what are the bus routes recommended?', False), ('what are the business cards shared?', False),
+    ('what are the buses kev recommended?', True),
+    # A capitalized property label after a property word, or in a known compound, isn't a speaker (as on main),
+    # bare or with "here"; "the song Price" still names one.
+    ('what is the file Size shared?', False), ('what is the screen Resolution recommended?', False),
+    ('what is the data Rate recommended?', False), ('what is the file Size shared here?', False),
+    ('what is the screen Resolution recommended here?', False), ('what is the data Rate recommended here?', False),
+    ('what is the frame Rate posted?', False), ('what is the sample Rate recommended?', False),
+    ('what was the song Price mentioned here?', True), ('what was the song Price mentioned', True),
+])
+def test_the_speaker_is_a_name_not_a_compound_or_a_property(text, expected):
+    """fri #239, items 1 and 2."""
+    assert requested(text) is expected
+
+
 @pytest.mark.parametrize('ask', ['what did kev recommend?', 'search chat for watched', 'find the clips jo posted',
                                  'what was that song kev mentioned', 'who recommended Minecraft?',
                                  'what was that song <@123> mentioned', 'find the clips jo posted in <#123> this morning'])
