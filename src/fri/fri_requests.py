@@ -8,7 +8,7 @@ import discord
 
 from . import feedback as commands
 from .fri_notices import notice_text
-from .previews import PagedPreview, strip
+from .previews import PagedPreview, erasures, strip, turn_fence
 from .reviews import request_reference
 
 NO_MENTIONS = discord.AllowedMentions.none()
@@ -24,11 +24,13 @@ def request_dm_component(interaction, bot_id):
 
 
 class DraftView(PagedPreview):
-    def __init__(self, cog, user_id, draft, *, public=False, reviewed=False, source_id=None, fence=None):
+    def __init__(self, cog, user_id, draft, *, public=False, reviewed=False, source_id=None, fence=None, baselines=None):
         self.cog, self.user_id, self.draft = cog, user_id, draft
         # The staged turn's privacy fence: a draft built from other members' words is never
-        # shown again or submitted once any of them erases or changes privacy.
+        # shown again or submitted once any of them erases or changes privacy, here (against `baselines`, every
+        # member's erasures here as the turn came in, or else as this is made) or through Gene (fri #316).
         self.fence = dict(fence) if fence else None
+        self.baselines = dict(baselines) if baselines is not None else erasures(getattr(cog, 'agent', None))
         self.source_id = source_id or uuid.uuid4().hex
         self.owner = user_id == cog.owner_id
         self.reviewed = reviewed
@@ -71,7 +73,7 @@ class DraftView(PagedPreview):
             return
         await self.fenced()
         view = DraftView(self.cog, self.user_id, self.draft, reviewed=True, source_id=self.source_id,
-                         fence=self.fence)
+                         fence=self.fence, baselines=self.baselines)
         view.preview_interaction = interaction
         if interaction.guild_id is None or getattr(getattr(interaction.message, 'flags', None), 'ephemeral', False):
             await interaction.response.edit_message(content=view.content, embed=None, attachments=[], view=view,
@@ -79,7 +81,11 @@ class DraftView(PagedPreview):
             self.message = None  # The preview shows there now, and takes its own controls off (see on_timeout).
         else:
             from .fri_panel import sessions
-            await sessions(self.cog).show(interaction, content=view.content, attachments=[], view=view)
+
+            async def still():  # Again once the panel's lock is taken, right before the edit (fri #316).
+                await view.fenced()
+                return True
+            await sessions(self.cog).show(interaction, content=view.content, attachments=[], view=view, still=still)
 
     async def submit(self, interaction):
         if not self.reviewed or not await self.interaction_check(interaction):
@@ -114,8 +120,17 @@ class DraftView(PagedPreview):
             self.stop()
 
     async def fenced(self):
-        if self.fence:
-            await self.cog.api('POST', '/chat/turn/check', self.fence)
+        """The draft's whole fence: its requester's and sources' erasures here, then Gene's check of the turn, then
+        those erasures again with nothing awaited after (fri #316). Moved, it refuses."""
+        if not self.fence:
+            return
+        unmoved = turn_fence(getattr(self.cog, 'agent', None), self.fence, self.user_id, self.baselines).unmoved
+        from .fri import CHANGED
+        if not unmoved():
+            raise commands.UserFeedbackCheckFailure(CHANGED)
+        await self.cog.api('POST', '/chat/turn/check', self.fence)
+        if not unmoved():  # A "forget me" taken in here while Gene answered.
+            raise commands.UserFeedbackCheckFailure(CHANGED)
 
     async def recheck(self):
         # Paging reveals more of the draft, so it needs the same fence as preview and submit.

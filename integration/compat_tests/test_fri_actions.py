@@ -20,6 +20,7 @@ from fri.fri_actions import CATCH_UP_CHARS, Actions
 from fri.fri_agent import Agent
 from fri.fri_chat import SCHEMA, Chat, ChatResult
 
+GONE = {'code': 10008, 'message': 'Unknown Message'}  # Discord's 404 for a message that's gone, as it answers it.
 
 def test_owner_learning_endpoints_reject_other_roles_and_forged_owners(setup_agent):
     _, settings, _ = setup_agent
@@ -88,7 +89,9 @@ def harness(monkeypatch, tmp_path):
     agent.state.update(channels=['1', '2', '3', '456'], history_channels=['1', '2'], started=time.time()-3600)
     agent.dedicated = 3
     agent.member = AsyncMock(return_value=SimpleNamespace(id=10))
-    agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'summary': ''})
+    # As the controller answers: removed_at 0, they never erased or removed a note. Without it, Fri can't tell and
+    # leaves their posts out of what it reads (fri #337's round 1).
+    agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'summary': '', 'removed_at': 0})
     reads = []
     ids = iter(range(1, 10**6))
     def message(user=20, text='I love trance', bot=False, age=60):
@@ -186,7 +189,14 @@ def catch_up_channel(channels, reads, rows):
                         key=lambda m: m.id, reverse=True)
         for message in newest[:kwargs['limit']]:
             yield message
+
+    async def fetch_message(mid):  # By its ID, as Discord answers: a 404 once it's gone.
+        found = next((message for message in messages if message.id == mid), None)
+        if found is None:
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), GONE)
+        return found
     channels[1].history = history
+    channels[1].fetch_message = fetch_message
     return messages
 
 

@@ -18,7 +18,7 @@ from fri.fri_agent import Agent
 def fenced_batch(learning, monkeypatch):  # noqa: F811
     """batch(), on a controller offering the atomic author check, every controller call it makes recorded."""
     agent, store, ids, finishes, asked, signing = batch(learning, monkeypatch)
-    agent.fri.capabilities = frozenset({'author-fence'})
+    agent.fri.capabilities = agent.fri.capabilities | {'author-fence'}
     api, calls = agent.fri.api, []
 
     async def recording(method, path, payload=None):
@@ -78,7 +78,10 @@ def test_a_learning_batch_with_nothing_moved_checks_its_authors_in_one_call(lear
         agent.profile.side_effect = lambda channel, user: (reads.append(bool(signed)), profile(channel, user))[1]
         await agent.learn()
         assert [[record['id'] for record in data['messages']] for data in asked] == [[first, second]]
-        assert calls[signed[0]:signed[0]+1] == ['/agent/authors/check']  # The fence's one call after the sign-in,
+        after = [path.rsplit('/', 1)[-1] if path.startswith('/agent/learning/') else path
+                 for path in calls[signed[0]:signed[0]+2]]
+        # After the sign-in, what Gene knows was withdrawn (fri #335), then the fence's one call for every author,
+        assert after == ['withdrawn', '/agent/authors/check']
         assert True not in reads  # and no profile read after it.
 
     asyncio.run(scenario())
@@ -120,17 +123,21 @@ def test_an_explorations_planner_is_fenced_against_its_target(learning, monkeypa
     evidence excerpts, and that request wasn't fenced: the target erasing during its sign-in, here or through Gene,
     still sent their name and exact evidence. Signed in, the target's Gene revision and erasures here are read again;
     moved, the planner isn't asked and the pass stops for that member, as when their eligibility changes."""
-    from compat_tests.test_fri_exploration import archive, row
+    from compat_tests.test_fri_exploration import archive, by_id, offered, row
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
+    capabilities = offered(client)
     old, later = row(clock[0]-120*86400), row(clock[0]-160*86400, text='minecraft redstone was fun')
     channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()),
                               permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True))
     finishes, roles, pages, agents, passes = [], [], iter([[old], [old, later], []]), [], []
+    targets = []
 
     async def api(method, path, payload=None):
         response = client.request(method, path, json=payload, headers=headers('fri'))
         assert response.status_code == 200, response.text
+        if path.endswith('/target'):
+            targets.append(response.json()['target'])
         if path.endswith('/finish'):
             finishes.append(payload)
         return response.json()
@@ -161,7 +168,8 @@ def test_an_explorations_planner_is_fenced_against_its_target(learning, monkeypa
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), http=SimpleNamespace(request=http),
+                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), capabilities=capabilities,
+                              http=SimpleNamespace(request=by_id(http, [old, later])),
                               chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri)
         agents.append(agent)
@@ -178,7 +186,9 @@ def test_an_explorations_planner_is_fenced_against_its_target(learning, monkeypa
         await agent.learn()
 
     asyncio.run(scenario())
-    if moved == 'nothing':
+    if 'revision' not in targets[-1]:  # Before HumanMint/gene#197: never a planner request (fri #304).
+        assert roles == []
+    elif moved == 'nothing':
         assert len(roles) == 1 and 'historical_topics' in roles[0]
     else:
         assert roles == [] and finishes[-1]['error']

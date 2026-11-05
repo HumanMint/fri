@@ -29,6 +29,30 @@ def assigned(scheduler, claim):
     return scheduler.exploration.target(claim['id'], [{'user_id': '11', 'name': 'friend', 'role_id': '90'}])
 
 
+def offered(client):
+    """What a pass's Fri, built by hand here, offers of the controller's: learning-withdrawals, which a pass needs
+    before it sends anything (fri #335). A test of a pass that sends skips against a controller without it."""
+    found = set(client.get('/fri/contract', headers=headers('fri')).json()['capabilities']) & {'learning-withdrawals'}
+    if not found:
+        pytest.skip('needs a controller offering learning-withdrawals')
+    return frozenset(found)
+
+
+def by_id(http, rows):
+    """An archive's Discord HTTP, `http`, that also reads a message by its ID, as a pass does right before it sends
+    it (fri #335): from `rows`, what Discord holds now; one not there is gone."""
+    import discord
+
+    async def request(route, params=None):
+        if '/channels/' in route.url and '/messages/' in route.url:
+            found = next((row for row in rows if row['id'] == route.url.rsplit('/', 1)[-1]), None)
+            if found is None:
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+            return found
+        return await http(route, params)
+    return request
+
+
 def row(at, user='11', text='played minecraft with everyone', channel='1', bot=False):
     return {'id': str(int(snowflake_floor(at))+1), 'channel_id': channel,
             'author': {'id': user, 'bot': bot}, 'content': text}
@@ -56,6 +80,7 @@ def finish(scheduler, claim, items, observations=(), **changes):
 def test_real_learning_harness_explores_old_messages_and_deduplicates_cross_query(learning):
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
+    offered(client)  # A pass asks for no batch from a controller without learning-withdrawals (fri #346).
     old = row(clock[0]-120*86400)
     new = row(clock[0]-160*86400, text='minecraft redstone was fun')
     store.personal_control('13', 'disable')
@@ -65,11 +90,13 @@ def test_real_learning_harness_explores_old_messages_and_deduplicates_cross_quer
     plans = iter([{'member_id': '11', 'term': 'minecraft', 'reason': 'follow their Minecraft discussions'},
                   {'member_id': '11', 'term': 'minecraft', 'reason': 'continue the unchecked older results'}])
     pages = iter([[old], [old, new], []])
-    model_inputs, searches = [], []
+    model_inputs, searches, targets = [], [], []
 
     async def api(method, path, payload=None):
         response = client.request(method, path, json=payload, headers=headers('fri'))
         assert response.status_code == 200, response.text
+        if path.endswith('/target'):
+            targets.append(response.json()['target'])
         return response.json()
 
     async def http(route, params):
@@ -126,6 +153,11 @@ def test_real_learning_harness_explores_old_messages_and_deduplicates_cross_quer
         agent = runtime()  # Restart and overlap a different search with a previously read message.
         agent.run = summarize
         second = await agent.learn()
+        if 'revision' not in targets[-1]:
+            # A controller before HumanMint/gene#197 can't say what the planner's context is current for: no planner
+            # request, and a broad read instead (fri #304). The rest of this follows the planner's search.
+            assert 'exploration_plan' not in [role for role, _ in model_inputs] and 'content' not in searches[-1]
+            return
         assert second['scanned'] == 2 and second['eligible'] == second['historical_notes'] == 1
         assert model_inputs[-1][1]['messages'][0]['id'] == new['id']
         assert searches[1]['author_id'] == '11' and searches[1]['content'] == 'minecraft'
