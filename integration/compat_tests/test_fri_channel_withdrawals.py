@@ -253,3 +253,42 @@ def test_a_queue_that_cant_be_read_holds_everything_back_until_a_sweep(monkeypat
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_deletion_in_another_server_queues_nothing(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            elsewhere = SimpleNamespace(id=4242, guild=SimpleNamespace(id=777), threads=[])
+            if handler := getattr(w.fri, 'on_guild_channel_delete', None):
+                await handler(elsewhere)
+            if handler := getattr(w.fri, 'on_raw_thread_delete', None):
+                await handler(SimpleNamespace(thread_id=4243, guild_id=777, parent_id=4242, thread=None))
+            await landed(w)
+            assert withdrawals(w) == [] and await asked(w) == ['I like Minecraft']
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_sweep_names_the_channel_of_a_thread_saved_before_the_controller_kept_it(monkeypatch, tmp_path):
+    """A thread whose turns an older controller saved: the sweep names its channel from the cache, so that channel's
+    deletion takes it too, though no event comes for the thread."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            await w.say(THREAD, 'fri I like osu', 'cool', note('I like osu'))
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            with w.store.connection() as db:
+                db.execute('DELETE FROM chat_thread_parents')  # As an older controller saved it.
+            await landed(w)
+            with w.store.connection() as db:
+                assert [tuple(row) for row in db.execute('SELECT thread_id,parent_id FROM chat_thread_parents')] == [
+                    (str(THREAD), str(GENERAL))]
+            await deleted(w, GENERAL)
+            assert await asked(w) == ['I like chess']
+        finally:
+            await w.fri.close()
+    run(scenario)
