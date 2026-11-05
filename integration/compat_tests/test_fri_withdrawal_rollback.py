@@ -704,7 +704,8 @@ def test_memory_views_show_nothing_saved_while_closed(monkeypatch, tmp_path):
 
 def test_a_hold_outlives_a_later_event_for_its_message_and_another_start(monkeypatch, tmp_path):
     """A by-ID event for a held message (its raw delete, say) never turns the hold into a request kept only in memory:
-    after another start it's still held back."""
+    after another start it's still held back. The deletion, its event just checked, names its server, so it's asked
+    about by ID now (Sol round 1 of #364, S1); while the controller can't take it, it's on disk as the hold was."""
     async def scenario():
         import json
 
@@ -715,7 +716,10 @@ def test_a_hold_outlives_a_later_event_for_its_message_and_another_start(monkeyp
             (tmp_path/'withdrawals.json').write_text(json.dumps({'pending': {str(held_back.id): {'scope': 'lost'}}}))
             w.agent.saved_turns = SavedTurns(w.agent)
             assert w.agent.saved_turns.pending[str(held_back.id)].get('hold')
+            failing(w, SAVED)
             await delete(w, held_back, guild=123)
+            entry = w.agent.saved_turns.pending[str(held_back.id)]
+            assert entry.get('deleted') is True and not entry.get('hold') and entry['server'] == '123'
             w.agent.saved_turns = SavedTurns(w.agent)
             assert w.agent.saved_turns.withheld([held_back.id]) == {str(held_back.id)}
         finally:
