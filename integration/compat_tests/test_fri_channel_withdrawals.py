@@ -202,6 +202,9 @@ def test_without_a_controller_that_takes_channels_every_saved_context_is_held_ba
             await deleted(w, GENERAL)
             assert withdrawals(w) == []
             assert await asked(w) == []
+            # fri health says why: the channel queue, not an unreadable withdrawals record.
+            assert w.fri.agent.channel_withdrawals.status()['holding'] is True
+            assert w.fri.agent.saved_turns.status()['closed_until'] is None
             before = w.fri.agent
             agent = w.fri.agent = Agent(w.fri)  # Restarted: only what's on disk carries over.
             agent.state, agent.record = before.state, AsyncMock()
@@ -211,6 +214,27 @@ def test_without_a_controller_that_takes_channels_every_saved_context_is_held_ba
             await landed(w)
             assert withdrawals(w) == [{'guild_id': '123', 'channel_ids': [str(GENERAL)]}]
             assert await asked(w) == ['I like chess']
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_queue_that_cant_be_read_holds_everything_back_until_a_sweep(monkeypatch, tmp_path):
+    """What it named would come back were it read as empty: until a sweep has read what the controller holds, and
+    found nothing gone that isn't withdrawn, nothing saved reaches a request."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            (tmp_path/'channel-withdrawals.json').write_text('{"pending": {')
+            before = w.fri.agent
+            agent = w.fri.agent = Agent(w.fri)  # Restarted.
+            agent.state, agent.record = before.state, AsyncMock()
+            assert await asked(w) == []
+            await landed(w)
+            assert agent.channel_withdrawals.status() == {'pending': 0, 'holding': False, 'unreadable': False,
+                                                          'swept_at': agent.channel_withdrawals.swept}
+            assert await asked(w) == ['I like Minecraft']
         finally:
             await w.fri.close()
     run(scenario)
