@@ -20,6 +20,7 @@ from fri.fri_actions import CATCH_UP_CHARS, Actions
 from fri.fri_agent import Agent
 from fri.fri_chat import SCHEMA, Chat, ChatResult
 
+GONE = {'code': 10008, 'message': 'Unknown Message'}  # Discord's 404 for a message that's gone, as it answers it.
 
 def test_owner_learning_endpoints_reject_other_roles_and_forged_owners(setup_agent):
     _, settings, _ = setup_agent
@@ -188,7 +189,14 @@ def catch_up_channel(channels, reads, rows):
                         key=lambda m: m.id, reverse=True)
         for message in newest[:kwargs['limit']]:
             yield message
+
+    async def fetch_message(mid):  # By its ID, as Discord answers: a 404 once it's gone.
+        found = next((message for message in messages if message.id == mid), None)
+        if found is None:
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), GONE)
+        return found
     channels[1].history = history
+    channels[1].fetch_message = fetch_message
     return messages
 
 

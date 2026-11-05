@@ -611,6 +611,9 @@ class Actions:
                 latest = {message.id: (message.author.id, message.content, message.edited_at, carried(message))
                           async for message in found if message.id in shown}
                 if latest != shown:
+                    # One no longer listed may only be unpinned: taken back only if Discord says by its ID that it's
+                    # deleted (fri #358).
+                    await self.agent.deleted(channel, sorted(shown.keys()-latest.keys()), self.guild)
                     return False
         except discord.HTTPException:
             return False
