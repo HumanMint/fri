@@ -914,3 +914,79 @@ def test_a_panel_reply_written_while_its_channel_went_never_shows_or_is_saved(mo
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_my_memory_after_an_edit_read_before_its_channel_went_never_shows(monkeypatch, tmp_path):
+    """Sol round 3 of #372, for My memory's edits: removing one preference reads the listing back, and #general's
+    withdrawal is accepted before that answer comes back. Where things stood is taken before the edit's read, so that
+    listing, still holding #general's note, is never shown."""
+    async def scenario():
+        from unittest.mock import Mock
+
+        from fri.fri import PANEL_SKIPPED
+        from fri.fri_memory import profiled
+        from fri.fri_memory_panel import MemoryView
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            with w.store.connection() as db:
+                db.execute(LEGACY)
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            shown = []
+
+            async def reply(cog, interaction, content=None, *, embed=None, still=None, **kwargs):
+                if still is None or await still():
+                    shown.append(embed.description if embed else content)
+            monkeypatch.setattr('fri.fri_panel.reply', reply)
+            monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            chess = next(entry for entry in state['entries'] if entry['evidence'] == 'I like chess')
+            real = w.fri.api
+
+            async def api(method, path, payload=None):
+                answer = await real(method, path, payload)
+                if path.startswith('/chat/memory/notes/'):
+                    await deleted(w, GENERAL)  # Accepted before the edit's answer comes back.
+                return answer
+            w.fri.api = api
+            view = MemoryView(w.fri, scope, state, selected=chess['id'])
+            interaction = Mock(spec=discord.Interaction, guild_id=None, channel_id=DM,
+                               user=SimpleNamespace(id=20, display_name='member 20'))
+            interaction.id = discord.utils.time_snowflake(discord.utils.utcnow())
+            await view.remove(interaction)
+            assert 'I like Minecraft' not in ' '.join(shown) and PANEL_SKIPPED in shown
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_context_read_again_is_held_to_every_check_again(monkeypatch, tmp_path):
+    """Sol round 3 of #372: what's read again after a channel's withdrawal goes through the request's checks again. A
+    message taken back here while the first copy waited, its withdrawal still on its way, so the controller still holds
+    its exchange and note, stays out of the copy read again too."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            with w.store.connection() as db:
+                db.execute(LEGACY)
+            chess = w.message(GAMING, 'fri I like chess')
+            await w.say(GAMING, chess.content, 'cool', note('I like chess'), event=chess)
+            real = w.fri.api
+
+            async def api(method, path, payload=None):
+                if path.startswith('/chat/turn/withdraw'):
+                    raise TimeoutError()  # The controller doesn't take it yet: it still holds that exchange.
+                return await real(method, path, payload)
+            w.fri.api = api
+
+            async def gone_now():
+                w.fri.agent.unsend(GAMING, [chess.id])
+                await deleted(w, GENERAL)
+            paused_private_context(w, gone_now)
+            assert await asked(w) == []
+        finally:
+            await w.fri.close()
+    run(scenario)
