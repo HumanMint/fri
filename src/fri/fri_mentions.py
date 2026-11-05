@@ -177,7 +177,7 @@ class Invitation:
                 current = await post.channel.fetch_message(mid)  # A linked post's from its own channel.
             except discord.NotFound:
                 return False
-            if current.id != mid or unsigned(stills(current)[0]) != urls:
+            if current.id != mid or unsigned(stills(current, len(urls))[0]) != urls:  # As many as it showed.
                 return False
         return True
 
