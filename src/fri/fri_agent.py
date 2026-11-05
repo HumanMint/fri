@@ -2533,8 +2533,16 @@ class Agent:
             return set()
         if LEARNING_WITHDRAWALS not in getattr(self.fri, 'capabilities', ()):
             raise ValueError("Messages Gene knows were taken back can't be told apart; this pass waits")
-        answer = await self.fri.api('POST', f'/agent/learning/{batch}/withdrawn',
-                                    {'messages': [{'id': i, 'user_id': user} for i, user in held]})
+        try:
+            answer = await self.fri.api('POST', f'/agent/learning/{batch}/withdrawn',
+                                        {'messages': [{'id': i, 'user_id': user} for i, user in held]})
+        except ControllerRejected as exc:
+            if exc.status == 404:  # Its endpoint's gone: a controller rolled back under Fri since it read its contract.
+                # Not offered any more, so the next pass reads the contract again, through the withdrawal queue's
+                # throttled reader, before it claims (see learning_offered), and waits while it can't say (fri #351).
+                self.fri.capabilities = frozenset(getattr(self.fri, 'capabilities', ())) - {LEARNING_WITHDRAWALS}
+                raise ValueError("Messages Gene knows were taken back can't be told apart; this pass waits") from None
+            raise
         withdrawn = answer.get('withdrawn') if isinstance(answer, dict) else None
         asked = {i for i, _ in held}
         # Only the IDs it was asked about, as strings: anything else (null, an object, a number, another ID) means the
