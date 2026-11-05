@@ -54,7 +54,7 @@ from .fri_reports import ReportButton, report_component
 from .fri_requests import request_dm_component
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
-from .fri_turn_withdrawal import exchange, held
+from .fri_turn_withdrawal import EDIT_TIMES, exchange, held, turn_versions
 from .fri_usage import describe_usage, usage_query, usage_requested, window_applied
 from .panels import defer_panel
 from .privacy import clean
@@ -702,7 +702,8 @@ class Fri(discord.Client):
                 if image_source is None and quick_closure(
                         text, {**context, 'recent': self.agent.messages(channel_id) if self.agent else []}):
                     result = ChatResult(status='completed', response_kind='react', reaction='👍')
-                    result = self.stage_turn(scope, source, text, context, result, model='local-closing', derived=False)
+                    result = self.stage_turn(scope, source, text, context, result, model='local-closing', derived=False,
+                                             event=event)
                     await self.api('POST', '/chat/turn/check', result.turn)  # Fence even a reaction.
                     return result
                 if user_id == self.owner_id and guild_id == self.guild_id and usage_requested(text):
@@ -714,7 +715,7 @@ class Fri(discord.Client):
                     report = describe_usage(usage, by_model='by model' in ' '.join(text.casefold().split()),
                                             window=label, windowless=windowless)
                     result = self.stage_turn(scope, source, text, context, ChatResult(reply=report, status='completed'),
-                                             model='local-usage-report', derived=False)
+                                             model='local-usage-report', derived=False, event=event)
                     await self.api('POST', '/chat/turn/check', result.turn)  # An erasure mid-turn stops it.
                     return result
                 if self.agent and self.agent.gave_way(event):
@@ -726,7 +727,7 @@ class Fri(discord.Client):
                         saved_result = (ChatResult(reply='Earlier check: gene_command. Fetch current evidence for follow-up details; no findings are retained here.', status='completed')
                                         if operation.tool_receipt else operation.result)
                         operation.result.turn = self.stage_turn(scope, source, text, context, saved_result,
-                                                                model='local-control', derived=False).turn
+                                                                model='local-control', derived=False, event=event).turn
                         operation.result.turn['verbatim'] = saved_result is operation.result
                         try:
                             await self.api('POST', '/chat/turn/check', operation.result.turn)
@@ -968,7 +969,9 @@ class Fri(discord.Client):
                         'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
                                                                          result.post_preview or result.clarification),
                         'provenance': provenance, 'verbatim': stored == result.reply, **self.summary_generation(context),
-                        **({'audience': audience(context)} if context.get('audience') else {})}
+                        **({'audience': audience(context)} if context.get('audience') else {}),
+                        # Which version of its messages it answered (fri #358), for record_turn, not the model.
+                        'versions': turn_versions(event, context.get('message_burst', []))}
                     if len(result.turn['provenance']) > MAX_PROVENANCE:
                         return ChatResult(reply=unrecorded(receipts, reason='too many people were in that context to '
                                                            'track safely.'), status='completed')
@@ -992,7 +995,7 @@ class Fri(discord.Client):
                     return result
                 if context.get('gene_receipts') and not await actions.valid(outage=True, sending=True):
                     raise commands.UserFeedbackCheckFailure('my access changed mid-check. ask again.')
-                result = self.stage_turn(scope, source, text, context, result, actions=actions)
+                result = self.stage_turn(scope, source, text, context, result, actions=actions, event=event)
                 await looked(result)
                 # The save's privacy fence runs before delivery; the save itself waits for delivery.
                 await self.echoes_standing(context)
@@ -1002,7 +1005,7 @@ class Fri(discord.Client):
         finally:
             self.busy.discard(user_id)
 
-    def stage_turn(self, scope, source, text, context, result, *, model=None, actions=None, derived=True):
+    def stage_turn(self, scope, source, text, context, result, *, model=None, actions=None, derived=True, event=None):
         """Prepare the turn record; record_turn saves it only after Discord accepts the delivery."""
         if context.get('force_text_reply'):
             from .fri_mentions import force_text
@@ -1035,7 +1038,9 @@ class Fri(discord.Client):
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
             **(self.summary_generation(context) if derived else {}),
             **(self.drawn_on(context) if derived else {}),
-            **({'audience': audience(context)} if context.get('audience') else {})}
+            **({'audience': audience(context)} if context.get('audience') else {}),
+            # Which version of its messages it answered (fri #358), for record_turn, not the model.
+            'versions': turn_versions(event, context.get('message_burst', []))}
         if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
             result.echo = self.echo(scope, context, provenance, reply, draws_on_summary(result.turn), carried(context))
         return result
@@ -1242,6 +1247,11 @@ class Fri(discord.Client):
         payload, result.turn = result.turn, None
         if not payload:
             return None
+        # Which version of its messages the turn answered: kept here for Fri's own exchange either way, and sent to a
+        # controller offering edit times, which places an edit by ID against them (fri #358).
+        versions = payload.get('versions') or {}
+        if EDIT_TIMES not in self.capabilities:
+            payload = {key: value for key, value in payload.items() if key != 'versions'}
         if isinstance(getattr(sent, 'id', None), int) and payload.get('response_kind', 'reply') == 'reply':
             payload = {**payload, 'reply_message_id': str(sent.id)}  # Later references resolve to its sources.
             delivered = getattr(sent, 'content', None)
@@ -1258,10 +1268,10 @@ class Fri(discord.Client):
         except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError) as exc:
             LOG.warning('Delivered turn was not recorded: %s', type(exc).__name__)  # Includes privacy changes mid-reply.
             if isinstance(exc, (TimeoutError, ControllerUnavailable)) and self.agent:  # A lost reply, not a refusal:
-                self.agent.saved_turns.kept(payload, None, began, erasure)  # it may have landed all the same.
+                self.agent.saved_turns.kept(payload, None, began, erasure, versions)  # it may have landed anyway.
             return None
         if self.agent:  # So its messages taken back later take it with them (fri #129).
-            self.agent.saved_turns.kept(payload, saved, began, erasure)
+            self.agent.saved_turns.kept(payload, saved, began, erasure, versions)
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
             notice = self.first_memory(saved)
             content = (sent.content or '')+notice

@@ -41,7 +41,7 @@ from .fri_notices import ReplyInProgress, notice_text
 from .fri_panel import DraftView
 from .fri_reports import report_message
 from .fri_responses import REACTIONS
-from .fri_turn_withdrawal import SavedTurns
+from .fri_turn_withdrawal import EDIT_TIMES, SavedTurns, version
 from .fri_turns import Arrivals, Turns
 from .fri_usage import usage_requested
 from .previews import PagedPreview, turn_fence
@@ -633,7 +633,7 @@ class Agent:
             for window in list(self.passes):  # Every member's edit, for a running learning pass to leave out (fri #325).
                 window.taken([message.id])
         if edited and message.id in self.looked:
-            self.revise(message.id)
+            self.revise(message.id, message.edited_at.timestamp())
         if (self.handling[message.id] or message.id in self.rerunning) and edited:
             self.saw_edit(message.id, message.edited_at)
             return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
@@ -658,14 +658,16 @@ class Agent:
                 else:
                     rows.remove(row)
 
-    def revise(self, mid):
+    def revise(self, mid, edited_at=None):
         now = time.time()
         self.revised.pop(mid, None)
         self.revised[mid] = now
         # Kept an hour, as withdrawn is: longer than any turn that could still hold a copy runs.
         while self.revised and (next(iter(self.revised.values())) < now-3600 or len(self.revised) > 100000):
             del self.revised[next(iter(self.revised))]
-        self.saved_turns.withdraw([mid])  # What it said before goes from its author's saved exchange too.
+        # What it said before goes from its author's saved exchange too, unless that answered this version or a later
+        # one (edited_at: the edit's, see SavedTurns.withdraw).
+        self.saved_turns.withdraw([mid], edited_at=edited_at)
 
     def forget(self, user, erased=False):
         """The member used a privacy control through Fri: their messages still waiting for a reply
@@ -2590,6 +2592,7 @@ class Agent:
             return await explore(self, claim)
         records, scanned, before, done, output, counters, error = [], 0, claim['before'], False, {}, {}, ''
         held = []  # Each record's author and their erasures here before the history was read (see unmoved).
+        read = {}  # Which version of each message it read (fri #358): beside the records at the finish, not in them.
         # Members' erasures here, once, before anything is read: every record is held to this, so a "forget me" during
         # the history read, or between two of a member's records, counts against all of theirs (fri #290's round 1).
         snapshot = dict(self.forgotten)
@@ -2628,6 +2631,7 @@ class Agent:
                     'role_id': claim['role_id'], 'revision': profile['revision'],
                     'text': clean(message.content, 500), 'at': message.created_at.timestamp()})
                 held.append((message.author.id, snapshot.get(message.author.id, 0)))
+                read[str(message.id)] = version(message)
 
             async def verify(kept):
                 """Signed in, the batch's history read again as it was read (fri #335): a message gone, or reading
@@ -2660,10 +2664,11 @@ class Agent:
             error = type(exc).__name__+': learning pass could not complete'
         finally:  # Nothing more of the batch is sent, whatever stopped it, a cancellation too (fri #335).
             self.passes.discard(window)
+        versions = {record['id']: read[record['id']] for record in records if read.get(record['id']) is not None}
         receipt = await self.fri.api('POST', '/agent/learning/'+claim['id']+'/finish', {
             'records': records, 'result': output, 'scanned': scanned, 'before': before,
             'done': done, 'counters': counters, 'error': error, 'oldest': oldest, 'newest': newest,
-            'newest_id': newest_id})
+            'newest_id': newest_id, **({'versions': versions} if EDIT_TIMES in self.fri.capabilities else {})})
         try:
             await self.send_reports()
         except (discord.HTTPException, commands.UserFeedbackCheckFailure):

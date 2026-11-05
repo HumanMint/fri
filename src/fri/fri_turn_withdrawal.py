@@ -22,6 +22,7 @@ from when it was queued, after anything saved from its message (fri #329, see la
 """
 
 import asyncio
+import datetime as dt
 import io
 import json
 import json.decoder
@@ -364,11 +365,13 @@ class SavedTurns:
         """How many times the member said "forget me": a save sent before one answers too late to record (see kept)."""
         return self.erasures.get(str(user), 0)
 
-    def kept(self, payload, saved, began, erasure=None):
+    def kept(self, payload, saved, began, erasure=None, versions=None):
         """The controller saved this turn, or may have (`saved` None: no answer came). `began`: time.time() and
         time.monotonic() just before it was sent. One of its messages withdrawn since went while the save was on its
         way, before anything here knew of it, so its exchange goes now. erasure: the member's (see erasure) as it was
-        sent; once they've said "forget me" since, the controller erased it, so nothing of it is recorded here."""
+        sent; once they've said "forget me" since, the controller erased it, so nothing of it is recorded here.
+        versions: which version of each message it answered (see turn_versions), so an edit no later than that leaves
+        it alone (see withdraw)."""
         if not self.offered() or payload.get('mention_grant'):  # A mention keeps only a placeholder.
             return
         if erasure is not None and self.erasure(payload.get('user_id')) != erasure:
@@ -385,7 +388,7 @@ class SavedTurns:
         now = time.time()
         for i in ids:
             self.saved.pop(i, None)
-            self.saved[i] = (now, scope, revision)
+            self.saved[i] = (now, scope, revision, (versions or {}).get(str(i)))
         while self.saved and (next(iter(self.saved.values()))[0] < now-KEPT_SECONDS or len(self.saved) > MOST):
             del self.saved[next(iter(self.saved))]
         wall, monotonic = began
@@ -410,7 +413,10 @@ class SavedTurns:
         edited_at: when Discord says an edit was made (fri #358). From a controller offering EDIT_TIMES, an edit is
         asked about by ID whatever its message's age, with that time, and the controller takes only what was saved
         before it: a pin repeating an earlier edit's time takes nothing learned since. Of two edits queued for one
-        message, the later time stands; one with no time takes everything, so it stands over any time."""
+        message, the later time stands; one with no time takes everything, so it stands over any time. The controller
+        places the time against the version of the message each save was made from, on Discord's clock (see
+        turn_versions); so does this, for an exchange Fri saved itself: an edit no later than the version it answered is
+        a pin or an embed refresh, and takes nothing (Sol round 1 of #364)."""
         authors = {int(i): str(user) for i, user in (authors or {}).items() if str(user).isdigit()}
         ids = [int(i) for i in ids]
         horizon = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
@@ -423,8 +429,15 @@ class SavedTurns:
             return max(known['edited_at'], edited_at) if timed and 'edited_at' in known else None
         for i in ids:
             known = self.pending.get(str(i), {})
-            if known.get('hold') and deleted and known.get('server'):
-                known = {}  # Kept out of use for an edit it couldn't place (see drain): a deletion takes it all.
+            if known.get('hold') and deleted and server is not None:
+                # A hold (kept out of use for an edit the controller couldn't place, or read from disk, which keeps no
+                # server): this deletion, its event just checked, names the server, and takes it all (Sol round 1 of
+                # fri #364).
+                known = {}
+            mine = self.saved.get(i)
+            if (mine is not None and not deleted and edited_at is not None and len(mine) > 3 and mine[3] is not None
+                    and edited_at <= mine[3]+SAME):
+                continue  # Fri saved it from this version or a later one: a pin or an embed refresh took nothing.
             entry = self.saved.pop(i, None)
             if entry is not None:
                 if self.offered():
@@ -1116,6 +1129,32 @@ def queued(value):
 def sent_at(message_id):
     """When a Discord message was sent, from its ID."""
     return ((message_id >> 22)+1420070400000)/1000
+
+
+SAME = 0.001  # Seconds: one edit's time, read twice.
+
+
+def version(message):
+    """Which version of a Discord message Fri has in hand, on Discord's clock (fri #358): its edit time, or when it was
+    sent (its ID's time) if it was never edited. None for anything else."""
+    edited, i = getattr(message, 'edited_at', None), getattr(message, 'id', None)
+    if isinstance(edited, dt.datetime):
+        return edited.timestamp()
+    return sent_at(i) if isinstance(i, int) else None
+
+
+def turn_versions(event, burst=()):
+    """Which version of its own messages a turn answered (see version): the message it answers as Fri has it, and a
+    burst's earlier messages by when they were sent, as an edit takes one out of its burst before the burst is
+    answered. Saved with the turn, so an edit by ID is placed against them (see withdraw)."""
+    found = {}
+    for row in burst:
+        source = row.get('source') or {}
+        if source.get('kind') == 'discord_message' and str(source.get('id', '')).isdigit():
+            found[str(source['id'])] = sent_at(int(source['id']))
+    if isinstance(getattr(event, 'id', None), int) and version(event) is not None:
+        found[str(event.id)] = version(event)
+    return found
 
 
 def saved_lately(message_id):
