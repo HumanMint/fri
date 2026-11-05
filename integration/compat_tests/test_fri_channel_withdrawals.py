@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import discord
+import pytest
 
 from compat_tests.test_fri_member_profiles import (
     DM,
@@ -75,6 +76,13 @@ async def thread_deleted(w, tid, settle=True):
         await landed(w)
 
 
+def needs_channels(w):
+    """A test whose deletion must reach the controller: against one without channel-withdrawals (a mixed pair with an
+    older controller), Fri holds back instead, which the hold's own test covers."""
+    if 'channel-withdrawals' not in w.fri.capabilities:
+        pytest.skip('needs a controller offering channel-withdrawals')
+
+
 def withdrawals(w):
     return [body for path, body in w.calls if path == '/chat/channels/withdraw']
 
@@ -88,6 +96,7 @@ def test_a_deleted_channel_takes_the_profile_note_learned_there(monkeypatch, tmp
     no longer reaches a later private-panel request. One learned in #gaming still does."""
     async def scenario():
         w = world(monkeypatch, tmp_path)
+        needs_channels(w)
         try:
             await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
             await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
@@ -103,6 +112,7 @@ def test_a_deleted_channel_takes_the_profile_note_learned_there(monkeypatch, tmp
 def test_a_deleted_thread_takes_what_was_learned_in_it(monkeypatch, tmp_path):
     async def scenario():
         w = world(monkeypatch, tmp_path)
+        needs_channels(w)
         try:
             await w.say(THREAD, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
             await w.say(GENERAL, 'fri I like chess', 'cool', note('I like chess'))
@@ -120,6 +130,7 @@ def test_a_deleted_channel_takes_its_threads_whether_fri_still_held_them_or_not(
     async def scenario():
         for cached in ((), (THREAD,)):
             w = world(monkeypatch, tmp_path/str(len(cached)))
+            needs_channels(w)
             try:
                 await w.say(THREAD, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
                 await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
@@ -136,6 +147,7 @@ def test_a_deletion_fri_missed_is_found_by_a_later_read(monkeypatch, tmp_path):
     have it. A thread whose read answers the same goes too."""
     async def scenario():
         w = world(monkeypatch, tmp_path)
+        needs_channels(w)
         try:
             await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
             await w.say(THREAD, 'fri I like osu', 'cool', note('I like osu'))
@@ -210,6 +222,8 @@ def test_without_a_controller_that_takes_channels_every_saved_context_is_held_ba
             agent.state, agent.record = before.state, AsyncMock()
             await landed(w)
             assert await asked(w) == []
+            if 'channel-withdrawals' not in offered:  # A mixed pair with an older controller: held back it stays.
+                return
             w.fri.capabilities = offered
             await landed(w)
             assert withdrawals(w) == [{'guild_id': '123', 'channel_ids': [str(GENERAL)]}]
@@ -224,6 +238,7 @@ def test_a_queue_that_cant_be_read_holds_everything_back_until_a_sweep(monkeypat
     found nothing gone that isn't withdrawn, nothing saved reaches a request."""
     async def scenario():
         w = world(monkeypatch, tmp_path)
+        needs_channels(w)
         try:
             await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
             (tmp_path/'channel-withdrawals.json').write_text('{"pending": {')
