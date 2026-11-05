@@ -300,6 +300,8 @@ class Agent:
         self.windows = {}
         self.called = {}  # Message IDs in a burst that spoke to Fri -> when they came in (monotonic).
         self.saved_turns = SavedTurns(self)  # Members' messages Fri saved exchanges with, dropped if taken back.
+        from .fri_channel_withdrawal import ChannelWithdrawals
+        self.channel_withdrawals = ChannelWithdrawals(self)  # Channels and threads deleted, until Gene took them.
         from .fri_mentions import Receipts
         self.receipts = Receipts()  # Fri's answers to outside pings a direct reply may read (see Invitation.answer).
 
@@ -2298,7 +2300,12 @@ class Agent:
             if any(taken(event) for event in events):
                 return 'message deleted'
             # Fri's earlier answer a ping read, taken back or out of date since (see Invitation.standing).
-            return 'nearby message deleted' if changed(result.shown) or (invitation and not invitation.standing()) else None
+            return 'nearby message deleted' if stale() or (invitation and not invitation.standing()) else None
+
+        def stale():
+            """A message the model was shown taken back here, or a channel's withdrawal accepted past the read its
+            saved context came from (Sol round 3 of #372): it may hold the channel's words, a note naming no message."""
+            return bool(changed(result.shown)) or self.channel_withdrawals.moved(result.channels)
 
         async def gone():
             """Handled, and True, once something was taken back here: while Fri composed, or while the whole turn's
@@ -2315,7 +2322,7 @@ class Agent:
                     missed('message deleted')
                 await self.fri.waiting_notices.clear(message.author.id)
                 return True
-            if changed(result.shown) or (invitation and not invitation.standing()):
+            if stale() or (invitation and not invitation.standing()):
                 # Someone took back a message the model was shown: the reply may repeat it, and a reaction or a quiet
                 # decision answers it. None goes out or is saved; only a reply's words are worth saying why.
                 if ambient:
@@ -3027,6 +3034,8 @@ class Agent:
             except Exception as exc:  # Never at the cost of the stages below.
                 LOG.warning('Meme notes not verified this tick: %s', type(exc).__name__)
             results = [await self.stage('presence', self.check_presence),
+                       # Whatever learning or memory does: a deleted channel's saves go (fri #358).
+                       await self.stage('channel_withdrawals', self.channel_withdrawals.settle),
                        await self.stage('posts', lambda: deliver_post(self.fri)),
                        await self.stage('reminders', lambda: deliver_reminder(self.fri)),
                        await self.stage('reports', self.send_reports),

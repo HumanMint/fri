@@ -391,6 +391,20 @@ class Watch:
                          + ('; learning passes wait until then' if getattr(agent, 'learning_paused', False) else '')
                          + ('; to end it early, remove withdrawals.closed.json once nothing it holds back matters (see '
                             'docs/operations.md)' if past else ''))
+        channels = getattr(agent, 'channel_withdrawals', None) if agent else None
+        if channels is not None and (state := channels.status())['holding']:  # Every saved context (fri #372 r2, S1).
+            parts = []
+            if state['pending']:
+                parts.append(f"{state['pending']} waits for the controller to take it" if state['pending'] == 1
+                             else f"{state['pending']} wait for the controller to take them")
+            if state['recovering']:
+                parts.append('the queue is recovering (it couldn\'t be read, or wasn\'t written down in full): '
+                             + (f"{state['answered']} of {state['held']} held channels answered by Discord so far"
+                                if state['held'] is not None else 'no sweep has read the held channels yet')
+                             + '; it ends once every one is answered and the controller took what was gone')
+            if not state['offered']:
+                parts.append("the controller doesn't take channels yet, so it stays until one that does is back")
+            lines.append('- saved context: held back for deleted channels: ' + '; '.join(parts))
         if getattr(agent, 'summaries_wait_for_gene', False):  # A build skipped for it (fri #333, #348 r1, #349).
             lines.append("- member summaries: paused and none used, the controller doesn't name a summary's messages "
                          'and recheck kept ones (summary-sources, summary-rechecks), so none can be checked; they '

@@ -87,6 +87,10 @@ LEGACY = '[an earlier fri reply from before fri tracked its sources]'
 CHANGED = 'someone in that context changed their privacy settings while i was replying. ask again for a fresh answer.'
 CONVERSATION_CHANGED = 'the conversation changed while i was typing. ask again and i’ll catch up.'
 READ_CHANGED = 'that chat changed while i was reading it. ask again.'
+CHANNELS_MOVED = 'something i was reading changed while i was on it. ask again.'  # See chat_once (fri #372).
+REREADS = 2  # How often a request's saved context is read again past a channel's withdrawal (see chat_once).
+# What a request reads again then: what ChannelWithdrawals.drop takes that the controller's chat context holds.
+REREAD = ('turns', 'pending', 'elsewhere', 'personal_memory', 'note_sources', 'profile_origins', 'member_summary')
 WITHDRAWN = 'the message i was answering got edited or deleted while i was on it. ask again if you still want it.'
 # A /fri panel turn that stopped, as a DM's goes quiet: the panel says so rather than keep thinking (fri #288).
 PANEL_SKIPPED = 'skipped that one, something changed while i was on it. ask again if you still want it.'
@@ -407,8 +411,19 @@ class Fri(discord.Client):
         LOG.warning('Usage receipt set aside in usage/rejected: %s', cause)
 
     async def chat_once(self, text, context):
-        async def ready():  # Signed in by now, so nothing waits between these checks and the request they clear.
+        async def ready(depth=0):  # Signed in by now, so nothing waits between these checks and the request they clear.
             fence = context.get('fence')
+
+            async def refreshed():
+                """A context read before a channel's withdrawal was accepted: what it held of the channel can't be told
+                from the rest, so it's dropped whole, read again, and every check here repeated on that, at most REREADS
+                times. Withdrawals still moving past each read, the member is told to ask again rather than answered
+                with nothing saved (Sol rounds 3 and 4 of #372)."""
+                self.agent.channel_withdrawals.drop(context)
+                if fence.get('reread') is None or depth >= REREADS:
+                    raise commands.UserFeedbackCheckFailure(CHANNELS_MOVED)
+                await fence['reread'](context)
+                return await ready(depth + 1)
             looked = [read['event'].id for read in context.get('image_reads', [])]
             if context.get('image_event') is not None:
                 looked.append(context['image_event'].id)
@@ -476,6 +491,11 @@ class Fri(discord.Client):
                 # With the summaries Fri's replies in view (and one it answers) drew on, as they stand now: refused
                 # if one went. They count for the save only once the request still carries them (see depend). Only
                 # what the request could still carry: a row taken back by now goes before it (fri #217).
+                # A context a channel's withdrawal moved past is read again before the turn's check, which it would
+                # otherwise decide: a reply it holds may have drawn on a summary that went with the channel (Sol round
+                # 4 of #372, S1). Its earlier requests' dependencies stay in the fence.
+                if self.agent and self.agent.channel_withdrawals.moved(fence.get('channels')):
+                    return await refreshed()
                 prospective = self.dependencies(self.standing(context))
                 try:
                     await self.api('POST', '/chat/turn/check', {**fence['turn'], 'provenance': turn_provenance(
@@ -502,6 +522,10 @@ class Fri(discord.Client):
             # Saved context holding a message its author took back since it was read, or whose withdrawal the
             # controller hasn't taken yet (a timeout, a restart): its words stay out. What's left counts as carried, so
             # a take-back from here on withholds the answer, and keeps nothing at the save (fri #215).
+            # And a context read before a channel's withdrawal was accepted, whole: what it held of the channel can't be
+            # told from the rest, a note naming no message, say (fri #372 round 2, B3).
+            if self.agent and fence and self.agent.channel_withdrawals.moved(fence.get('channels')):
+                return await refreshed()  # Accepted during the checks above (see refreshed).
             if self.agent:
                 seen.update(int(i) for i in self.agent.saved_turns.withhold(context))
             # One this turn quotes or replies to refuses it instead: the answer would be about words taken back,
@@ -585,6 +609,7 @@ class Fri(discord.Client):
         seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
         result = await self.chat.respond(text, context, ready=ready)
         result.shown = seen
+        result.channels = (context.get('fence') or {}).get('channels')  # As its last read was (see ready).
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
             'attempt_id': attempt, 'model': context['model'], 'effort': context['effort'],
@@ -658,6 +683,8 @@ class Fri(discord.Client):
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
+                # Channel withdrawals accepted from here on drop this context whole (see ready, fri #372 round 2, B3).
+                channels = self.agent.channel_withdrawals.generation if self.agent else None
                 context = place_notes(self.get_channel, attributed(await self.api(
                     'POST', '/chat/context', profiled(self, scope, True))), scope['conversation_id'])
                 if revision is not None and context['revision'] != revision:
@@ -668,12 +695,22 @@ class Fri(discord.Client):
                     # Private conversations never do.
                     context['audience'] = ('server' if visibility == 'public' and heard and all(heard) and
                                            server_wide(getattr(event, 'channel', None) or channel) else 'conversation')
-                    context['elsewhere'] = self.elsewhere(context.get('elsewhere', []), guild_id)
-                    if self.summaries:  # Fri's own summary of the member: their private chats and readable channels only.
-                        context['member_summary'] = self.member_summary(
-                            context.get('member_summary'), guild_id, visibility == 'private' or context['audience'] == 'server')
-                else:
-                    context['elsewhere'] = []
+                summarized = visibility == 'private' or context.get('audience') == 'server'
+                self.shaped(context, guild_id, summarized)
+
+                async def reread(into):
+                    """What drop takes, read again into the request's context, as above, after a channel's withdrawal
+                    was accepted past the read it came from (Sol round 3 of #372). Its fences run again (see ready)."""
+                    generation = self.agent.channel_withdrawals.generation  # Before the read, as above.
+                    fresh = self.shaped(place_notes(self.get_channel, attributed(await self.api(
+                        'POST', '/chat/context', profiled(self, scope, True))), scope['conversation_id']),
+                        guild_id, summarized)
+                    fresh = {key: fresh.get(key) for key in REREAD}
+                    # The turn's own context too, which a tool's follow-up request copies: a later one then reads what
+                    # this did, under the generation it records (Sol round 4 of #372, S2).
+                    context.update(fresh)
+                    into.update(fresh)
+                    into['fence']['channels'] = generation
                 conversation, targets = {}, []
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence
@@ -846,7 +883,8 @@ class Fri(discord.Client):
                 context['fence'] = {'turn': {**scope, 'revision': context['revision'], 'source': source.model_dump(),
                                              'input': text, 'reply': '', 'model': context['model'],
                                              'effort': context['effort']},
-                                    'actions': actions, 'shown': set(), 'began': began}
+                                    'actions': actions, 'shown': set(), 'began': began, 'channels': channels,
+                                    'reread': reread if self.agent else None}
                 if self.agent and source.kind == 'discord_message':
                     context['fence']['commit'] = lambda: self.agent.commit(event)
                 if self.agent and forgotten is not None:
@@ -1049,6 +1087,17 @@ class Fri(discord.Client):
         if self.agent and context.get('recent') and await self.agent.retired(context['recent'], guild,
                                                                              turn=self.agent.rechecks(fence)):
             raise commands.UserFeedbackCheckFailure(CONVERSATION_CHANGED)
+
+    def shaped(self, context, guild_id, summarized):
+        """A chat context as read, as a request uses it: other channels' only while everyone can read them, and Fri's
+        own summary of the member (`summarized`: their private chat, or a channel everyone can read) where it may show."""
+        if self.profiles:
+            context['elsewhere'] = self.elsewhere(context.get('elsewhere', []), guild_id)
+            if self.summaries:  # Fri's own summary of the member: their private chats and readable channels only.
+                context['member_summary'] = self.member_summary(context.get('member_summary'), guild_id, summarized)
+        else:
+            context['elsewhere'] = []
+        return context
 
     def still_open(self, context):
         """Before delivery: every other channel whose words reached the model is still one everyone can read."""
@@ -1417,7 +1466,8 @@ class Fri(discord.Client):
                 since = {int(i) for i, at in agent.withdrawn.items() if at >= began and i.isdigit()}
                 since |= {i for i, at in agent.revised.items() if at >= began}
                 since |= {int(i) for i, at in agent.saved_turns.marked.items() if at >= began and i.isdigit()}
-                return bool((agent.unsent.keys() | since) & carried)
+                # Or a channel's withdrawal accepted past the read the reply came from (Sol round 3 of #372).
+                return bool((agent.unsent.keys() | since) & carried) or agent.channel_withdrawals.moved(result.channels)
 
             def unmoved():
                 if not held:
@@ -1454,7 +1504,8 @@ class Fri(discord.Client):
             else:
                 await reply(self, interaction, embed=card('Fri', result.reply), view=view, still=standing)
             # A newer panel interaction can supersede this one; record only what was displayed.
-            saved = await self.record_turn(result) if sessions(self).displayed(interaction) else None
+            saved = (await self.record_turn(result) if sessions(self).displayed(interaction) and not (
+                held and self.agent.channel_withdrawals.moved(result.channels)) else None)
             if saved and saved.get('first_memory') and not result.settings_preview:
                 await reply(self, interaction, embed=card('Fri', result.reply+self.first_memory(saved)), view=view,
                             still=lambda: standing(quiet=True))
@@ -1478,6 +1529,17 @@ class Fri(discord.Client):
     async def on_raw_bulk_message_delete(self, payload):
         if self.agent:
             self.agent.unsend(payload.channel_id, payload.message_ids, self.agent.saved_in(payload))
+
+    # A channel or thread deleted takes every message in it, with no event for each (fri #358): what was saved from it
+    # goes by the channel. discord.py sends a thread event for each thread under it that the cache holds; the
+    # controller knows the others from the turns saved in them. A permission change withdraws nothing.
+    async def on_guild_channel_delete(self, channel):
+        if self.agent and channel.guild:
+            self.agent.channel_withdrawals.withdraw(channel.guild.id, channel.id)
+
+    async def on_raw_thread_delete(self, payload):
+        if self.agent:
+            self.agent.channel_withdrawals.withdraw(payload.guild_id, payload.thread_id)
 
     async def on_raw_message_edit(self, payload):
         if self.agent:
@@ -1593,6 +1655,7 @@ class Fri(discord.Client):
                 'current': self.agent.heartbeat_current} if self.agent else None,
             'outcomes': self.agent.ledger.snapshot() if self.agent else None,
             'withdrawals': self.agent.saved_turns.status() if self.agent else None,
+            'channel_withdrawals': self.agent.channel_withdrawals.status() if self.agent else None,
             'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,
