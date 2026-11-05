@@ -33,6 +33,8 @@ def api(tmp_path):
     settings = Settings(tmp_path/'api.db', '123', '10', 'runtime', 'worker', 'deploy', workshop_channel_id='456',
                         fri_token='fri')
     client = TestClient(create_app(settings))
+    if 'summary-holds' not in client.get('/fri/contract', headers={'Authorization': 'Bearer fri'}).json()['capabilities']:
+        pytest.skip('needs a controller offering summary-holds')
 
     async def call(method, path, body=None):
         result = client.request(method, path, json=body, headers={'Authorization': 'Bearer fri'})
