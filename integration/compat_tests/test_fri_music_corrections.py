@@ -377,6 +377,86 @@ FIX = 'not the one, i meant join us for a bite'
     ('wrong song, the Not Now by Blink-182, not now', 'Not Now Blink-182', True),
     ('wrong song, the Not Now by Blink-182, i said "Not Now"', 'The Not Now Blink-182', True),
     ('wrong song, the No More by Blink-182, not now', 'No More Blink-182', False),
+    # gene #156 (1): past an artist they named, the title is over, so a closing "not now" or "no more" after a pause
+    # takes the song back even when the song they proposed took it in, quoted artist or plain...
+    ('wrong song, Glad You Came by "The Wanted", not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Glad You Came by "The Wanted" not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Tear You Apart by "She Wants Revenge", not now', 'Tear You Apart She Wants Revenge not now', False),
+    ("wrong song, Glad You Came by 'The Wanted', no more", 'Glad You Came The Wanted no more', False),
+    ('wrong song, Love Story by Taylor Swift, not now', 'Love Story Taylor Swift not now', False),
+    ('wrong song, Love Story by Taylor Swift nah not now lol', 'Love Story Taylor Swift nah not now lol', False),
+    # ...though not the song said again, a title they quoted, or after a connector that names no one ("By Me").
+    ('wrong song, Not Now by "Blink-182", not now', 'Not Now Blink-182 not now', True),
+    ('wrong song, the Not Now by "Blink-182", not now', 'Not Now Blink-182 not now', True),
+    ('wrong song, "Love Story by Taylor Swift, not now"', 'Love Story by Taylor Swift not now', True),
+    ('wrong song, Stand By Me, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By "Me", No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By ‘Me’, No More', 'Stand By Me No More', True),
+    # gene #156 (2): a verb reporting someone's words, or hearing them, is never an artist's name, as one introducing
+    # them isn't ("by Alex said Taylor"); a verb handing the song to someone may still be its second word.
+    ("wrong song, 'Love Story' by Taylor told Alex", 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor asked Alex", 'Love Story', False),
+    ('wrong song, Love Story by Taylor tells Alex', 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor asks Alex", 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor say Alex", 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor mentions Alex", 'Love Story', False),
+    ("wrong song, 'Love Story' by Taylor heard Alex", 'Love Story', False),
+    ("wrong song, 'Love' by Alex Picked Taylor", 'Love', True),
+    ('wrong song, "Love" by "Taylor Told Alex"', 'Love', True),  # What they quoted is the artist's, every word.
+    # A pronoun they quoted as an artist (gene #156's third part) is left as main has it: split out after four review
+    # rounds. Every quoted artist from those rounds (spaced, nested, unclosed and punctuated quotes) decides exactly as
+    # main does, round 8's two fixes only naming the title over past an artist whose first word isn't a pronoun.
+    ('wrong song, "Not Now by ‘Me’", not now', 'Not Now by Me', True),
+    ('wrong song, “Not Now by ‘Me’”, not now', 'Not Now by Me', True),
+    ('wrong song, "Not Now by ‘Me’", i said not now', 'Not Now by Me', True),
+    ('wrong song, "Not Now by \'Me\'", not now', 'Not Now by Me', False),
+    ('wrong song, "Not Now by ‘Blink-182’", i said "Not Now"', 'Not Now by Blink-182', True),
+    ('wrong song, "Not Now by ‘My Chemical Romance’", i said "Not Now"', 'Not Now by My Chemical Romance', True),
+    ('wrong song, "Not Now by “My Chemical Romance”", i said "Not Now"', 'Not Now by My Chemical Romance', True),
+    ('wrong song, "Not Now by \'Our Lady Peace\'", i said "Not Now"', 'Not Now by Our Lady Peace', False),
+    ('wrong song, Glad You Came by "My Chemical Romance", not now', 'Glad You Came My Chemical Romance not now', False),
+    ('wrong song, Stand By "Me ", No More', 'Stand By Me No More', True),
+    ("wrong song, Stand By 'Me ', No More", 'Stand By Me No More', True),
+    ('wrong song, Stand By “ Me ”, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By "Me, No More', 'Stand By Me No More', True),
+    ('wrong song, "Not Now by \'Me \'", not now', 'Not Now by Me', False),
+    ('wrong song, "Not Now by ‘My Chemical Romance ’", i said "Not Now"', 'Not Now by My Chemical Romance', True),
+    ("wrong song, Stand By ' Me ', No More", 'Stand By Me No More', True),
+    ("wrong song, Stand By ' Me, No More", 'Stand By Me No More', True),
+    ('wrong song, Stand By “‘Me’”, No More', 'Stand By Me No More', True),
+    ('wrong song, "Not Now by ‘Me & My’", i said "Not Now"', 'Not Now by Me & My', True),
+    ('wrong song, "Not Now by ‘You+Me’", i said "Not Now"', 'Not Now by You+Me', True),
+    ("wrong song, Stand By 'Me ' No More", 'Stand By Me No More', True),
+    ('wrong song, "Not Now by ‘ Me & My ’", i said "Not Now"', 'Not Now by Me & My', True),
+    ('wrong song, "Not Now by \'Me \' and You", not now', 'Not Now by Me and You', False),
+    # Round 5 of gene#165's review: an artist read as no word at all (an empty quote, or a quote that doesn't close)
+    # or whose first word past any punctuation is a pronoun isn't one, so the title isn't over past it and main's
+    # decision stands.
+    ('wrong song, Stand By ‘…Me’, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By ‘—Me’, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By ‘...Me’, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By ‘ … Me’, No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By "", Me, No More', 'Stand By Me No More', True),
+    ("wrong song, Stand By '', Me, No More", 'Stand By Me No More', True),
+    ('wrong song, Stand By “”, Me, No More', 'Stand By Me No More', True),
+    # Round 6 of gene#165's review: an artist they quoted is read inside the quote, never past its closing mark. One
+    # that holds no word (an empty or blank quote, nested or not) names no one, so a title's words after it stay the
+    # title's. Within a quote they closed, the first word past any punctuation names the artist, so a closing "not
+    # now" past it is theirs, as past "The Wanted" (S1).
+    ('wrong song, Stand By "" No More', 'Stand By No More', True),
+    ('wrong song, Stand By " " No More', 'Stand By No More', True),
+    ('wrong song, Stand By "  " No More', 'Stand By No More', True),
+    ("wrong song, Stand By ' ' No More", 'Stand By No More', True),
+    ('wrong song, Stand By ‘’ No More', 'Stand By No More', True),
+    ('wrong song, Stand By ‘ ’ No More', 'Stand By No More', True),
+    ('wrong song, Stand By "“”" No More', 'Stand By No More', True),
+    ('wrong song, Stand By "‘’" No More', 'Stand By No More', True),
+    ('wrong song, Glad You Came by ‘…The Wanted’, not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Glad You Came by "…The Wanted", not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Glad You Came by "\U0001f3b5 The Wanted", not now', 'Glad You Came The Wanted not now', False),
+    ('wrong song, Love Story by "…Taylor Swift", no more', 'Love Story Taylor Swift no more', False),
+    ('wrong song, Stand By "…Me" No More', 'Stand By Me No More', True),
+    ('wrong song, Stand By "…" No More', 'Stand By No More', True),
 ])
 def test_fri_and_gene_hold_the_same_correction_rule(text, argument, expected):
     from gene.gene_controls import correction as genes  # The controller this Fri is pinned to.
@@ -426,7 +506,9 @@ SHAPES = [("'", "a' ", ''), ("'", "rockin' ", ''), ('', "''a ", ''), ('', "' ", 
           ('love story', ', no more of those songs', ''), ('love story', ' is what x, y and', ' i never asked'),
           ('love story', " isn't what i and", ' x chose'), ('no more', ', no more', ' x'),
           ('love story', ' by she wants revenge', ''), ('love', ' by "she wants revenge"', ''), ('love', ' by a b c d', ''),
-          ('love', " by 'a", ''), ('love story', ', i said no, not now', ' x'), ('love', " by 'a'", '')]
+          ('love', " by 'a", ''), ('love story', ', i said no, not now', ' x'), ('love', " by 'a'", ''),
+          ('love', ' by "a"', ', not now'), ('love', ' by \u2018me\u2019', ', not now'), ('love', ' by a told b', ''),
+          ('"love', ' by \u2018me\u2019', '", not now'), ('love by ', '\u2018 \u201c ', ', not now')]
 
 
 def message(shape, length=4000):
