@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 
 import aiohttp
@@ -51,6 +52,11 @@ class ChannelWithdrawals:
         self.cursor = 0  # Where the next sweep starts reading channels missing from the cache (see sweep).
         self.swept = 0.0  # When a sweep last ran through; never, after a start.
         self.sending = None  # The task sending the queue now, if one is.
+        self.written = 0  # Which write of the queue is on disk, as its marker must say too (see marker).
+        self.held = set()  # The channels the last sweep found the controller holding anything from.
+        # Moved by every withdrawal the controller accepted: a request's context read before it is dropped whole at
+        # its last check (see moved, Sol round 2 of #372, B3).
+        self.generation = 0
 
     @property
     def pending(self):
@@ -63,8 +69,9 @@ class ChannelWithdrawals:
         return None if data is None else data/RECORD
 
     def marker(self):
-        """Beside the queue while what's on disk is all of it: a write that fails removes it, which needs no space, so
-        a start finds the queue may be missing something (Sol round 1 of #372, F2)."""
+        """Beside the queue while what's on disk is all of it, naming that write of it: removed, durably, before any
+        new write starts, and written again only once that write has landed, so a start finds the queue may be missing
+        something whenever a write was cut short (Sol round 1 of #372, F2; round 2, B4)."""
         path = self.record()
         return None if path is None else path.with_name(SAVED)
 
@@ -86,6 +93,9 @@ class ChannelWithdrawals:
             return self.loaded
         try:
             data = json.loads(path.read_text())
+            written = data.get('written', 0)
+            if type(written) is not int:
+                raise ValueError('not a write number')
             now = time.time()
             pending = {str(channel): {'guild_id': str(entry['guild_id']), 'queued_at': when(entry['queued_at'], now),
                                       'threads': [str(thread) for thread in entry.get('threads', [])
@@ -94,11 +104,22 @@ class ChannelWithdrawals:
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             self.recover(f'could not be read ({type(exc).__name__})')
             return {}
+        stamp = self.stamp(marker)
+        self.written = max(written, stamp or 0)
         if data.get('recovering') is True:
             self.recover('was recovering')
-        elif not marker.exists():
+        elif stamp != written:  # No marker, or one for another write: this one may not have landed whole.
             self.recover('was not written down in full')
         return pending
+
+    @staticmethod
+    def stamp(marker):
+        """Which write the marker says landed, or None without one that can be read."""
+        try:
+            value = json.loads(marker.read_text()).get('written')
+        except (OSError, ValueError, AttributeError):
+            return None
+        return value if type(value) is int else None
 
     def recover(self, why):
         if not self.recovering:
@@ -107,13 +128,19 @@ class ChannelWithdrawals:
         self.recovering, self.resolved = True, set()
 
     def persist(self):
-        """The queue to disk, with whether it's recovering, then its marker; a write that fails removes the marker."""
+        """The queue to disk, with whether it's recovering and which write it is: its marker removed, durably, first,
+        then the queue, then a marker naming that write. A write that fails, or stops part way, leaves no marker for it
+        (Sol round 2 of #372, B4)."""
         path, marker = self.record(), self.marker()
         if path is None:
             return True
+        pending = self.pending  # Read first: reading is what finds a queue recovering.
         try:
-            private_json(path, {'pending': self.pending, 'recovering': self.recovering})
-            marker.touch(mode=0o600)
+            marker.unlink(missing_ok=True)
+            synced(marker.parent)
+            self.written += 1
+            private_json(path, {'pending': pending, 'recovering': self.recovering, 'written': self.written})
+            private_json(marker, {'written': self.written})
         except OSError as exc:  # Still queued, and held back, in memory; a start finds it unwritten.
             LOG.warning('Pending channel withdrawals could not be saved: %s', type(exc).__name__)
             try:
@@ -180,10 +207,11 @@ class ChannelWithdrawals:
                 self.persist()
 
     def taken(self, messages):
-        """The messages the controller took with a channel, taken back here as a deleted message is: a copy of what
-        they said that a request read before (its context, waiting on Discord or the model) is held back, by the same
-        marks (see SavedTurns.withhold), and a memory view reads again, since its marks moved (Sol round 1 of #372,
-        F1)."""
+        """A withdrawal the controller accepted, naming the messages it took (none, for one it had taken already, its
+        first answer lost). Any request's context read before it is dropped whole at its last check (see moved), and
+        a memory view reads again, since the withdrawal queue's generation moved (Sol round 2 of #372, B3). The
+        messages are marked as taken back here too, as a deleted message is (Sol round 1, F1)."""
+        self.generation += 1
         turns, now = self.agent.saved_turns, time.time()
         for message in messages:
             if str(message).isdigit():
@@ -204,14 +232,16 @@ class ChannelWithdrawals:
         if guild is None:
             return False
         held = (await fri.api('POST', '/chat/channels/held', {'guild_id': str(guild.id)}))['channels']
+        self.held = {row['id'] for row in held}
         missing, parents = [], {}
         for row in held:
             channel = fri.get_channel(int(row['id']))
             if channel is None:
-                missing.append(row)
-            elif row.get('parent') is None and getattr(channel, 'parent_id', None):
-                parents[row['id']] = str(channel.parent_id)
+                missing.append(row)  # Answered only once read, or once the server's list has it (round 2, B2).
+                continue
             self.resolved.add(row['id'])  # Discord holds it.
+            if row.get('parent') is None and getattr(channel, 'parent_id', None):
+                parents[row['id']] = str(channel.parent_id)
         listed = set()
         if missing:
             listed = {str(channel.id) for channel in await guild.fetch_channels()}
@@ -243,6 +273,7 @@ class ChannelWithdrawals:
         if parents:
             await fri.api('POST', '/chat/channels/parents', {'guild_id': str(guild.id),
                                                              'parents': dict(sorted(parents.items())[:500])})
+            self.taken(())  # A thread named under a withdrawn channel is withdrawn with it there (gene #243 G2).
         return all(row['id'] in self.resolved for row in held)
 
     async def settle(self):
@@ -265,9 +296,38 @@ class ChannelWithdrawals:
 
     def status(self):
         """For fri health: how many deletions wait for the controller, whether saved context is held back for them or
-        for recovery, and when the last sweep ran. No IDs."""
+        for recovery, how many held channels recovery has had answered of those the last sweep found, whether the
+        controller takes channels, and when the last sweep ran. No IDs."""
         return {'pending': len(self.pending), 'holding': self.holding(), 'recovering': self.recovering,
+                'answered': len(self.held & self.resolved) if self.recovering else None,
+                'held': len(self.held) if self.swept else None, 'offered': self.offered(),
                 'swept_at': self.swept or None}
+
+    def moved(self, since):
+        """Whether a withdrawal was accepted since `since` (see generation): a context read before it is dropped."""
+        return since is not None and self.generation != since
+
+    @staticmethod
+    def drop(context):
+        """Every saved context of a request read before a channel's withdrawal (see moved): what it held of the
+        channel can't be told from the rest, so none of it goes to the model, as when a withdrawals record can't be
+        read (SavedTurns.withhold)."""
+        context['turns'], context['pending'], context['elsewhere'] = [], None, []
+        if context.get('personal_memory'):
+            context['personal_memory']['notes'] = []
+        for key in ('note_sources', 'profile_origins'):
+            if context.get(key) is not None:
+                context[key] = {}
+        context['member_summary'] = None
+
+
+def synced(directory):
+    """The directory's entries durably on disk: a marker removed stays removed whatever happens next."""
+    handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(handle)
+    finally:
+        os.close(handle)
 
 
 def when(value, now):

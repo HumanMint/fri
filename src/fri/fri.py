@@ -501,6 +501,10 @@ class Fri(discord.Client):
             # Saved context holding a message its author took back since it was read, or whose withdrawal the
             # controller hasn't taken yet (a timeout, a restart): its words stay out. What's left counts as carried, so
             # a take-back from here on withholds the answer, and keeps nothing at the save (fri #215).
+            # And a context read before a channel's withdrawal was accepted, whole: what it held of the channel can't be
+            # told from the rest, a note naming no message, say (fri #372 round 2, B3).
+            if self.agent and fence and self.agent.channel_withdrawals.moved(fence.get('channels')):
+                self.agent.channel_withdrawals.drop(context)
             if self.agent:
                 seen.update(int(i) for i in self.agent.saved_turns.withhold(context))
             # One this turn quotes or replies to refuses it instead: the answer would be about words taken back,
@@ -657,6 +661,8 @@ class Fri(discord.Client):
         self.busy.add(user_id)
         try:
             async with self.chat_slots:
+                # Channel withdrawals accepted from here on drop this context whole (see ready, fri #372 round 2, B3).
+                channels = self.agent.channel_withdrawals.generation if self.agent else None
                 context = place_notes(self.get_channel, attributed(await self.api(
                     'POST', '/chat/context', profiled(self, scope, True))), scope['conversation_id'])
                 if revision is not None and context['revision'] != revision:
@@ -845,7 +851,7 @@ class Fri(discord.Client):
                 context['fence'] = {'turn': {**scope, 'revision': context['revision'], 'source': source.model_dump(),
                                              'input': text, 'reply': '', 'model': context['model'],
                                              'effort': context['effort']},
-                                    'actions': actions, 'shown': set(), 'began': began}
+                                    'actions': actions, 'shown': set(), 'began': began, 'channels': channels}
                 if self.agent and source.kind == 'discord_message':
                     context['fence']['commit'] = lambda: self.agent.commit(event)
                 if self.agent and forgotten is not None:

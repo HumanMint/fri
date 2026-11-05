@@ -276,8 +276,9 @@ def test_a_queue_that_cant_be_read_holds_everything_back_until_a_sweep(monkeypat
             agent.state, agent.record = before.state, AsyncMock()
             assert await asked(w) == []
             await landed(w)
-            assert agent.channel_withdrawals.status() == {'pending': 0, 'holding': False, 'recovering': False,
-                                                          'swept_at': agent.channel_withdrawals.swept}
+            assert agent.channel_withdrawals.status() == {
+                'pending': 0, 'holding': False, 'recovering': False, 'answered': None, 'held': 1, 'offered': True,
+                'swept_at': agent.channel_withdrawals.swept}
             assert await asked(w) == ['I like Minecraft']
         finally:
             await w.fri.close()
@@ -325,8 +326,8 @@ def test_a_sweep_names_the_channel_of_a_thread_saved_before_the_controller_kept_
 
 def test_a_copy_read_before_the_channel_went_never_reaches_the_reply_model(monkeypatch, tmp_path):
     """Sol round 1 of #372, F1: a private request's context, read from the controller just before #general is deleted
-    and withdrawn, goes on once the withdrawal has landed. The messages the controller says it took are taken back here
-    too, so that copy's note from #general is held back, as a deleted message's is; and My memory reads again."""
+    and withdrawn, goes on once the withdrawal has landed. Its saved context is dropped at the request's last check, so
+    the note from #general never reaches the model; and My memory reads again."""
     async def scenario():
         w = world(monkeypatch, tmp_path)
         needs_channels(w)
@@ -345,8 +346,11 @@ def test_a_copy_read_before_the_channel_went_never_reaches_the_reply_model(monke
                         await deleted(w, GENERAL)  # While this copy waits to be used.
                 return answer
             w.fri.api = api
-            assert await asked(w) == ['I like chess'] and paused
+            # That copy is dropped whole (round 2, B3: a copy can't always be told from what was withdrawn), and the
+            # next request reads it again, as the controller has it now.
+            assert await asked(w) == [] and paused
             assert screening(w.fri) != before
+            assert await asked(w) == ['I like chess']
         finally:
             await w.fri.close()
     run(scenario)
