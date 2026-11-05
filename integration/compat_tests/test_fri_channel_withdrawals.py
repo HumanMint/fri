@@ -7,6 +7,7 @@ withdraw, with everything saved from it and from its threads, and every saved co
 deletion Fri missed is found by a later read of what the controller holds: one Discord says is gone, not one Fri can no
 longer see.
 """
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -81,6 +82,32 @@ def needs_channels(w):
     older controller), Fri holds back instead, which the hold's own test covers."""
     if 'channel-withdrawals' not in w.fri.capabilities:
         pytest.skip('needs a controller offering channel-withdrawals')
+
+
+def rolled_back(w):
+    """The controller, as one without channel-withdrawals: Fri reads it so, its contract read again too. Returns
+    what puts it back."""
+    real = w.fri.api
+    offered = w.fri.capabilities
+
+    async def api(method, path, payload=None):
+        answer = await real(method, path, payload)
+        if path == '/fri/contract':
+            answer = {**answer, 'capabilities': [c for c in answer['capabilities'] if c != 'channel-withdrawals']}
+        return answer
+    w.fri.api, w.fri.capabilities = api, offered - {'channel-withdrawals'}
+
+    def back():
+        w.fri.api, w.fri.capabilities = real, offered
+    return back
+
+
+def restarted(w):
+    """Fri started again on the same disk: only what's on it carries over."""
+    before = w.fri.agent
+    agent = w.fri.agent = Agent(w.fri)
+    agent.state, agent.record = before.state, AsyncMock()
+    return agent
 
 
 def withdrawals(w):
@@ -211,7 +238,7 @@ def test_without_a_controller_that_takes_channels_every_saved_context_is_held_ba
             await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
             await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
             offered = w.fri.capabilities
-            w.fri.capabilities = offered - {'channel-withdrawals'}
+            back = rolled_back(w)
             await deleted(w, GENERAL)
             assert withdrawals(w) == []
             assert await asked(w) == []
@@ -225,7 +252,8 @@ def test_without_a_controller_that_takes_channels_every_saved_context_is_held_ba
             assert await asked(w) == []
             if 'channel-withdrawals' not in offered:  # A mixed pair with an older controller: held back it stays.
                 return
-            w.fri.capabilities = offered
+            back()
+            agent.saved_turns.reread_at = float('-inf')  # Its contract read again now, not a minute on.
             await landed(w)
             assert withdrawals(w) == [{'guild_id': '123', 'channel_ids': [str(GENERAL)]}]
             assert await asked(w) == ['I like chess']
@@ -248,7 +276,7 @@ def test_a_queue_that_cant_be_read_holds_everything_back_until_a_sweep(monkeypat
             agent.state, agent.record = before.state, AsyncMock()
             assert await asked(w) == []
             await landed(w)
-            assert agent.channel_withdrawals.status() == {'pending': 0, 'holding': False, 'unreadable': False,
+            assert agent.channel_withdrawals.status() == {'pending': 0, 'holding': False, 'recovering': False,
                                                           'swept_at': agent.channel_withdrawals.swept}
             assert await asked(w) == ['I like Minecraft']
         finally:
@@ -289,6 +317,171 @@ def test_a_sweep_names_the_channel_of_a_thread_saved_before_the_controller_kept_
                 assert [tuple(row) for row in db.execute('SELECT thread_id,parent_id FROM chat_thread_parents')] == [
                     (str(THREAD), str(GENERAL))]
             await deleted(w, GENERAL)
+            assert await asked(w) == ['I like chess']
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_copy_read_before_the_channel_went_never_reaches_the_reply_model(monkeypatch, tmp_path):
+    """Sol round 1 of #372, F1: a private request's context, read from the controller just before #general is deleted
+    and withdrawn, goes on once the withdrawal has landed. The messages the controller says it took are taken back here
+    too, so that copy's note from #general is held back, as a deleted message's is; and My memory reads again."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            from fri.fri_memory_panel import withdrawals as screening
+            before = screening(w.fri)
+            real, paused = w.fri.api, []
+
+            async def api(method, path, payload=None):
+                answer = await real(method, path, payload)
+                if path == '/chat/context' and str((payload or {}).get('conversation_id', '')).startswith('private'):
+                    if not paused:
+                        paused.append(path)
+                        await deleted(w, GENERAL)  # While this copy waits to be used.
+                return answer
+            w.fri.api = api
+            assert await asked(w) == ['I like chess'] and paused
+            assert screening(w.fri) != before
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_queue_recovering_stays_so_across_a_restart_whatever_is_written_since(monkeypatch, tmp_path):
+    """Sol round 1 of #372, F2: a queue that couldn't be read, then another deletion, sent and taken: the queue written
+    then still says it's recovering, so a restart before any sweep holds everything back."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            (tmp_path/'channel-withdrawals.json').write_text('{"pending": {')
+            restarted(w)
+            thread = w.channels.pop(THREAD)
+            await w.fri.on_raw_thread_delete(SimpleNamespace(thread_id=THREAD, guild_id=123, parent_id=GENERAL,
+                                                             thread=thread))
+            await queue(w).sending  # Sent and taken; no sweep yet.
+            assert withdrawals(w) == [{'guild_id': '123', 'channel_ids': [str(THREAD)]}]
+            restarted(w)
+            assert queue(w).holding() and await asked(w) == []
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_deletion_whose_queue_could_not_be_written_still_holds_after_a_restart(monkeypatch, tmp_path):
+    """Sol round 1 of #372, F2: the disk is full when #general's deletion is queued, and the controller doesn't take
+    channels yet. A restart can't read it from the queue, but finds the queue wasn't written: everything stays held back
+    until a sweep has found what's gone."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            back = rolled_back(w)
+            assert not queue(w).holding()  # Read, and written down, once before.
+            import fri.fri_channel_withdrawal as channels
+
+            def full(path, data):
+                raise OSError(28, 'No space left on device')
+            monkeypatch.setattr(channels, 'private_json', full)
+            await deleted(w, GENERAL)
+            monkeypatch.undo()
+            restarted(w)
+            assert queue(w).holding() and await asked(w) == []
+            back()
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_recovery_waits_for_every_read_to_be_answered(monkeypatch, tmp_path):
+    """Sol round 1 of #372, F3: recovering, a sweep whose read of a channel times out, with the server's channel list
+    coming back empty, hasn't found what's gone: everything stays held back."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            w.channels.pop(GAMING)
+            (tmp_path/'channel-withdrawals.json').write_text('{"pending": {')
+            agent = restarted(w)
+            guild = w.fri.get_guild(123)
+            guild.fetch_channels = AsyncMock(return_value=[])
+            guild.fetch_channel = AsyncMock(side_effect=TimeoutError())
+            await landed(w)
+            assert agent.channel_withdrawals.holding() and withdrawals(w) == []
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_every_held_channel_is_read_in_turn(monkeypatch, tmp_path):
+    """Sol round 1 of #372, F4: 26 channels the controller holds something from, none in the cache: the first 25 answer
+    Missing Access every time, the last Unknown Channel. Sweeps take turns through them, so the last is read, and
+    withdrawn, too."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            ids = [str(1000+i) for i in range(1, 27)]
+            with w.store.connection() as db:
+                for cid in ids:
+                    db.execute('INSERT INTO chat_turns(guild_id,channel_id,user_id,input,reply,model,effort,at) '
+                               "VALUES ('123',?,'20','hi','hey','model','high',strftime('%s','now'))", ('public:'+cid,))
+            guild = w.fri.get_guild(123)
+            guild.fetch_channels = AsyncMock(return_value=[w.channels[GENERAL]])
+
+            async def fetch(cid):
+                if str(cid) == ids[-1]:
+                    raise gone(10003)
+                raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'),
+                                        {'code': 50001, 'message': 'Missing Access'})
+            guild.fetch_channel = AsyncMock(side_effect=fetch)
+            for _ in range(3):
+                queue(w).swept = 0
+                await landed(w)
+            assert [body['channel_ids'] for body in withdrawals(w)] == [[ids[-1]]]
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_queued_time_that_isnt_a_time_never_holds_forever(monkeypatch, tmp_path):
+    """Sol round 1 of #372, F5: a queue whose time is not a number, infinite, or far ahead counts from now, so it ends
+    when one queued now would."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            for when in ('NaN', 'Infinity', '1e300'):
+                (tmp_path/'channel-withdrawals.json').write_text(
+                    '{"pending": {"5": {"guild_id": "123", "threads": [], "queued_at": %s}}}' % when)
+                agent = restarted(w)
+                at = agent.channel_withdrawals.pending['5']['queued_at']
+                assert at == at and abs(at - time.time()) < 60, when
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_controller_that_offers_channels_again_is_found_while_the_queue_holds(monkeypatch, tmp_path):
+    """Sol round 1 of #372, F6: Fri read the controller without channel-withdrawals; it's offered again, with nothing
+    restarting. While the queue holds, the heartbeat reads its contract again (at most a minute apart), and sends."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            w.fri.capabilities = w.fri.capabilities - {'channel-withdrawals'}  # As read before; offered now.
+            await deleted(w, GENERAL)
+            w.fri.agent.saved_turns.reread_at = float('-inf')
+            await landed(w)
+            assert withdrawals(w) == [{'guild_id': '123', 'channel_ids': [str(GENERAL)]}]
             assert await asked(w) == ['I like chess']
         finally:
             await w.fri.close()
