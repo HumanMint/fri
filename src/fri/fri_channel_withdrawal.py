@@ -96,17 +96,20 @@ class ChannelWithdrawals:
             written = data.get('written', 0)
             if type(written) is not int:
                 raise ValueError('not a write number')
-            now = time.time()
-            pending = {str(channel): {'guild_id': str(entry['guild_id']), 'queued_at': when(entry['queued_at'], now),
-                                      'threads': [str(thread) for thread in entry.get('threads', [])
-                                                  if str(thread).isdigit()]}
-                       for channel, entry in data['pending'].items() if str(channel).isdigit()}
+            now, pending, unread = time.time(), {}, 0
+            for channel, entry in data['pending'].items():
+                if (valid := entry_of(channel, entry, now)) is None:
+                    unread += 1  # Not as this writes them: what it named is found again by recovery's sweep.
+                else:
+                    pending[channel] = valid
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             self.recover(f'could not be read ({type(exc).__name__})')
             return {}
         stamp = self.stamp(marker)
         self.written = max(written, stamp or 0)
-        if data.get('recovering') is True:
+        if unread:  # Sol round 3 of #372: nothing in it is discarded unaccounted for.
+            self.recover(f'had {unread} entries that could not be read')
+        elif data.get('recovering') is True:
             self.recover('was recovering')
         elif stamp != written:  # No marker, or one for another write: this one may not have landed whole.
             self.recover('was not written down in full')
@@ -324,6 +327,18 @@ def synced(directory):
         os.fsync(handle)
     finally:
         os.close(handle)
+
+
+def entry_of(channel, entry, now):
+    """A queued entry as this writes it, or None: a channel ID, its server's ID, a list of thread IDs and a time, each
+    of its own type exactly, so a boolean (an int to Python) is none of them (Sol round 3 of #372)."""
+    if not (type(channel) is str and channel.isdigit() and type(entry) is dict):
+        return None
+    guild, threads, queued = entry.get('guild_id'), entry.get('threads', []), entry.get('queued_at')
+    if not (type(guild) is str and guild.isdigit() and type(threads) is list and type(queued) in (int, float) and
+            all(type(thread) is str and thread.isdigit() for thread in threads)):
+        return None
+    return {'guild_id': guild, 'queued_at': when(queued, now), 'threads': threads}
 
 
 def when(value, now):
