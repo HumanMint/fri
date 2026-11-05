@@ -12,7 +12,7 @@ import httpx
 
 from . import feedback as commands
 from .fri_context import ChatSource, addressed_content, discord_source
-from .fri_errors import ControllerRejected
+from .fri_errors import HELD, ControllerRejected
 from .fri_workspace import CHANGED, send_once, taken_back
 from .privacy import clean
 from .subscription import private_json
@@ -344,7 +344,12 @@ async def deliver_one(fri):
         if not isinstance(dm, discord.DMChannel) or not dm.recipient or str(dm.recipient.id) != row['user_id']:
             raise ValueError('The reminder DM no longer matches its author')
         embed = reminder_embed(row)
-        await fri.api('POST', '/social/reminders/'+row['id']+'/sending', {'lease': row['lease']})
+        try:
+            await fri.api('POST', '/social/reminders/'+row['id']+'/sending', {'lease': row['lease']})
+        except ControllerRejected as exc:
+            if getattr(exc, 'status', None) == HELD:  # Put back unsent until a summary it depends on checks out:
+                return  # it's claimed and sent then, so nothing is recorded (fri #355).
+            raise
         sending = True
         result = await send_once(fri, {'id': row['id'], 'target_id': row['dm_id'],
             'body': f"Reminder\nScheduled for <t:{int(row['due'])}:F>."}, embed=embed.to_dict() if embed else None)
