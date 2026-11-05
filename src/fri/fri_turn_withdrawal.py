@@ -413,7 +413,7 @@ class SavedTurns:
         ids = [int(i) for i in ids]
         horizon = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
         queued, now = False, time.time()
-        just_edited = not deleted and fresh(edited_at, now)
+        just_edited = fresh(edited_at, now)
         for i in ids:
             known = self.pending.get(str(i), {})
             entry = self.saved.pop(i, None)
