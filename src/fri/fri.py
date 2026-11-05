@@ -613,7 +613,7 @@ class Fri(discord.Client):
         depends = (context['fence'].setdefault('dependencies', {'messages': set(), 'unknown': False, 'summary': None})
                    if context.get('fence') else {'messages': set(), 'unknown': False, 'summary': None})
         result = await self.chat.respond(text, context, ready=ready)
-        if self.agent:  # As the request carried it: `ready` withholds what it may not, right before it.
+        if getattr(self, 'agent', None):  # As the request carried it: `ready` withholds what it may not, right before it.
             found, unknown = self.agent.saved_turns.dependencies(context)
             depends['messages'] |= found
             depends['unknown'] = depends['unknown'] or unknown
