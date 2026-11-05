@@ -187,12 +187,13 @@ def test_a_permission_change_withdraws_nothing(monkeypatch, tmp_path):
                 if queue(w) is not None:
                     queue(w).swept = 0
                 await landed(w)
-            guild.fetch_channels = AsyncMock(return_value=[w.channels[GENERAL]])
-            guild.fetch_channel = AsyncMock(side_effect=discord.Forbidden(
-                SimpleNamespace(status=403, reason='Forbidden'), {'code': 50001, 'message': 'Missing Access'}))
-            if queue(w) is not None:
-                queue(w).swept = 0
-            await landed(w)
+            guild.fetch_channels = AsyncMock(return_value=[w.channels[GENERAL]])  # Not even in the list now.
+            for answer in (discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'),
+                                             {'code': 50001, 'message': 'Missing Access'}), gone(10004)):
+                guild.fetch_channel = AsyncMock(side_effect=answer)  # Not Unknown Channel: nothing says it's gone.
+                if queue(w) is not None:
+                    queue(w).swept = 0
+                await landed(w)
             assert withdrawals(w) == []
             context = w.store.chat_context('123', 'private:20', '20', True)
             assert remembered(context) == ['I like chess']

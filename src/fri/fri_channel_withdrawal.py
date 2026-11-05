@@ -3,8 +3,8 @@
 Deleting a channel or a thread deletes every message in it, and Discord sends no event for each one, so nothing Fri
 withdrew by message ID reached what it saved from there: a server-profile note learned in a deleted channel still
 reached a later private-panel request once the channel had left the cache. The deletion's own event now queues the
-channel, with the threads under it the cache still holds, for the controller to withdraw: everything it holds from them,
-and from the threads it knows are under them (see Gene's fri_channel_withdrawal). The queue is written to disk first,
+channel (discord.py sends one for each thread under it the cache holds) for the controller to withdraw: everything it
+holds from it, and from the threads it knows are under it (see Gene's fri_channel_withdrawal). The queue is written to disk first,
 and until the controller has taken all of it every saved context is held back (see holding, which SavedTurns.closed
 reads), so nothing from the channel reaches a request meanwhile. A controller that doesn't take channels (CAPABILITY),
 an older one in a rollback window, takes nothing, so everything stays held back until one that does is back, at most

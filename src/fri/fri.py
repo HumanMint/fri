@@ -1464,12 +1464,11 @@ class Fri(discord.Client):
             self.agent.unsend(payload.channel_id, payload.message_ids, self.agent.saved_in(payload))
 
     # A channel or thread deleted takes every message in it, with no event for each (fri #358): what was saved from it
-    # goes by the channel, with the threads under it the cache still holds. discord.py sends a thread event only for
-    # those; the controller knows the others from the turns saved in them. A permission change withdraws nothing.
+    # goes by the channel. discord.py sends a thread event for each thread under it that the cache holds; the
+    # controller knows the others from the turns saved in them. A permission change withdraws nothing.
     async def on_guild_channel_delete(self, channel):
         if self.agent and channel.guild:
-            self.agent.channel_withdrawals.withdraw(channel.guild.id, channel.id,
-                                                    [thread.id for thread in getattr(channel, 'threads', ())])
+            self.agent.channel_withdrawals.withdraw(channel.guild.id, channel.id)
 
     async def on_raw_thread_delete(self, payload):
         if self.agent:
