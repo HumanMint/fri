@@ -396,3 +396,163 @@ def test_332_a_panel_reply_drawing_on_the_summary_is_held_to_its_sources(monkeyp
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+# Sol round 1 of #382: S1 and S2, both over-withholding.
+
+@pytest.mark.parametrize('deleted', ['a message neither drew on', 'nothing'])
+def test_382_r1_s1_after_an_ordinary_panel_exchange_the_next_reply_shows(monkeypatch, tmp_path, deleted):
+    """Sol round 1's S1: member 20's ordinary /fri panel exchange, then their next panel turn, and while its reply waits
+    a message neither drew on is deleted. The first exchange's source, an interaction, never entered what this Fri knows
+    its replies drew on, and its save named nothing it drew on, so it read as one saved before this Fri started: the
+    reply was held back. Main shows it, and so does this now."""
+    async def scenario():
+        fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        unrelated = source(age=1200, channel='1')
+        carried = []
+
+        async def respond(text, context, ready):
+            await ready()
+            carried.append(str(context.get('turns')))
+            return ChatResult(status='completed', reply='first answer' if len(carried) == 1 else 'second answer')
+        model(fri, tmp_path, respond)
+        first = panel(fri)
+        await fri.chat_interaction(first, 'hey')
+        assert 'first answer' in shown(first)
+        second = panel(fri)
+        second.id = first.id+1
+        api, saved, taken = fri.api, [], []
+        lock = fri.private_panels.locks.setdefault((123, 20), asyncio.Lock())
+
+        async def holder():
+            while not getattr(lock, '_waiters', None):
+                await asyncio.sleep(0)
+            if deleted != 'nothing':
+                await fri.on_raw_message_delete(SimpleNamespace(channel_id=1, guild_id=123,
+                                                                message_id=int(unrelated['id'])))
+                assert unrelated['id'] in agent.saved_turns.marked
+            lock.release()
+
+        async def recording(method, path, payload=None):
+            if path == '/chat/turn':
+                saved.append(payload)
+            answer = await api(method, path, payload)
+            if path == '/chat/turn/check' and not taken:
+                taken.append(path)
+                await lock.acquire()
+                asyncio.get_running_loop().create_task(holder())
+            return answer
+        fri.api = recording
+        try:
+            await fri.chat_interaction(second, 'and now')
+            assert taken and 'first answer' in carried[-1]  # The request carried the first exchange.
+            assert 'second answer' in shown(second) and saved
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('derived', [True, False], ids=['a model reply', 'one Fri answers itself'])
+def test_382_r1_s1_a_turn_that_carried_nothing_else_names_an_empty_list(monkeypatch, derived):
+    """S1's second cause: a turn whose requests carried nothing besides its own message, and one Fri answers itself (a
+    usage report, a control), named nothing it drew on. To a controller offering withdrawal sources it names an empty
+    list now (the controller's own default), so the reply reads as drawing on nothing. An older controller gets
+    nothing, as before."""
+    from compat_tests.test_fri_runtime import configured
+    from fri.fri_context import ChatSource
+    from fri.fri_turn_withdrawal import SOURCES
+    fri = configured(monkeypatch)
+    said = source(age=60)
+    scope = {'guild_id': '123', 'channel_id': '456', 'conversation_id': 'private:456', 'user_id': '20'}
+    context = {'revision': 0, 'model': 'gpt-6.1-sol', 'effort': 'high', 'turns': [], 'recent': [],
+               'fence': {'turn': {'source': said}}}
+    for capabilities, named in ((frozenset({SOURCES}), {'drew_on': []}), (frozenset(), {})):
+        fri.capabilities = capabilities
+        turn = fri.stage_turn(scope, ChatSource(**said), 'hey', context, ChatResult(reply='yo', status='completed'),
+                              **({} if derived else {'model': 'local-control', 'derived': False})).turn
+        assert {key: turn[key] for key in turn if key == 'drew_on'} == named
+
+
+S2 = ["someone else's message", "a reply of Fri's that carried it", 'its own source',
+      "someone else's message, and they said forget me"]
+
+
+@pytest.mark.parametrize('taken', S2)
+def test_382_r1_s2_a_withdrawal_the_controller_took_keeps_its_author_for_my_memory(monkeypatch, tmp_path, taken):
+    """Sol round 1's S2: member 20's summary, and an older message of member 30's withdrawn, its author known. Once the
+    controller took the withdrawal, it left the queue and its author with it, while its mark stays an hour, so My
+    memory hid the summary for that hour; main shows it. The author stays with the mark now, and Fri's own replies that
+    carried a deleted message are marked as Fri's. The summary's own source still hides it, and so does one whose
+    author said "forget me" since: what Fri knew of them goes, so it can't be ruled out."""
+    async def scenario():
+        from compat_tests.test_fri_member_summaries import SUMMARY
+        from compat_tests.test_fri_panel_fences_2 import DM_SCOPE, dm_panel, listed
+        from fri.fri_memory import profiled
+        from fri.fri_memory_panel import show
+        w = taken_by_the_controller(monkeypatch, tmp_path, taken)
+        try:
+            under, gone = await w.taken()
+            turns = w.fri.agent.saved_turns
+            if taken.endswith('forget me'):
+                w.fri.agent.forget('30', erased=True)
+                assert str(under-1) in turns.marked and str(under-1) not in turns.marked_by
+            monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
+            interaction = dm_panel(w.fri)
+            await show(w.fri, interaction, profiled(w.fri, dict(DM_SCOPE)))
+            assert (listed(interaction, SUMMARY) > 0) is (taken in S2[:2])
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def taken_by_the_controller(monkeypatch, tmp_path, taken):
+    """Member 20's summary, six newer exchanges, and a withdrawal the controller has taken: of the summary's source, or
+    of an older message of member 30's (and with it a reply of Fri's that carried it, for that case)."""
+    from compat_tests.test_fri_member_profiles import world
+    w = world(monkeypatch, tmp_path)
+    under, go = summary_from(w, monkeypatch)
+
+    async def done():
+        await go()
+        newer_exchanges(w)
+        turns = w.fri.agent.saved_turns
+        if taken == "a reply of Fri's that carried it":  # In view, its turn having carried member 30's message.
+            w.fri.agent.drawn[str(under+1)] = (time.time(), frozenset({str(under-1)}))
+        if taken == 'its own source':
+            gone = [under]
+            turns.withdraw(gone, 123, deleted=True, authors={under: 20})
+        else:
+            gone = [under-1]
+            turns.withdraw(gone, 123, deleted=True, authors={under-1: 30})
+        await asyncio.gather(*list(turns.tasks))
+        assert not turns.pending and all(str(i) in turns.marked for i in gone)  # Taken, still marked.
+        if taken == "a reply of Fri's that carried it":
+            assert str(under+1) in turns.marked
+        return under, gone
+    w.taken = done
+    return w
+
+
+def test_382_r1_s2_a_withdrawal_the_controller_took_of_someone_elses_message_leaves_the_summary_in_a_request(
+        monkeypatch, tmp_path):
+    """S2 for the panel: the same withdrawal, taken before member 20's panel turn, took their summary out of its
+    request for the hour; now it stays."""
+    async def scenario():
+        from compat_tests.test_fri_member_summaries import SUMMARY
+        w = taken_by_the_controller(monkeypatch, tmp_path, "someone else's message")
+        try:
+            await w.taken()
+            carried = []
+
+            async def respond(text, context, ready):
+                await ready()
+                carried.append(context.get('member_summary'))
+                return ChatResult(status='completed', reply='you plan raids, '+MARKER)
+            model(w.fri, tmp_path, respond)
+            interaction = panel(w.fri)
+            await w.fri.chat_interaction(interaction, 'remind me what we planned')
+            assert carried and SUMMARY in str(carried[0]) and MARKER in shown(interaction)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
