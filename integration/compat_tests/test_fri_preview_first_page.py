@@ -226,3 +226,4 @@ def test_an_image_reply_whose_source_erased_while_its_image_was_checked_never_go
         finally:
             await fri.close()
     asyncio.run(scenario())
+
