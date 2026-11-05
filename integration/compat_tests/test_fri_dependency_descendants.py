@@ -140,9 +140,10 @@ def test_a_saved_reply_quoting_the_summary_leaves_the_request_with_it(monkeypatc
 
 # 3. A DM's and a channel's final fence.
 
+@pytest.mark.parametrize('tracked', [True, False], ids=['saved by this Fri', 'saved before it started'])
 @pytest.mark.parametrize('where', ['a DM', 'a channel'])
 @pytest.mark.parametrize('gone', [True, False], ids=['the quoted message deleted', 'nothing'])
-def test_a_reply_is_held_to_what_its_saved_context_drew_on(monkeypatch, tmp_path, where, gone):
+def test_a_reply_is_held_to_what_its_saved_context_drew_on(monkeypatch, tmp_path, where, gone, tracked):
     """The issue's repro: member 20's saved reply B drew on A, and their next message's reply reads B and repeats it. A
     is deleted during Gene's last check of the turn, its withdrawal still pending: the reply doesn't go out, nor is it
     saved, as a /fri panel reply's isn't."""
@@ -156,9 +157,10 @@ def test_a_reply_is_held_to_what_its_saved_context_drew_on(monkeypatch, tmp_path
         said = source(age=600, channel=channel)
         store.save_chat('123', conversation, '20', 0, 'what did ash say', REPLY, 'model', 'high', source=said,
                         provenance=[], drew_on=[quoted['id']])
-        agent.saved_turns.kept({'guild_id': '123', 'channel_id': channel, 'conversation_id': conversation,
-                                'user_id': '20', 'revision': 0, 'source': said, 'drew_on': [quoted['id']]}, {},
-                               (time.time(), time.monotonic()))
+        if tracked:  # Else saved before this Fri started: what it drew on can't be told, so any taken back counts.
+            agent.saved_turns.kept({'guild_id': '123', 'channel_id': channel, 'conversation_id': conversation,
+                                    'user_id': '20', 'revision': 0, 'source': said, 'drew_on': [quoted['id']]}, {},
+                                   (time.time(), time.monotonic()))
         answered = []
 
         async def respond(text, context, ready):
@@ -193,3 +195,90 @@ def test_a_reply_is_held_to_what_its_saved_context_drew_on(monkeypatch, tmp_path
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_a_dm_reply_drawing_on_the_summary_is_held_to_its_sources(monkeypatch, tmp_path):
+    """Item 3 for the summary: member 20's DM reads their summary, built from A; A is deleted during Gene's last check,
+    its withdrawal queued here. The reply doesn't go out, as a /fri panel reply's doesn't (fri #382)."""
+    async def scenario():
+        from unittest.mock import AsyncMock
+
+        from compat_tests.test_fri_member_profiles import DM, GENERAL, world
+        w = world(monkeypatch, tmp_path)
+        try:
+            under, go = summary_from(w, monkeypatch)
+            await go()
+            newer_exchanges(w)
+            agent = w.fri.agent
+            agent.saved_turns.kick = lambda: None
+            agent.config['support_dms'] = True
+            w.channels[DM].fetch_message = AsyncMock(side_effect=lambda mid: w.posted[mid])
+            agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+            answered = []
+
+            async def respond(text, context, ready):
+                await ready()
+                assert context.get('member_summary')
+                answered.append(True)
+                return ChatResult(status='completed', reply='you plan raids, '+MARKER)
+            model(w.fri, tmp_path, respond)
+            api, deleting = w.fri.api, []
+
+            async def recording(method, path, payload=None):
+                answer = await api(method, path, payload)
+                if path == '/chat/turn/check' and answered and not deleting:
+                    deleting.append(path)
+                    await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=GENERAL, guild_id=123, message_id=under))
+                return answer
+            w.fri.api = recording
+            dm = w.message(DM, 'what did we plan')
+            dm.reply = AsyncMock(return_value=SimpleNamespace(id=dm.id+1, content='okay', edit=AsyncMock()))
+            await agent.handle(dm)
+            assert deleting and MARKER not in str(dm.reply.await_args_list)
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+# Item 2's edges, on SavedTurns.withhold alone.
+
+def quoting_context(summary, *turns):
+    return {'turns': [dict(turn) for turn in turns], 'member_summary': summary, 'pending': None, 'elsewhere': []}
+
+
+def saved(i, summaries=(), reply='quoted '+MARKER):
+    return {'input': 'x', 'reply': reply, 'source': {'kind': 'discord_message', 'id': str(i)}, 'burst': [],
+            'summaries': [{'user_id': str(user), 'generation': 0} for user in summaries]}
+
+
+@pytest.mark.parametrize('case', ['quoting someone else\'s summary', 'its summary not in the request',
+                                  'a reply that drew on the quoting one'])
+def test_withholding_a_reply_that_quoted_a_held_summary(monkeypatch, tmp_path, case):
+    """Member 20's own message under their summary is taken back, its withdrawal queued. A saved reply that quoted only
+    member 30's summary stays; one that quoted member 20's goes though the request didn't carry the summary itself
+    (when it was made isn't known then, so any of theirs counts); and one this Fri saved that drew on that reply goes
+    with it."""
+    fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+    fri.capabilities = frozenset(asyncio.run(fri.api('GET', '/fri/contract'))['capabilities'])
+    turns = agent.saved_turns
+    turns.kick = lambda: None
+    under = int(source(age=4000, channel='1')['id'])
+    turns.withdraw([under], 123, deleted=True, authors={under: 20})
+    summary = {'text': 'raids', 'refreshed': time.time()}
+    quoted, later = int(source(age=300, channel='1')['id']), int(source(age=200, channel='1')['id'])
+    if case == 'quoting someone else\'s summary':
+        context = quoting_context(summary, saved(quoted, summaries=[30]))
+        turns.withhold(context, member='20')
+        assert len(context['turns']) == 1 and context['member_summary'] is None
+    elif case == 'its summary not in the request':
+        context = quoting_context(None, saved(quoted, summaries=[20]))
+        turns.withhold(context, member='20')
+        assert context['turns'] == []
+    else:
+        turns.kept({'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20',
+                    'revision': 0, 'source': {'kind': 'discord_message', 'id': str(later)}, 'drew_on': [str(quoted)]},
+                   {}, (time.time(), time.monotonic()))
+        context = quoting_context(summary, saved(quoted, summaries=[20]), saved(later, reply='again '+MARKER))
+        turns.withhold(context, member='20')
+        assert context['turns'] == []
+    asyncio.run(fri.close())
