@@ -12,7 +12,10 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 
 from compat_tests.test_api import headers
-from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import (
+    GONE,
+    learning,  # noqa: F401 (the fixture)
+)
 from compat_tests.test_fri_panel_and_learning_fences import batch
 from fri.fri_agent import Agent
 from fri.fri_errors import ControllerRejected
@@ -209,9 +212,12 @@ def explorer(learning, moved):  # noqa: F811
         if not route.url.endswith('/messages/search'):  # One message, read again by its ID (fri #335).
             found = current.get(route.url.rsplit('/', 1)[-1])
             if found is None:
-                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), GONE)
             if found == 'refused':  # Discord won't say (fri #358).
                 raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Access')
+            if found == 'no channel':  # A 404 that doesn't say the message is gone (Sol round 1 of fri #362).
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'),
+                                       {'code': 10003, 'message': 'Unknown Channel'})
             return found
         return {'messages': [[found] for found in next(pages, [])], 'doing_deep_historical_index': False}
 
@@ -220,6 +226,8 @@ def explorer(learning, moved):  # noqa: F811
             current.pop(old['id'], None)  # No event reaches the agent.
         if passes == [1] and moved == 'its row, refused by its ID, while the summary signs in':
             current[old['id']] = 'refused'
+        if passes == [1] and moved == 'its row, an unknown channel by its ID, while the summary signs in':
+            current[old['id']] = 'no channel'
         if passes == [1] and moved == 'its row, through Gene alone, while the summary signs in':
             store.withdraw_saved('123', [old['id']], deleted=True)
         if passes == [1, 2] and moved == 'its topic, through Gene alone, while the planner signs in' and not planned:

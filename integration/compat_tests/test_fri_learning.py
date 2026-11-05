@@ -17,6 +17,7 @@ from gene.store import Store
 from compat_tests.test_api import headers
 from fri.fri_agent import Agent
 
+GONE = {'code': 10008, 'message': 'Unknown Message'}  # Discord's 404 for a message that's gone, as it answers it.
 
 @pytest.fixture
 def learning(tmp_path, monkeypatch):
@@ -67,7 +68,7 @@ class HistoryChannel(discord.abc.Messageable):
         """One message by its ID, as Discord answers it: a 404 once it's gone."""
         row = next((row for row in self.rows if row.id == int(message_id)), None)
         if row is None:
-            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), GONE)
         return {'id': str(row.id), 'message': row}
 
     def add(self, at, user=11, bot=False, text='I love trance'):

@@ -12,7 +12,7 @@ import discord
 import httpx
 import pytest
 
-from compat_tests.test_fri_actions import harness
+from compat_tests.test_fri_actions import GONE, harness
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_sass_eval import Scripted, grader  # noqa: F401
@@ -204,7 +204,7 @@ def read_harness(monkeypatch, tmp_path):
 
     async def fetch(mid):  # By its ID, as Discord answers: a 404 once it's gone.
         if mid not in rows:
-            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), GONE)
         return rows[mid]
     channel.fetch_message = AsyncMock(side_effect=fetch)
     return fri, agent, channel, rows, post

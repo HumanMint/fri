@@ -17,7 +17,10 @@ import discord
 import pytest
 
 from compat_tests.test_fri_history_search import query, setup
-from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import (
+    GONE,
+    learning,  # noqa: F401 (the fixture)
+)
 from compat_tests.test_fri_looking import read_harness
 from compat_tests.test_fri_panel_and_learning_fences import batch
 from compat_tests.test_fri_pass_withdrawals import explorer
@@ -32,7 +35,9 @@ from fri.fri_agent import Agent
 from fri.fri_turn_withdrawal import KEPT_SECONDS, NOTED_SECONDS, SOURCES, SavedTurns
 
 TRANCE = 'I love trance'  # Member 11's message in the learning batch, and what Fri learned from it earlier.
-UNCONFIRMED = ['refused', 'failing', 'timing out']
+# Discord doesn't say the message is gone: it refuses, fails, times out, or answers a 404 that isn't about the message
+# itself, Unknown Channel (Sol round 1 of #362: any 404 was taken as a deletion).
+UNCONFIRMED = ['refused', 'failing', 'timing out', 'an unknown channel']
 
 
 def taken(monkeypatch):
@@ -53,6 +58,9 @@ def answer(how):
         raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'Missing Access')
     if how == 'failing':
         raise discord.HTTPException(SimpleNamespace(status=503, reason='Service Unavailable'), 'try again')
+    if how == 'an unknown channel':
+        raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'),
+                               {'code': 10003, 'message': 'Unknown Channel'})
     raise TimeoutError()
 
 
@@ -187,10 +195,12 @@ def test_an_archive_pass_that_finds_a_row_deleted_takes_it_back(learning, monkey
 
 
 @pytest.mark.parametrize('moved', ['its row, refused by its ID, while the summary signs in',
+                                   'its row, an unknown channel by its ID, while the summary signs in',
                                    'its row, through Gene alone, while the summary signs in'])
 def test_an_archive_pass_takes_back_nothing_discord_doesnt_say_was_deleted(learning, monkeypatch, moved):  # noqa: F811
-    """Refused by its ID (the pass stops, as any failed read stops it), or withdrawn through Gene alone with Discord
-    still showing it: nothing is sent, and nothing is taken back here."""
+    """Refused by its ID (the pass stops, as any failed read stops it), a 404 for its channel rather than the message
+    (left out, Sol round 1 of #362), or withdrawn through Gene alone with Discord still showing it: nothing is sent, and
+    nothing is taken back here."""
     found = taken(monkeypatch)
     _, summarized, _ = explorer(learning, moved)
     assert summarized == [] and found == []
@@ -263,10 +273,10 @@ def test_a_reads_recheck_takes_back_only_a_post_discord_says_is_deleted(monkeypa
 
 # R1 on an archive search (HistorySearch).
 
-@pytest.mark.parametrize('change', ['deleted', 'refused'])
+@pytest.mark.parametrize('change', ['deleted', 'refused', 'an unknown channel'])
 def test_an_archive_search_takes_back_a_result_discord_says_is_deleted(monkeypatch, tmp_path, change):
-    """Discord's index can still list a message after it's deleted. Read by its ID, a 404 leaves it out, as before, and
-    now takes it back under the server; a refusal takes back nothing."""
+    """Discord's index can still list a message after it's deleted. Read by its ID, a 404 for the message leaves it out,
+    as before, and now takes it back under the server; a refusal, or a 404 for its channel, takes back nothing."""
     async def scenario():
         found = taken(monkeypatch)
         fri, agent, actions, channels, rows, messages = setup(monkeypatch, tmp_path)
@@ -275,7 +285,7 @@ def test_an_archive_search_takes_back_a_result_discord_says_is_deleted(monkeypat
 
         async def by_id(mid):
             if mid == gone and change == 'deleted':
-                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+                raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), GONE)
             if mid == gone:
                 answer(change)
             return await fetch(mid)
@@ -285,6 +295,38 @@ def test_an_archive_search_takes_back_a_result_discord_says_is_deleted(monkeypat
             result = await actions.execute(query())
             assert str(gone) not in str(result.get('messages'))
             assert found == ([(1, [gone], 123)] if change == 'deleted' else [])
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['deleted', 'an unknown channel', 'refused'])
+def test_an_archive_searchs_recheck_takes_back_a_result_deleted_since_it_was_shown(monkeypatch, tmp_path, change):
+    """Sol round 1 of #362, B2 (pre-existing): before the model request and before delivery, each result the search
+    showed is read again by its ID. One deleted since refused the turn, but nothing was withdrawn, so a note saved from
+    it stayed. A 404 for the message itself now takes it back under the search's server first. The turn is refused
+    either way, and a refusal, or a 404 for its channel, takes back nothing."""
+    async def scenario():
+        found = taken(monkeypatch)
+        fri, agent, actions, channels, rows, messages = setup(monkeypatch, tmp_path)
+        channel = channels[1]
+        try:
+            await actions.execute(query())
+            shown = sorted(message for _, message in actions.history.evidence)[-1]
+            assert await actions.history.valid({'1': channel})
+            fetch = channel.fetch_message.side_effect
+
+            async def by_id(mid):
+                if mid == shown and change == 'deleted':
+                    raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), GONE)
+                if mid == shown:
+                    answer(change)
+                return await fetch(mid)
+
+            channel.fetch_message.side_effect = by_id
+            with pytest.raises(discord.HTTPException):
+                await actions.history.valid({'1': channel})
+            assert found == ([(1, [shown], 123)] if change == 'deleted' else [])
         finally:
             await fri.close()
     asyncio.run(scenario())
