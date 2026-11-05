@@ -146,6 +146,17 @@ def test_a_report_with_nothing_taken_back_goes_as_before(learning):  # noqa: F81
     asyncio.run(scenario())
 
 
+def test_with_nothing_pending_nobody_is_looked_up(learning):  # noqa: F811
+    """The owner isn't in the cache: with no report pending, Fri doesn't look them up from Discord either."""
+    async def scenario():
+        agent, owner, scheduler, report, store = reporting(learning, owner_cached=False)
+        scheduler.delivered(report['id'])
+        agent.fri.fetch_user = AsyncMock(side_effect=AssertionError('looked up with nothing to send'))
+        await agent.send_reports()
+        owner.send.assert_not_awaited()
+    asyncio.run(scenario())
+
+
 # 3. fri health.
 
 @pytest.mark.parametrize('missing', [('summary-holds',), ('summary-sources', 'summary-rechecks')])
