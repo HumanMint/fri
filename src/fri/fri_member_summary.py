@@ -86,11 +86,12 @@ async def changed(agent, messages):
 
 async def build(agent):
     """Build at most one claimed summary. The controller hears how it went either way: the call counts."""
-    # fri health says so while it waits for that (Sol round 1 of #348), or for rechecks (fri #349).
+    # fri health says so while it waits for that (Sol round 1 of #348), for rechecks (fri #349), or for holds (fri #355):
+    # without them none is used, so none is built.
     capabilities = getattr(agent.fri, 'capabilities', ())
-    agent.summaries_wait_for_gene = SOURCES not in capabilities or RECHECKS not in capabilities
+    agent.summaries_wait_for_gene = not {SOURCES, RECHECKS, HOLDS} <= set(capabilities)
     if agent.summaries_wait_for_gene:
-        LOG.info('Member summaries wait for a controller that names their sources and rechecks them')
+        LOG.info('Member summaries wait for a controller that names their sources, rechecks them and holds them back')
         return None
     # Claimed once the model is free and Fri is signed in, so nothing waits between reading the words
     # and sending them: anything erased before the claim is never sent.
