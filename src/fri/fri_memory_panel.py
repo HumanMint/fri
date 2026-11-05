@@ -202,7 +202,7 @@ async def screened(cog, scope, state):
         state = await cog.api('POST', '/chat/memory/notes', asked)
     context = await cog.api('POST', '/chat/context', asked)
     from .fri_memory import place_notes
-    return turns.screen(place_notes(cog.get_channel, context, scope['conversation_id']), state)
+    return turns.screen(place_notes(cog.get_channel, context, scope['conversation_id']), state, scope.get('user_id'))
 
 
 def movable(cog, scope):

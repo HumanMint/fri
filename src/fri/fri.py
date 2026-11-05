@@ -526,8 +526,9 @@ class Fri(discord.Client):
             # told from the rest, a note naming no message, say (fri #372 round 2, B3).
             if self.agent and fence and self.agent.channel_withdrawals.moved(fence.get('channels')):
                 return await refreshed()  # Accepted during the checks above (see refreshed).
-            if self.agent:
-                seen.update(int(i) for i in self.agent.saved_turns.withhold(context))
+            if self.agent:  # And what saved replies, and the member's summary, drew on (fri #332).
+                seen.update(int(i) for i in self.agent.saved_turns.withhold(
+                    context, member=((fence or {}).get('turn') or {}).get('user_id')))
             # One this turn quotes or replies to refuses it instead: the answer would be about words taken back,
             # which saved turns may still hold. So does one the turn itself answers, its own message or one of
             # its burst, if taken back since it came in (see Agent.rerun).
@@ -607,8 +608,17 @@ class Fri(discord.Client):
             self.depend(context)  # What the request carries now drew on those summaries (fri #193).
         # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
         seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
+        # And what the saved context it carried drew on, kept apart: never in a request, nor in the save's own drew_on
+        # (fri #332). See SavedTurns.dependencies and taken_since. Each model call of a turn adds to it.
+        depends = (context['fence'].setdefault('dependencies', {'messages': set(), 'unknown': False, 'summary': None})
+                   if context.get('fence') else {'messages': set(), 'unknown': False, 'summary': None})
         result = await self.chat.respond(text, context, ready=ready)
-        result.shown = seen
+        if getattr(self, 'agent', None):  # As the request carried it: `ready` withholds what it may not, right before it.
+            found, unknown = self.agent.saved_turns.dependencies(context)
+            depends['messages'] |= found
+            depends['unknown'] = depends['unknown'] or unknown
+            depends['summary'] = context.get('member_summary') or depends['summary']
+        result.shown, result.dependencies = seen, depends
         result.channels = (context.get('fence') or {}).get('channels')  # As its last read was (see ready).
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
@@ -1073,7 +1083,7 @@ class Fri(discord.Client):
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
             **(self.summary_generation(context) if derived else {}),
-            **(self.drawn_on(context) if derived else {}),
+            **self.drawn_on(context, derived),
             **({'audience': audience(context)} if context.get('audience') else {})}
         if derived and result.response_kind == 'reply' and not unattributed and not crossed and not recalled:
             result.echo = self.echo(scope, context, provenance, reply, draws_on_summary(result.turn), carried(context))
@@ -1188,11 +1198,17 @@ class Fri(discord.Client):
         if found := self.dependencies(context):
             context['fence'].setdefault('summary_dependencies', set()).update(found)
 
-    def drawn_on(self, context):
+    def drawn_on(self, context, derived=True):
         """For a controller offering withdrawal-sources: the messages the turn's model requests carried besides its own
-        (see chat_once), so a withdrawal of one retires its saved reply, or refuses it before then (gene #141). Never
+        (see chat_once), so a withdrawal of one retires its saved reply, or refuses it before then (gene #141). An empty
+        list where they carried nothing else, or for a reply Fri made itself (not derived), as the controller's default
+        is: said, so this Fri knows the reply drew on nothing (see SavedTurns.kept; fri #382's round 1, S1). Never
         dropped to fit: too many refuse it, as too many people do. Nothing for an older controller."""
-        if SOURCES not in self.capabilities or not context.get('fence'):
+        if SOURCES not in self.capabilities:
+            return {}
+        if not derived:
+            return {'drew_on': []}
+        if not context.get('fence'):
             return {}
         own = {str((context['fence'].get('turn') or {}).get('source', {}).get('id', '')),
                *(str(row['source']['id']) for row in context.get('message_burst', []))}
@@ -1200,7 +1216,7 @@ class Fri(discord.Client):
         if len(ids) > MAX_DRAWN:
             raise commands.UserFeedbackCheckFailure('that drew on too many messages for me to keep track of safely. '
                                                     'ask again in a bit.')
-        return {'drew_on': ids} if ids else {}
+        return {'drew_on': ids}
 
     async def memory_overview(self, scope, context, private):
         """Everything for the member's own eyes in private; in public, only what that channel can see. Neither shows
@@ -1215,13 +1231,13 @@ class Fri(discord.Client):
             if turns is not None and turns.withholding():
                 if not screening and SOURCES in self.capabilities:
                     state = await self.api('POST', '/chat/memory/notes', profiled(self, scope, True))
-                state = turns.screen(context, state)
+                state = turns.screen(context, state, scope['user_id'])
             enabled, rows = state['enabled'], state['entries']
             # As a request would use it, with nothing awaited from here to the answer (Sol round 1 of #354).
             summary = escape(state['summary']['text']) if state.get('summary') and summaries_usable(self) else None
         else:
             if screening:
-                turns.screen(context)
+                turns.screen(context, member=scope['user_id'])
             profile, summary = context['personal_memory'], context.get('member_summary')
             enabled, rows = profile['enabled'], profile['notes']
             # Its words stay out of a public channel; that it exists may show where it would itself.
@@ -1438,6 +1454,7 @@ class Fri(discord.Client):
         # Gene's check of the turn can't see a "forget me" of theirs Fri took in and hasn't sent on (fri #301).
         baselines = {str(member): count for member, count in self.agent.forgotten.items()} if held else {}
         began = time.time()  # A message the turn carries taken back after this is held back (fri #306).
+        deleted_after = time.monotonic()  # Deletions are timed so (see Agent.unsend).
         await defer_panel(interaction)
         await reply(self, interaction, 'Thinking…', view=HomeView(self, user))
         try:
@@ -1467,7 +1484,11 @@ class Fri(discord.Client):
                 since |= {i for i, at in agent.revised.items() if at >= began}
                 since |= {int(i) for i, at in agent.saved_turns.marked.items() if at >= began and i.isdigit()}
                 # Or a channel's withdrawal accepted past the read the reply came from (Sol round 3 of #372).
-                return bool((agent.unsent.keys() | since) & carried) or agent.channel_withdrawals.moved(result.channels)
+                if (agent.unsent.keys() | since) & carried or agent.channel_withdrawals.moved(result.channels):
+                    return True
+                # Or one what its saved context drew on may be (fri #332): see SavedTurns.taken_since.
+                since |= {i for i, at in agent.unsent.items() if at >= deleted_after}
+                return agent.saved_turns.taken_since(getattr(result, 'dependencies', None), since, user)
 
             def unmoved():
                 if not held:
