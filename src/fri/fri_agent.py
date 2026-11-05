@@ -2343,16 +2343,15 @@ class Agent:
             # Neither outcome renews active attention or the ambient reply timer.
             await self.fri.waiting_notices.clear(message.author.id)
             return
-        # A preview (a settings preview's first page, a post's or a reminder's card) carries the words of everyone the
-        # turn drew on, and so does a reply drawing on someone else's after a read awaited past talk's fence (a DM's
-        # membership lookup, a ping's reads): held to the turn's whole fence too, as a preview's later pages and Apply
-        # are (fri #324 item 1). Their erasures here since the turn began, then Gene's check of the whole turn, then
-        # those erasures again, here, after the last awaited read. The send's own last check is the part that reads
-        # nothing; what was delivered is held to the whole fence again before it's recorded.
+        # A reply drawing on someone else's words, after a read awaited past talk's fence (a DM's membership lookup, a
+        # ping's reads; a public reply awaits none): held to the turn's whole fence too, as a preview's later pages and
+        # Apply are (fri #324 item 1). That's a settings preview's first page, a post's or a reminder's card, or any
+        # reply. Their erasures here since the turn began, then Gene's check of the whole turn, then those erasures
+        # again, here, after the last awaited read. The send's own last check is the part that reads nothing; what was
+        # delivered is held to the whole fence again before it's recorded.
         drew = {str(row.get('user_id')) for row in (result.turn or {}).get('provenance') or []}
         whole = (turn_fence(self, result.turn, message.author.id, counts)
-                 if result.settings_preview or result.post_preview or result.social_preview
-                 or ((dm or invitation) and drew - {str(message.author.id)}) else None)
+                 if (dm or invitation) and drew - {str(message.author.id)} else None)
         if whole and not await whole():
             if self.forgotten.get(message.author.id, 0) != counts.get(str(message.author.id), 0):
                 return missed('author privacy changed')  # Their own erasure: nothing goes out, quietly.

@@ -192,7 +192,9 @@ def test_the_requesters_own_erasure_during_the_fence_says_nothing(monkeypatch, t
         agent.member = AsyncMock(side_effect=member)
 
         async def api(method, path, payload=None):
-            if path == '/chat/turn/check' and {'fresh': True} in looked[1:]:  # The fence's, past the last lookup.
+            # The fence's own check, past the last membership lookup (the third fresh one: at the message, before the
+            # model call, and dm_closed's after it), after talk's own checks.
+            if path == '/chat/turn/check' and looked.count({'fresh': True}) >= 3:
                 agent.forget(10, erased=True)
             return await real(method, path, payload)
         fri.api = api
