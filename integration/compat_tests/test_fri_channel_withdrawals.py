@@ -1089,3 +1089,29 @@ def test_a_later_request_reads_the_context_read_again_after_a_channel_went(monke
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_channel_withdrawn_during_the_turn_check_is_caught_at_the_last_check(monkeypatch, tmp_path):
+    """Sol round 4 of #372: the context is read again before the controller's turn check, and again at the last check,
+    for a withdrawal accepted during that check's own wait: #general goes while the controller answers it. Its note,
+    named by no message, never reaches the model."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            with w.store.connection() as db:
+                db.execute(LEGACY)
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            real, went = w.fri.api, []
+
+            async def api(method, path, payload=None):
+                if (path == '/chat/turn/check' and not went and
+                        str((payload or {}).get('conversation_id', '')).startswith('private')):
+                    went.append(path)
+                    await deleted(w, GENERAL)  # Accepted while the controller checks the turn.
+                return await real(method, path, payload)
+            w.fri.api = api
+            assert await asked(w) == ['I like chess'] and went
+        finally:
+            await w.fri.close()
+    run(scenario)
