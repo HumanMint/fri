@@ -24,14 +24,14 @@ from fri.fri_chat import ChatResult
 FIRST = 'say ' + MARKER + ' sometimes. ' + ' '.join(['keep it dry and short.']*40)  # The marker on page one.
 
 
-def owner_dm(monkeypatch, tmp_path, result, moved, during='lookup'):
+def owner_dm(monkeypatch, tmp_path, result, moved, during='lookup', source=None, text='sharper voice please'):
     """The owner's DM to Fri, its reply drawing on member 30's saved words, and member 30 erasing (`moved`: through
     Gene, here, or not at all) during the owner's last membership lookup (dm_closed's, after the model call and talk's
-    own fence), or the send itself."""
+    own fence), or the send itself. `source`: the saved exchange's own message, for one deleted meanwhile."""
     fri, agent, store, _, _, _, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
     channel, message = direct(fri, agent, rows)
     store.save_chat('123', 'private:555', '10', 0, 'what did they say', 'member thirty plays the oud', 'model',
-                    'high', provenance=[ASH])
+                    'high', provenance=[ASH], **({'source': source} if source else {}))
     answered = []
 
     async def respond(text, context, ready):
@@ -51,7 +51,7 @@ def owner_dm(monkeypatch, tmp_path, result, moved, during='lookup'):
             erase()
         return SimpleNamespace(id=10)
     agent.member = AsyncMock(side_effect=member)
-    dm = message('sharper voice please')
+    dm = message(text)
     dm.author = SimpleNamespace(id=10, display_name='owner', bot=False)
     sent = SimpleNamespace(id=dm.id+100, content='okay', edit=AsyncMock())
 
@@ -60,6 +60,7 @@ def owner_dm(monkeypatch, tmp_path, result, moved, during='lookup'):
             erase()
         return sent
     dm.reply = AsyncMock(side_effect=reply)
+    dm.sent = sent  # What Discord took, for a later edit.
     return fri, agent, store, dm
 
 
