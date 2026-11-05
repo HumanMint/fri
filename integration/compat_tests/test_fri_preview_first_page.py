@@ -95,9 +95,9 @@ def test_a_preview_whose_source_erased_while_it_went_out_is_not_recorded(monkeyp
         recorded = []
         record = fri.record_turn
 
-        async def recording(result, sent=None):
+        async def recording(result, sent=None, **kwargs):
             recorded.append(result)
-            return await record(result, sent)
+            return await record(result, sent, **kwargs)
         fri.record_turn = recording
         try:
             await agent.handle(dm)
@@ -162,7 +162,7 @@ def test_a_post_card_whose_source_erased_while_it_went_out_is_not_recorded(monke
             'local', during='send')
         recorded = []
 
-        async def recording(result, sent=None):
+        async def recording(result, sent=None, **kwargs):
             recorded.append(result)
         fri.record_turn = recording
 
