@@ -530,3 +530,159 @@ def test_recovery_never_trusts_an_empty_channel_list_or_an_unanswered_read(monke
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_recovery_needs_every_uncached_channel_actually_read(monkeypatch, tmp_path):
+    """Sol round 2 of #372, B2: recovering, 26 held channels none of which the cache holds, the first 25 answering
+    Missing Access and the 26th deleted. One sweep reads 25: the 26th, never read, isn't answered, so recovery goes on;
+    the next sweep reads it, finds it gone, and only then does recovery end."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            ids = [str(1000+i) for i in range(1, 27)]
+            with w.store.connection() as db:
+                for cid in ids:
+                    db.execute('INSERT INTO chat_turns(guild_id,channel_id,user_id,input,reply,model,effort,at) '
+                               "VALUES ('123',?,'20','hi','hey','model','high',strftime('%s','now'))", ('public:'+cid,))
+            (tmp_path/'channel-withdrawals.json').write_text('{"pending": {')
+            agent = restarted(w)
+            guild = w.fri.get_guild(123)
+            guild.fetch_channels = AsyncMock(return_value=[w.channels[GENERAL]])
+
+            async def fetch(cid):
+                if str(cid) == ids[-1]:
+                    raise gone(10003)
+                raise discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'),
+                                        {'code': 50001, 'message': 'Missing Access'})
+            guild.fetch_channel = AsyncMock(side_effect=fetch)
+            await landed(w)
+            assert agent.channel_withdrawals.holding() and withdrawals(w) == []
+            await landed(w)
+            assert [body['channel_ids'] for body in withdrawals(w)] == [[ids[-1]]]
+            assert not agent.channel_withdrawals.holding()
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def paused_private_context(w, during):
+    """A private request's context, read from the controller, then `during()` before it's used."""
+    real, paused = w.fri.api, []
+
+    async def api(method, path, payload=None):
+        answer = await real(method, path, payload)
+        if path == '/chat/context' and str((payload or {}).get('conversation_id', '')).startswith('private'):
+            if not paused:
+                paused.append(path)
+                await during()
+        return answer
+    w.fri.api = api
+    return paused
+
+
+def test_a_copy_of_a_note_with_no_message_named_never_reaches_the_reply_model(monkeypatch, tmp_path):
+    """Sol round 2 of #372, B3: a profile note learned in #general before notes named their messages. A copy read before
+    #general's withdrawal names no message to hold it back by; the withdrawal itself moves what the request's last check
+    compares, so the copy goes."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            with w.store.connection() as db:
+                db.execute("INSERT INTO personal_notes(guild_id,channel_id,user_id,category,evidence,at,origin,provenance) "
+                           "VALUES ('123','server','20','games','I like Minecraft',strftime('%s','now'),'public:1','[]')")
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+
+            async def gone_now():
+                await deleted(w, GENERAL)
+            paused = paused_private_context(w, gone_now)
+            assert await asked(w) == [] and paused  # Every saved context of that copy goes.
+            assert await asked(w) == ['I like chess']  # Read again after: as the controller has it now.
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_copy_read_before_a_withdrawal_whose_first_answer_was_lost_never_reaches_the_reply_model(monkeypatch,
+                                                                                                    tmp_path):
+    """Sol round 2 of #372, B3: the controller took #general, but its answer was lost; asked again, it names nothing
+    (it already took it all). Accepting that empty answer still moves what the request's last check compares."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            await w.say(GAMING, 'fri I like chess', 'cool', note('I like chess'))
+            from fri.fri_errors import ControllerUnavailable
+            real, lost = w.fri.api, []
+
+            async def api(method, path, payload=None):
+                answer = await real(method, path, payload)
+                if path == '/chat/channels/withdraw' and not lost:
+                    lost.append(answer)
+                    raise ControllerUnavailable('its answer was lost')
+                return answer
+            w.fri.api = api
+
+            async def gone_now():
+                await deleted(w, GENERAL)
+            paused_private_context(w, gone_now)
+            assert await asked(w) == [] and lost and len(withdrawals_sent(lost)) == 1
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def withdrawals_sent(lost):
+    return [answer for answer in lost if answer.get('ok')]
+
+
+def test_a_queue_write_cut_short_before_it_lands_holds_after_a_restart(monkeypatch, tmp_path):
+    """Sol round 2 of #372, B4: an install whose queue and marker were written; a deletion is queued and Fri stops
+    before the new queue replaces the old one. The old marker no longer vouches for what's on disk, so a restart
+    holds everything back until a sweep has found what's gone."""
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            back = rolled_back(w)
+            assert not queue(w).holding()  # Its empty queue and marker written once before.
+
+            def stopped(*args):
+                raise SystemExit('stopped before the new queue landed')
+            monkeypatch.setattr('fri.private_files.os.replace', stopped)
+            w.channels.pop(GENERAL)
+            with pytest.raises(SystemExit):
+                queue(w).withdraw(123, GENERAL)
+            monkeypatch.undo()
+            agent = restarted(w)
+            assert agent.channel_withdrawals.holding() and await asked(w) == []
+            back()
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_fri_health_says_when_saved_context_waits_for_deleted_channels(monkeypatch, tmp_path):
+    """Sol round 2 of #372, S1: the owner's fri health names a hold for the channel queue, and how far recovery got."""
+    from fri.fri_watch import Watch
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            await w.say(GENERAL, 'fri I like Minecraft', 'cubes', note('I like Minecraft'))
+            back = rolled_back(w)
+            await deleted(w, GENERAL)
+            report = await Watch(w.fri).report()
+            line = next(line for line in report.splitlines() if 'deleted channel' in line)
+            assert '1 waits' in line and "doesn't take channels" in line
+            back()
+            (tmp_path/'channel-withdrawals.json').write_text('{"pending": {')
+            restarted(w)
+            report = await Watch(w.fri).report()
+            line = next(line for line in report.splitlines() if 'deleted channel' in line)
+            assert 'recovering' in line
+        finally:
+            await w.fri.close()
+    run(scenario)
