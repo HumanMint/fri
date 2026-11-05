@@ -585,7 +585,7 @@ class Fri(discord.Client):
         # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
         seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
         # And what the saved context it carried drew on, kept apart: never in a request, nor in the save's own drew_on
-        # (fri #332). See SavedTurns.dependencies and taken_since.
+        # (fri #332). See SavedTurns.dependencies and taken_since. Each model call of a turn adds to it.
         depends = (context['fence'].setdefault('dependencies', {'messages': set(), 'unknown': False, 'summary': None})
                    if context.get('fence') else {'messages': set(), 'unknown': False, 'summary': None})
         result = await self.chat.respond(text, context, ready=ready)

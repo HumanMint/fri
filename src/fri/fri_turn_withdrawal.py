@@ -487,13 +487,11 @@ class SavedTurns:
         return None if unknown else found
 
     def dependencies(self, context):
-        """What the saved context a request carried drew on (fri #332): each saved exchange's and exchange elsewhere's
-        reply, as their messages name them here (see depends_on), as message IDs (strings); and whether any reply among
-        them drew on what this can't tell. Never what a model reads."""
+        """What the saved context a request carried drew on (fri #332): each saved exchange's reply, as its messages
+        name it here (see depends_on), as message IDs (strings); and whether any reply among them drew on what this
+        can't tell. Exchanges elsewhere hold only the member's own words, never a reply. Never what a model reads."""
         found, unknown = set(), False
-        rows = [exchange(turn) for turn in context.get('turns', []) if turn.get('reply')]
-        rows += [{str(i) for i in row.get('messages') or ()} for row in context.get('elsewhere', [])]
-        for messages in rows:
+        for messages in (exchange(turn) for turn in context.get('turns', []) if turn.get('reply')):
             drew = self.depends_on(messages - {''})
             if drew is None:
                 unknown = True
@@ -521,13 +519,14 @@ class SavedTurns:
     def taken_since(self, depends, recent, member=None):
         """Whether the saved context a reply's requests carried may hold a message taken back since (fri #332), so the
         reply is held back: `depends`, what that context drew on (see dependencies), as chat_once kept it; `recent`, the
-        messages taken back here since the turn began. One of what it drew on taken back since, or queued now and not
-        yet taken; any taken back since, where a saved reply it carried drew on what this can't tell (one saved before
-        this started); or one that may be a source of the member's summary it carried (see summary_sources)."""
+        messages taken back here since the turn began. One of what it drew on taken back since; any taken back since,
+        where a saved reply it carried drew on what this can't tell (one saved before this started); or one that may be
+        a source of the member's summary it carried (see summary_sources). One taken back before is withheld from the
+        request already (see withhold)."""
         if not depends:
             return False
         recent = {str(i) for i in recent}
-        if ({*recent, *self.pending} & depends['messages']) or (depends['unknown'] and recent):
+        if (recent & depends['messages']) or (depends['unknown'] and recent):
             return True
         return self.summary_sources(depends.get('summary'), member, recent)
 
@@ -621,9 +620,7 @@ class SavedTurns:
         found = held(context)
         gone = self.withheld(found)
         drew = [self.depends_on(exchange(turn) - {''}) or set() for turn in context.get('turns', [])]
-        away = [self.depends_on({str(i) for i in row.get('messages') or ()}) or set()
-                for row in context.get('elsewhere', [])]
-        taken = self.withheld({i for ids in [*drew, *away] for i in ids})
+        taken = self.withheld({i for ids in drew for i in ids})
         if context.get('member_summary') and self.summary_sources(context['member_summary'], member):
             context['member_summary'] = None
         if not gone and not taken:
@@ -640,8 +637,8 @@ class SavedTurns:
         context['turns'] = history
         if str(((context.get('pending') or {}).get('source') or {}).get('id', '')) in gone:
             context['pending'] = None
-        context['elsewhere'] = [row for row, depends in zip(context.get('elsewhere', []), away)
-                                if not {str(i) for i in row.get('messages') or ()} & gone and not depends & taken]
+        context['elsewhere'] = [row for row in context.get('elsewhere', [])
+                                if not {str(i) for i in row.get('messages') or ()} & gone]
         sources, memory = context.get('note_sources'), context.get('personal_memory') or {}
         if sources is not None and memory.get('notes'):
             from .fri_memory import note_key

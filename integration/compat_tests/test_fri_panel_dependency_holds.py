@@ -102,6 +102,52 @@ def test_332_a_panel_reply_is_held_to_what_its_saved_replies_drew_on(monkeypatch
     asyncio.run(scenario())
 
 
+def test_332_a_deletion_where_fri_saves_no_exchange_still_holds_a_reply_that_drew_on_it(monkeypatch, tmp_path):
+    """A message a saved reply quoted, linked from a channel Fri doesn't chat in, so Fri looked at it to answer, deleted
+    while the reply waits: nothing is queued or marked for it, only its deletion is known here (see Agent.unsend).
+    That holds the reply back too."""
+    async def scenario():
+        fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        interaction = panel(fri)
+        quoted = source(age=1200, channel='1')
+        quoting(store, fri, quoted['id'], tracked=True)
+
+        async def respond(text, context, ready):
+            await ready()
+            return ChatResult(status='completed', reply=REPLY)
+        model(fri, tmp_path, respond)
+        api, saved, taken = fri.api, [], []
+        lock = fri.private_panels.locks.setdefault((123, 20), asyncio.Lock())
+
+        async def holder():
+            while not getattr(lock, '_waiters', None):
+                await asyncio.sleep(0)
+            agent.saved_in = lambda event: None  # A channel Fri doesn't chat in.
+            agent.looked[int(quoted['id'])] = (time.monotonic(), False)  # Looked at to answer B.
+            await fri.on_raw_message_delete(SimpleNamespace(channel_id=77, guild_id=123, message_id=int(quoted['id'])))
+            assert int(quoted['id']) in agent.unsent
+            assert quoted['id'] not in agent.saved_turns.marked
+            lock.release()
+
+        async def recording(method, path, payload=None):
+            if path == '/chat/turn':
+                saved.append(payload)
+            answer = await api(method, path, payload)
+            if path == '/chat/turn/check' and not taken:
+                taken.append(path)
+                await lock.acquire()
+                asyncio.get_running_loop().create_task(holder())
+            return answer
+        fri.api = recording
+        try:
+            await fri.chat_interaction(interaction, 'what did ash say again')
+            assert taken and edits(interaction, REPLY) == 0 and not saved
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_332_a_reply_of_fris_a_saved_reply_drew_on_counts_with_what_it_drew_on(monkeypatch, tmp_path):
     """Transitively: B drew on Fri's own reply R (an echo it repeated), and R drew on A. Deleting A holds a reply
     that read B back, as it would one that read R."""
@@ -226,11 +272,13 @@ def test_324_my_memory_holds_the_summary_while_a_pending_withdrawal_may_be_its_s
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('deleted', [True, False], ids=['its source deleted', 'nothing'])
+@pytest.mark.parametrize('deleted', ['its source, while the reply waits', 'its source, before the turn',
+                                     "someone else's message, before the turn", 'nothing'])
 def test_332_a_panel_reply_drawing_on_the_summary_is_held_to_its_sources(monkeypatch, tmp_path, deleted):
     """The issue's second repro: member 20's /fri panel turn reads their summary, built from message A. A is deleted
     during Gene's last check, and its withdrawal stays queued here: the reply had no source of the summary to hold it
-    to, so it showed and was saved. Now it's held back."""
+    to, so it showed and was saved. Now it's held back. Deleted before the turn, the summary stays out of the request
+    instead, and the reply shows; a deletion of someone else's message, its author known, leaves the summary in."""
     async def scenario():
         from compat_tests.test_fri_member_profiles import GENERAL, world
         from compat_tests.test_fri_member_summaries import SUMMARY
@@ -242,12 +290,16 @@ def test_332_a_panel_reply_drawing_on_the_summary_is_held_to_its_sources(monkeyp
             turns = w.fri.agent.saved_turns
             turns.kick = lambda: None
             interaction = panel(w.fri)
-
-            responded = []
+            before = deleted.endswith('before the turn')
+            if deleted == 'its source, before the turn':
+                await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=GENERAL, guild_id=123, message_id=under))
+            elif deleted == "someone else's message, before the turn":
+                turns.withdraw([under-1], 123, deleted=True, authors={under-1: 30})
+            responded, carried = [], []
 
             async def respond(text, context, ready):
                 await ready()
-                assert SUMMARY in str(context.get('member_summary'))  # The request carried the summary.
+                carried.append(context.get('member_summary'))
                 responded.append(text)
                 return ChatResult(status='completed', reply='you plan raids, '+MARKER)
             model(w.fri, tmp_path, respond)
@@ -258,17 +310,21 @@ def test_332_a_panel_reply_drawing_on_the_summary_is_held_to_its_sources(monkeyp
                     saved.append(payload)
                 answer = await api(method, path, payload)
                 # Gene's last check, after the model answered.
-                if path == '/chat/turn/check' and deleted and responded and not deleting:
+                if (path == '/chat/turn/check' and deleted == 'its source, while the reply waits' and responded
+                        and not deleting):
                     deleting.append(path)
                     await w.fri.on_raw_message_delete(SimpleNamespace(channel_id=GENERAL, guild_id=123,
                                                                       message_id=under))
                 return answer
             w.fri.api = recording
             await w.fri.chat_interaction(interaction, 'remind me what we planned')
-            if deleted:
+            assert carried
+            # The request carried the summary, but where its source was taken back before.
+            assert (SUMMARY in str(carried[0])) is (deleted != 'its source, before the turn')
+            if deleted == 'its source, while the reply waits':
                 assert deleting and MARKER not in shown(interaction) and not saved
             else:
-                assert MARKER in shown(interaction) and saved
+                assert MARKER in shown(interaction) and saved and (before or deleted == 'nothing')
         finally:
             await w.fri.close()
     asyncio.run(scenario())
