@@ -83,6 +83,8 @@ RECHARGING = '🪫'
 ERASED = 'erased'  # owner_control: the author erased their chats while it waited.
 # Gene says which messages a learning pass holds it knows were withdrawn, as its finish would refuse them (fri #335).
 LEARNING_WITHDRAWALS = 'learning-withdrawals'
+# A controller whose history channels' narrower answer says the removal cutoff on Discord's clock on request (#368).
+HISTORY_CUTOFFS = 'history-cutoffs'
 NO_USAGE = {'input_tokens': 0, 'output_tokens': 0, 'reasoning_output_tokens': 0}  # A learning batch that asked nothing.
 CHECK_SECONDS = 10  # A slower owner settings check gives way to the Sol settings call.
 MEMORY_CONTROLS = ('disable', 'enable')  # "forget me", "remember me again": they change what Fri keeps.
@@ -368,8 +370,11 @@ class Agent:
         return await analyze(self.fri.chat, instruction, data, model, effort, schema, headers=headers, **options)
 
     async def profile(self, channel, user):
+        # A history channel's narrower answer says the removal cutoff on Discord's clock to a Fri that asks, where the
+        # controller offers it (#368); older Fris check that answer field for field, so it's only on request.
+        asks = {'discord_cutoffs': True} if HISTORY_CUTOFFS in getattr(self.fri, 'capabilities', ()) else {}
         return await self.fri.api('POST', '/agent/context', {
-            **self.identity(user, self.channel_guild(channel)), 'channel_id': str(channel)})
+            **self.identity(user, self.channel_guild(channel)), 'channel_id': str(channel), **asks})
 
     async def member(self, user, fresh=False, guild_id=None):
         guild_id = guild_id or self.fri.guild_id
