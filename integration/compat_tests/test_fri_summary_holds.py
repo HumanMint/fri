@@ -11,13 +11,14 @@ import pytest
 from compat_tests.test_fri_member_profiles import (
     DM,
     GAMING,
+    GENERAL,
     model,
     model_context,
     run,
     turns,
     world,
 )
-from compat_tests.test_fri_member_summaries import CONTINUATION, SUMMARY
+from compat_tests.test_fri_member_summaries import CONTINUATION, SUMMARY, settled, summarizer
 from compat_tests.test_fri_summary_generations import CHECK, REFUSED, sent, summarized_from
 from fri.fri_chat import ChatResult
 from fri.fri_errors import ControllerRejected
@@ -106,6 +107,26 @@ def test_a_saved_reply_on_a_held_summary_reads_as_withheld_in_the_next_request(m
             history = str(model_context(w)['turns'])
             assert CONTINUATION not in history and 'being checked again' in history
             assert not model_context(w).get('member_summary')
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_no_summary_is_built_for_a_controller_that_cant_hold_back_what_is_made_from_it(monkeypatch, tmp_path):
+    """None would be used, so none is built: no claim, no model call, and fri health says it waits for the
+    controller."""
+    async def scenario():
+        from fri.fri_member_summary import build
+        w = world(monkeypatch, tmp_path)
+        try:
+            holds(w)
+            seen = summarizer(monkeypatch, w)
+            for text in ('fri raid tonight?', 'fri which build for it'):
+                await w.say(GENERAL, text)
+            settled(w, 13*3600)
+            w.fri.capabilities = frozenset(w.fri.capabilities)-{HOLDS}
+            assert await build(w.fri.agent) is None and w.fri.agent.summaries_wait_for_gene
+            assert seen == [] and not sent(w, '/agent/member-summary/claim')
         finally:
             await w.fri.close()
     run(scenario)
