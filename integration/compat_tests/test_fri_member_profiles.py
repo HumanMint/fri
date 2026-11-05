@@ -34,10 +34,10 @@ from fri.subscription import SubscriptionError
 GENERAL, GAMING, STAFF, SPICY, DM, THREAD, SECRET = 1, 2, 5, 6, 900, 70, 71
 
 
-def world(monkeypatch, tmp_path):
+def world(monkeypatch, tmp_path, *, agent_channels='1,2,5,6', history_channels=''):
     settings = Settings(tmp_path/'profiles.db', '123', '10', 'runtime-'+'x'*32, 'worker-'+'x'*32,
                         'deploy-'+'x'*32, fri_token='fri-'+'x'*32, workshop_channel_id='456',
-                        agent_channels='1,2,5,6')
+                        agent_channels=agent_channels, agent_history_channels=history_channels)
     client = TestClient(create_app(settings))
     store = client.app.state.store
     AgentStore(store, settings).update({'enabled': True}, 0, '10')

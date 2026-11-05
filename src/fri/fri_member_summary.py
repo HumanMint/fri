@@ -7,6 +7,7 @@ Discord message is gone or edited since, though Fri never heard of it, and it's 
 whose messages were taken back while the model wrote it isn't kept (fri #333).
 """
 
+import asyncio
 import logging
 
 import aiohttp
@@ -133,7 +134,9 @@ async def build(agent):
                                          for i in row['messages']] +
                                  [(item['id'], item['conversation_id'], item['saved_at'])
                                   for item in (previous or {}).get('messages', [])])
-        except (discord.DiscordException, KeyError, TypeError) as exc:  # A claim that doesn't say, too.
+        # A claim that doesn't say, too; and a read that times out or loses its connection, as the recheck catches
+        # (fri #357): it raised past the finish, and left the claim pending for ten minutes (HumanMint/fri#369).
+        except (discord.DiscordException, aiohttp.ClientError, asyncio.TimeoutError, OSError, KeyError, TypeError) as exc:
             LOG.warning('Member summary sources could not be checked: %s', type(exc).__name__)
             exchanges, previous = [], None
         else:
