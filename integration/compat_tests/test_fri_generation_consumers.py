@@ -172,3 +172,19 @@ def test_fri_health_names_the_capabilities_a_summary_pause_waits_for(monkeypatch
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_fri_health_says_summaries_resume_once_the_controller_offers_it_all(monkeypatch, tmp_path):
+    """Paused on a controller since upgraded, before the next build looks again: nothing is missing now."""
+    from compat_tests.test_fri_member_profiles import run, world
+    from fri.fri_watch import Watch
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            w.fri.agent.summaries_wait_for_gene = True  # As a build on the older one left it.
+            line = next(line for line in (await Watch(w.fri).report()).splitlines() if 'member summaries' in line)
+            assert 'next build' in line and 'summary-' not in line
+        finally:
+            await w.fri.close()
+    run(scenario)

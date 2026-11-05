@@ -2542,8 +2542,9 @@ class Agent:
             await self.fri.api('POST', '/agent/reports/'+report['id']+'/delivered')
 
     def taken_back_mark(self):
-        """Where withdrawals stand here: a channel's accepted, or a message's queued, moves it (fri #378)."""
-        return self.channel_withdrawals.generation, self.saved_turns.generation
+        """Where withdrawals stand here (fri #378): a message's queued moves it, and so does a channel's accepted, which
+        moves SavedTurns' generation too (see ChannelWithdrawals.taken)."""
+        return self.saved_turns.generation
 
 
     def watching(self):
