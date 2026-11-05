@@ -27,6 +27,10 @@ SOURCES = 'summary-sources'
 # Without it a kept one may hold a message deleted where Fri never heard of it, so none is used (see Fri.member_summary)
 # and none is built.
 RECHECKS = 'summary-rechecks'
+# And while one is held back until it's read again, it keeps what was made from it out of use too: a turn that copied
+# it, saved replies, drafts and reminders (fri #355). Without it those reach members while the summary can't be vouched
+# for, so none is used.
+HOLDS = 'summary-holds'
 SKEW = 5  # Seconds Discord's clock and the controller's may differ by, when an edit is placed against a save.
 SCHEMA = obj({'summary': STRING})
 INSTRUCTION = '''You keep a short running summary of what one member talked about with Fri lately, so Fri
@@ -244,9 +248,11 @@ async def sources(agent, messages):
 
 
 def usable(fri):
-    """Whether any kept summary may be used or shown now (fri #349): only from a controller that rechecks them, and
-    only once this process's first recheck claim has gone through, which holds every one back until it's read again
-    (see recheck). A request (Fri.member_summary), the DM's "what do you remember" and My memory all ask, My memory
-    again in its last check (Sol round 1 of #354)."""
-    return RECHECKS in getattr(fri, 'capabilities', ()) and bool(getattr(getattr(fri, 'agent', None),
-                                                                          'summaries_rechecked', False))
+    """Whether any kept summary may be used or shown now (fri #349): only from a controller that rechecks them and
+    keeps what was made from one out of use while it's held back (HOLDS, fri #355), and only once this process's first
+    recheck claim has gone through, which holds every one back until it's read again (see recheck). A request
+    (Fri.member_summary), the DM's "what do you remember" and My memory all ask, My memory again in its last check
+    (Sol round 1 of #354)."""
+    capabilities = getattr(fri, 'capabilities', ())
+    return (RECHECKS in capabilities and HOLDS in capabilities and
+            bool(getattr(getattr(fri, 'agent', None), 'summaries_rechecked', False)))
