@@ -43,6 +43,8 @@ KEPT_SECONDS = 7*86400  # As long as the controller keeps a saved exchange.
 NOTED_SECONDS = 90*86400  # As long as it keeps a note, which a controller offering SOURCES drops with its message.
 MOST = 20000  # Bounds memory only: the controller keeps six exchanges per member and conversation.
 MARKED_SECONDS = 3600  # As Agent.withdrawn: longer than any turn that could still hold a copy runs.
+# Seconds before Fri's clock an edit's own time (Discord's) still counts as just made: clock skew and gateway delay.
+FRESH = 15*60
 BATCH = 10  # As many IDs as /chat/turn/withdraw/saved takes at once.
 RETRY_SECONDS = (2, 15, 60, 300)  # After each failure, then every five minutes while it stays pending.
 REREAD_SECONDS = 60  # At most this often, the controller's contract read again for a refusal (see reread).
@@ -399,21 +401,25 @@ class SavedTurns:
         self.withdraw(i for i in ids if i not in deleted and (agent.withdrawn.get(str(i), 0) >= wall or
                                                               agent.revised.get(i, 0) >= wall))
 
-    def withdraw(self, ids, server=None, deleted=False, authors=None):
+    def withdraw(self, ids, server=None, deleted=False, authors=None, edited_at=None):
         """Messages taken back: each exchange Fri saved with one goes, asked for once. server: the one Fri saves
         exchanges said where they were taken back under (see Agent.saved_in); any other one is then asked about by
         ID, ten at a time, from a controller offering it: a deletion whatever its message's age, since what drew on it
         can be saved long after it was sent (a note learned from an old message quoted in a newer conversation, fri
         #342), and its entry lasts from when it was queued (see lasts); an edit while its message is young enough to be
         in an exchange still (or in a note, from a controller offering SOURCES), as an update with no fresh edit, a
-        pin of one edited long ago say, looks the same here. deleted: not edited, so what carried them goes too (gene
-        #141, #150). authors: message ID -> its author, where Fri knows it, so that one by ID can be kept on disk (see
-        lasting). Each is held back from requests from now on (see withhold). A change to a queued one is a new entry
-        (see drain)."""
+        pin of one edited long ago say, looks the same here; and an edit of an older message whose own time,
+        edited_at (Discord's), is fresh (see fresh), as what drew on it can be saved long after it was sent too (fri
+        #358 E1). That asks as main does, with no time, so what was saved from it in the minutes since goes as well,
+        and a refresh repeating that edit's time inside the window asks again; both take more than they must, never
+        less. deleted: not edited, so what carried them goes too (gene #141, #150). authors: message ID -> its author,
+        where Fri knows it, so that one by ID can be kept on disk (see lasting). Each is held back from requests from
+        now on (see withhold). A change to a queued one is a new entry (see drain)."""
         authors = {int(i): str(user) for i, user in (authors or {}).items() if str(user).isdigit()}
         ids = [int(i) for i in ids]
         horizon = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
         queued, now = False, time.time()
+        just_edited = fresh(edited_at, now)
         for i in ids:
             known = self.pending.get(str(i), {})
             entry = self.saved.pop(i, None)
@@ -423,7 +429,7 @@ class SavedTurns:
                                                       deleted=deleted or known.get('deleted') is True,
                                                       since=known.get('queued_at'))
                     queued = True
-            elif server is not None and (deleted or sent_at(i) > now-horizon):
+            elif server is not None and (deleted or just_edited or sent_at(i) > now-horizon):
                 if self.offered() and self.capable(SAVED_CAPABILITY):
                     if known.get('hold'):  # Held from disk: it stays held, and on disk, whatever comes by ID.
                         pass
@@ -1091,6 +1097,13 @@ def queued(value):
 def sent_at(message_id):
     """When a Discord message was sent, from its ID."""
     return ((message_id >> 22)+1420070400000)/1000
+
+
+def fresh(edited_at, now):
+    """Whether an edit was just made, by its own time (Discord's) against Fri's clock `now`: no more than FRESH before
+    it, or any time after it (a clock behind Discord's). A pin or an embed refresh repeats an earlier edit's time,
+    which isn't, unless that edit was itself just made (fri #358 E1)."""
+    return edited_at is not None and edited_at >= now-FRESH
 
 
 def saved_lately(message_id):

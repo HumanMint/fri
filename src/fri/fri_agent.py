@@ -643,8 +643,10 @@ class Agent:
             self.receipts.withdraw([message.id])  # receipt naming it.
         else:  # Any other update of a member's post one names too, a card suppressed during a check's last wait say.
             self.receipts.changed(message.id)
-        if edited:
-            self.saved_turns.withdraw([message.id], saved_in, authors={message.id: sender.id} if sender else None)
+        if edited:  # With the edit's own time, so a fresh edit of an old message is asked about too (fri #358 E1).
+            when = message.edited_at.timestamp() if isinstance(message.edited_at, dt.datetime) else None
+            self.saved_turns.withdraw([message.id], saved_in, authors={message.id: sender.id} if sender else None,
+                                      edited_at=when)
             for window in list(self.passes):  # Every member's edit, for a running learning pass to leave out (fri #325).
                 window.taken([message.id])
         if edited and message.id in self.looked:
