@@ -98,7 +98,7 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
     scope = profiled(cog, scope or scope_for(cog, interaction))
     # Taken before anything here waits, the membership lookup included (fri #315), unless the listing came with its own.
     baselines = dict(erased) if state is not None and erased is not None else forgets(getattr(cog, 'agent', None))
-    before = channels if state is not None else channel_generation(cog)
+    before = channels if state is not None and channels is not None else channel_generation(cog)
     if not await allowed(cog, interaction, scope, message=False, tell=True):
         return
     state = state or await cog.api('POST', '/chat/memory/notes', scope)
