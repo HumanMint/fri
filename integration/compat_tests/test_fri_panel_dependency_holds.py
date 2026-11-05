@@ -148,6 +148,74 @@ def test_332_a_deletion_where_fri_saves_no_exchange_still_holds_a_reply_that_dre
     asyncio.run(scenario())
 
 
+async def unrelated_deletion_while_waiting(fri, agent, interaction, tmp_path, before=None):
+    """Member 20's panel turn, with an unrelated message deleted while its reply waits for the panel's lock, after
+    `before()` (if given) runs ahead of the turn. Returns whether the reply showed and was saved."""
+    unrelated = source(age=1100, channel='1')
+
+    async def respond(text, context, ready):
+        await ready()
+        return ChatResult(status='completed', reply='nothing to repeat')
+    model(fri, tmp_path, respond)
+    if before:
+        await before()
+    api, saved, taken = fri.api, [], []
+    lock = fri.private_panels.locks.setdefault((123, 20), asyncio.Lock())
+
+    async def holder():
+        while not getattr(lock, '_waiters', None):
+            await asyncio.sleep(0)
+        await fri.on_raw_message_delete(SimpleNamespace(channel_id=1, guild_id=123, message_id=int(unrelated['id'])))
+        lock.release()
+
+    async def recording(method, path, payload=None):
+        if path.startswith('/chat/turn/withdraw'):
+            raise TimeoutError()
+        if path == '/chat/turn':
+            saved.append(payload)
+        answer = await api(method, path, payload)
+        if path == '/chat/turn/check' and not taken:
+            taken.append(path)
+            await lock.acquire()
+            asyncio.get_running_loop().create_task(holder())
+        return answer
+    fri.api = recording
+    await fri.chat_interaction(interaction, 'what did ash say again')
+    return bool(taken) and 'nothing to repeat' in shown(interaction) and bool(saved)
+
+
+def test_332_a_saved_exchange_with_no_reply_drew_on_nothing(monkeypatch, tmp_path):
+    """Saved before Fri started, but with no reply (a reaction, say): it drew on nothing, so a message taken back
+    while the turn runs, which it can't have read, doesn't hold the reply back."""
+    async def scenario():
+        fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        store.save_chat('123', 'private:456', '20', 0, 'nice one', '', 'model', 'high', provenance=[],
+                        source=source(age=60, channel='456'), response_kind='react', reaction='\U0001F44D')
+        try:
+            assert await unrelated_deletion_while_waiting(fri, agent, panel(fri), tmp_path)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_332_saved_context_withheld_before_the_request_counts_for_nothing(monkeypatch, tmp_path):
+    """A saved reply this Fri can't place, its own message deleted before the turn: it stays out of the request, so
+    what it drew on can't hold the reply back, and an unrelated message taken back while the turn runs doesn't."""
+    async def scenario():
+        fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        said = quoting(store, fri, source(age=1200, channel='1')['id'], tracked=False)
+
+        async def deleted():
+            await fri.on_raw_message_delete(SimpleNamespace(channel_id=456, guild_id=123, message_id=int(said['id'])))
+        try:
+            assert await unrelated_deletion_while_waiting(fri, agent, panel(fri), tmp_path, before=deleted)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_332_a_reply_of_fris_a_saved_reply_drew_on_counts_with_what_it_drew_on(monkeypatch, tmp_path):
     """Transitively: B drew on Fri's own reply R (an echo it repeated), and R drew on A. Deleting A holds a reply
     that read B back, as it would one that read R."""
