@@ -633,7 +633,7 @@ class Agent:
             for window in list(self.passes):  # Every member's edit, for a running learning pass to leave out (fri #325).
                 window.taken([message.id])
         if edited and message.id in self.looked:
-            self.revise(message.id, message.edited_at.timestamp())
+            self.revise(message.id, message.edited_at.timestamp(), saved_in)
         if (self.handling[message.id] or message.id in self.rerunning) and edited:
             self.saw_edit(message.id, message.edited_at)
             return self.withdraw(SimpleNamespace(id=message.id, channel=SimpleNamespace(id=channel)))
@@ -658,7 +658,7 @@ class Agent:
                 else:
                     rows.remove(row)
 
-    def revise(self, mid, edited_at=None):
+    def revise(self, mid, edited_at=None, saved_in=None):
         now = time.time()
         self.revised.pop(mid, None)
         self.revised[mid] = now
@@ -666,8 +666,8 @@ class Agent:
         while self.revised and (next(iter(self.revised.values())) < now-3600 or len(self.revised) > 100000):
             del self.revised[next(iter(self.revised))]
         # What it said before goes from its author's saved exchange too, unless that answered this version or a later
-        # one (edited_at: the edit's, see SavedTurns.withdraw).
-        self.saved_turns.withdraw([mid], edited_at=edited_at)
+        # one (edited_at: the edit's, saved_in: its server, see SavedTurns.withdraw), as the edit's own call asked.
+        self.saved_turns.withdraw([mid], saved_in, edited_at=edited_at)
 
     def forget(self, user, erased=False):
         """The member used a privacy control through Fri: their messages still waiting for a reply

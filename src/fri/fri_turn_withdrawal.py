@@ -416,7 +416,8 @@ class SavedTurns:
         message, the later time stands; one with no time takes everything, so it stands over any time. The controller
         places the time against the version of the message each save was made from, on Discord's clock (see
         turn_versions); so does this, for an exchange Fri saved itself: an edit no later than the version it answered is
-        a pin or an embed refresh, and takes nothing (Sol round 1 of #364)."""
+        a pin or an embed refresh, and leaves it (Sol round 1 of #364), but the message is still asked about by ID with
+        that time, for whatever else holds it (round 2). Without edit times, an edit takes Fri's exchange as before."""
         authors = {int(i): str(user) for i, user in (authors or {}).items() if str(user).isdigit()}
         ids = [int(i) for i in ids]
         horizon = NOTED_SECONDS if self.capable(SOURCES) else KEPT_SECONDS
@@ -435,10 +436,12 @@ class SavedTurns:
                 # fri #364).
                 known = {}
             mine = self.saved.get(i)
-            if (mine is not None and not deleted and edited_at is not None and len(mine) > 3 and mine[3] is not None
-                    and edited_at <= mine[3]+SAME):
-                continue  # Fri saved it from this version or a later one: a pin or an embed refresh took nothing.
-            entry = self.saved.pop(i, None)
+            # Fri saved its own exchange from this version or a later one: a pin or an embed refresh took nothing from
+            # it, so it stays. It vouches for nothing else that holds the message, a note learned from an earlier
+            # version say, so the rest is asked about by ID with the edit's time (Sol round 2 of #364).
+            same = (timed and server is not None and mine is not None and len(mine) > 3 and mine[3] is not None
+                    and edited_at <= mine[3]+SAME)
+            entry = None if same else self.saved.pop(i, None)
             if entry is not None:
                 if self.offered():
                     self.pending[str(i)] = self.entry(scope=entry[1], revision=entry[2], restored=known.get('restored'),
