@@ -17,12 +17,13 @@ from compat_tests.test_fri_member_profiles import (
     GAMING,
     GENERAL,
     THREAD,
-    model_context,
+    model,
     note,
     run,
     world,
 )
 from fri.fri_agent import Agent
+from fri.fri_chat import ChatResult
 
 
 def remembered(context):
@@ -30,9 +31,15 @@ def remembered(context):
 
 
 async def asked(w):
-    """What a later private-panel request's model reads of the member's notes."""
+    """What a later private-panel request's model reads of the member's notes, past Fri's own last checks."""
+    seen = []
+
+    async def respond(text, context):
+        seen.append(context)
+        return ChatResult(status='completed', reply='bold of you')
+    model(w, respond)
     await w.say(DM, 'fri what should i play tonight')
-    return remembered(model_context(w))
+    return remembered(seen[-1])
 
 
 def queue(w):
