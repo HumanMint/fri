@@ -24,6 +24,7 @@ from compat_tests.test_fri_turn_withdrawal import MARKER, WITHDRAW, saved, settl
 
 SOURCES = 'withdrawal-sources'
 LIKE = 'i like lavender bicycles'
+RETIRED = 'Earlier answer drawing on a message since edited or deleted.'  # Gene's breadcrumb (gene #141).
 
 
 def needs_sources(w):
@@ -434,9 +435,10 @@ def test_a_withdrawal_reaching_the_controller_after_forget_me_writes_nothing(mon
     asyncio.run(scenario())
 
 
-def test_an_edit_leaves_fris_reply_in_view_and_other_members_saved_replies(monkeypatch, tmp_path):
-    """gene #150: only a deletion takes the replies that carried a message. An edit takes the member's own exchange,
-    as before, and what it taught."""
+def test_an_edit_leaves_fris_reply_in_view_and_retires_other_members_saved_replies(monkeypatch, tmp_path):
+    """An edit takes the member's own exchange, as before, and what it taught. Since gene #246, other members' saved
+    replies whose requests carried the message keep only a breadcrumb, as after a deletion (gene #150 left them). Fri's
+    reply stays in its own view of the channel, where Discord still shows it, and nothing is sent as a deletion."""
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         needs_sources(w)
@@ -449,7 +451,7 @@ def test_an_edit_leaves_fris_reply_in_view_and_other_members_saved_replies(monke
             await w.agent.handle(asked)
             await edit(w, edited(nearby))
             assert any(row['text'] == 'they said '+MARKER for row in w.agent.recent[1])
-            assert 'they said '+MARKER in saved(w, '30')
+            assert MARKER not in saved(w, '30') and RETIRED in saved(w, '30')
             assert all(not payload.get('deleted') for path, payload in w.calls if path == SAVED)
         finally:
             await w.fri.close()
