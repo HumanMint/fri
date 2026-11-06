@@ -1198,8 +1198,7 @@ class Fri(discord.Client):
         rows = [row for row in context.get('recent', []) if self.agent.current(row, live) and (row.get(
             'gene_error') or not str(row.get('id', '')).isdigit() or int(row['id']) not in self.agent.unsent)]
         gone = self.agent.saved_turns.withheld(held(context))
-        return {**context, 'recent': rows, 'turns': [turn for turn in context.get('turns', [])
-                                                     if not exchange(turn) & gone and not unreadable(turn)]}
+        return {**context, 'recent': rows, 'turns': [turn for turn in context.get('turns', []) if not exchange(turn) & gone]}
 
     def depend(self, context):
         """Last thing before a request, once nothing more leaves its context: the turn depends on the summaries what it

@@ -160,3 +160,44 @@ def test_an_ordinary_request_with_unreadable_summaries_leaves_that_turn_out(monk
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+# The edges, on SavedTurns alone.
+
+def test_an_exchange_with_no_reply_stays_while_a_withdrawal_waits(monkeypatch, tmp_path):
+    """Item 1 holds back only replies: a reaction's exchange, saved before this Fri started, repeats nothing but the
+    member's own message, which is withheld itself if it's taken back."""
+    fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+    fri.capabilities = frozenset(asyncio.run(fri.api('GET', '/fri/contract'))['capabilities'])
+    turns = agent.saved_turns
+    turns.kick = lambda: None
+    turns.withdraw([int(source(age=900, channel='1')['id'])], 123, deleted=True)
+    reacted = {'input': 'lol', 'reply': '', 'response_kind': 'react', 'burst': [],
+               'source': {'kind': 'discord_message', 'id': source(age=300, channel='1')['id']}}
+    said = {'input': 'and?', 'reply': 'and '+MARKER, 'burst': [],
+            'source': {'kind': 'discord_message', 'id': source(age=200, channel='1')['id']}}
+    context = {'turns': [reacted, said], 'pending': None, 'elsewhere': []}
+    turns.withhold(context)
+    assert context['turns'] == [reacted]
+    asyncio.run(fri.close())
+
+
+def test_a_reply_drawing_on_one_that_cant_be_told_still_cant_once_that_record_goes(monkeypatch, tmp_path):
+    """Item 2 for what can't be told: R's record says it drew on what can't be told; C drew on R (R in the live view,
+    say, so no saved exchange of the request said so). Once R's record is pruned, C's still says it."""
+    monkeypatch.setattr('fri.fri_turn_withdrawal.MOST', 2)
+    fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+    fri.capabilities = frozenset(asyncio.run(fri.api('GET', '/fri/contract'))['capabilities'])
+    turns = agent.saved_turns
+
+    def kept(age, drew, unknown=False):
+        said = source(age=age, channel='1')
+        turns.kept({'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20',
+                    'revision': 0, 'source': said, 'drew_on': drew}, {}, (time.time(), time.monotonic()), None, unknown)
+        return said['id']
+    first = kept(900, [], unknown=True)
+    later = kept(600, [first])
+    kept(300, [])  # So the first record is pruned.
+    assert int(first) not in turns.drawn
+    assert turns.depends_on([later]) == ({first}, True)
+    asyncio.run(fri.close())
