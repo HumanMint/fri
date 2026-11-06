@@ -93,6 +93,27 @@ def test_forget_my_chats_committing_while_the_last_report_fetch_answers_holds_th
     asyncio.run(scenario())
 
 
+def test_a_report_read_while_forget_my_chats_was_on_its_way_waits_for_the_next_round(learning, monkeypatch):  # noqa: F811
+    """The other edge: "Forget my chats" is on its way when the report is read, and its answer comes, the change done,
+    before the report's does. Nothing holds it then, but the mark moved as it finished: the report goes no more."""
+    async def scenario():
+        holder, tasks = {}, []
+
+        async def during(store):
+            holder['open'].released.set()  # The change's answer comes first, and the button finishes.
+            await tasks[0]
+        api, store, scheduler, report = controller(learning, '/agent/reports', 2, during)
+        owner = dm_owner()
+        agent = Agent(SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_user=lambda _: owner))
+        holder['open'] = Open(lambda: None)  # It commits nothing here, so the report is still read.
+        tasks.append(forget_my_chats(monkeypatch, agent, holder['open']))
+        await holder['open'].committed.wait()
+        await agent.send_reports()
+        assert agent.privacy_pending == 0
+        owner.send.assert_not_awaited()
+    asyncio.run(scenario())
+
+
 def test_forget_my_chats_committing_while_details_load_shows_nothing_of_it(learning, monkeypatch):  # noqa: F811
     """The same for Details: its view read the report, then "Forget my chats" commits, its answer still on its way
     when the view's comes back. The DM isn't edited with what the controller deleted."""

@@ -2576,9 +2576,9 @@ class Agent:
         """A member's privacy change on its way to the controller: "forget me" or memory back on, a cleared chat, a
         note's or the summary's edit. The controller may commit it, and delete every pending report with it, before
         its answer comes back. No report is sent or shown while one is (see reports_held), and the mark moves as it
-        starts and as it finishes, so a report read across either is read again (fri #390 item 1)."""
+        finishes, so a report read while it was on its way is read again (fri #390 item 1). A read that began before
+        it is caught either way: it answers while the change is on its way, or after it finished."""
         self.privacy_pending += 1
-        self.privacy_control_taken()
         try:
             yield
         finally:
