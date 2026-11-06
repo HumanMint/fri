@@ -12,9 +12,9 @@ COMMON; and every rare word (see rare). A text holds what an edit took out once 
 - a shared run weighs 2 where it has a rare word (a quote), 1 otherwise;
 - a shared pair no shared run covers weighs its rare words, at least 1;
 - a rare word no shared run or pair covers weighs its own (see rare).
-A year, a time or a date (see number) is a rare word that weighs 1 alone, but never makes a run a quote or adds to a
-pair, and a run whose only words not COMMON are such numbers counts as one of them; all of them together weigh at most
-1, so they need words beside them (gene #261 round 1).
+A year, a time or a date (see rare) is a rare word that weighs 1, in a pair too, but never makes a run a quote, and a
+run whose only words not COMMON are such numbers counts as one of them; all of them that no run or pair covers weigh at
+most 1 together, so they need words beside them (gene #261 round 1).
 
 So a quoted run with a name or a distinctive number in it is enough alone, and so is a distinctive number (a phone or a
 house number, a code), or a paraphrase keeping two names or rare words, or a year with a name beside it; one name alone,
@@ -201,7 +201,7 @@ def holds(text, key, taken):
             covered |= set(span)
     for i, pair in pairs(said).items():
         if not {i, i+1} <= covered and shared(pair):
-            weight += max(1, sum(alone[j] for j in (i, i+1) if not plain[j]))
+            weight += max(1, alone[i]+alone[i+1])
             covered |= {i, i+1}
     for i, word in enumerate(said):
         if i not in covered and alone[i] and shared('1 '+word):
