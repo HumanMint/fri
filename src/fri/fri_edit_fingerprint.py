@@ -12,11 +12,21 @@ COMMON; and every rare word (see rare). A text holds what an edit took out once 
 - a shared run weighs 2 where it has a rare word (a quote), 1 otherwise;
 - a shared pair no shared run covers weighs its rare words, at least 1;
 - a rare word no shared run or pair covers weighs its own (see rare).
+A year, a time or a date (see number) is a rare word that weighs 1 alone, but never makes a run a quote or adds to a
+pair, and a run whose only words not COMMON are such numbers counts as one of them; all of them together weigh at most
+1, so they need words beside them (gene #261 round 1).
 
-So a quoted run with a name or a number in it is enough alone, and so is a number, or a paraphrase keeping two names or
-rare words; one name alone, or a common phrase, isn't. An element is hashed with a salt (HMAC-SHA256, the first 16 hex
-digits), so the fingerprint can't be read back as words or matched against another's; it's never written down, by Fri
-or Gene."""
+So a quoted run with a name or a distinctive number in it is enough alone, and so is a distinctive number (a phone or a
+house number, a code), or a paraphrase keeping two names or rare words, or a year with a name beside it; one name alone,
+a year, a time or a date alone, or a common phrase, isn't. What the message says now (kept) is never counted as taken
+out, whoever says it was (see removed).
+
+An element is hashed with a salt (HMAC-SHA256, the first 16 hex digits), which keeps words out of the request, and the
+fingerprint is never written down, by Fri or Gene. It's not secret from whoever receives it: the salt travels with it, so
+an element from a set small enough to try (a year, a time, a short number, a word or name from a dictionary, a run of
+them) can be found by hashing each candidate. Fri salts every edit while it runs with one salt (so two queued edits of a
+message merge), so within a process the same element hashes alike in every request, and two fingerprints can be matched
+against each other. Only the controller receives it, which holds the saved exchanges themselves."""
 import hashlib
 import hmac
 import re
@@ -43,26 +53,85 @@ ENOUGH = 2
 MOST = 3000  # Of each list sent: a 4000-character message has fewer elements than this.
 
 
+SUFFIXED = re.compile(r'(\d+)[^\W\d_]+')  # A number with letters after it: "1990s", "0930am", "4217b".
+
+
 def words(text):
     """The text's words: compatibility forms folded, case folded, a possessive's "'s" dropped and apostrophes inside a
     word too ("don't" is "dont"), then runs of letters and digits, digits next to each other joined ("555 0199" is
     "5550199", as a number written either way)."""
+    return weighed(text)[0]
+
+
+def weighed(text):
+    """The text's words (see words), what each says alone, and whether each is a year, a time or a date (see rare)."""
     text = unicodedata.normalize('NFKC', text or '').casefold()
-    said = []
+    said, groups = [], []
     for word in WORD.findall(APOSTROPHE.sub('', POSSESSIVE.sub('', text))):
         if said and word.isdigit() and said[-1].isdigit():
             said[-1] += word
+            groups[-1].append(word)
         else:
             said.append(word)
-    return said
+            groups.append([word])
+    weights = [rare(word, written) for word, written in zip(said, groups)]
+    return said, [alone for alone, _ in weights], [plain for _, plain in weights]
 
 
-def rare(word):
-    """How much a word alone says: 2 for one with four digits or more (a number, a code), 1 for one of six characters or
-    more not COMMON (a name, a place), 0 otherwise."""
+def rare(word, groups=None):
+    """How much a word alone says, and whether it's a year, a time or a date: for a number, by its groups of digits as
+    written ("555 0199" is two groups, "5550199" one, "12:30" two; groups, from weighed: the word alone otherwise) or one
+    with letters after it ("1990s", "0930am"), 0 for one of fewer than four digits, 1 for a year, a time or a date (see
+    dated), 2 for any other (a phone or a house number, a PIN, a code); 2 for any other word with four digits or more (a
+    code), 1 for one of six characters or more not COMMON (a name, a place), 0 otherwise."""
+    groups = groups or [word]
+    suffixed = SUFFIXED.fullmatch(word)
+    digits = groups if all(group.isdecimal() for group in groups) else [suffixed.group(1)] if suffixed else None
+    if digits is not None:
+        if len(''.join(digits)) < 4:
+            return 0, False
+        return (1, True) if dated(digits) else (2, False)
     if sum(character.isdigit() for character in word) >= 4:
-        return 2
-    return 1 if len(word) >= 6 and word not in COMMON else 0
+        return 2, False
+    return (1 if len(word) >= 6 and word not in COMMON else 0), False
+
+
+def dated(groups):
+    """Whether groups of digits are a year (1900 to 2100), a time ("12:30", "12:30:15", "1530"), a date ("2024-05-01",
+    "5/1/2024", "01.05.24", "may 5, 2024", "20240501"), or years next to each other: what many messages name."""
+    if len(groups) == 1:
+        [digits] = groups
+        return year(digits) or (len(digits) == 4 and clock(digits[:2], digits[2:])) or (
+            len(digits) == 8 and day(digits[:4], digits[4:6], digits[6:]))
+    return all(year(group) for group in groups) or clock(*groups) or day(*groups)
+
+
+def year(digits):
+    return len(digits) == 4 and 1900 <= int(digits) <= 2100
+
+
+def clock(hour, minute, second='00', *rest):
+    return (not rest and 1 <= len(hour) <= 2 and int(hour) <= 23 and len(minute) == 2 and int(minute) <= 59
+            and len(second) == 2 and int(second) <= 59)
+
+
+def day(*groups):
+    """A date, year first ("2024-05-01") or last ("1/5/2024", "5/1/24"), or a day and month either way, or a month or
+    day and a year ("may 5, 2024" has the groups 5 and 2024)."""
+    def month(digits):
+        return len(digits) <= 2 and 1 <= int(digits) <= 12
+
+    def date(digits):
+        return len(digits) <= 2 and 1 <= int(digits) <= 31
+    if len(groups) == 3:
+        first, middle, last = groups
+        return ((year(first) and month(middle) and date(last)) or
+                ((year(last) or len(last) == 2) and ((date(first) and month(middle)) or (month(first) and date(middle)))))
+    if len(groups) == 2:
+        first, last = groups
+        return ((year(first) and month(last)) or (year(last) and date(first)) or (month(first) and date(last))
+                or (date(first) and month(last)))
+    return False
 
 
 def runs(said):
@@ -78,8 +147,8 @@ def pairs(said):
 
 def elements(text):
     """Each element of the text (see above): its runs, pairs and rare words."""
-    said = words(text)
-    return {*runs(said).values(), *pairs(said).values(), *('1 '+word for word in said if rare(word))}
+    said, alone, _ = weighed(text)
+    return {*runs(said).values(), *pairs(said).values(), *('1 '+word for word, weight in zip(said, alone) if weight)}
 
 
 def hashed(element, salt):
@@ -102,17 +171,18 @@ def fingerprint(before, after, key):
 
 def removed(fingerprint, befores=()):
     """What the edit took out, as hashes: what the fingerprint says, and what each of `befores` (the controller's own
-    copies of the message as it stood) has that the fingerprint's kept text doesn't."""
+    copies of the message as it stood) has, less all the fingerprint's kept text, whichever says it was taken out (gene
+    #261 round 1: what the message says now never was, however the fingerprint was put together)."""
     taken, kept = set(fingerprint.get('removed') or ()), set(fingerprint.get('kept') or ())
     for before in befores:
-        taken |= {hashed(element, fingerprint['salt']) for element in elements(before)} - kept
-    return taken
+        taken |= {hashed(element, fingerprint['salt']) for element in elements(before)}
+    return taken - kept
 
 
 def holds(text, key, taken):
     """Whether the text holds enough of what an edit took out (`taken`, hashed with `key`): what it shares of that
     weighs ENOUGH (see above), each element counted once."""
-    said, counted, covered, weight = words(text), set(), set(), 0
+    (said, alone, plain), counted, covered, weight, numbers = weighed(text), set(), set(), 0, 0
 
     def shared(element):
         if element in counted or hashed(element, key) not in taken:
@@ -121,13 +191,22 @@ def holds(text, key, taken):
         return True
     for i, run in runs(said).items():
         if shared(run):
-            weight += 2 if any(rare(word) for word in said[i:i+3]) else 1
-            covered |= {i, i+1, i+2}
+            span = range(i, i+3)
+            if any(alone[j] and not plain[j] for j in span):
+                weight += 2
+            elif any(said[j] not in COMMON and not plain[j] for j in span):
+                weight += 1
+            else:  # Only a year, a time or a date among common words: as it alone.
+                numbers = 1
+            covered |= set(span)
     for i, pair in pairs(said).items():
         if not {i, i+1} <= covered and shared(pair):
-            weight += max(1, rare(said[i])+rare(said[i+1]))
+            weight += max(1, sum(alone[j] for j in (i, i+1) if not plain[j]))
             covered |= {i, i+1}
     for i, word in enumerate(said):
-        if i not in covered and rare(word) and shared('1 '+word):
-            weight += rare(word)
-    return weight >= ENOUGH
+        if i not in covered and alone[i] and shared('1 '+word):
+            if plain[i]:
+                numbers = 1
+            else:
+                weight += alone[i]
+    return weight+numbers >= ENOUGH

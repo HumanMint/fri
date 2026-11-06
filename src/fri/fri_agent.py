@@ -678,9 +678,10 @@ class Agent:
 
     def fingerprinted(self, channel, message):
         """What a member's edit took out, as a fingerprint (gene #150, #246; see fri_edit_fingerprint): from what the
-        live view held of the message before (as receive() stores it, so compared alike) to what it says now, and all
-        of what it says now, so the controller can tell from its own saved exchange too. Nothing it can tell from where
-        the view held nothing and the edit says nothing (a partial update): the controller does as before."""
+        live view held of the message before to all of what it says now, which is kept too, so the controller can tell
+        from its own saved exchange as well. The view holds 500 characters, but the edit is read in full: one that only
+        put words before them took none out (gene #246 round 1, B2). Nothing it can tell from where the view held
+        nothing and the edit says nothing (a partial update): the controller does as before."""
         from .fri_edit_fingerprint import fingerprint
         before = next((row['text'] for row in self.recent.get(channel, ()) if row['id'] == str(message.id)
                        and not row['gene_error'] and not row.get('fri')), None)
@@ -688,11 +689,7 @@ class Agent:
         now = clean(content, 4000) if isinstance(content, str) and getattr(message, 'author', None) else None
         if before is None and now is None:
             return None
-        printed = fingerprint(before, now[:500] if now is not None and before is not None else now,
-                              self.saved_turns.salt)
-        if now is not None:
-            printed['kept'] = fingerprint(None, now, self.saved_turns.salt)['kept']
-        return {message.id: printed}
+        return {message.id: fingerprint(before, now, self.saved_turns.salt)}
 
     def revise(self, mid):
         now = time.time()
