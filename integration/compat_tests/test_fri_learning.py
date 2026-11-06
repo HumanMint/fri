@@ -191,10 +191,7 @@ def test_legacy_cursor_resumes_from_enablement_and_failed_summary_retries_same_s
         error='Summary failed', newest_id=source_id)
     assert value(store, 'cursors') == original
     assert not store.chat_context('123', 'public:1', '11')['personal_memory']['notes']
-    # The failed pass's allowance: a controller before gene #262 keeps the whole reservation (30); one from it on hands
-    # it back, as the slice is read again.
-    kept = value(store, 'budget')['used']
-    assert kept in (0, 30)
+    assert value(store, 'budget')['used'] == 30
     clock[0] += 1800
     assert scheduler.claim() is None  # Pending owner report still blocks learning.
     scheduler.delivered(claim['id'])
@@ -206,7 +203,7 @@ def test_legacy_cursor_resumes_from_enablement_and_failed_summary_retries_same_s
     assert value(store, 'cursors') == original
     saved = restarted.finish(retry['id'], records, result, 1, source_id, False, {}, newest_id=source_id)
     assert saved['saved'] == 1
-    assert value(store, 'budget')['used'] == kept+1
+    assert value(store, 'budget')['used'] == 31
     assert value(store, 'cursors')['1']['after_id'] == str(int(retry['until_id'])-1)
 
 
