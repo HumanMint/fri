@@ -495,9 +495,10 @@ class SavedTurns:
 
     def depends_on(self, messages):
         """What saved replies with these messages (strings) drew on, as far as this Fri saved them, and what those drew
-        on in turn, through Fri's own replies among them (see drawn), or None for one of them it can't tell: a saved
-        reply it didn't save itself, or one it saved whose own requests carried such a reply (see kept's unknown), however
-        far back (fri #383 item 1). Each read once, so a cycle ends."""
+        on in turn, through Fri's own replies among them (see drawn); and whether one of them drew on what it can't
+        tell: a saved reply it didn't save itself, or one it saved whose own requests carried such a reply (see kept's
+        unknown), however far back (fri #383 item 1). What's known stands either way, so a reply known to draw on a
+        message taken back goes with it (Sol round 1 of #386, B1). Each read once, so a cycle ends."""
         found, todo, unknown = set(), [str(i) for i in messages if str(i).isdigit()], False
         known = [i for i in todo if int(i) in self.drawn]
         if todo and not known:
@@ -513,14 +514,16 @@ class SavedTurns:
                 found.add(item)
                 if int(item) in self.drawn and item not in seen:
                     known.append(item)
-        return None if unknown else found
+        return found, unknown
 
     @staticmethod
     def quotes(turn, member=None):
         """Whether a saved reply drew on the member's summary, any generation of it, as the controller names it (its
-        `summaries`, a covered rebuild's too); with no member known, anyone's (fri #383 item 2)."""
-        return any(isinstance(item, dict) and (member is None or str(item.get('user_id')) == str(member))
-                   for item in turn.get('summaries') or ())
+        `summaries`, a covered rebuild's too); with no member known, anyone's (fri #383 item 2). One whose `summaries`
+        can't be read (see unreadable) may have quoted anyone's."""
+        if unreadable(turn):
+            return True
+        return any(member is None or str(item['user_id']) == str(member) for item in turn.get('summaries') or ())
 
     def dependencies(self, context):
         """What the saved context a request carried drew on (fri #332): each saved exchange's reply, as its messages
@@ -528,11 +531,9 @@ class SavedTurns:
         can't tell. Exchanges elsewhere hold only the member's own words, never a reply. Never what a model reads."""
         found, unknown = set(), False
         for messages in (exchange(turn) for turn in context.get('turns', []) if turn.get('reply')):
-            drew = self.depends_on(messages - {''})
-            if drew is None:
-                unknown = True
-            else:
-                found |= drew
+            drew, cant_tell = self.depends_on(messages - {''})
+            found |= drew
+            unknown = unknown or cant_tell
         return found, unknown
 
     def summary_sources(self, summary, member=None, taken=None):
@@ -661,7 +662,7 @@ class SavedTurns:
             return set()
         found = held(context)
         gone = self.withheld(found)
-        drew = [self.depends_on(exchange(turn) - {''}) or set() for turn in context.get('turns', [])]
+        drew = [self.depends_on(exchange(turn) - {''})[0] for turn in context.get('turns', [])]
         taken = self.withheld({i for ids in drew for i in ids})
         summary = context.get('member_summary')
         if summary and self.summary_sources(summary, member):
@@ -673,8 +674,10 @@ class SavedTurns:
         if any(quoting) and self.summary_sources(summary or UNDATED, member):
             taken |= {i for turn, quotes in zip(context.get('turns', []), quoting) if quotes for i in exchange(turn) - {''}}
         else:
-            quoting = [False]*len(quoting)
-        if not gone and not taken:
+            # One whose summaries can't be read can't be dated or tied to anyone: it goes, and what drew on it (S4).
+            quoting = [unreadable(turn) for turn in context.get('turns', [])]
+            taken |= {i for turn, bad in zip(context.get('turns', []), quoting) if bad for i in exchange(turn) - {''}}
+        if not gone and not taken and not any(quoting):
             return set(found)
         said, history = ([] if said is None else said), []
         for turn, depends, quotes in zip(context.get('turns', []), drew, quoting):
@@ -1244,6 +1247,14 @@ def fresh(edited_at, now):
 def saved_lately(message_id):
     """Sent recently enough that the controller may keep an exchange holding it, from the time in its Discord ID."""
     return sent_at(message_id) > time.time()-KEPT_SECONDS
+
+
+def unreadable(turn):
+    """Whether a saved reply's `summaries` aren't as the controller writes them, a list of {'user_id', 'generation'}: whose
+    summary it quoted, or when, can't be told then (Sol round 1 of #386, S4)."""
+    items = turn.get('summaries')
+    return items is not None and not (isinstance(items, list) and all(
+        isinstance(item, dict) and str(item.get('user_id', '')).isdigit() for item in items))
 
 
 def exchange(turn):
