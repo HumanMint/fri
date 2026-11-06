@@ -199,7 +199,8 @@ def test_a_second_edit_before_the_first_is_taken_adds_what_it_took_out(monkeypat
             message = setting(w, QUOTE, 'see you at 7719 birchwood lane then', UNRELATED)
             turns = w.agent.saved_turns
             turns.kick = lambda: None
-            await edit(w, edited(message, 'my new address is 7719 birchwood lane, come by friday'))
+            # The second takes out nothing the first reply quotes: only what the first took out retires it.
+            await edit(w, edited(message, 'my place is 7719 birchwood lane, come by friday'))
             await edit(w, edited(message, AFTER))
             del turns.kick
             turns.kick()
