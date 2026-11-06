@@ -9,9 +9,11 @@
 No model input changes but what's withheld.
 """
 import asyncio
+import datetime as dt
 import time
 from types import SimpleNamespace
 
+import discord
 import pytest
 
 from compat_tests.test_fri_edit_reanswer import model
@@ -399,3 +401,117 @@ def test_a_reply_quoting_the_summary_where_it_no_longer_shows_is_held_to_its_sou
         finally:
             await w.fri.close()
     asyncio.run(scenario())
+
+
+def test_a_dm_reply_is_held_to_a_row_only_the_live_view_had(monkeypatch, tmp_path):
+    """Sol round 1's witness for the record of withdrawn rows: A, member 30's ten-minute-old message, is still in Fri's
+    live view of #1, which Fri no longer chats in, and no request of Fri's read it. B drew on A. During the DM's last
+    check an update for A comes with no author, repeating its five-minute-old edit time: no saved exchange holds A and
+    nothing marks or revises it, so only the live view's withdrawal records it. The reply doesn't go out."""
+    async def scenario():
+        fri, agent, store, _, _, message, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        _, message = direct(fri, agent, rows)
+        quoted = source(age=600, user='30', channel='1')
+        agent.recent[1].append({'id': quoted['id'], 'at': time.time()-600, 'gene_error': False, 'user_id': '30',
+                                'text': 'the plan is '+MARKER})
+        agent.state['channels'] = [c for c in agent.state['channels'] if str(c) != '1']
+        assert not agent.allowed(fri.get_channel(1)) and int(quoted['id']) not in agent.looked
+        said = source(age=300, channel='555')
+        store.save_chat('123', 'private:555', '20', 0, 'what did ash say', REPLY, 'model', 'high', source=said,
+                        provenance=[], drew_on=[quoted['id']])
+        agent.saved_turns.kept({'guild_id': '123', 'channel_id': '555', 'conversation_id': 'private:555',
+                                'user_id': '20', 'revision': 0, 'source': said, 'drew_on': [quoted['id']]}, {},
+                               (time.time(), time.monotonic()))
+        answered = []
+
+        async def respond(text, context, ready):
+            await ready()
+            answered.append(True)
+            return ChatResult(status='completed', reply=REPLY)
+        model(fri, tmp_path, respond)
+        api, taken = fri.api, []
+
+        async def recording(method, path, payload=None):
+            if path.startswith('/chat/turn/withdraw'):
+                raise TimeoutError()
+            answer = await api(method, path, payload)
+            if path == '/chat/turn/check' and answered and not taken:
+                taken.append(path)
+                await fri.on_raw_message_edit(SimpleNamespace(channel_id=1, guild_id=123, message=SimpleNamespace(
+                    id=int(quoted['id']), edited_at=discord.utils.utcnow()-dt.timedelta(minutes=5))))
+                assert quoted['id'] not in agent.saved_turns.marked and int(quoted['id']) not in agent.revised
+                assert quoted['id'] in agent.withdrawn  # The only record that knows.
+            return answer
+        fri.api = recording
+        asked = message('fri say what ash said again')
+        asked.reply.return_value = SimpleNamespace(id=asked.id+100, content='okay', edit=None)
+        try:
+            await agent.handle(asked)
+            assert taken and MARKER not in str(asked.reply.await_args_list)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+# Sol round 1 of #386.
+
+@pytest.mark.parametrize('queued', [True, False], ids=['its deletion queued', 'nothing'])
+def test_what_a_reply_is_known_to_draw_on_holds_it_under_unknown_ancestry(monkeypatch, tmp_path, queued):
+    """B1: B, saved with a marker before this Fri started, and five newer exchanges. A panel request reads B and saves
+    C, which repeats it, so B leaves the six Gene keeps. C drew on B, and on whatever B drew on, which can't be told.
+    B's deletion is queued, not yet taken, and member 20 asks again: C stays out of the request. What can't be told
+    used to drop what was known with it."""
+    async def scenario():
+        fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        quoted = source(age=1200, channel='1')
+        said = quoting(store, fri, quoted['id'], tracked=False)
+        for n in range(5):
+            store.save_chat('123', 'private:456', '20', 0, f'line {n}', 'ok', 'model', 'high',
+                            source=source(age=500-10*n, channel='456'), provenance=[])
+        carried = []
+
+        async def respond(text, context, ready):
+            await ready()
+            carried.append(str(context.get('turns')))
+            return ChatResult(status='completed', reply=REPLY)
+        model(fri, tmp_path, respond)
+        first = panel(fri)
+        try:
+            await fri.chat_interaction(first, 'what did ash say')
+            assert REPLY in shown(first) and said['id'] in carried[-1]
+            turns = agent.saved_turns
+            turns.kick = lambda: None  # Gene hasn't taken it yet.
+            if queued:
+                turns.withdraw([int(said['id'])], 123, deleted=True)
+            second = panel(fri)
+            second.id = first.id+1
+            await fri.chat_interaction(second, 'say that again')
+            assert said['id'] not in carried[-1]  # B left the six.
+            assert (MARKER in carried[-1]) is not queued
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('summaries', [True, 3, 'raids', [None], [{'generation': 0}]],
+                         ids=['true', 'a number', 'text', 'an item not a dict', 'an item naming nobody'])
+@pytest.mark.parametrize('taken', [True, False], ids=['something taken back', 'nothing'])
+def test_a_saved_reply_with_summaries_not_as_the_controller_writes_them(monkeypatch, tmp_path, summaries, taken):
+    """S4: `summaries` as no controller writes it raised TypeError while the request was screened. Whose summary it
+    quoted, or when, can't be told: the reply stays out of the request, as one quoting the member's own does while
+    anything is taken back, and at the delivery fence too."""
+    fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+    fri.capabilities = frozenset(asyncio.run(fri.api('GET', '/fri/contract'))['capabilities'])
+    turns = agent.saved_turns
+    turns.kick = lambda: None
+    if taken:
+        under = int(source(age=4000, user='30', channel='1')['id'])
+        turns.withdraw([under], 123, deleted=True, authors={under: 30})
+    turn = {**saved(int(source(age=300, channel='1')['id'])), 'summaries': summaries}
+    assert turns.quotes(turn, '20') and turns.quotes(turn)
+    context = quoting_context(None, turn)
+    turns.withhold(context, member='20')
+    assert context['turns'] == []
+    asyncio.run(fri.close())
