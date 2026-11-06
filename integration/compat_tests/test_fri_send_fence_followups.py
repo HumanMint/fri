@@ -385,6 +385,31 @@ def test_the_controller_down_at_the_final_fence_is_an_outage_not_a_change(monkey
     asyncio.run(scenario())
 
 
+def test_the_controller_down_at_the_final_fence_as_dms_go_off_says_nothing(monkeypatch, tmp_path):
+    """S2 with the DM switch: DMs go off while the final fence finds the controller down. Not even the outage notice
+    goes out in a DM that's off."""
+    async def scenario():
+        from fri.fri_errors import ControllerUnavailable
+        fri, agent, asked, calls, answered = asking_after_saved(monkeypatch, tmp_path, 'dm')
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        api = fri.api
+
+        async def down(method, path, payload=None):
+            checks = [p for p, _ in calls[answered[0]:] if p == '/chat/turn/check'] if answered else []
+            if path == '/chat/turn/check' and len(checks) == 1:
+                calls.append((path, payload))
+                agent.config['support_dms'] = False  # While it found the controller down.
+                raise ControllerUnavailable('down')
+            return await api(method, path, payload)
+        fri.api = down
+        try:
+            await agent.handle(asked)
+            asked.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_reply_held_for_saved_messages_whose_requester_erased_while_it_went_is_not_recorded(monkeypatch, tmp_path):
     """S3 keeps the local part before recording: member 20's "forget me" taken in here while the reply goes out, before
     the controller has it. The reply is out, but it isn't recorded, though Gene isn't asked again first."""
