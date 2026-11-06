@@ -137,6 +137,9 @@ async def explore(agent, claim):
         read_at = target.get('revision')
         if target['first_visit'] or target['exhausted'] or not isinstance(read_at, int) or isinstance(read_at, bool):
             plan = {'term': '', 'reason': "Read this member's own wording before choosing topic filters."}
+            # Its channel's messages alone are sent then (see search), so another channel's withdrawal leaves it be (see
+            # Watch, fri #385). With a planner, its historical topics can come from any channel: every one stops it.
+            window.scope = {str(channel.id)}
         else:
             async def moved():
                 """Signed in, the target as the request would carry them: the historical topics' evidence is their

@@ -93,13 +93,25 @@ class ReportButton(discord.ui.DynamicItem[discord.ui.Button], template=REPORT_ID
             await interaction.followup.send('server access is needed to open this report.', ephemeral=True,
                                              allowed_mentions=NO_MENTIONS)
             return
+        report = None
         try:
-            report = await fri.api('POST', f'/agent/reports/{self.report_id}/view',
-                                  {'guild_id': str(fri.guild_id), 'user_id': str(fri.owner_id)})
+            # Something taken back while it answered (a withdrawal, a privacy control) may have changed it since:
+            # it's read again once, and not shown if that moves too (fri #385; see Agent.taken_back_mark).
+            for _ in range(2):
+                before = fri.agent.taken_back_mark()
+                fetched = await fri.api('POST', f'/agent/reports/{self.report_id}/view',
+                                       {'guild_id': str(fri.guild_id), 'user_id': str(fri.owner_id)})
+                if fri.agent.taken_back_mark() == before:
+                    report = fetched
+                    break
         except commands.UserFeedbackCheckFailure:
             await interaction.followup.send('i couldn’t load that report. it may have expired or been cleared; '
                                              'if it’s recent, try again in a moment.',
                                              ephemeral=True, allowed_mentions=NO_MENTIONS)
+            return
+        if report is None:
+            await interaction.followup.send('that report shifted while it loaded, since something was just taken '
+                                             'back. try again in a moment.', ephemeral=True, allowed_mentions=NO_MENTIONS)
             return
         content, view = report_message(report, self.page)
         await interaction.edit_original_response(content=content, embed=None, attachments=[], view=view,

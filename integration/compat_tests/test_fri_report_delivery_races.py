@@ -10,7 +10,6 @@
    it nothing (and its scan reservation, which the controller keeps for a pass that fails, isn't spent for it).
 """
 import asyncio
-import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -20,7 +19,7 @@ from gene.api import create_app
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_generation_consumers import read_by, sources_kept
-from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import dm_owner, learning  # noqa: F401 (the fixture)
 from compat_tests.test_fri_panel_and_learning_fences import batch
 from compat_tests.test_fri_reports import complete, event
 from fri.fri_agent import Agent
@@ -59,10 +58,26 @@ def test_forget_me_as_the_last_report_fetch_answers_sends_nothing(learning):  # 
     """The issue's first repro: the controller deleted the report with the erasure, but the card fetched just before
     it went, as forgetting moved nothing Fri compared."""
     async def scenario():
-        owner = SimpleNamespace(send=AsyncMock())
+        owner = dm_owner()
         agent, scheduler, report, store = delivering(learning, owner, final=forgotten)
         await agent.send_reports()
         owner.send.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_forget_my_chats_on_the_panel_moves_the_mark_too(monkeypatch):
+    """The panel's "Forget my chats" deletes pending learning reports at the controller as well (clear_chats)."""
+    from fri import fri_panel
+
+    async def scenario():
+        monkeypatch.setattr(fri_panel, 'defer_panel', AsyncMock())
+        monkeypatch.setattr(fri_panel, 'reply', AsyncMock())
+        agent = Agent(SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456))
+        cog = SimpleNamespace(api=AsyncMock(return_value={'ok': True}), agent=agent, guild_id=123)
+        before = agent.taken_back_mark()
+        await fri_panel.HomeView(cog).forget_chats.callback(SimpleNamespace(guild_id=123, user=SimpleNamespace(id=11)))
+        cog.api.assert_awaited_once_with('POST', '/chat/clear', {'guild_id': '123', 'user_id': '11'})
+        assert agent.taken_back_mark() != before
     asyncio.run(scenario())
 
 
@@ -75,6 +90,8 @@ class Owner:
         self.dm_channel, self.opening, self.sent = None, opening, []
 
     async def create_dm(self):
+        if self.dm_channel is not None:  # As discord.py's: the cached one, with no wait.
+            return self.dm_channel
         await self.opening()
         self.dm_channel = SimpleNamespace(send=AsyncMock(side_effect=lambda content, **kwargs: self.sent.append(content)))
         return self.dm_channel
@@ -173,11 +190,70 @@ def test_a_pass_aborts_only_for_a_withdrawal_that_may_touch_its_channel(learning
     asyncio.run(scenario())
 
 
-def test_the_withdrawal_log_names_what_send_and_a_sweep_took(learning, monkeypatch):  # noqa: F811
-    """What scopes it: a withdrawal Fri sent names its channel and threads; a sweep's naming threads names them."""
-    agent, *_ = batch(learning, monkeypatch)
-    channels = agent.channel_withdrawals
-    before = channels.generation
-    channels.taken((), channels=['5', '70'])
-    assert not channels.touches(before, {'6'}) and channels.touches(before, {'70'}) and channels.touches(before, None)
-    json.dumps(list(channels.accepted))  # Plain values only.
+@pytest.mark.parametrize('withdrawn', ['another channel', 'its own channel'])
+@pytest.mark.parametrize('visit', ['first', 'later'])
+def test_an_exploration_stops_only_for_a_withdrawal_that_may_touch_what_it_sends(learning, monkeypatch, visit,  # noqa: F811
+                                                                                withdrawn):
+    """A first visit sends its channel's messages alone, so only its channel's withdrawal stops it. A later one asks
+    the planner with the member's historical topics, which can come from any channel, so every one does."""
+    from compat_tests.test_fri_exploration_baseline import explore
+
+    def taking(agent):
+        agent.channel_withdrawals.taken((), channels=['999' if withdrawn == 'another channel' else '1'])
+    asked = explore(learning, monkeypatch, (1 if visit == 'first' else 2, 'target'), taking)
+    if visit == 'first':
+        assert [kind for kind, _ in asked[1]] == (['summary'] if withdrawn == 'another channel' else [])
+    else:
+        assert asked[1] and asked[2] == []
+
+
+def test_withdrawals_name_the_channels_they_took(monkeypatch, tmp_path):
+    """What scopes it: a sweep naming a thread's channel names both, as the controller may take the thread with a
+    channel withdrawn before; a deleted channel's withdrawal names it and the threads under it Fri knew. A pass that read
+    none of them goes on; one whose scope isn't known, or after a withdrawal that didn't say, doesn't."""
+    from compat_tests.test_fri_channel_withdrawals import deleted, landed, needs_channels, queue
+    from compat_tests.test_fri_member_profiles import GAMING, GENERAL, THREAD, note, run, world
+
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        needs_channels(w)
+        try:
+            channels = queue(w)
+            await w.say(THREAD, 'fri I like osu', 'cool', note('I like osu'))
+            with w.store.connection() as db:
+                db.execute('DELETE FROM chat_thread_parents')  # As an older controller saved it: the sweep names it.
+            before = channels.generation
+            await landed(w)
+            assert channels.generation == before+1 and channels.accepted[before+1] == {str(THREAD), str(GENERAL)}
+            await deleted(w, GENERAL, (THREAD,))
+            named = [channels.accepted[g] for g in range(before+2, channels.generation+1)]
+            assert named and set().union(*named) == {str(GENERAL), str(THREAD)}
+            assert not channels.touches(before, {str(GAMING)})
+            assert channels.touches(before, {str(THREAD)}) and channels.touches(before, None)
+            assert not channels.touches(channels.generation, None)  # Nothing since.
+            since = channels.generation
+            channels.taken(())
+            assert channels.touches(since, {str(GAMING)})
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_a_pass_over_a_thread_counts_its_channels_withdrawal(learning, monkeypatch):  # noqa: F811
+    """A thread goes with its channel's withdrawal, which may not name it (the controller knows it's under it)."""
+    async def scenario():
+        agent, store, _, finishes, asked, signing = batch(learning, monkeypatch)
+        agent.fri.capabilities = frozenset(agent.fri.capabilities) | {'author-fence'}
+        channel = agent.fri.get_channel(1)
+        channel.parent_id = 2  # Channel 1 is a thread under 2, another approved channel.
+        api, went = agent.fri.api, []
+
+        async def checking(method, path, payload=None):
+            if path == '/agent/authors/check' and not went:
+                went.append(True)
+                agent.channel_withdrawals.taken((), channels=['2'])
+            return await api(method, path, payload)
+        agent.fri.api = checking
+        await agent.learn()
+        assert went and asked == [] and finishes[-1]['error']
+    asyncio.run(scenario())

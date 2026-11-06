@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 
 from compat_tests.test_api import headers
-from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import dm_owner, learning  # noqa: F401 (the fixture)
 from compat_tests.test_fri_panel_and_learning_fences import batch
 from fri.fri_agent import Agent
 from fri.fri_turn_withdrawal import CLOSED_RECORD, SavedTurns
@@ -262,7 +262,7 @@ def test_an_archive_search_cancelled_while_reading_the_roster_leaves_no_watch(le
     async def scenario():
         channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()))
         runtime = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                                  get_user=lambda _: SimpleNamespace(send=AsyncMock()),
+                                  get_user=lambda _: dm_owner(),
                                   http=SimpleNamespace(request=http), chat=SimpleNamespace(headers=AsyncMock()))
         agent = Agent(runtime)
         agent.state = scheduler.state()

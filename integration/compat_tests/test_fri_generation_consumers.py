@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 
 from compat_tests.test_api import headers
-from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import dm_owner, learning  # noqa: F401 (the fixture)
 from compat_tests.test_fri_panel_and_learning_fences import batch
 from compat_tests.test_fri_reports import complete
 from fri.fri_agent import Agent
@@ -78,7 +78,7 @@ def reporting(learning, *, owner_cached=True, during=None):  # noqa: F811
     owner is looked up, or, with owner_cached, right after the report is fetched."""
     _, store, settings, scheduler, report = complete(learning)
     client = TestClient(create_app(settings))
-    owner = SimpleNamespace(send=AsyncMock())
+    owner = dm_owner()
     holder = {}
 
     async def api(method, path, payload=None):

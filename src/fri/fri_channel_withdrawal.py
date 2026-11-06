@@ -37,6 +37,7 @@ KEPT_SECONDS = 90*86400  # As long as a note, the longest anything withdrawn her
 SWEEP_SECONDS = 3600  # How often the controller's channels are read again for deletions Fri missed.
 SWEEP_MOST = 25  # Reads of channels missing from the cache in one sweep; the rest wait for the next.
 MOST = 100  # Channels and threads the controller takes at once.
+NAMED = 1000  # Accepted withdrawals whose channels are remembered (see touches); past that, every one counts.
 UNKNOWN_CHANNEL = 10003
 LOG = logging.getLogger('fri.agent')
 
@@ -57,6 +58,8 @@ class ChannelWithdrawals:
         # Moved by every withdrawal the controller accepted: a request's context read before it is dropped whole at
         # its last check (see moved, Sol round 2 of #372, B3).
         self.generation = 0
+        # Generation: the channel and thread IDs that withdrawal named, as text; None, it didn't say (see touches).
+        self.accepted = {}
 
     @property
     def pending(self):
@@ -200,17 +203,21 @@ class ChannelWithdrawals:
                     OSError) as exc:
                 LOG.warning('A channel withdrawal was not sent: %s; it stays queued', type(exc).__name__)
                 return
-            self.taken((answer or {}).get('messages') or ())
+            self.taken((answer or {}).get('messages') or (), channels=[channel, *entry['threads']])
             if self.pending.get(channel) is entry:
                 del self.pending[channel]
                 self.persist()
 
-    def taken(self, messages):
+    def taken(self, messages, channels=None):
         """A withdrawal the controller accepted, naming the messages it took (none, for one it had taken already, its
         first answer lost). Any request's context read before it is dropped whole at its last check (see moved), and
         a memory view reads again, since the withdrawal queue's generation moved (Sol round 2 of #372, B3). The
-        messages are marked as taken back here too, as a deleted message is (Sol round 1, F1)."""
+        messages are marked as taken back here too, as a deleted message is (Sol round 1, F1). `channels`: the
+        channels and threads it was for, so a learning pass that read none of them goes on (see touches, fri #385);
+        None, not said, counts for every pass."""
         self.generation += 1
+        self.accepted[self.generation] = None if channels is None else frozenset(str(c) for c in channels)
+        self.accepted.pop(self.generation-NAMED, None)
         turns, now = self.agent.saved_turns, time.time()
         for message in messages:
             if str(message).isdigit():
@@ -270,9 +277,10 @@ class ChannelWithdrawals:
             if row.get('parent') is None and getattr(found, 'parent_id', None):
                 parents[row['id']] = str(found.parent_id)  # An archived thread, say.
         if parents:
-            await fri.api('POST', '/chat/channels/parents', {'guild_id': str(guild.id),
-                                                             'parents': dict(sorted(parents.items())[:500])})
-            self.taken(())  # A thread named under a withdrawn channel is withdrawn with it there (gene #243 G2).
+            named = dict(sorted(parents.items())[:500])
+            await fri.api('POST', '/chat/channels/parents', {'guild_id': str(guild.id), 'parents': named})
+            # A thread named under a withdrawn channel is withdrawn with it there (gene #243 G2).
+            self.taken((), channels=[*named, *named.values()])
         return all(row['id'] in self.resolved for row in held)
 
     async def settle(self):
@@ -305,6 +313,18 @@ class ChannelWithdrawals:
     def moved(self, since):
         """Whether a withdrawal was accepted since `since` (see generation): a context read before it is dropped."""
         return since is not None and self.generation != since
+
+    def touches(self, since, scope):
+        """Whether a withdrawal accepted since `since` (see generation) may have taken something from `scope`, the
+        channel IDs a learning pass read. One for other channels can't have: the pass goes on (fri #385). One that
+        didn't say which, one past those remembered (NAMED), or a scope not known (None), counts."""
+        if not self.moved(since):
+            return False
+        if scope is None or self.generation-since >= NAMED:
+            return True
+        scope = {str(channel) for channel in scope}
+        return any(self.accepted.get(generation) is None or self.accepted[generation] & scope
+                   for generation in range(since+1, self.generation+1))
 
     @staticmethod
     def drop(context):

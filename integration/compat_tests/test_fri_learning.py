@@ -19,6 +19,16 @@ from fri.fri_agent import Agent
 
 GONE = {'code': 10008, 'message': 'Unknown Message'}  # Discord's 404 for a message that's gone, as it answers it.
 
+
+def dm_owner(send=None):
+    """The owner, as their discord.User with the DM channel open: create_dm hands that back, as discord.py's does, and
+    a report goes through it (fri #385). send(): it, so a test can read what was sent from either."""
+    owner = SimpleNamespace(send=send or AsyncMock())
+    owner.dm_channel = owner
+    owner.create_dm = AsyncMock(return_value=owner)
+    return owner
+
+
 @pytest.fixture
 def learning(tmp_path, monkeypatch):
     clock = [1792450800.0]
@@ -87,7 +97,7 @@ def test_initial_scan_then_new_messages_drain_without_skips_after_restart(learni
     channel = HistoryChannel()
     old = channel.add(clock[0]-100)
     store.personal_control('13', 'disable')
-    owner = SimpleNamespace(send=AsyncMock())
+    owner = dm_owner()
     client = TestClient(create_app(settings))
     needs_learning_withdrawals(client)
     requests, summaries = [], []
@@ -319,7 +329,7 @@ def test_learning_keeps_what_a_member_is_working_on_in_its_channel(learning):
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api,
-            get_channel=lambda _: channel, get_user=lambda _: SimpleNamespace(send=AsyncMock()))
+            get_channel=lambda _: channel, get_user=lambda _: dm_owner())
         agent = Agent(fri)
         agent.state = scheduler.state()
         agent.member = AsyncMock(return_value=SimpleNamespace(roles=[SimpleNamespace(id=90)]))
