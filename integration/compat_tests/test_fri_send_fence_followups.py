@@ -42,10 +42,11 @@ def dms_off_at(monkeypatch, agent, check):
         async def still():
             calls.append(True)
             standing = await inner()
+            still.unavailable = getattr(inner, 'unavailable', False)
             if len(calls) == check:
                 agent.config['support_dms'] = False
             return standing
-        still.unmoved = inner.unmoved
+        still.unmoved, still.unavailable = inner.unmoved, False
         return still
     monkeypatch.setattr(fri_agent, 'turn_fence', fence)
 
@@ -310,6 +311,111 @@ def test_a_dm_previews_later_pages_and_apply_are_held_to_what_was_taken_back_her
                                           edit_original_response=AsyncMock())
                 await view.apply(pressed)
                 assert bool(applied) is not deleted
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+# Sol round 1 of #392.
+
+def asking_after_saved(monkeypatch, tmp_path, where):
+    """Member 20's message reading a saved exchange of theirs: a DM, or a ping in a chat channel. Returns what's
+    needed to run it, and the controller calls made, with where the model answered among them."""
+    fri, agent, store, _, _, message, calls, rows = environment(monkeypatch, tmp_path, channel_id=1)
+    if where == 'dm':
+        _, message = direct(fri, agent, rows)
+    channel = '555' if where == 'dm' else '1'
+    store.save_chat('123', 'private:555' if where == 'dm' else 'public:1', '20', 0, 'remember chess', 'noted',
+                    'model', 'high', source=source(age=60, channel=channel), provenance=[],
+                    **({} if where == 'dm' else {'audience': 'server'}))
+    answered = []
+
+    async def respond(text, context, ready):
+        await ready()
+        answered.append(len(calls))
+        return ChatResult(status='completed', reply='you said chess')
+    respond_with(fri, tmp_path, respond)
+    asked = message('what did i say' if where == 'dm' else '<@99> what did i say')
+    asked.reply.return_value = SimpleNamespace(id=asked.id+100, content='okay', edit=AsyncMock())
+    return fri, agent, asked, calls, answered
+
+
+@pytest.mark.parametrize('where', ['dm', 'ping'])
+def test_a_reply_held_for_saved_messages_costs_one_turn_check_more(monkeypatch, tmp_path, where):
+    """S3: a requester-only DM reading saved messages, or a ping in a chat channel, made three turn checks after the
+    model answered, where main makes one. It makes two: talk's own, and the final fence before the send. The save's
+    own validation is Gene's check of what was delivered, so it isn't asked again first."""
+    async def scenario():
+        fri, agent, asked, calls, answered = asking_after_saved(monkeypatch, tmp_path, where)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        try:
+            await agent.handle(asked)
+            assert 'you said chess' in said(asked)
+            after = [path for path, _ in calls[answered[0]:] if path in ('/chat/turn/check', '/chat/turn')]
+            assert after == ['/chat/turn/check', '/chat/turn/check', '/chat/turn']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('where', ['dm', 'ping'])
+def test_the_controller_down_at_the_final_fence_is_an_outage_not_a_change(monkeypatch, tmp_path, where):
+    """S2: only the final fence's check found the controller down. A ping was told things changed, and a DM that it was
+    skipped. It's the outage it is: the outage notice, and nothing of the reply, which couldn't be checked."""
+    async def scenario():
+        from fri.fri_errors import UNREACHABLE, ControllerUnavailable
+        fri, agent, asked, calls, answered = asking_after_saved(monkeypatch, tmp_path, where)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        api = fri.api
+
+        async def down(method, path, payload=None):
+            checks = [p for p, _ in calls[answered[0]:] if p == '/chat/turn/check'] if answered else []
+            if path == '/chat/turn/check' and len(checks) == 1:  # The second after the model: the final fence's.
+                calls.append((path, payload))
+                raise ControllerUnavailable('down')
+            return await api(method, path, payload)
+        fri.api = down
+        try:
+            await agent.handle(asked)
+            told = said(asked)
+            assert 'you said chess' not in told and UNREACHABLE in told
+            assert PANEL_SKIPPED not in told and CONTEXT_CHANGED not in told
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_dms_turned_off_while_the_requesters_erasure_is_read_after_a_failed_fence_say_nothing(monkeypatch, tmp_path):
+    """S1: member 30 erases through Gene, so the whole turn's check fails; then DMs go off while the owner's own
+    erasure is read, to tell which it was. Not even the skipped line goes out."""
+    async def scenario():
+        fri, agent, store, dm = owner_dm(monkeypatch, tmp_path, ChatResult(
+            status='completed', reply='member thirty says '+MARKER), 'gene')
+        from fri import fri_agent
+        real_fence, fenced = fri_agent.turn_fence, []
+
+        def fence(*args, **kwargs):
+            inner = real_fence(*args, **kwargs)
+
+            async def still():
+                fenced.append(True)
+                standing = await inner()
+                still.unavailable = getattr(inner, 'unavailable', False)
+                return standing
+            still.unmoved, still.unavailable = inner.unmoved, False
+            return still
+        monkeypatch.setattr(fri_agent, 'turn_fence', fence)
+        real_erasure = agent.erasure
+
+        async def erasure(*args):
+            if fenced:  # The lookup after the fence failed.
+                agent.config['support_dms'] = False
+            return await real_erasure(*args)
+        agent.erasure = erasure
+        try:
+            await agent.handle(dm)
+            assert fenced
+            dm.reply.assert_not_awaited()
         finally:
             await fri.close()
     asyncio.run(scenario())
