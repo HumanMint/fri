@@ -2399,10 +2399,11 @@ class Agent:
         fenced = turn_fence(self, result.turn, message.author.id, counts)  # Kept apart: saving clears result.turn.
         held = (dm and (drew - {author} or saved)) or (invitation and saved)
         whole = fenced if held else None
-        # Before what was delivered is recorded, #375's DM turns are held to the whole fence again. One held only for
-        # its saved messages, or a ping's, is held to its local part: the save's own validation is Gene's check of
-        # it, so asking Gene first would only repeat it (fri #379's round 1, S3).
-        again = dm and (drew - {author} or draws_on_summary(turn))
+        # Before what was delivered is recorded, a DM drawing on someone else's words is held to the whole fence again
+        # (fri #324). One held only for its saved messages or its requester's summary, or a ping's, is held to its
+        # local part: the save's own validation is Gene's check of those, so asking Gene first would only repeat it
+        # (fri #379's round 1, S3).
+        again = dm and bool(drew - {author})
 
         async def recheck():
             return await whole() if again else fenced.unmoved()

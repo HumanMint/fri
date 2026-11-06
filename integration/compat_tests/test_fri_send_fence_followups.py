@@ -358,6 +358,37 @@ def test_a_reply_held_for_saved_messages_costs_one_turn_check_more(monkeypatch, 
     asyncio.run(scenario())
 
 
+def test_a_dm_on_the_requesters_own_summary_costs_one_turn_check_more_too(monkeypatch, tmp_path):
+    """S3 for #375's own-summary DM: held to the final fence, and not asked again before the save, whose validation
+    holds it to the summary's generation as Gene's check would."""
+    async def scenario():
+        from compat_tests.test_fri_member_profiles import DM, model, world
+        from compat_tests.test_fri_member_summaries import CONTINUATION
+        from compat_tests.test_fri_summary_generations import summarized_from
+        w = world(monkeypatch, tmp_path)
+        try:
+            await summarized_from(monkeypatch, w)
+            agent, answered = w.fri.agent, []
+            agent.config['support_dms'] = True
+            w.channels[DM].fetch_message = AsyncMock(side_effect=lambda mid: w.posted[mid])
+            agent.member = AsyncMock(return_value=SimpleNamespace(id=20))
+
+            async def respond(text, context):
+                assert context['member_summary']
+                answered.append(len(w.calls))
+                return ChatResult(status='completed', reply=CONTINUATION)
+            model(w, respond)
+            dm = w.message(DM, 'what were we on about')
+            dm.reply = AsyncMock(return_value=SimpleNamespace(id=dm.id+1, content='okay', edit=AsyncMock()))
+            await agent.handle(dm)
+            assert CONTINUATION in said(dm)
+            after = [path for path, _ in w.calls[answered[0]:] if path in ('/chat/turn/check', '/chat/turn')]
+            assert after == ['/chat/turn/check', '/chat/turn/check', '/chat/turn']
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('where', ['dm', 'ping'])
 def test_the_controller_down_at_the_final_fence_is_an_outage_not_a_change(monkeypatch, tmp_path, where):
     """S2: only the final fence's check found the controller down. A ping was told things changed, and a DM that it was
