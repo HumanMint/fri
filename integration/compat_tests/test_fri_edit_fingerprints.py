@@ -121,7 +121,7 @@ def test_the_fingerprint_says_whether_its_kept_list_is_whole(monkeypatch, tmp_pa
             [entry] = turns.pending.values()
             assert entry['fingerprint']['complete'] is True
             monkeypatch.setattr('fri.fri_edit_fingerprint.MOST', 0)  # The next edit's list cut short.
-            await edit(w, edited(message, AFTER))
+            await edit(w, edited(message, 'my new address is still 4217 juniper crescent'))
             [entry] = turns.pending.values()
             assert entry['fingerprint']['complete'] is False
             path, payload = turns.request([(str(message.id), entry)])
@@ -204,7 +204,8 @@ def test_what_it_sends_holds_no_words_and_nothing_of_it_is_written_down(monkeypa
             turns.kick = lambda: None  # Queued, as when the controller can't be reached.
             await edit(w, edited(message, AFTER))
             [entry] = turns.pending.values()
-            assert entry['fingerprint']['removed'] and entry['fingerprint']['kept']
+            # AFTER holds no run of four words with a rare word, nor a number: its kept list is whole, and empty.
+            assert entry['fingerprint']['removed'] and entry['fingerprint']['complete'] is True
             record = turns.record().read_text()
             assert 'fingerprint' not in record and entry['fingerprint']['salt'] not in record
             path, payload = turns.request([(str(message.id), entry)])

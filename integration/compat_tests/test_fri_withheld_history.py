@@ -448,11 +448,13 @@ def test_an_edit_leaves_fris_reply_in_view_and_takes_saved_replies_only_where_th
             w.agent.recent[1].append({'id': str(nearby.id), 'user_id': '20', 'name': 'member', 'text': nearby.content,
                                       'at': discord.utils.utcnow().timestamp(), 'revision': 0, 'gene_error': False})
             asked = w.said('fri what did they say?', user=30)
-            asked.reply.return_value = SimpleNamespace(id=asked.id+100, content='they said '+MARKER, edit=AsyncMock())
+            # It quotes a run of four words the edit took out, which is what retires a reply (gene #261 round 2).
+            quoted = 'they said the plan is '+MARKER
+            asked.reply.return_value = SimpleNamespace(id=asked.id+100, content=quoted, edit=AsyncMock())
             await w.agent.handle(asked)
             await edit(w, edited(nearby))
-            assert any(row['text'] == 'they said '+MARKER for row in w.agent.recent[1])
-            assert ('they said '+MARKER in saved(w, '30')) is ('edit-fingerprints' not in w.fri.capabilities)
+            assert any(row['text'] == quoted for row in w.agent.recent[1])
+            assert (quoted in saved(w, '30')) is ('edit-fingerprints' not in w.fri.capabilities)
             assert all(not payload.get('deleted') for path, payload in w.calls if path == SAVED)
         finally:
             await w.fri.close()
