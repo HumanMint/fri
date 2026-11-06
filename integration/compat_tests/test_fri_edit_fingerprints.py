@@ -112,9 +112,9 @@ def test_its_exchange_alone_says_what_it_said_once_it_left_the_view(monkeypatch,
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         try:
-            message = setting(w, QUOTE, UNRELATED, in_view=False, exchange=True)
+            message = setting(w, QUOTE, 'come by friday works for me', UNRELATED, in_view=False, exchange=True)
             await edit(w, edited(message, AFTER))
-            assert replies(w) == [DRAWN, UNRELATED]
+            assert replies(w) == [DRAWN, 'come by friday works for me', UNRELATED]  # What it still says stays.
         finally:
             await w.fri.close()
     asyncio.run(scenario())
