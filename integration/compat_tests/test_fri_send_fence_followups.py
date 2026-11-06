@@ -385,6 +385,26 @@ def test_the_controller_down_at_the_final_fence_is_an_outage_not_a_change(monkey
     asyncio.run(scenario())
 
 
+def test_a_reply_held_for_saved_messages_whose_requester_erased_while_it_went_is_not_recorded(monkeypatch, tmp_path):
+    """S3 keeps the local part before recording: member 20's "forget me" taken in here while the reply goes out, before
+    the controller has it. The reply is out, but it isn't recorded, though Gene isn't asked again first."""
+    async def scenario():
+        fri, agent, asked, calls, answered = asking_after_saved(monkeypatch, tmp_path, 'dm')
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        recorded = recorder(fri)
+
+        async def reply(*args, **kwargs):
+            agent.forget(20, erased=True)
+            return SimpleNamespace(id=asked.id+100, content='okay', edit=AsyncMock())
+        asked.reply = AsyncMock(side_effect=reply)
+        try:
+            await agent.handle(asked)
+            assert 'you said chess' in said(asked) and recorded == []
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_dms_turned_off_while_the_requesters_erasure_is_read_after_a_failed_fence_say_nothing(monkeypatch, tmp_path):
     """S1: member 30 erases through Gene, so the whole turn's check fails; then DMs go off while the owner's own
     erasure is read, to tell which it was. Not even the skipped line goes out."""
