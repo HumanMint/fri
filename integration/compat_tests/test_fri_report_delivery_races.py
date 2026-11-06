@@ -1,13 +1,15 @@
 """Owner reports and learning passes, after #384 (fri #385).
 
 1. "Forget me" while the last report fetch answered: the controller deleted the report, but forgetting moved nothing
-   Fri compared, so the card it fetched went. Privacy controls taken in here count in the delivery mark now.
+   Fri compared, so the card it fetched went. Privacy controls taken in here count in the delivery mark now, the
+   panel's "Forget my chats" too.
 2. An uncached DM channel: a User's send() opens it first, a wait after the last check. It's opened before the last
    fetch now, and the card goes through it.
 3. Details and Summary: a withdrawal while /agent/reports/{id}/view answered showed what was withdrawn. The fetch is
    held to the same mark: read again once if it moved, and not shown if it moves again.
 4. A pass aborts only for a channel's withdrawal that may have touched the channel it read, so an unrelated one costs
-   it nothing (and its scan reservation, which the controller keeps for a pass that fails, isn't spent for it).
+   it nothing (and its scan reservation, which the controller keeps for a pass that fails, isn't spent for it). An
+   exploration whose planner read the member's topics, which can come from any channel, still stops for every one.
 """
 import asyncio
 from types import SimpleNamespace
@@ -237,6 +239,19 @@ def test_withdrawals_name_the_channels_they_took(monkeypatch, tmp_path):
         finally:
             await w.fri.close()
     run(scenario)
+
+
+def test_a_withdrawal_no_longer_remembered_counts(learning, monkeypatch):  # noqa: F811
+    """Past the last NAMED withdrawals, which channels the oldest took is forgotten: a pass from before it stops."""
+    monkeypatch.setattr('fri.fri_channel_withdrawal.NAMED', 2)
+    agent, *_ = batch(learning, monkeypatch)
+    channels = agent.channel_withdrawals
+    since = channels.generation
+    for _ in range(2):
+        channels.taken((), channels=['999'])
+    assert not channels.touches(since, {'1'})
+    channels.taken((), channels=['999'])  # The first is forgotten now.
+    assert channels.touches(since, {'1'}) and not channels.touches(since+1, {'1'})
 
 
 def test_a_pass_over_a_thread_counts_its_channels_withdrawal(learning, monkeypatch):  # noqa: F811

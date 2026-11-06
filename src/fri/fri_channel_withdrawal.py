@@ -317,10 +317,10 @@ class ChannelWithdrawals:
     def touches(self, since, scope):
         """Whether a withdrawal accepted since `since` (see generation) may have taken something from `scope`, the
         channel IDs a learning pass read. One for other channels can't have: the pass goes on (fri #385). One that
-        didn't say which, one past those remembered (NAMED), or a scope not known (None), counts."""
+        didn't say which, one no longer remembered (see NAMED), or a scope not known (None), counts."""
         if not self.moved(since):
             return False
-        if scope is None or self.generation-since >= NAMED:
+        if scope is None:
             return True
         scope = {str(channel) for channel in scope}
         return any(self.accepted.get(generation) is None or self.accepted[generation] & scope
