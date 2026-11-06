@@ -647,7 +647,7 @@ class Agent:
         if edited:  # With the edit's own time, so a fresh edit of an old message is asked about too (fri #358 E1).
             when = message.edited_at.timestamp() if isinstance(message.edited_at, dt.datetime) else None
             self.saved_turns.withdraw([message.id], saved_in, authors={message.id: sender.id} if sender else None,
-                                      edited_at=when)
+                                      edited_at=when, fingerprints=self.fingerprinted(channel, message))
             for window in list(self.passes):  # Every member's edit, for a running learning pass to leave out (fri #325).
                 window.taken([message.id])
         if edited and message.id in self.looked:
@@ -675,6 +675,24 @@ class Agent:
                         row.pop('attachments', None)
                 else:
                     rows.remove(row)
+
+    def fingerprinted(self, channel, message):
+        """What a member's edit took out, as a fingerprint (gene #150, #246; see fri_edit_fingerprint): from what the
+        live view held of the message before (as receive() stores it, so compared alike) to what it says now, and all
+        of what it says now, so the controller can tell from its own saved exchange too. Nothing it can tell from where
+        the view held nothing and the edit says nothing (a partial update): the controller does as before."""
+        from .fri_edit_fingerprint import fingerprint
+        before = next((row['text'] for row in self.recent.get(channel, ()) if row['id'] == str(message.id)
+                       and not row['gene_error'] and not row.get('fri')), None)
+        content = getattr(message, 'content', None)
+        now = clean(content, 4000) if isinstance(content, str) and getattr(message, 'author', None) else None
+        if before is None and now is None:
+            return None
+        printed = fingerprint(before, now[:500] if now is not None and before is not None else now,
+                              self.saved_turns.salt)
+        if now is not None:
+            printed['kept'] = fingerprint(None, now, self.saved_turns.salt)['kept']
+        return {message.id: printed}
 
     def revise(self, mid):
         now = time.time()

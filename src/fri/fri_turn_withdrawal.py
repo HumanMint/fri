@@ -30,6 +30,8 @@ import math
 import re
 import time
 
+from .fri_edit_fingerprint import MOST as MOST_HASHES
+from .fri_edit_fingerprint import salt
 from .fri_errors import ControllerRejected
 from .fri_protocol import compatible
 from .private_files import private_json
@@ -39,6 +41,9 @@ SAVED_CAPABILITY = 'saved-turn-withdrawal'
 # The controller also drops notes learned from it and retires replies that carried it (gene #141), keeps the messages
 # a turn carried (drew_on), and names where notes and exchanges elsewhere came from when asked.
 SOURCES = 'withdrawal-sources'
+# And with an edit, what it took out, hashed (see fri_edit_fingerprint): replies that carried it and hold that retire too
+# (gene #150, #246).
+FINGERPRINTS = 'edit-fingerprints'
 KEPT_SECONDS = 7*86400  # As long as the controller keeps a saved exchange.
 NOTED_SECONDS = 90*86400  # As long as it keeps a note, which a controller offering SOURCES drops with its message.
 MOST = 20000  # Bounds memory only: the controller keeps six exchanges per member and conversation.
@@ -86,6 +91,9 @@ class SavedTurns:
         self.timer = None
         self.generation = 0  # Each queued entry's own number: a reply to an older one never settles a newer one.
         self.erasures = {}  # Member (str) -> how many times they said "forget me" (see forget, kept).
+        # What every edit's fingerprint is salted with, while this process runs, so two of a message's merge (see
+        # fingerprinted). Never written down, as fingerprints aren't (see lasting).
+        self.salt = salt()
         self.reread_at = 0.0  # time.monotonic() as the contract was last read again (see reread).
         self.closed_until = 0.0  # time.time() until which every saved context is held back (see fail_closed).
         self.closed_for = set()  # Why (UNREADABLE_CAUSE, CAPACITY_CAUSE), as far as it's known (see mark_closed).
@@ -352,8 +360,9 @@ class SavedTurns:
         Fri may not know whose it is, and a restart forgets any "forget me" before it, so it's never sent again from
         there (fri #224 round 3) and names no member; it holds the message back until nothing it names can be kept (see
         prune). A hold stays one. Either keeps when it was queued (see entry), which names no one."""
-        if 'scope' in entry:
-            return {key: value for key, value in entry.items() if key not in ('gen', 'erasure', 'restored')}
+        if 'scope' in entry:  # An edit's fingerprint never: what it took out, even hashed, stays in memory only.
+            return {key: value for key, value in entry.items()
+                    if key not in ('gen', 'erasure', 'restored', 'fingerprint')}
         return {'hold': True, 'queued_at': entry['queued_at']}
 
     def persist(self):
@@ -424,7 +433,18 @@ class SavedTurns:
         self.withdraw(i for i in ids if i not in deleted and (agent.withdrawn.get(str(i), 0) >= wall or
                                                               agent.revised.get(i, 0) >= wall))
 
-    def withdraw(self, ids, server=None, deleted=False, authors=None, edited_at=None):
+    def fingerprinted(self, known, fingerprint):
+        """An edit's fingerprint (see fri_edit_fingerprint), with the one already queued for its message: what each
+        edit took out, and what it says after the last. One salted otherwise (none is, in one process) replaces it."""
+        before = known.get('fingerprint')
+        if not fingerprint:
+            return before
+        if not before or before.get('salt') != fingerprint.get('salt'):
+            return fingerprint
+        return {'salt': fingerprint['salt'], 'kept': fingerprint['kept'],
+                'removed': sorted(set(before['removed']) | set(fingerprint['removed']))[:MOST_HASHES]}
+
+    def withdraw(self, ids, server=None, deleted=False, authors=None, edited_at=None, fingerprints=None):
         """Messages taken back: each exchange Fri saved with one goes, asked for once. server: the one Fri saves
         exchanges said where they were taken back under (see Agent.saved_in); any other one is then asked about by
         ID, ten at a time, from a controller offering it: a deletion whatever its message's age, since what drew on it
@@ -446,28 +466,34 @@ class SavedTurns:
         for i in ids:
             known = self.pending.get(str(i), {})
             entry = self.saved.pop(i, None)
+            # An edit's fingerprint (message ID -> what it took out), with the one queued for it: a deletion needs none,
+            # and a new one is queued afresh where it adds something (gene #150, #246).
+            printed = self.fingerprinted(known, None if deleted else (fingerprints or {}).get(i))
+            gone = deleted or known.get('deleted') is True
+            extra = {'fingerprint': printed} if printed and not gone else {}
+            adds = bool(extra) and printed != known.get('fingerprint')
             if entry is not None:
                 if self.offered():
                     self.pending[str(i)] = self.entry(scope=entry[1], revision=entry[2], restored=known.get('restored'),
-                                                      deleted=deleted or known.get('deleted') is True,
-                                                      since=known.get('queued_at'))
+                                                      deleted=gone, since=known.get('queued_at'), **extra)
                     queued = True
             elif server is not None and (deleted or just_edited or sent_at(i) > now-horizon):
                 if self.offered() and self.capable(SAVED_CAPABILITY):
                     if known.get('hold'):  # Held from disk: it stays held, and on disk, whatever comes by ID.
                         pass
                     elif 'scope' in known:  # Fri knows where it was saved: that one stands, deleted or not.
-                        if deleted and not known.get('deleted'):
+                        if (deleted and not known.get('deleted')) or adds:
                             self.pending[str(i)] = self.entry(**{key: known[key] for key in ('scope', 'revision')},
-                                                              deleted=True, restored=known.get('restored'),
-                                                              since=known.get('queued_at'))
+                                                              deleted=gone, restored=known.get('restored'),
+                                                              since=known.get('queued_at'), **extra)
                             queued = True
-                    elif not known or (deleted and not known.get('deleted')) or (i in authors and 'user_id' not in known):
+                    elif (not known or (deleted and not known.get('deleted')) or (i in authors and 'user_id' not in known)
+                          or adds):
                         author = authors.get(i, known.get('user_id'))
-                        self.pending[str(i)] = self.entry(server=str(server), deleted=deleted or known.get('deleted')
-                                                          is True, restored=known.get('restored'),
+                        self.pending[str(i)] = self.entry(server=str(server), deleted=gone,
+                                                          restored=known.get('restored'),
                                                           since=known.get('queued_at'),
-                                                          **({'user_id': author} if author else {}))
+                                                          **({'user_id': author} if author else {}), **extra)
                         queued = True
             else:
                 continue  # Nothing Fri saves could hold it.
@@ -834,9 +860,18 @@ class SavedTurns:
         """The request for these, in the shape the controller takes as it last said (see extra)."""
         (first, entry), ids = batch[0], [i for i, _ in batch]
         if 'scope' in entry:
-            return '/chat/turn/withdraw', {**entry['scope'], 'message_id': str(first), **self.extra(entry)}
+            return '/chat/turn/withdraw', {**entry['scope'], 'message_id': str(first), **self.extra(entry),
+                                           **self.printed(entry)}
+        printed = {i: self.printed(each)['fingerprint'] for i, each in batch if self.printed(each)}
         return '/chat/turn/withdraw/saved', {'guild_id': entry['server'], 'message_ids': ids,
-                                             **self.extra({'deleted': entry.get('deleted')})}
+                                             **self.extra({'deleted': entry.get('deleted')}),
+                                             **({'fingerprints': printed} if printed else {})}
+
+    def printed(self, entry):
+        """An edit's fingerprint, for a controller offering FINGERPRINTS: an older one would refuse the field."""
+        if entry.get('deleted') or not entry.get('fingerprint') or not self.capable(FINGERPRINTS):
+            return {}
+        return {'fingerprint': entry['fingerprint']}
 
     async def post(self, batch):
         """Sent as the controller takes it. A refusal may come from a controller rolled back alone, which doesn't know a
