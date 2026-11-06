@@ -56,14 +56,22 @@ def forgotten(store, report, agent):
 
 # 1. Forget me.
 
-def test_forget_me_as_the_last_report_fetch_answers_sends_nothing(learning):  # noqa: F811
+def cleared(store, report, agent):
+    """Member 11 removes a note through Fri, no erasure: the controller deletes pending reports with it as well."""
+    agent.forget(11)
+    store.clear_chats('11')  # As a note's removal does (cleared), which deletes every pending report too.
+
+
+@pytest.mark.parametrize('control', [forgotten, cleared], ids=['forget me', 'a note removed'])
+def test_a_privacy_control_as_the_last_report_fetch_answers_sends_nothing(learning, control):  # noqa: F811
     """The issue's first repro: the controller deleted the report with the erasure, but the card fetched just before
-    it went, as forgetting moved nothing Fri compared."""
+    it went, as forgetting moved nothing Fri compared. A control that erases nothing deletes it too."""
     async def scenario():
         owner = dm_owner()
-        agent, scheduler, report, store = delivering(learning, owner, final=forgotten)
+        agent, scheduler, report, store = delivering(learning, owner, final=control)
         await agent.send_reports()
         owner.send.assert_not_awaited()
+        assert not scheduler.reports()  # Gone at the controller, not left for later.
     asyncio.run(scenario())
 
 
