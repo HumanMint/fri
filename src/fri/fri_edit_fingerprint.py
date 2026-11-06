@@ -7,16 +7,16 @@ typo fix, so one is retired only where it holds enough of what the edit took out
 message as it stood and as it stands; Gene reads a saved reply the same way, and its own saved copy of the message too.
 This module is the same in both repositories: Fri's integration tests check it word for word.
 
-What's compared is each element of a text:
-- every run of three words, not all COMMON, weighing 2, so a quote of it is enough alone;
-- every pair of words, neither COMMON, weighing 1;
-- every rare word: one with four digits or more, weighing 2 (a number, a code), or eight letters or more and not
-  COMMON, weighing 1.
+What's compared is each element of a text: every run of three words, not all COMMON; every pair of words, neither
+COMMON; and every rare word (see rare). A text holds what an edit took out once what it shares of that weighs ENOUGH:
+- a shared run weighs 2 where it has a rare word (a quote), 1 otherwise;
+- a shared pair no shared run covers weighs its rare words, at least 1;
+- a rare word no shared run or pair covers weighs its own (see rare).
 
-A text holds what an edit took out once the elements of it that the edit took out weigh ENOUGH: a quoted run, a
-number, or a close paraphrase keeping two names or rare words, or a name and a pair. An element is hashed with a salt
-(HMAC-SHA256, the first 16 hex digits), so the fingerprint can't be read back as words or matched against another's; it's
-never written down, by Fri or Gene."""
+So a quoted run with a name or a number in it is enough alone, and so is a number, or a paraphrase keeping two names or
+rare words; one name alone, or a common phrase, isn't. An element is hashed with a salt (HMAC-SHA256, the first 16 hex
+digits), so the fingerprint can't be read back as words or matched against another's; it's never written down, by Fri
+or Gene."""
 import hashlib
 import hmac
 import re
@@ -36,33 +36,50 @@ same say said she should so some such than that thats the their theirs them then
 through to too under until up us very was we well were what when where which while who whom why will with would yeah
 yes you your youre yours yourself yourselves ok okay oh hey hi lmao haha gonna wanna gotta tho though bro dude guys
 something anything everything nothing someone anyone everyone nobody tomorrow yesterday tonight today because actually
-probably definitely basically literally whatever honestly seriously""".split())
+probably definitely basically literally whatever honestly seriously please tell told thanks thank pretty little better
+people around already another almost always anyway enough sorry sure good great nice cool want need going make time
+still also last next first never maybe every thats theres whats""".split())
 ENOUGH = 2
 MOST = 3000  # Of each list sent: a 4000-character message has fewer elements than this.
 
 
 def words(text):
     """The text's words: compatibility forms folded, case folded, a possessive's "'s" dropped and apostrophes inside a
-    word too ("don't" is "dont"), then runs of letters and digits."""
+    word too ("don't" is "dont"), then runs of letters and digits, digits next to each other joined ("555 0199" is
+    "5550199", as a number written either way)."""
     text = unicodedata.normalize('NFKC', text or '').casefold()
-    return WORD.findall(APOSTROPHE.sub('', POSSESSIVE.sub('', text)))
+    said = []
+    for word in WORD.findall(APOSTROPHE.sub('', POSSESSIVE.sub('', text))):
+        if said and word.isdigit() and said[-1].isdigit():
+            said[-1] += word
+        else:
+            said.append(word)
+    return said
+
+
+def rare(word):
+    """How much a word alone says: 2 for one with four digits or more (a number, a code), 1 for one of six characters or
+    more not COMMON (a name, a place), 0 otherwise."""
+    if sum(character.isdigit() for character in word) >= 4:
+        return 2
+    return 1 if len(word) >= 6 and word not in COMMON else 0
+
+
+def runs(said):
+    """The text's runs of three words, by where each starts, not all COMMON."""
+    return {i: '3 '+' '.join(said[i:i+3]) for i in range(len(said)-2) if any(w not in COMMON for w in said[i:i+3])}
+
+
+def pairs(said):
+    """Its pairs of words, by where each starts, neither COMMON."""
+    return {i: '2 '+said[i]+' '+said[i+1] for i in range(len(said)-1)
+            if said[i] not in COMMON and said[i+1] not in COMMON}
 
 
 def elements(text):
-    """Each element of the text (see above), with its weight."""
-    found, said = {}, words(text)
-    for i in range(len(said)-2):
-        if any(word not in COMMON for word in said[i:i+3]):
-            found['3 '+' '.join(said[i:i+3])] = 2
-    for i in range(len(said)-1):
-        if said[i] not in COMMON and said[i+1] not in COMMON:
-            found['2 '+said[i]+' '+said[i+1]] = 1
-    for word in said:
-        if sum(character.isdigit() for character in word) >= 4:
-            found['1 '+word] = 2
-        elif len(word) >= 8 and word.isalpha() and word not in COMMON:
-            found['1 '+word] = 1
-    return found
+    """Each element of the text (see above): its runs, pairs and rare words."""
+    said = words(text)
+    return {*runs(said).values(), *pairs(said).values(), *('1 '+word for word in said if rare(word))}
 
 
 def hashed(element, salt):
@@ -93,6 +110,24 @@ def removed(fingerprint, befores=()):
 
 
 def holds(text, key, taken):
-    """Whether the text holds enough of what an edit took out (`taken`, hashed with `key`): its elements among them
-    weigh ENOUGH."""
-    return sum(weight for element, weight in elements(text).items() if hashed(element, key) in taken) >= ENOUGH
+    """Whether the text holds enough of what an edit took out (`taken`, hashed with `key`): what it shares of that
+    weighs ENOUGH (see above), each element counted once."""
+    said, counted, covered, weight = words(text), set(), set(), 0
+
+    def shared(element):
+        if element in counted or hashed(element, key) not in taken:
+            return False
+        counted.add(element)
+        return True
+    for i, run in runs(said).items():
+        if shared(run):
+            weight += 2 if any(rare(word) for word in said[i:i+3]) else 1
+            covered |= {i, i+1, i+2}
+    for i, pair in pairs(said).items():
+        if not {i, i+1} <= covered and shared(pair):
+            weight += max(1, rare(said[i])+rare(said[i+1]))
+            covered |= {i, i+1}
+    for i, word in enumerate(said):
+        if i not in covered and rare(word) and shared('1 '+word):
+            weight += rare(word)
+    return weight >= ENOUGH
