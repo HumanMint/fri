@@ -9,6 +9,7 @@ too. A reply that carried the message and holds enough of it keeps a breadcrumb;
 say what the message said before, nothing more goes than on main, and a deletion is as before. A controller that
 doesn't offer it gets no fingerprint, and none is ever written down.
 """
+import asyncio
 import inspect
 import json
 import time
@@ -18,6 +19,7 @@ import pytest
 from compat_tests.test_fri_endings import source
 from compat_tests.test_fri_saved_withdrawal import delete, edit, edited
 from compat_tests.test_fri_saved_withdrawal import world as saved_world
+from fri.fri_edit_fingerprint import fingerprint
 
 CAPABILITY = 'edit-fingerprints'
 BEFORE = 'my new address is 4217 juniper crescent, come by friday'
@@ -184,6 +186,64 @@ def test_what_it_sends_holds_no_words_and_nothing_of_it_is_written_down(monkeypa
             path, payload = turns.request([(str(message.id), entry)])
             assert payload['fingerprint'] == entry['fingerprint']
             assert not any(word.strip(',') in json.dumps(payload['fingerprint']) for word in BEFORE.split())
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def queued(w):
+    """Edits are queued, as when the controller can't be reached, until sent() (see test_a_second_edit_...)."""
+    turns = w.agent.saved_turns
+    turns.kick = lambda: None
+
+    async def sent():
+        del turns.kick
+        turns.kick()
+        await asyncio.gather(*turns.tasks)
+    return turns, sent
+
+
+@pytest.mark.parametrize('how', ['a long edit', 'two edits back to it, queued'])
+def test_what_the_message_says_now_is_never_sent_as_taken_out(monkeypatch, tmp_path, how):
+    """Sol round 1, B2 and B3: an edit that put 90 words before the message was compared at 500 characters, so all of it
+    went as taken out; and edits queued back to the original kept the first's. Either retired a reply quoting what the
+    message says now. What Fri sends as taken out never holds any of it, and the reply stays."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            message = setting(w, QUOTE, UNRELATED)
+            turns, sent = queued(w)
+            if how == 'a long edit':
+                await edit(w, edited(message, 'hello '*90 + BEFORE))
+            else:
+                await edit(w, edited(message, 'never mind'))
+                await edit(w, edited(message, BEFORE))
+            [entry] = turns.pending.values()
+            printed = entry['fingerprint']
+            assert not set(printed['removed']) & set(printed['kept'])
+            assert not set(printed['removed']) & set(fingerprint(None, BEFORE, printed['salt'])['kept'])
+            await sent()
+            assert replies(w) == [QUOTE, UNRELATED]
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_edit_naming_a_year_retires_no_reply_about_another(monkeypatch, tmp_path):
+    """Sol round 1, B1: a year alone isn't enough; with a rare word beside it, a reply still goes."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            message = w.said('my diagnosis was in 2024', user=20)
+            w.agent.recent[1].append({'id': str(message.id), 'user_id': '20', 'name': 'friend',
+                                      'text': 'my diagnosis was in 2024', 'at': time.time(), 'revision': 0,
+                                      'gene_error': False})
+            for age, text in enumerate(['the olympics were held in 2024', 'your diagnosis was in 2024? thats a lot']):
+                w.store.save_chat('123', 'public:1', '30', 0, f'question {age}', text, 'm', 'high', verbatim=True,
+                                  source=source(age=30-age, user='30', channel='1'),
+                                  provenance=[{'user_id': '20', 'revision': 0}], drew_on=[str(message.id)])
+            await edit(w, edited(message, 'never mind'))
+            assert replies(w) == ['the olympics were held in 2024', DRAWN]
         finally:
             await w.fri.close()
     asyncio.run(scenario())
