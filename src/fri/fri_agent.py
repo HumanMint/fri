@@ -2383,7 +2383,8 @@ class Agent:
         # here since the turn began, then Gene's check of the whole turn (a summary's generation included: fri #375's
         # round 1, S1), then those erasures again, here, after the last awaited read. Then what was taken back here
         # while Gene answered: from there to the send, nothing is awaited (round 1, B1). What was delivered is held to
-        # all of it again before it's recorded. A public reply awaits nothing past talk's fence.
+        # the local part again before it's recorded, and the save's own validation to the rest (see below). A public
+        # reply awaits nothing past talk's fence.
         #
         # A DM drawing on saved messages, even only its requester's, or a ping in a chat channel drawing on a summary
         # or on saved messages, is held to it too (fri #379 items 2 and 3): Gene withdrawing one of those (deleted, or
@@ -2399,14 +2400,6 @@ class Agent:
         fenced = turn_fence(self, result.turn, message.author.id, counts)  # Kept apart: saving clears result.turn.
         held = (dm and (drew - {author} or saved)) or (invitation and saved)
         whole = fenced if held else None
-        # Before what was delivered is recorded, a DM drawing on someone else's words is held to the whole fence again
-        # (fri #324). One held only for its saved messages or its requester's summary, or a ping's, is held to its
-        # local part: the save's own validation is Gene's check of those, so asking Gene first would only repeat it
-        # (fri #379's round 1, S3).
-        again = dm and bool(drew - {author})
-
-        async def recheck():
-            return await whole() if again else fenced.unmoved()
         if whole:
             still = await whole()
             if dms_off():  # Turned off while Gene answered: nothing goes out, quietly.
@@ -2442,8 +2435,9 @@ class Agent:
 
         async def delivered():  # A preview is answered once posted, even if binding it fails next.
             self.answered(events)
-            # Deleted, or someone it drew on erased, while it posted: the card stays, but isn't saved.
-            if not taken_back() and (whole is None or (await recheck() and not taken_back())):
+            # Deleted, or someone it drew on erased, while it posted: the card stays, but isn't saved (see the save
+            # below for why Gene isn't asked again first).
+            if not taken_back() and (whole is None or fenced.unmoved()):
                 await self.fri.record_turn(result)
 
         if result.post_preview:
@@ -2498,7 +2492,10 @@ class Agent:
             self.answered(events, told=COOLDOWN if result.status == 'cooldown' else None)  # Its one notice.
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
             # Deleted, or someone it drew on erased, while it was sent: the reply stays, but isn't saved or echoed.
-            saved = (None if taken_back() or (whole and not (await recheck() and not taken_back()))
+            # Held to the fence's local part, what was taken back and erased here: the save's own validation is
+            # Gene's check of the rest, which refuses what that would, so Gene isn't asked again first (fri #379's
+            # round 1, S3).
+            saved = (None if taken_back() or (whole and not fenced.unmoved())
                      else await self.fri.record_turn(result, sent, still=standing))
             # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory,
             # or a save that failed, whose reply may carry exactly what the controller would have refused.

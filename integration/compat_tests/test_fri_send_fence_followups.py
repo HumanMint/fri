@@ -358,6 +358,33 @@ def test_a_reply_held_for_saved_messages_costs_one_turn_check_more(monkeypatch, 
     asyncio.run(scenario())
 
 
+def test_a_dm_drawing_on_someone_else_asks_gene_nothing_between_its_send_and_its_save(monkeypatch, tmp_path):
+    """S3 for #375's DMs drawing on another member's words too: after the reply goes out, it's held to what was taken
+    back and erased here, and the save's own validation is Gene's check. No turn check comes between."""
+    async def scenario():
+        fri, agent, store, dm = owner_dm(monkeypatch, tmp_path, ChatResult(
+            status='completed', reply='member thirty says '+MARKER), 'nothing')
+        real, seen = fri.api, []
+
+        async def api(method, path, payload=None):
+            seen.append(path)
+            return await real(method, path, payload)
+        fri.api = api
+        sending = dm.reply.side_effect
+
+        async def reply(*args, **kwargs):
+            seen.append('sent')
+            return await sending(*args, **kwargs)
+        dm.reply.side_effect = reply
+        try:
+            await agent.handle(dm)
+            after = seen[seen.index('sent'):]
+            assert [path for path in after if path in ('/chat/turn/check', '/chat/turn', 'sent')] == ['sent', '/chat/turn']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
 def test_a_dm_on_the_requesters_own_summary_costs_one_turn_check_more_too(monkeypatch, tmp_path):
     """S3 for #375's own-summary DM: held to the final fence, and not asked again before the save, whose validation
     holds it to the summary's generation as Gene's check would."""

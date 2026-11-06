@@ -53,8 +53,10 @@ def recorder(fri):
 @pytest.mark.parametrize('kind', ['reply', 'card', 'settings preview'])
 def test_a_saved_exchange_taken_back_while_the_fence_waits_is_held_back(monkeypatch, tmp_path, kind, when):
     """B1's repro: the owner's DM draws on a saved exchange holding member 30's words. Its message is deleted while
-    Gene checks the whole turn, and its withdrawal times out, so Gene still holds it. Before the send, nothing of the
-    reply goes out; after it, it isn't recorded."""
+    Gene checks the whole turn, or, past it, while the reply goes out, and its withdrawal times out, so Gene still
+    holds it. Before the send, nothing of the reply goes out; during it, it isn't recorded. (The delete used to come
+    during a second check before the save, which fri #379's round 1 dropped: nothing's awaited there now but the send
+    before it.)"""
     async def scenario():
         earlier = source(age=60, user='10', channel='555')
         fri, agent, store, dm = owner_dm(monkeypatch, tmp_path, results(kind), 'nothing', source=earlier)
@@ -66,12 +68,23 @@ def test_a_saved_exchange_taken_back_while_the_fence_waits_is_held_back(monkeypa
             return await lookup(*args, **kwargs)
         agent.member = AsyncMock(side_effect=member)
 
+        async def deleting():
+            done.append(True)
+            await fri.on_raw_message_delete(SimpleNamespace(channel_id=555, guild_id=None,
+                                                            message_id=int(earlier['id'])))
+        if when == 'before the save':  # While the reply, or the card, goes out.
+            sending = dm.reply.side_effect
+
+            async def reply(*args, **kwargs):
+                if not done:
+                    await deleting()
+                return await sending(*args, **kwargs)
+            dm.reply.side_effect = reply
+
         async def api(method, path, payload=None):
             if (path == '/chat/turn/check' and not done and looked.count({'fresh': True}) >= 3 and
-                    (when == 'before the send') is (not dm.reply.await_count)):
-                done.append(path)
-                await fri.on_raw_message_delete(SimpleNamespace(channel_id=555, guild_id=None,
-                                                                message_id=int(earlier['id'])))
+                    when == 'before the send' and not dm.reply.await_count):
+                await deleting()
             if path.startswith('/chat/turn/withdraw'):
                 raise TimeoutError()  # Gene doesn't take the withdrawal yet: it still holds the exchange.
             return await real(method, path, payload)
