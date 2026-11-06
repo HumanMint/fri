@@ -93,7 +93,9 @@ def test_the_repro_an_edit_retires_a_reply_quoting_what_it_took_out(monkeypatch,
     asyncio.run(scenario())
 
 
-def test_a_close_paraphrase_goes_too(monkeypatch, tmp_path):
+def test_a_paraphrase_stays(monkeypatch, tmp_path):
+    """Precision first (Sol round 2 of gene #261): only a quoted run of four words, or a distinctive number, retires a
+    reply. A paraphrase quotes neither, so it stays, as on main."""
     import asyncio
 
     async def scenario():
@@ -101,7 +103,29 @@ def test_a_close_paraphrase_goes_too(monkeypatch, tmp_path):
         try:
             message = setting(w, PARAPHRASE, UNRELATED)
             await edit(w, edited(message, AFTER))
-            assert replies(w) == [DRAWN, UNRELATED]
+            assert replies(w) == [PARAPHRASE, UNRELATED]
+        finally:
+            await w.fri.close()
+    asyncio.run(scenario())
+
+
+def test_the_fingerprint_says_whether_its_kept_list_is_whole(monkeypatch, tmp_path):
+    """Sol round 2 of gene #261, R2-B3: the controller reads its own copy of the message only where the kept list is
+    all of what it says now. Fri says so with every edit's fingerprint, and a merge says it as the last edit does."""
+    async def scenario():
+        w = await world(monkeypatch, tmp_path)
+        try:
+            message = setting(w, QUOTE, UNRELATED, exchange=True)
+            turns, sent = queued(w)
+            await edit(w, edited(message, 'never mind'))
+            [entry] = turns.pending.values()
+            assert entry['fingerprint']['complete'] is True
+            monkeypatch.setattr('fri.fri_edit_fingerprint.MOST', 0)  # The next edit's list cut short.
+            await edit(w, edited(message, AFTER))
+            [entry] = turns.pending.values()
+            assert entry['fingerprint']['complete'] is False
+            path, payload = turns.request([(str(message.id), entry)])
+            assert payload['fingerprint']['complete'] is False
         finally:
             await w.fri.close()
     asyncio.run(scenario())
@@ -256,7 +280,7 @@ def test_a_second_edit_before_the_first_is_taken_adds_what_it_took_out(monkeypat
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         try:
-            message = setting(w, QUOTE, 'see you at 7719 birchwood lane then', UNRELATED)
+            message = setting(w, QUOTE, 'so your place is 7719 birchwood lane then', UNRELATED)
             turns = w.agent.saved_turns
             turns.kick = lambda: None
             # The second takes out nothing the first reply quotes: only what the first took out retires it.
