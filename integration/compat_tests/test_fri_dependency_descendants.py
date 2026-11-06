@@ -515,3 +515,28 @@ def test_a_saved_reply_with_summaries_not_as_the_controller_writes_them(monkeypa
     turns.withhold(context, member='20')
     assert context['turns'] == []
     asyncio.run(fri.close())
+
+
+@pytest.mark.parametrize('case', ['a reply that drew on it', 'one naming no message'])
+def test_what_goes_with_a_saved_reply_whose_summaries_cant_be_read(monkeypatch, tmp_path, case):
+    """S4's edges, with nothing taken back: a reply this Fri saved that drew on the unreadable one goes with it, as one
+    that drew on a quoting reply does; and an unreadable one goes though its exchange names no message (one saved
+    before the controller kept sources), so nothing else would have taken it out."""
+    fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+    fri.capabilities = frozenset(asyncio.run(fri.api('GET', '/fri/contract'))['capabilities'])
+    turns = agent.saved_turns
+    turns.kick = lambda: None
+    first, later = int(source(age=300, channel='1')['id']), int(source(age=200, channel='1')['id'])
+    if case == 'a reply that drew on it':
+        turns.kept({'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20',
+                    'revision': 0, 'source': {'kind': 'discord_message', 'id': str(later)}, 'drew_on': [str(first)]},
+                   {}, (time.time(), time.monotonic()))
+        context = quoting_context(None, {**saved(first), 'summaries': True}, saved(later, reply='again '+MARKER))
+    else:
+        context = quoting_context(None, {**saved(first), 'summaries': True, 'source': None},
+                                  {**saved(later, reply='fine'), 'summaries': []})
+    turns.withhold(context, member='20')
+    assert MARKER not in str(context['turns'])
+    if case == 'one naming no message':
+        assert [turn['reply'] for turn in context['turns']] == ['fine']
+    asyncio.run(fri.close())
