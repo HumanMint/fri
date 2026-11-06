@@ -11,15 +11,15 @@ from gene.api import create_app
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_exploration import archive, by_id, offered, row
-from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import dm_owner, learning  # noqa: F401 (the fixture)
 from fri.fri_agent import Agent
 
 
-def explore(learning, monkeypatch, erase_at):  # noqa: F811
+def explore(learning, monkeypatch, erase_at, taking=None):  # noqa: F811
     """Two exploration passes over member 11, as test_fri_exploration's: the first reads their history broadly and notes
     a topic, the second asks the planner with it (on a controller that says what its context was read at) or reads
     broadly again. erase_at: (pass, 'roster' or 'target'), when member 11's "forget me" lands here, with Gene not told
-    yet. Returns each pass's model requests, as (kind, data)."""
+    yet, or taking(agent) runs instead. Returns each pass's model requests, as (kind, data)."""
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
     capabilities = offered(client)
@@ -30,7 +30,7 @@ def explore(learning, monkeypatch, erase_at):  # noqa: F811
 
     def erase(where):
         if (len(passes), where) == erase_at:
-            agents[0].forget(11, erased=True)
+            (taking or (lambda agent: agent.forget(11, erased=True)))(agents[0])
 
     async def api(method, path, payload=None):
         response = client.request(method, path, json=payload, headers=headers('fri'))
@@ -63,7 +63,7 @@ def explore(learning, monkeypatch, erase_at):  # noqa: F811
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), capabilities=capabilities,
+                              get_user=lambda _: dm_owner(), capabilities=capabilities,
                               http=SimpleNamespace(request=by_id(http, [old, later])),
                               chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri)

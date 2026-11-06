@@ -15,6 +15,7 @@ from gene.store import Store
 
 from compat_tests.test_api import actor, headers
 from compat_tests.test_fri_chat import response_event
+from compat_tests.test_fri_learning import dm_owner
 from fri.fri_agent import ERASED, Agent, BehaviorPreview
 from fri.fri_agent_model import SUMMARY, analyze
 from fri.fri_chat import Chat
@@ -400,7 +401,7 @@ def test_history_search_cannot_quote_a_different_channel_publicly():
 
 def test_failed_report_delivery_keeps_outbox_pending():
     async def scenario():
-        owner = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError('DM unavailable')))
+        owner = dm_owner(AsyncMock(side_effect=RuntimeError('DM unavailable')))
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456,
             api=AsyncMock(return_value=[{'id': 'a'*32, 'body': 'Learning pass'}]), get_user=lambda _: owner)
         with pytest.raises(RuntimeError):

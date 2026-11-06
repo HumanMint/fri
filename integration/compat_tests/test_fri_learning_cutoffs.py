@@ -14,7 +14,7 @@ from gene.api import create_app
 from gene.fri_memory_store import edit, entries
 
 from compat_tests.test_api import headers
-from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import dm_owner, learning  # noqa: F401 (the fixture)
 from compat_tests.test_fri_panel_and_learning_fences import batch
 from fri.fri_agent import Agent
 
@@ -134,7 +134,7 @@ def explored(learning, monkeypatch, moved):  # noqa: F811
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), capabilities=capabilities,
+                              get_user=lambda _: dm_owner(), capabilities=capabilities,
                               http=SimpleNamespace(request=by_id(http, [old, later])),
                               chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri)

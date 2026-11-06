@@ -10,6 +10,7 @@ from gene.fri_agent_store import AgentStore, snowflake_floor
 from gene.store import Store
 
 from compat_tests.test_api import headers
+from compat_tests.test_fri_learning import dm_owner
 from compat_tests.test_fri_learning import learning as learning
 from fri import feedback as commands
 from fri.fri import Fri
@@ -84,7 +85,7 @@ def test_real_learning_harness_explores_old_messages_and_deduplicates_cross_quer
     old = row(clock[0]-120*86400)
     new = row(clock[0]-160*86400, text='minecraft redstone was fun')
     store.personal_control('13', 'disable')
-    owner = SimpleNamespace(send=AsyncMock())
+    owner = dm_owner()
     channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()),
         permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True))
     plans = iter([{'member_id': '11', 'term': 'minecraft', 'reason': 'follow their Minecraft discussions'},

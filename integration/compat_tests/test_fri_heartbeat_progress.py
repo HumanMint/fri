@@ -14,7 +14,7 @@ from gene.api import create_app
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import response_event
 from compat_tests.test_fri_heartbeat import heartbeat as heartbeat  # noqa: F401
-from compat_tests.test_fri_learning import HistoryChannel, needs_learning_withdrawals
+from compat_tests.test_fri_learning import HistoryChannel, dm_owner, needs_learning_withdrawals
 from compat_tests.test_fri_learning import learning as learning  # noqa: F401
 from compat_tests.test_fri_memes import attachment, build
 from fri.fri_agent import Agent
@@ -162,7 +162,7 @@ def test_a_long_learning_batch_keeps_the_tick_moving_message_by_message(learning
         return SimpleNamespace(roles=[SimpleNamespace(id=90)])
 
     fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, capabilities=frozenset(),
-                          get_channel=lambda _: channel, get_user=lambda _: SimpleNamespace(send=AsyncMock()))
+                          get_channel=lambda _: channel, get_user=lambda _: dm_owner())
     agent = Agent(fri)
     agent.member = member
     agent.profile = AsyncMock(side_effect=lambda channel, user: scheduler.context(str(channel), str(user)))

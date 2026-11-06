@@ -432,6 +432,8 @@ class HomeView(ScopedView):
     async def forget_chats(self, interaction, button):
         await defer_panel(interaction)
         await self.cog.api('POST', '/chat/clear', actor(interaction))
+        if getattr(self.cog, 'agent', None):  # It deleted any pending learning report too (fri #385).
+            self.cog.agent.privacy_control_taken()
         await reply(self.cog, interaction, 'Recent chat context cleared. Personal notes stay in My memory; '
                     'say “fri forget me” to clear those too and stop remembering. Discord posts and backups are separate.')
 

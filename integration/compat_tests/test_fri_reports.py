@@ -13,6 +13,7 @@ from gene.store import Store
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_exploration import archive, assigned, finish, note, row
+from compat_tests.test_fri_learning import dm_owner
 from compat_tests.test_fri_learning import learning as learning
 from compat_tests.test_fri_runtime import configured
 from fri import feedback as commands
@@ -93,7 +94,8 @@ def event(report):
     # Autospec checks real discord.py method parameters, not just mock call counts.
     interaction = create_autospec(discord.Interaction, instance=True)
     fri = SimpleNamespace(owner_id=10, guild_id=123, user=SimpleNamespace(id=99),
-        api=AsyncMock(return_value=report), agent=SimpleNamespace(member=AsyncMock(return_value=object())))
+        api=AsyncMock(return_value=report), agent=SimpleNamespace(member=AsyncMock(return_value=object()),
+                                                                taken_back_mark=lambda: 0))
     interaction.client, interaction.guild_id = fri, None
     interaction.type = discord.InteractionType.component
     interaction.user = SimpleNamespace(id=10)
@@ -213,7 +215,7 @@ def test_sends_compact_dm_then_acknowledges_with_no_attachment_or_model_call(lea
     client = TestClient(create_app(settings))
 
     async def scenario():
-        owner = SimpleNamespace(send=AsyncMock())
+        owner = dm_owner()
 
         async def api(method, path, payload=None):
             if path.endswith('/delivered'):

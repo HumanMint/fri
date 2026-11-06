@@ -16,7 +16,7 @@ from gene.fri_agent_store import AgentStore
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_edit_reanswer import model
-from compat_tests.test_fri_learning import HistoryChannel, learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import HistoryChannel, dm_owner, learning  # noqa: F401 (the fixture)
 from compat_tests.test_fri_mentions import environment
 from fri import fri as runtime
 from fri.fri_agent import Agent
@@ -295,7 +295,7 @@ def batch(learning, monkeypatch, older=False):  # noqa: F811 (the fixture's valu
 
     fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, capabilities=frozenset(
                               () if older else offered),
-                          get_channel=lambda _: channel, get_user=lambda _: SimpleNamespace(send=AsyncMock()))
+                          get_channel=lambda _: channel, get_user=lambda _: dm_owner())
     agent = Agent(fri)
     agent.state = scheduler.state()
     agent.member = AsyncMock(return_value=SimpleNamespace(roles=[SimpleNamespace(id=90)]))
@@ -447,7 +447,7 @@ def test_an_exploration_passs_summary_request_carries_no_record_whose_author_era
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), capabilities=capabilities,
+                              get_user=lambda _: dm_owner(), capabilities=capabilities,
                               http=SimpleNamespace(request=by_id(http, [old])), chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri)
         agents.append(agent)
