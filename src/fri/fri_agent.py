@@ -2399,10 +2399,21 @@ class Agent:
         fenced = turn_fence(self, result.turn, message.author.id, counts)  # Kept apart: saving clears result.turn.
         held = (dm and (drew - {author} or saved)) or (invitation and saved)
         whole = fenced if held else None
+        # Before what was delivered is recorded, #375's DM turns are held to the whole fence again. One held only for
+        # its saved messages, or a ping's, is held to its local part: the save's own validation is Gene's check of
+        # it, so asking Gene first would only repeat it (fri #379's round 1, S3).
+        again = dm and (drew - {author} or draws_on_summary(turn))
+
+        async def recheck():
+            return await whole() if again else fenced.unmoved()
         if whole:
             still = await whole()
             if dms_off():  # Turned off while Gene answered: nothing goes out, quietly.
                 return missed('dms off')
+            if not still and fenced.unavailable:
+                # The controller didn't answer: an outage, as at talk's fence, not a change. Nothing of the reply
+                # goes out, since nothing checked it (fri #379's round 1, S2).
+                return await outage()
             if not still:
                 # Their own erasure, here or through Gene (round 1, S2): nothing goes out, quietly. A failed read
                 # of it counts as one.
@@ -2412,6 +2423,8 @@ class Agent:
                 if invitation:  # A ping hears it as for a nearby post that changed, while it still stands.
                     return await self.withheld(message, events, 'nearby privacy changed', invitation,
                                                fenced=since is not None, control=since is None)
+                if dms_off():  # Turned off during that read (fri #379's round 1, S1).
+                    return missed('dms off')
                 await message.reply(PANEL_SKIPPED, allowed_mentions=NO_MENTIONS, mention_author=False)
                 self.explained(events, 'source privacy changed')  # Nothing of what changed, or whose, is said.
                 await self.fri.waiting_notices.clear(message.author.id)
@@ -2429,7 +2442,7 @@ class Agent:
         async def delivered():  # A preview is answered once posted, even if binding it fails next.
             self.answered(events)
             # Deleted, or someone it drew on erased, while it posted: the card stays, but isn't saved.
-            if not taken_back() and (whole is None or (await whole() and not taken_back())):
+            if not taken_back() and (whole is None or (await recheck() and not taken_back())):
                 await self.fri.record_turn(result)
 
         if result.post_preview:
@@ -2484,7 +2497,7 @@ class Agent:
             self.answered(events, told=COOLDOWN if result.status == 'cooldown' else None)  # Its one notice.
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
             # Deleted, or someone it drew on erased, while it was sent: the reply stays, but isn't saved or echoed.
-            saved = (None if taken_back() or (whole and not (await whole() and not taken_back()))
+            saved = (None if taken_back() or (whole and not (await recheck() and not taken_back()))
                      else await self.fri.record_turn(result, sent, still=standing))
             # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory,
             # or a save that failed, whose reply may carry exactly what the controller would have refused.
