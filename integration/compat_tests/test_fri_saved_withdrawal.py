@@ -35,7 +35,8 @@ async def world(monkeypatch, tmp_path, capable=True):
 
 
 def asked(w, path=SAVED):
-    return [payload for p, payload in w.calls if p == path]
+    """What Fri asked, an edit's fingerprint aside (gene #150, #246; see test_fri_edit_fingerprints)."""
+    return [{key: value for key, value in payload.items() if key != 'fingerprints'} for p, payload in w.calls if p == path]
 
 
 def edited(message, text='current safe caption'):

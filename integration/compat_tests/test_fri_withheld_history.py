@@ -434,9 +434,12 @@ def test_a_withdrawal_reaching_the_controller_after_forget_me_writes_nothing(mon
     asyncio.run(scenario())
 
 
-def test_an_edit_leaves_fris_reply_in_view_and_other_members_saved_replies(monkeypatch, tmp_path):
-    """gene #150: only a deletion takes the replies that carried a message. An edit takes the member's own exchange,
-    as before, and what it taught."""
+def test_an_edit_leaves_fris_reply_in_view_and_takes_saved_replies_only_where_they_hold_what_it_took_out(monkeypatch,
+                                                                                                        tmp_path):
+    """gene #150: only a deletion takes every reply that carried a message. An edit takes the member's own exchange, as
+    before, and what it taught; and, from a controller offering edit-fingerprints, a saved reply holding what it took
+    out (gene #246; see test_fri_edit_fingerprints), as this one quoting it. Fri's reply in the live view, still in the
+    channel, stays."""
     async def scenario():
         w = await world(monkeypatch, tmp_path)
         needs_sources(w)
@@ -449,7 +452,7 @@ def test_an_edit_leaves_fris_reply_in_view_and_other_members_saved_replies(monke
             await w.agent.handle(asked)
             await edit(w, edited(nearby))
             assert any(row['text'] == 'they said '+MARKER for row in w.agent.recent[1])
-            assert 'they said '+MARKER in saved(w, '30')
+            assert ('they said '+MARKER in saved(w, '30')) is ('edit-fingerprints' not in w.fri.capabilities)
             assert all(not payload.get('deleted') for path, payload in w.calls if path == SAVED)
         finally:
             await w.fri.close()

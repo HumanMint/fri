@@ -650,7 +650,7 @@ class Agent:
         if edited:  # With the edit's own time, so a fresh edit of an old message is asked about too (fri #358 E1).
             when = message.edited_at.timestamp() if isinstance(message.edited_at, dt.datetime) else None
             self.saved_turns.withdraw([message.id], saved_in, authors={message.id: sender.id} if sender else None,
-                                      edited_at=when)
+                                      edited_at=when, fingerprints=self.fingerprinted(channel, message))
             for window in list(self.passes):  # Every member's edit, for a running learning pass to leave out (fri #325).
                 window.taken([message.id])
         if edited and message.id in self.looked:
@@ -678,6 +678,21 @@ class Agent:
                         row.pop('attachments', None)
                 else:
                     rows.remove(row)
+
+    def fingerprinted(self, channel, message):
+        """What a member's edit took out, as a fingerprint (gene #150, #246; see fri_edit_fingerprint): from what the
+        live view held of the message before to all of what it says now, which is kept too, so the controller can tell
+        from its own saved exchange as well. The view holds 500 characters, but the edit is read in full: one that only
+        put words before them took none out (gene #246 round 1, B2). Nothing it can tell from where the view held
+        nothing and the edit says nothing (a partial update): the controller does as before."""
+        from .fri_edit_fingerprint import fingerprint
+        before = next((row['text'] for row in self.recent.get(channel, ()) if row['id'] == str(message.id)
+                       and not row['gene_error'] and not row.get('fri')), None)
+        content = getattr(message, 'content', None)
+        now = clean(content, 4000) if isinstance(content, str) and getattr(message, 'author', None) else None
+        if before is None and now is None:
+            return None
+        return {message.id: fingerprint(before, now, self.saved_turns.salt)}
 
     def revise(self, mid):
         now = time.time()
