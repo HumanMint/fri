@@ -618,6 +618,13 @@ class Fri(discord.Client):
             depends['messages'] |= found
             depends['unknown'] = depends['unknown'] or unknown
             depends['summary'] = context.get('member_summary') or depends['summary']
+            # A saved reply it carried that quoted the member's summary holds the reply to that summary's sources too,
+            # its making undated where the request didn't carry the summary itself (fri #383 item 2).
+            member = ((context.get('fence') or {}).get('turn') or {}).get('user_id')
+            if not depends['summary'] and any(self.agent.saved_turns.quotes(turn, member)
+                                              for turn in context.get('turns', [])):
+                from .fri_turn_withdrawal import UNDATED
+                depends['summary'] = UNDATED
         result.shown, result.dependencies = seen, depends
         result.channels = (context.get('fence') or {}).get('channels')  # As its last read was (see ready).
         attempt = uuid.uuid4().hex
@@ -1322,15 +1329,17 @@ class Fri(discord.Client):
         began = time.time(), time.monotonic()
         # A "forget me" before the answer comes erased it: nothing of it is recorded then (see SavedTurns.kept).
         erasure = self.agent.saved_turns.erasure(payload.get('user_id')) if self.agent else None
+        # Its saved context drew on what can't be told: so can't what it drew on, wherever it's read (fri #383 item 1).
+        unknown = bool((getattr(result, 'dependencies', None) or {}).get('unknown'))
         try:
             saved = await self.api('POST', '/chat/turn', payload)
         except (commands.UserFeedbackCheckFailure, ControllerRejected, TimeoutError) as exc:
             LOG.warning('Delivered turn was not recorded: %s', type(exc).__name__)  # Includes privacy changes mid-reply.
             if isinstance(exc, (TimeoutError, ControllerUnavailable)) and self.agent:  # A lost reply, not a refusal:
-                self.agent.saved_turns.kept(payload, None, began, erasure)  # it may have landed all the same.
+                self.agent.saved_turns.kept(payload, None, began, erasure, unknown)  # it may have landed all the same.
             return None
         if self.agent:  # So its messages taken back later take it with them (fri #129).
-            self.agent.saved_turns.kept(payload, saved, began, erasure)
+            self.agent.saved_turns.kept(payload, saved, began, erasure, unknown)
         if saved.get('first_memory') and sent is not None and payload.get('response_kind', 'reply') == 'reply':
             notice = self.first_memory(saved)
             content = (sent.content or '')+notice

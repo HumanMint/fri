@@ -2164,6 +2164,7 @@ class Agent:
         # Every member's erasures here before the turn reads anything, for a preview it makes (fri #322).
         counts = {str(member): count for member, count in self.forgotten.items()}
         began = time.time()  # A nearby post edited before this was read as it is now (see changed).
+        deleted_after = time.monotonic()  # Deletions are timed so (see unsend).
         arrival = self.arrival(event.id for event in events)  # Its own messages as they read when they came in.
         own = {event.id for event in events}
 
@@ -2305,8 +2306,19 @@ class Agent:
 
         def stale():
             """A message the model was shown taken back here, or a channel's withdrawal accepted past the read its
-            saved context came from (Sol round 3 of #372): it may hold the channel's words, a note naming no message."""
-            return bool(changed(result.shown)) or self.channel_withdrawals.moved(result.channels)
+            saved context came from (Sol round 3 of #372): it may hold the channel's words, a note naming no message.
+            Or one what that saved context drew on may be, as a /fri panel reply is held to (SavedTurns.taken_since,
+            fri #383 item 3): only a turn whose saved context drew on something, or on the member's summary, asks."""
+            if changed(result.shown) or self.channel_withdrawals.moved(result.channels):
+                return True
+            depends = getattr(result, 'dependencies', None)
+            if not depends or not (depends['messages'] or depends['unknown'] or depends.get('summary')):
+                return False
+            since = {i for i, at in self.withdrawn.items() if at >= began}
+            since |= {str(i) for i, at in self.revised.items() if at >= began}
+            since |= {i for i, at in self.saved_turns.marked.items() if at >= began}
+            since |= {str(i) for i, at in self.unsent.items() if at >= deleted_after}
+            return self.saved_turns.taken_since(depends, since, message.author.id)
 
         async def gone():
             """Handled, and True, once something was taken back here: while Fri composed, or while the whole turn's
