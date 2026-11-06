@@ -417,10 +417,14 @@ class SavedTurns:
         if isinstance(drew, list):
             reply = str(payload.get('reply_message_id') or '')
             own = {int(item['id']) for item in sources if str(item.get('id', '')).isdigit()}
+            # And what its saved replies drew on, as far back as known, so pruning a record between them loses none
+            # of it (fri #387 item 2): a record never changes once kept, so this is all of it there will be.
+            drew = {str(item) for item in drew if str(item).isdigit()}
+            known = [i for i in drew if int(i) in self.drawn]
+            further, unknowable = self.depends_on(known) if known else (set(), False)
             for i in [*own, *([int(reply)] if reply.isdigit() else [])]:
                 self.drawn.pop(i, None)
-                self.drawn[i] = (now, scope['user_id'], frozenset(str(item) for item in drew if str(item).isdigit()),
-                                 bool(unknown))
+                self.drawn[i] = (now, scope['user_id'], frozenset(drew | further), bool(unknown) or unknowable)
             while self.drawn and (next(iter(self.drawn.values()))[0] < now-KEPT_SECONDS or len(self.drawn) > MOST):
                 del self.drawn[next(iter(self.drawn))]
         wall, monotonic = began
@@ -662,8 +666,16 @@ class SavedTurns:
             return set()
         found = held(context)
         gone = self.withheld(found)
-        drew = [self.depends_on(exchange(turn) - {''})[0] for turn in context.get('turns', [])]
+        ancestry = [self.depends_on(exchange(turn) - {''}) for turn in context.get('turns', [])]
+        drew = [found_here for found_here, _ in ancestry]
         taken = self.withheld({i for ids in drew for i in ids})
+        # A saved reply whose ancestry can't be told here (saved before this Fri started, or before a restart, or
+        # drawing on one) while a withdrawal waits for the controller: it may repeat what that takes back, which the
+        # controller retires once it has it, so it stays out until then (fri #387 item 1). With nothing queued, it
+        # costs nothing: the delivery fence holds it to what's taken back while the turn runs.
+        waiting = bool(self.pending)
+        lost = [waiting and bool(turn.get('reply')) and cant
+                for turn, (_, cant) in zip(context.get('turns', []), ancestry)]
         summary = context.get('member_summary')
         if summary and self.summary_sources(summary, member):
             context['member_summary'] = None
@@ -677,12 +689,12 @@ class SavedTurns:
             # One whose summaries can't be read can't be dated or tied to anyone: it goes, and what drew on it (S4).
             quoting = [unreadable(turn) for turn in context.get('turns', [])]
             taken |= {i for turn, bad in zip(context.get('turns', []), quoting) if bad for i in exchange(turn) - {''}}
-        if not gone and not taken and not any(quoting):
+        if not gone and not taken and not any(quoting) and not any(lost):
             return set(found)
         said, history = ([] if said is None else said), []
-        for turn, depends, quotes in zip(context.get('turns', []), drew, quoting):
+        for turn, depends, quotes, unknown in zip(context.get('turns', []), drew, quoting, lost):
             rows = turn.get('burst') or ()
-            if not exchange(turn) & gone and not depends & taken and not quotes:
+            if not exchange(turn) & gone and not depends & taken and not quotes and not unknown:
                 history.append(turn)
                 continue
             said += [row.get('text', '') for row in rows if str((row.get('source') or {}).get('id')) in gone]
@@ -1250,11 +1262,13 @@ def saved_lately(message_id):
 
 
 def unreadable(turn):
-    """Whether a saved reply's `summaries` aren't as the controller writes them, a list of {'user_id', 'generation'}: whose
-    summary it quoted, or when, can't be told then (Sol round 1 of #386, S4)."""
+    """Whether a saved reply's `summaries` aren't as the controller writes them, a list of {'user_id', 'generation'}, the
+    generation a whole number: whose summary it quoted, or when, can't be told then (Sol round 1 of #386, S4; fri #387
+    item 3)."""
     items = turn.get('summaries')
     return items is not None and not (isinstance(items, list) and all(
-        isinstance(item, dict) and str(item.get('user_id', '')).isdigit() for item in items))
+        isinstance(item, dict) and str(item.get('user_id', '')).isdigit() and type(item.get('generation')) is int
+        and item['generation'] >= 0 for item in items))
 
 
 def exchange(turn):

@@ -54,7 +54,7 @@ from .fri_reports import ReportButton, report_component
 from .fri_requests import request_dm_component
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
-from .fri_turn_withdrawal import exchange, held
+from .fri_turn_withdrawal import exchange, held, unreadable
 from .fri_usage import describe_usage, usage_query, usage_requested, window_applied
 from .panels import defer_panel
 from .privacy import clean
@@ -1181,7 +1181,10 @@ class Fri(discord.Client):
         known = getattr(fence.get('rechecks'), 'summaries', {})
         carried = [item for row in context.get('recent', []) for item in known.get(row.get('id'), ())]
         carried += context.get('reference_summaries', [])
-        carried += [item for turn in context.get('turns', []) for item in turn.get('summaries') or ()]
+        # A saved turn whose summaries no controller writes leaves the request (see SavedTurns.withhold): it names
+        # nothing here, and never raises before then (fri #387 item 3).
+        carried += [item for turn in context.get('turns', []) if not unreadable(turn)
+                    for item in turn.get('summaries') or ()]
         return {(str(item['user_id']), int(item['generation'])) for item in carried}
 
     def standing(self, context):
@@ -1195,7 +1198,8 @@ class Fri(discord.Client):
         rows = [row for row in context.get('recent', []) if self.agent.current(row, live) and (row.get(
             'gene_error') or not str(row.get('id', '')).isdigit() or int(row['id']) not in self.agent.unsent)]
         gone = self.agent.saved_turns.withheld(held(context))
-        return {**context, 'recent': rows, 'turns': [turn for turn in context.get('turns', []) if not exchange(turn) & gone]}
+        return {**context, 'recent': rows, 'turns': [turn for turn in context.get('turns', [])
+                                                     if not exchange(turn) & gone and not unreadable(turn)]}
 
     def depend(self, context):
         """Last thing before a request, once nothing more leaves its context: the turn depends on the summaries what it

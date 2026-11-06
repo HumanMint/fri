@@ -269,6 +269,10 @@ def test_withholding_a_reply_that_quoted_a_held_summary(monkeypatch, tmp_path, c
     summary = {'text': 'raids', 'refreshed': time.time()}
     quoted, later = int(source(age=300, channel='1')['id']), int(source(age=200, channel='1')['id'])
     if case == 'quoting someone else\'s summary':
+        # Saved by this Fri, drawing on no message: what can't be told is held back while a withdrawal waits (fri #387).
+        turns.kept({'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20',
+                    'revision': 0, 'source': {'kind': 'discord_message', 'id': str(quoted)}, 'drew_on': []},
+                   {}, (time.time(), time.monotonic()))
         context = quoting_context(summary, saved(quoted, summaries=[30]))
         turns.withhold(context, member='20')
         assert len(context['turns']) == 1 and context['member_summary'] is None
