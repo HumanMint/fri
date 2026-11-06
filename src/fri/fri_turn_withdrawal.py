@@ -436,14 +436,16 @@ class SavedTurns:
     def fingerprinted(self, known, fingerprint):
         """An edit's fingerprint (see fri_edit_fingerprint), with the one already queued for its message: what each
         edit took out, less what it says after the last, which is kept (gene #246 round 1, B3: edited back to what it
-        said, nothing of that was taken out). One salted otherwise (none is, in one process) replaces it."""
+        said, nothing of that was taken out), and whether that kept list is whole, as the last says (round 2, R2-B3).
+        One salted otherwise (none is, in one process) replaces it."""
         before = known.get('fingerprint')
         if not fingerprint:
             return before
         if not before or before.get('salt') != fingerprint.get('salt'):
             return fingerprint
         taken = (set(before['removed']) | set(fingerprint['removed'])) - set(fingerprint['kept'])
-        return {'salt': fingerprint['salt'], 'kept': fingerprint['kept'], 'removed': sorted(taken)[:MOST_HASHES]}
+        return {'salt': fingerprint['salt'], 'kept': fingerprint['kept'], 'removed': sorted(taken)[:MOST_HASHES],
+                'complete': fingerprint.get('complete') is True}
 
     def withdraw(self, ids, server=None, deleted=False, authors=None, edited_at=None, fingerprints=None):
         """Messages taken back: each exchange Fri saved with one goes, asked for once. server: the one Fri saves
