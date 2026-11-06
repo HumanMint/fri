@@ -2388,16 +2388,16 @@ class Agent:
         # A DM drawing on saved messages, even only its requester's, or a ping in a chat channel drawing on a summary
         # or on saved messages, is held to it too (fri #379 items 2 and 3): Gene withdrawing one of those (deleted, or
         # a summary's source) moves no revision, and the DM's lookup or the ping's own reads came after talk's fence.
-        # A ping's own reads fence only the posts it read. An outside ping's turn carries its grant, which Gene's
-        # check doesn't take, and reads no saved context. A DM drawing on nothing saved, nor anyone else's words, nor a
-        # summary, keeps its hot path: their erasure, or a note of theirs removed, moves their revision, which the read
-        # above (erasure) takes after the lookup.
+        # A ping's own reads fence only the posts it read. An outside ping's turn names neither (see invited_talk): its
+        # grant, which Gene's check doesn't take, and its reads fence it. A DM drawing on nothing saved, nor anyone
+        # else's words, nor a summary, keeps its hot path: their erasure, or a note of theirs removed, moves their
+        # revision, which the read above (erasure) takes after the lookup.
         from .fri import PANEL_SKIPPED, draws_on_summary
         author, turn = str(message.author.id), result.turn or {}
         drew = {str(row.get('user_id')) for row in turn.get('provenance') or []}
         saved = draws_on_summary(turn) or bool(turn.get('drew_on'))
         fenced = turn_fence(self, result.turn, message.author.id, counts)  # Kept apart: saving clears result.turn.
-        held = (dm and (drew - {author} or saved)) or (invitation and saved and not turn.get('mention_grant'))
+        held = (dm and (drew - {author} or saved)) or (invitation and saved)
         whole = fenced if held else None
         if whole:
             still = await whole()

@@ -27,6 +27,7 @@ from compat_tests.test_fri_preview_first_page_2 import image, recorder, rejectin
 from compat_tests.test_fri_rerun_fence import direct
 from fri.fri import PANEL_SKIPPED
 from fri.fri_chat import ChatResult
+from fri.fri_mentions import CONTEXT_CHANGED
 
 
 def dms_off_at(monkeypatch, agent, check):
@@ -66,6 +67,46 @@ def test_dms_turned_off_while_the_whole_turn_is_checked_send_nothing(monkeypatch
             assert (MARKER in said(dm)) is not off and bool(recorded) is not off
             if off:
                 dm.reply.assert_not_awaited()  # Quietly, as for DMs turned off at any other point.
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_dms_turned_off_as_the_whole_turn_fails_say_nothing_at_all(monkeypatch, tmp_path):
+    """Member 30 erases through Gene during the DM's lookup, so Gene's check of the whole turn fails, and DMs go off
+    while it answers: not even the skipped line goes out in a DM that's off."""
+    async def scenario():
+        fri, agent, store, dm = owner_dm(monkeypatch, tmp_path, ChatResult(
+            status='completed', reply='member thirty says '+MARKER), 'gene')
+        dms_off_at(monkeypatch, agent, 1)
+        try:
+            await agent.handle(dm)
+            dm.reply.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_memory_control_in_a_dm_is_answered_though_dms_go_off_meanwhile(monkeypatch, tmp_path):
+    """The DM switch never holds back a memory control's answer: DMs go off as "forget me" in a DM is carried out, and
+    it's still told it went through, as before, though its reply now passes the switch's later checks too."""
+    async def scenario():
+        fri, agent, store, _, _, _, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        _, message = direct(fri, agent, rows)
+        api = fri.api
+
+        async def controlling(method, path, payload=None):
+            answer = await api(method, path, payload)
+            if path == '/chat/memory/control':
+                agent.config['support_dms'] = False  # While the erasure was carried out.
+            return answer
+        fri.api = controlling
+        dm = message('forget me')
+        dm.reply.return_value = SimpleNamespace(id=dm.id+100, content='okay', edit=AsyncMock())
+        try:
+            await agent.handle(dm)
+            assert 'erased' in said(dm)
         finally:
             await fri.close()
     asyncio.run(scenario())
@@ -188,6 +229,38 @@ def test_a_ping_carrying_the_requesters_summary_is_held_to_the_whole_turn(monkey
             await agent.handle(ping)
             assert answered and taken == ([1] if withdrawn else [])
             assert (CONTINUATION in said(ping)) is not withdrawn and bool(recorded) is not withdrawn
+            if withdrawn:  # Told as for a nearby post that changed, while the ping stands: not the panel's line.
+                assert CONTEXT_CHANGED in said(ping) and PANEL_SKIPPED not in said(ping)
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_an_ordinary_channel_reply_keeps_its_hot_path(monkeypatch, tmp_path):
+    """Not a ping: a member's message to Fri in a chat channel, reading a saved exchange of theirs. Nothing is awaited
+    past talk's own fence, which holds the reply to Gene's check, so it asks Gene nothing more before it sends: one
+    check after the model answered, talk's, not a second for the whole turn."""
+    async def scenario():
+        fri, agent, store, _, _, message, calls, _ = environment(monkeypatch, tmp_path, channel_id=1)
+        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
+        store.save_chat('123', 'public:1', '20', 0, 'remember '+MARKER, 'noted', 'model', 'high',
+                        source=source(age=60, channel='1'), provenance=[], audience='server')
+        answered = []
+
+        async def respond(text, context, ready):
+            await ready()
+            assert MARKER in str(context.get('turns'))
+            answered.append(len(calls))
+            return ChatResult(status='completed', reply='you said '+MARKER)
+        respond_with(fri, tmp_path, respond)
+        asked = message('fri what did i say')
+        asked.reply.return_value = SimpleNamespace(id=asked.id+100, content='okay', edit=AsyncMock())
+        try:
+            await agent.handle(asked)
+            assert MARKER in said(asked)
+            saved = [body for path, body in calls if path == '/chat/turn']
+            assert saved and saved[-1].get('drew_on')  # It drew on saved messages, as a held DM's or ping's does.
+            assert [path for path, _ in calls[answered[0]:] if path == '/chat/turn/check'] == ['/chat/turn/check']
         finally:
             await fri.close()
     asyncio.run(scenario())
