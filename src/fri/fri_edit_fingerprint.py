@@ -116,8 +116,9 @@ def clock(hour, minute, second='00', *rest):
 
 
 def day(*groups):
-    """A date, year first ("2024-05-01") or last ("1/5/2024", "5/1/24"), or a day and month either way, or a month or
-    day and a year ("may 5, 2024" has the groups 5 and 2024)."""
+    """A date, year first ("2024-05-01") or last ("1/5/2024", "5/1/24"), or a day and a month ("31 12"; a month and a
+    day of four digits is a time too), or a year and a month, or a day or month and a year ("may 5, 2024" has the
+    groups 5 and 2024)."""
     def month(digits):
         return len(digits) <= 2 and 1 <= int(digits) <= 12
 
@@ -129,8 +130,7 @@ def day(*groups):
                 ((year(last) or len(last) == 2) and ((date(first) and month(middle)) or (month(first) and date(middle)))))
     if len(groups) == 2:
         first, last = groups
-        return ((year(first) and month(last)) or (year(last) and date(first)) or (month(first) and date(last))
-                or (date(first) and month(last)))
+        return (year(first) and month(last)) or (year(last) and date(first)) or (date(first) and month(last))
     return False
 
 
