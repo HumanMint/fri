@@ -130,6 +130,7 @@ class Media:
 async def attach_and_open(client, media):
     await client.start(media)
     await client.open_conversation()
+    client.set_permission(True)
 
 
 def bridge(**kwargs):
@@ -169,13 +170,13 @@ def test_realtime_ga_session_input_output_and_final_transcripts():
                                                'input_token_details': {'audio_tokens': 10}}})
             assert [(e.item_id, e.started_at) for e in events.items] == [('callee2', 2.4),
                                                                        ('callee1', 1.2)]
-            await client.handle_event({'type': EVENTS['output_audio'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_audio'], 'response_id': 'command-1', 'item_id': 'fri1',
                                        'content_index': 0,
                                        'delta': base64.b64encode(ULAW).decode()})
             assert audio.frames == [('fri', ulaw_to_pcm16(ULAW))]
             assert audio.loop is asyncio.get_running_loop()
             assert media.sent[-2:] == [('media', ULAW), ('mark', '1')]
-            transcript = {'type': EVENTS['output_transcript'], 'item_id': 'fri1',
+            transcript = {'type': EVENTS['output_transcript'], 'response_id': 'command-1', 'item_id': 'fri1',
                           'content_index': 0, 'transcript': 'ありがとうございます。'}
             await client.handle_event(transcript)
             await client.handle_event(transcript)
@@ -200,7 +201,7 @@ def test_barge_in_truncates_only_acknowledged_audio_and_ignores_clear_acks():
         media = Media()
         await attach_and_open(client, media)
         try:
-            delta = {'type': EVENTS['output_audio'], 'item_id': 'fri1', 'content_index': 0,
+            delta = {'type': EVENTS['output_audio'], 'response_id': 'command-1', 'item_id': 'fri1', 'content_index': 0,
                      'delta': base64.b64encode(ULAW).decode()}
             await client.handle_event(delta)
             await client.mark('1')  # first 20 ms actually played
@@ -478,7 +479,7 @@ def test_barge_in_blocks_late_chunks_when_all_prior_chunks_were_played():
         media = Media()
         await attach_and_open(client, media)
         try:
-            delta = {'type': EVENTS['output_audio'], 'item_id': 'fri1', 'content_index': 0,
+            delta = {'type': EVENTS['output_audio'], 'response_id': 'command-1', 'item_id': 'fri1', 'content_index': 0,
                      'delta': base64.b64encode(ULAW).decode()}
             await client.handle_event(delta)
             await client.mark('1')
@@ -529,11 +530,11 @@ def test_full_twilio_realtime_bridge_with_in_memory_peers(monkeypatch):
         async def model(event):
             await original_send(event)
             if event['type'] == EVENTS['input_append']:
-                peer.feed({'type': EVENTS['output_audio'], 'item_id': 'fri1', 'content_index': 0,
+                peer.feed({'type': EVENTS['output_audio'], 'response_id': 'command-1', 'item_id': 'fri1', 'content_index': 0,
                            'delta': base64.b64encode(ULAW).decode()})
-                peer.feed({'type': EVENTS['output_audio_done'], 'item_id': 'fri1',
+                peer.feed({'type': EVENTS['output_audio_done'], 'response_id': 'command-1', 'item_id': 'fri1',
                            'content_index': 0})
-                peer.feed({'type': EVENTS['output_transcript'], 'item_id': 'fri1',
+                peer.feed({'type': EVENTS['output_transcript'], 'response_id': 'command-1', 'item_id': 'fri1',
                            'content_index': 0, 'transcript': 'こんにちは。'})
                 peer.feed({'type': EVENTS['response_done'], 'response': {
                     'id': 'r1', 'usage': realtime_usage(), 'status': 'completed', 'output': []}})
@@ -622,18 +623,18 @@ def test_interrupted_transcript_is_marked_even_when_generation_finished_first():
         client, audio, events, meter, peer = bridge()
         await attach_and_open(client, Media())
         try:
-            await client.handle_event({'type': EVENTS['output_audio'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_audio'], 'response_id': 'command-1', 'item_id': 'fri1',
                 'content_index': 0, 'delta': base64.b64encode(ULAW).decode()})
-            await client.handle_event({'type': EVENTS['output_audio_done'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_audio_done'], 'response_id': 'command-1', 'item_id': 'fri1',
                                        'content_index': 0})
-            await client.handle_event({'type': EVENTS['output_transcript'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_transcript'], 'response_id': 'command-1', 'item_id': 'fri1',
                                        'content_index': 0, 'transcript': '途中の文章'})
             assert not events.items
             await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'callee1',
                                        'audio_start_ms': 20})
             await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'callee1',
                                        'transcript': '予約できますか。'})
-            assert next(e for e in events.items if e.speaker == 'fri').text_ja == '途中の文章 …'
+            assert not any(e.speaker == 'fri' for e in events.items)  # Nothing was played.
         finally:
             await client.stop()
     asyncio.run(run())

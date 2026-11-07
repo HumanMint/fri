@@ -37,6 +37,7 @@ async def deliver(call, event):
 
 class Message:
     def __init__(self, content=None, **kwargs):
+        self.id = id(self)
         self.content, self.kwargs = content, kwargs
         self.edits = []
 
@@ -100,6 +101,8 @@ class Setup:
         self.guild = SimpleNamespace(id=1, voice_client=None)
         self.channel = MagicMock(spec=discord.VoiceChannel)
         self.channel.id = 2
+        self.http = SimpleNamespace(edit_message=AsyncMock(side_effect=self.edit_cost))
+        self.channel._state = SimpleNamespace(http=self.http)
         self.messages = []
         self.voice = SimpleNamespace(play=MagicMock(), stop=MagicMock(), disconnect=AsyncMock(),
                                      track_speaking=MagicMock(), is_connected=lambda: True,
@@ -117,18 +120,23 @@ class Setup:
 
         self.channel.connect = AsyncMock(side_effect=connect)
         self.channel.send = AsyncMock(side_effect=send)
-        self.session = SimpleNamespace(answer=AsyncMock(return_value=True), hang_up=AsyncMock())
+        self.session = SimpleNamespace(answer=AsyncMock(return_value=True), hang_up=AsyncMock(),
+                                       publication_allowed=True, consent_generation=1)
         self.engine = SimpleNamespace(plan=AsyncMock(side_effect=lambda request: CallBrief(
             request.request_id, 'book dinner.', 'AIです。', request.share, request.never)),
             start=AsyncMock(return_value=self.session))
         self.calls = DiscordCalls(None, self.engine, [1], Limits(allowed_user_ids=frozenset({10})))
+
+    async def edit_cost(self, channel_id, message_id, *, params):
+        message = next(message for message in self.messages if message.id == message_id)
+        await message.edit(embed=discord.Embed.from_dict(params.payload['embeds'][0]))
 
     def interaction(self, user=10):
         return Interaction(self.channel, self.guild, user)
 
     async def plan(self):
         interaction = self.interaction()
-        await self.calls.invoke(interaction, '+810000000000', 'dinner', 'party of two', 'no fees')
+        await self.calls.invoke(interaction, '+81300000000', 'dinner', 'party of two', 'no fees')
         return self.calls.active[1], interaction
 
     async def start(self):
@@ -158,12 +166,12 @@ def test_authorization_voice_and_one_reservation_per_guild():
     async def run():
         setup = Setup()
         interaction = setup.interaction(11)
-        await setup.calls.invoke(interaction, '+81', 'dinner')
+        await setup.calls.invoke(interaction, '+81300000000', 'dinner')
         assert 'not available' in interaction.texts()[0]
         setup.engine.plan.assert_not_awaited()
         interaction = setup.interaction()
         interaction.user.voice = None
-        await setup.calls.invoke(interaction, '+81', 'dinner')
+        await setup.calls.invoke(interaction, '+81300000000', 'dinner')
         assert 'join a voice' in interaction.texts()[0]
         started, release = asyncio.Event(), asyncio.Event()
 
@@ -173,10 +181,10 @@ def test_authorization_voice_and_one_reservation_per_guild():
             return CallBrief(request.request_id, 'dinner', 'AIです。', (), ())
 
         setup.engine.plan.side_effect = plan
-        first = asyncio.create_task(setup.calls.invoke(setup.interaction(), '+81', 'dinner'))
+        first = asyncio.create_task(setup.calls.invoke(setup.interaction(), '+81300000000', 'dinner'))
         await started.wait()
         second = setup.interaction()
-        await setup.calls.invoke(second, '+81', 'dinner')
+        await setup.calls.invoke(second, '+81300000000', 'dinner')
         assert 'one call' in second.texts()[0]
         assert setup.engine.plan.await_count == 1
         release.set()
@@ -246,7 +254,7 @@ def test_failures_release_slot_and_allocated_voice(stage):
         setup = Setup()
         if stage == 'plan':
             setup.engine.plan.side_effect = CallRejected('that number is blocked.')
-            await setup.calls.invoke(setup.interaction(), '+81', 'dinner')
+            await setup.calls.invoke(setup.interaction(), '+81300000000', 'dinner')
         else:
             call, _ = await setup.plan()
             if stage == 'connect':
@@ -256,11 +264,11 @@ def test_failures_release_slot_and_allocated_voice(stage):
             elif stage == 'start':
                 setup.engine.start.side_effect = RuntimeError('private details')
             else:
-                setup.channel.send.side_effect = discord.HTTPException(
-                    SimpleNamespace(status=403, reason='forbidden'), 'private details')
+                call.brief_message.edit = AsyncMock(side_effect=discord.HTTPException(
+                    SimpleNamespace(status=403, reason='forbidden'), 'private details'))
             await call.brief_view.dial.callback(setup.interaction())
-            assert call.audio.read() == b''
-            if stage != 'connect':
+            assert call.audio is None or call.audio.read() == b''
+            if stage not in ('connect', 'control_send'):
                 setup.voice.disconnect.assert_awaited_once_with(force=True)
         assert not setup.calls.active
         assert all('private details' not in (message.content or '') for message in setup.messages)
@@ -281,11 +289,11 @@ def test_finish_during_start_and_late_price_update_after_disconnect():
         assert call.phase == 'ended' and not setup.calls.active
         setup.session.hang_up.assert_awaited_once_with('closed_during_start')
         summary = call.cost.message
-        assert 'pending' in summary.content
+        assert 'pending' in summary.kwargs['embed'].description
         await deliver(call, UsageUpdated(call.request.request_id,
                                     (UsageLine('twilio', 'phone', {'minutes': 1}, .1, True),), True))
         assert call.cost.message is summary
-        assert 'pending' not in summary.content and 'booked.' in summary.content
+        assert 'pending' not in summary.kwargs['embed'].description and 'booked.' in summary.content
     asyncio.run(run())
 
 
@@ -300,12 +308,12 @@ def test_question_membership_modal_first_answer_and_close():
         assert not await view.interaction_check(outsider)
         await view.submit(outsider, 'yes')
         setup.session.answer.assert_not_awaited()
-        member = setup.interaction(11)  # The group may answer, not just start-call allowlist members.
+        member = setup.interaction()  # Only the designated requester authorizes disclosure.
         await view.free_text(member)
         assert isinstance(member.response.modal, AnswerModal)
-        await asyncio.gather(view.submit(setup.interaction(11), 'yes'),
+        await asyncio.gather(view.submit(setup.interaction(), 'yes'),
                              view.submit(setup.interaction(12), 'no'))
-        setup.session.answer.assert_awaited_once_with('q', 'yes', 11)
+        setup.session.answer.assert_awaited_once_with('q', 'yes', 10)
         assert view.closed and all(child.disabled for child in view.children)
         await deliver(call, QuestionClosed(call.request.request_id, 'q', 'answered', 'yes'))
         await call.stop('test')
@@ -318,7 +326,7 @@ def test_membership_rechecked_after_defer_and_terminal_status_closes_question():
         call = await setup.start()
         await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?'))
         view = call.questions['q']
-        member = setup.interaction(11)
+        member = setup.interaction()
 
         async def defer(**kwargs):
             member.user.voice = None
@@ -382,7 +390,7 @@ def test_shutdown_cancels_inflight_plan_without_resurrecting_brief():
             await asyncio.Future()
 
         setup.engine.plan.side_effect = plan
-        operation = asyncio.create_task(setup.calls.invoke(setup.interaction(), '+81', 'dinner'))
+        operation = asyncio.create_task(setup.calls.invoke(setup.interaction(), '+81300000000', 'dinner'))
         await started.wait()
         await setup.calls.close()
         assert operation.cancelled()
@@ -400,15 +408,17 @@ def test_leaving_during_last_discord_write_prevents_engine_start():
             interaction.user.voice = None
             return Message(content, **kwargs)
 
-        setup.channel.send.side_effect = send
+        async def edit(**kwargs):
+            interaction.user.voice = None
+        call.brief_message.edit = edit
         await call.brief_view.dial.callback(interaction)
         setup.engine.start.assert_not_awaited()
-        setup.voice.disconnect.assert_awaited_once_with(force=True)
+        setup.voice.disconnect.assert_not_awaited()
         assert not setup.calls.active
     asyncio.run(run())
 
 
-def test_late_translation_after_finish_updates_original_line():
+def test_late_translation_after_finish_is_not_published():
     from fri.jpcall.contract import Translation, Utterance
 
     async def run():
@@ -418,7 +428,7 @@ def test_late_translation_after_finish_updates_original_line():
         await deliver(call, CallFinished(call.request.request_id, 'done.', 10))
         await deliver(call, Translation(call.request.request_id, '1', 'yes'))
         await call.pager.flush()
-        assert 'callee · はい\n↳ yes' in call.pager.pages[0].message.content
+        assert '↳ yes' not in call.pager.pages[0].message.content
         assert not setup.calls.active
     asyncio.run(run())
 
@@ -456,7 +466,7 @@ def test_new_call_waits_for_phone_hangup_to_finish():
         closing = asyncio.create_task(call.stop('requested'))
         await hanging_up.wait()
         interaction = setup.interaction()
-        await setup.calls.invoke(interaction, '+81', 'another call')
+        await setup.calls.invoke(interaction, '+81300000000', 'another call')
         assert 'one call' in interaction.texts()[0]
         assert setup.engine.plan.await_count == 1
         release.set()
@@ -484,7 +494,7 @@ def test_brief_is_public_in_voice_chat_but_errors_stay_private():
         setup = Setup()
         call, interaction = await setup.plan()
         assert call.brief_message in setup.messages
-        assert call.brief_message.kwargs['embed'].description.startswith('opener · AIです。')
+        assert call.brief_message.kwargs['embed'].description.startswith('destination · +81300000000')
         assert call.brief_message.kwargs['view'] is call.brief_view
         assert call.brief_message.kwargs['allowed_mentions'].everyone is False
         assert 'ephemeral' not in call.brief_message.kwargs
@@ -495,7 +505,7 @@ def test_brief_is_public_in_voice_chat_but_errors_stay_private():
         setup.messages.clear()
         setup.engine.plan.side_effect = CallRejected('that number is blocked.')
         interaction = setup.interaction()
-        await setup.calls.invoke(interaction, '+81', 'dinner')
+        await setup.calls.invoke(interaction, '+81300000000', 'dinner')
         assert not setup.messages
         assert interaction.followups[-1].kwargs['ephemeral'] is True
     asyncio.run(run())
@@ -573,10 +583,11 @@ def test_all_messages_use_invoking_text_channel_while_voice_and_answers_stay_in_
         setup = Setup()
         text = MagicMock(spec=discord.TextChannel)
         text.id = 40
+        text._state = SimpleNamespace(http=setup.http)
         text.send = AsyncMock(side_effect=setup.channel.send.side_effect)
         invocation = setup.interaction()
         invocation.channel = text
-        await setup.calls.invoke(invocation, '+81', 'dinner')
+        await setup.calls.invoke(invocation, '+81300000000', 'dinner')
         call = setup.calls.active[1]
         assert call.voice_channel is setup.channel and call.text_channel is text
         await call.brief_view.dial.callback(setup.interaction())
@@ -589,18 +600,18 @@ def test_all_messages_use_invoking_text_channel_while_voice_and_answers_stay_in_
         outsider.user.voice = None
         await question.submit(outsider, 'yes')
         setup.session.answer.assert_not_awaited()
-        await question.submit(setup.interaction(12), 'yes')
-        setup.session.answer.assert_awaited_once_with('q', 'yes', 12)
+        await question.submit(setup.interaction(), 'yes')
+        setup.session.answer.assert_awaited_once_with('q', 'yes', 10)
         await deliver(call, CallFinished(call.request.request_id, 'done.', 10,
                                      (UsageLine('twilio', 'phone', {'minutes': 1}, None),)))
         summary = call.cost.message
         await deliver(call, UsageUpdated(call.request.request_id,
                                     (UsageLine('twilio', 'phone', {'minutes': 1}, .1, True),), True))
         assert call.cost.message is summary
-        assert 'pending' not in summary.content
+        assert 'pending' not in summary.kwargs['embed'].description
         assert call.brief_message in setup.messages and question.message in setup.messages
         assert call.pager.pages[0].message in setup.messages and summary in setup.messages
-        assert text.send.await_count >= 4
+        assert text.send.await_count >= 3
         setup.channel.send.assert_not_awaited()
     asyncio.run(run())
 
@@ -612,11 +623,14 @@ def test_brief_shows_short_opener_and_request_fields_without_a_script_claim():
             request.request_id, 'i will read the whole request aloud.', '안녕하세요.',
             ('rewritten share',), ('rewritten limits',))
         goal = 'Ask for a table.\nThen ask about parking.'
-        await setup.calls.invoke(setup.interaction(), '+81', goal, 'Name: Alex', 'No payment')
+        await setup.calls.invoke(setup.interaction(), '+81300000000', goal, 'Name: Alex', 'No payment')
         call = setup.calls.active[1]
         text = call.brief_message.kwargs['embed'].description
-        assert text == ('opener · 안녕하세요.\n\ngoal · ' + goal + '\n\n'
-                        'share · Name: Alex\nnever · No payment')
+        assert 'destination · +81300000000\nlanguage · Japanese' in text
+        assert ('opener · 안녕하세요.\n\ngoal · ' + goal + '\n\n'
+                'share · Name: Alex\nnever · No payment') in text
+        assert 'no bookings, payments, fees or cancellation terms' in text
+        assert 'requester 10' in text and 'text remains in this chat' in text
         await setup.calls.close()
     asyncio.run(run())
 
@@ -650,7 +664,7 @@ def test_engine_deadline_does_not_cancel_accepted_final_send_or_duplicate_late_p
         release.set()
         await call.flush_events()
         assert len(reports) == 1 and call.cost.message is reports[0]
-        assert reports[0].content.endswith('cost total: $0.05')
+        assert reports[0].kwargs['embed'].description == 'cost total: $0.05'
         assert not setup.calls.active
     asyncio.run(run())
 
@@ -665,7 +679,7 @@ def test_transcript_failure_does_not_suppress_final_or_late_price(monkeypatch, c
         await call.emit(UsageUpdated(call.request.request_id,
             (UsageLine('twilio', 'phone', {'minutes': 1}, .05, True),), True))
         await call.flush_events()
-        assert call.cost.message.content.endswith('cost total: $0.05')
+        assert call.cost.message.kwargs['embed'].description == 'cost total: $0.05'
         reports = [message for message in setup.messages
                    if (message.content or '').startswith('call ended')]
         assert reports == [call.cost.message]
@@ -699,6 +713,6 @@ def test_terminal_status_and_finish_produce_only_one_public_end_report():
                    if (message.content or '').startswith('call ended')]
         assert reports == [call.cost.message]
         assert not any('call · ended' in (message.content or '') for message in setup.messages)
-        assert reports[0].content.endswith('cost total: $0.05')
+        assert reports[0].kwargs['embed'].description == 'cost total: $0.05'
         assert 'minutes' not in reports[0].content and 'phone' not in reports[0].content
     asyncio.run(run())

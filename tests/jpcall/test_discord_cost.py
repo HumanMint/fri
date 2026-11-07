@@ -36,11 +36,11 @@ def test_late_price_edits_original_summary_and_keeps_outcome():
         summary = CostSummary(send, edit)
         await summary.emit(CallFinished('r', 'booked for six.', 120,
                                         (UsageLine('twilio', 'phone', {'minutes': 2}, None),)))
-        assert 'pending' in messages[0]
+        assert summary.receipt.usage[0].usd is None
         await summary.emit(UsageUpdated('r', (UsageLine('twilio', 'phone', {'minutes': 2},
                                                        0.1, True),), True))
         assert len(messages) == 1 and edits == [0]
-        assert 'booked for six.' in messages[0] and 'pending' not in messages[0]
+        assert 'booked for six.' in messages[0] and summary.usage_final
     asyncio.run(run())
 
 
@@ -95,12 +95,12 @@ def test_compact_final_has_one_short_outcome_and_total_without_breakdown():
              UsageLine('twilio', 'phone', {'minutes': .4}, .03))
     finished = CallFinished('r', 'Booked for six. reference AB12', 24, usage)
     assert render_final(finished, usage, False) == (
-        'call ended · 0.4 min\nbooked for six. reference AB12\nestimated cost total: $0.05')
+        'call ended · 0.4 min\nbooked for six. reference AB12')
     reference = CallFinished('r', 'AB12 is the confirmed reference.', 24, usage)
     assert render_final(reference, usage, False).splitlines()[1].startswith('AB12')
     long = CallFinished('r', ('long outcome ' * 1000) + '🦉' * 3000, 24, usage)
     text = render_final(long, usage, False)
-    assert len(text.splitlines()) == 5  # Header, at most three short outcome lines, total.
+    assert len(text.splitlines()) == 4  # Header and at most three short outcome lines; full result is accessible.
     assert len(text.encode('utf-16-le')) // 2 < 2000 and '…' in text
     assert 'audio in tokens' not in text and 'voice-model' not in text
 
@@ -116,7 +116,7 @@ def test_failed_call_has_one_plain_failure_line_and_cost(detail, outcome, durati
     finished = CallFinished('r', outcome, duration, usage)
     failure = StatusChanged('r', CallState.FAILED, detail) if detail else None
     assert render_final(finished, usage, False, failure) == (
-        f"call didn't connect · {reason}\nestimated cost total: $0.05")
+        f"call didn't connect · {reason}")
 
 
 def test_breakdown_is_private_and_tracks_late_exact_phone_price():
@@ -147,8 +147,8 @@ def test_breakdown_is_private_and_tracks_late_exact_phone_price():
         assert all(len(call.args[0]) <= 2000 for call in all_sends)
         await cost.emit(UsageUpdated('r', (UsageLine('twilio', 'phone', {'minutes': 1}, .05, True),), True))
         assert len(sent) == 1 and edited[-1][0] is cost.message
-        assert edited[-1][1].endswith('cost total: $0.05')
-        assert view.usage[-1].exact
+        assert edited[-1][2]['embed'].description == 'cost total: $0.05'
+        assert view.receipt.usage[-1].exact
         view.stop()
     asyncio.run(run())
 
@@ -166,7 +166,7 @@ def test_cancelled_waiter_cannot_orphan_initial_report_or_resend_on_update():
             return message
 
         async def edit(message, content, **kwargs):
-            edits.append((message, content))
+            edits.append((message, content, kwargs))
 
         cost = CostSummary(send, edit)
         publishing = asyncio.create_task(cost.emit(CallFinished('r', 'done.', 24)))
@@ -182,7 +182,7 @@ def test_cancelled_waiter_cannot_orphan_initial_report_or_resend_on_update():
         await cost.flush()
         assert len(accepted) == 1
         assert cost.message is accepted[0][0] and edits[-1][0] is cost.message
-        assert edits[-1][1].endswith('cost total: $0.05')
+        assert edits[-1][2]['embed'].description == 'cost total: $0.05'
         cost.view.stop()
     asyncio.run(run())
 
@@ -199,7 +199,7 @@ def test_replayed_finish_keeps_one_message_and_does_not_replace_exact_price():
         await cost.emit(finished)
         send.assert_awaited_once()
         assert cost.usage[-1].exact and cost.usage[-1].usd == .05
-        assert edit.call_args.args[1].endswith('cost total: $0.05')
+        assert edit.call_args.kwargs['embed'].description == 'cost total: $0.05'
         cost.view.stop()
     asyncio.run(run())
 
@@ -247,12 +247,13 @@ def test_nonce_retry_recovers_old_message_then_edits_latest_price():
 
         async def edit(message, content, **kwargs):
             message.content = content
+            message.embed = kwargs['embed']
 
         cost = CostSummary(send, edit)
         await cost.emit(CallFinished('r', 'done.', 24))
         await cost.emit(UsageUpdated('r',
             (UsageLine('twilio', 'phone', {'minutes': 1}, .05, True),), True))
         assert len(accepted) == 1 and cost.message is accepted[0]
-        assert accepted[0].content.endswith('cost total: $0.05')
+        assert accepted[0].embed.description == 'cost total: $0.05'
         cost.view.stop()
     asyncio.run(run())

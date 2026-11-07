@@ -241,8 +241,8 @@ class Fri(discord.Client):
     def __init__(self):
         self.jpcall_engine = self.jpcall_calls = None
         try:
-            from .jpcall.discord_runtime import optional_config
-            self.jpcall_config = optional_config()
+            from .jpcall.discord_runtime import load_config
+            self.jpcall_config = load_config()
             jpcall_enabled = self.jpcall_config is not None and self.jpcall_config.enabled
         except Exception as exc:
             LOG.warning('jpcall disabled: %s', type(exc).__name__)

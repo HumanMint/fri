@@ -75,7 +75,7 @@ def test_session_selects_call_language_speed_and_phone_persona(code, script, pol
         assert language.opener not in session['instructions']
         await client.connect()
         try:
-            await client.say(language.opener, out_of_band=True)
+            await client.say(language.opener, out_of_band=True, _opener=True)
             sent = peer.sent[-1]['response']['instructions']
             assert 'Fri' not in sent and script in sent
             assert json.loads(sent.rsplit(language.say_prefix, 1)[1]) == language.opener
@@ -88,10 +88,12 @@ def test_exact_openers_and_hold_phrases():
     ja, ko = CALL_LANGUAGES['ja'], CALL_LANGUAGES['ko']
     assert ja.opener == (
         'お忙しいところすみません。お客様の通訳をお手伝いしているAIのフリーです。'
-        'お客様からお伺いしたいことがあるのですが、よろしいでしょうか。')
+        'この通話はAIで処理し、お客様のグループが聞き、発言と英訳をチャットに保存します。'
+        'その形でご質問してもよろしいでしょうか。')
     assert ko.opener == (
         '안녕하세요! 손님 대신 통역 도와드리는 AI 프리입니다. '
-        '손님분들이 질문이 있는데 괜찮으실까요?')
+        '통화는 AI가 처리하고 일행이 듣고 원문과 영어 번역을 채팅에 저장해요. '
+        '이 방식으로 질문드려도 괜찮으실까요?')
     assert ko.hold == '아, 잠시만요. 일행분들께 바로 여쭤볼게요.'
     assert ko.apology == '죄송해요, 조금만 더 기다려 주세요.'
     assert ko.farewell == '감사해요. 좋은 하루 보내세요.'

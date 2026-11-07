@@ -1,6 +1,7 @@
 """Outcome and per-component usage, including late phone-line prices."""
 
 import asyncio
+import io
 import logging
 import re
 import textwrap
@@ -51,13 +52,13 @@ def render_usage(usage, usage_final):
 
 
 class CostDetails(discord.ui.View):
-    def __init__(self):
+    def __init__(self, receipt):
         super().__init__(timeout=None)
-        self.usage, self.usage_final = (), False
+        self.receipt = receipt
 
     @discord.ui.button(label='cost details', custom_id='jpcall:cost_details')
     async def details(self, interaction, button):
-        pages = chunks(render_usage(self.usage, self.usage_final))
+        pages = chunks(render_usage(self.receipt.usage, self.receipt.usage_final))
         for index, content in enumerate(pages):
             send = (interaction.response.send_message if index == 0
                     else interaction.followup.send)
@@ -97,31 +98,71 @@ def render_final(finished, usage, usage_final, failure=None):
         lines.extend(short[:3])
         if len(short) > 3:
             lines[-1] = lines[-1][:-1] + '…'
+    if finished.termination_confirmed is False:
+        lines.insert(0, 'phone termination unconfirmed; calling remains blocked.')
+    return '\n'.join(lines)
+
+
+def render_cost(usage, usage_final):
     known = [row.usd for row in usage if row.usd is not None]
     pending = not usage or len(known) != len(usage)
     estimated = pending or not usage_final or any(not row.exact for row in usage)
     label = 'estimated cost total' if estimated else 'cost total'
     price = f'${sum(known):.2f}' if known else 'pending'
     suffix = ' (pending prices)' if pending and known else ''
-    lines.append(f'{label}: {price}{suffix}')
-    return '\n'.join(lines)
+    return discord.Embed(description=f'{label}: {price}{suffix}')
+
+
+class UsageReceipt:
+    """Late billing retains HTTP + numeric locators and metering, never call content."""
+
+    def __init__(self, http=None, channel_id=None):
+        self.http, self.channel_id, self.message_id = http, channel_id, None
+        self.usage, self.usage_final = (), False
+        self.revision = 0
+        self._lock = asyncio.Lock()
+
+    async def emit(self, event):
+        if not isinstance(event, UsageUpdated):
+            return
+        self.usage, self.usage_final = event.usage, event.usage_final
+        self.revision += 1
+        await self.publish()
+
+    async def publish(self):
+        async with self._lock:
+            if self.http is None or self.message_id is None:
+                return
+            try:
+                # No content/view argument: Discord preserves the outcome and its controls.
+                with discord.http.handle_message_parameters(
+                        embed=render_cost(self.usage, self.usage_final)) as params:
+                    await self.http.edit_message(self.channel_id, self.message_id, params=params)
+            except Exception as exc:
+                LOG.warning('jpcall cost update failed: %s', type(exc).__name__)
 
 
 class CostSummary:
     """One public report; the breakdown lives in the ephemeral details view."""
 
-    def __init__(self, send, edit):
+    def __init__(self, send, edit, *, http=None, channel_id=None):
         self.send, self.edit = send, edit
         self.finished = self.failure = self.message = None
-        self.usage = ()
-        self.usage_final = False
-        self.view = CostDetails()
+        self.receipt = UsageReceipt(http, channel_id)
+        self.view = CostDetails(self.receipt)
         self._nonce = uuid.uuid4().int >> 64
         self._revision = 0
         self._event_type = 'CallFinished'
         self._send_attempts = 0
-        self._content = None
         self._publish_task = None
+
+    @property
+    def usage(self):
+        return self.receipt.usage
+
+    @property
+    def usage_final(self):
+        return self.receipt.usage_final
 
     async def emit(self, event):
         if isinstance(event, StatusChanged):
@@ -132,15 +173,15 @@ class CostSummary:
             # Replayed terminal events must not overwrite a newer posted phone price.
             if self.finished is None:
                 self.finished = event
-                if self._revision == 0:
-                    self.usage, self.usage_final = event.usage, event.usage_final
+                if self.receipt.revision == 0:
+                    self.receipt.usage, self.receipt.usage_final = event.usage, event.usage_final
         elif isinstance(event, UsageUpdated):
-            self.usage, self.usage_final = event.usage, event.usage_final
+            self.receipt.usage, self.receipt.usage_final = event.usage, event.usage_final
+            self.receipt.revision += 1
         else:
             return
         self._revision += 1
         self._event_type = type(event).__name__
-        self.view.usage, self.view.usage_final = self.usage, self.usage_final
         if self.finished is None:
             return
         if self._publish_task is None or self._publish_task.done():
@@ -154,16 +195,29 @@ class CostSummary:
                 revision = self._revision
                 event_type = self._event_type
                 text = render_final(self.finished, self.usage, self.usage_final, self.failure)
+                embed = render_cost(self.usage, self.usage_final)
                 if self.message is None:
                     self._send_attempts += 1
-                    self.message = await self.send(text, view=self.view, nonce=self._nonce)
+                    # Discord hosts the full result; persistent controls retain only usage.
+                    outcome = self.finished.outcome_en or 'no confirmed outcome.'
+                    with io.BytesIO(outcome.encode('utf-8')) as body:
+                        attachment = discord.File(body, filename='call-result.txt')
+                        try:
+                            self.message = await self.send(
+                                text, embed=embed, view=self.view, nonce=self._nonce,
+                                file=attachment)
+                        finally:
+                            attachment.close()
                     if self._send_attempts > 1:
                         # Nonce deduplication can return the earlier accepted message's
                         # old body. Reconcile it with the newest price after recovering its ID.
-                        await self.edit(self.message, text, view=self.view)
-                elif text != self._content:
-                    await self.edit(self.message, text, view=self.view)
-                self._content = text
+                        await self.edit(self.message, text, embed=embed, view=self.view)
+                else:
+                    await self.edit(self.message, text, embed=embed, view=self.view)
+                self.receipt.message_id = getattr(self.message, 'id', None)
+                # A price may arrive while the initial Discord send is pending.
+                if self.receipt.revision:
+                    await self.receipt.publish()
                 if revision == self._revision:
                     return
         except Exception as exc:

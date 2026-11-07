@@ -19,7 +19,6 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 
 import aiohttp
 
@@ -38,6 +37,7 @@ EVENTS = {
     'speech_started': 'input_audio_buffer.speech_started',
     'speech_stopped': 'input_audio_buffer.speech_stopped',
     'input_transcript': 'conversation.item.input_audio_transcription.completed',
+    'input_transcript_failed': 'conversation.item.input_audio_transcription.failed',
     'output_audio': 'response.output_audio.delta',
     'output_audio_done': 'response.output_audio.done',
     'output_transcript': 'response.output_audio_transcript.done',
@@ -57,6 +57,7 @@ LOG = logging.getLogger(__name__)
 FATAL_CODES = frozenset({'invalid_api_key', 'authentication_error', 'permission_denied',
                          'session_expired', 'session_not_found', 'invalid_session',
                          'model_not_found'})
+ASR_TIMEOUT_S = 5
 BUSY_CODES = frozenset({'conversation_already_has_active_response', 'response_in_progress'})
 ToolHook = Callable[[str, dict, str], Awaitable[None]]
 
@@ -73,6 +74,7 @@ class _Playout:
     played_bytes: int = 0
     started_at: float = 0
     response_id: str = ''
+    generation: int = 0
 
 
 @dataclass
@@ -80,6 +82,8 @@ class _Command:
     number: str
     response: dict
     done: asyncio.Future = field(repr=False)
+    generation: int = 0
+    opener: bool = False
 
 
 class RealtimeClient:
@@ -97,7 +101,9 @@ class RealtimeClient:
                  on_tool_call: ToolHook | None = None, tools: tuple[dict, ...] = (),
                  clock: Callable[[], float] = time.monotonic,
                  on_speech: Callable[[bool, str], None] | None = None,
-                 goal: str = '', timeline: DebugTimeline | None = None):
+                 goal: str = '', timeline: DebugTimeline | None = None,
+                 on_asr_failure: Callable[[], Awaitable[None]] | None = None,
+                 on_callee_response: Callable[[], None] | None = None):
         self.config, self.brief = config, brief
         self.audio_sink, self.events, self.meter = audio, events, meter
         self._session = session
@@ -109,6 +115,8 @@ class RealtimeClient:
         self._answered_at = 0.0
         self._on_tool_call, self._tools = on_tool_call, tools
         self._on_speech = on_speech
+        self._on_asr_failure = on_asr_failure
+        self._on_callee_response = on_callee_response
         self._goal = goal
         self.timeline = timeline or DebugTimeline(config.debug_timeline_path, clock=clock)
         self._recent_speech: deque[tuple[float, str, str]] = deque(maxlen=64)
@@ -116,12 +124,19 @@ class RealtimeClient:
         self._input_seen: set[str] = set()
         self._preopening_items: set[str] = set()
         self._turn_pending = False
+        self._reply_needed = False
         self._playout: dict[tuple[str, int], _Playout] = {}
         self._generating: set[tuple[str, int]] = set()
         self._marks: dict[str, tuple[tuple[str, int], int]] = {}
         self._mark_seq = 0
         self._interrupted: set[str] = set()
         self._starts: dict[str, float] = {}
+        self._ends: dict[str, float] = {}
+        self._asr_timers: dict[str, asyncio.Task] = {}
+        self._asr_failed_items: set[str] = set()
+        self._asr_recovery: asyncio.Task | None = None
+        self._asr_clarified = False
+        self._asr_ok = asyncio.Event()
         self._utterances: set[tuple[str, str]] = set()
         self._tools_seen: set[str] = set()
         self._stopped = False
@@ -142,6 +157,13 @@ class RealtimeClient:
         self._transcripts: dict[tuple[str, int], str] = {}
         self._opener_requested = False
         self._conversation_open = False
+        self._permission = False
+        self._permission_generation = 0
+        self._revocation: asyncio.Task | None = None
+        self._response_commands: dict[str, str] = {}
+        self._opener_responses: set[str] = set()
+        self._completed_responses: set[str] = set()
+        self._delivered_responses: set[str] = set()
         self._silenced = False
         self._allowed_responses: set[str] = set()
         self._blocked_responses: set[str] = set()
@@ -175,7 +197,7 @@ class RealtimeClient:
         return {'type': EVENTS['session_update'], 'session': session}
 
     def _turn_detection(self) -> dict:
-        # Transcription is asynchronous to VAD: release responses only after echo filtering.
+        # Transcription is asynchronous to VAD: classify the final text before replying.
         return {'type': 'server_vad', 'threshold': self.config.vad_threshold,
                 'silence_duration_ms': self.config.vad_silence_duration_ms,
                 'create_response': False, 'interrupt_response': False}
@@ -235,18 +257,48 @@ class RealtimeClient:
         if self._opener_requested or self._silenced or self._stopped or self._media is None:
             return
         self._opener_requested = True
-        generated = await self.say(self.brief.opener_ja)
+        generated = await self.say(self.brief.opener_ja, _opener=True)
         if await generated != 'completed':
             raise RealtimeError('The voice service could not speak the opening.')
         if not self._silenced and not self._stopped:
             self._conversation_open = True
+            self._schedule_reply()
+
+    def set_permission(self, granted: bool) -> None:
+        """Fence queued speech before the caller awaits any consent cleanup."""
+        if granted:
+            self._permission = True
+            return
+        self._permission = False
+        self._permission_generation += 1
+        self._blocked_commands.update(self._commands)
+        self._blocked_responses.update(self._active_responses)
+        self._blocked_responses.update(self._allowed_responses)
+        self._allowed_responses.clear()
+        self._marks.clear()
+        self.audio_sink.clear('fri')
+        if not self._stopped and self._media is not None:
+            responses = tuple(self._active_responses)
+            previous = self._revocation
+
+            async def revoke():
+                if previous is not None:
+                    await asyncio.shield(previous)
+                for response_id in responses:
+                    await self._send('response_cancel', response_id=response_id)
+                await self._barge_in()
+
+            self._revocation = self._background(revoke())
 
     def silence(self) -> None:
         """Fence output synchronously before voicemail cleanup can await anything."""
         self._silenced = True
+        self.audio_sink.clear('fri')
+        self._marks.clear()
         self._conversation_open = False
         self._blocked_commands.update(self._commands)
         self._blocked_responses.update(self._active_responses)
+        self._blocked_responses.update(self._allowed_responses)
         self._allowed_responses.clear()
 
     async def interrupt(self) -> None:
@@ -257,20 +309,37 @@ class RealtimeClient:
 
     def _output_allowed(self, event: dict) -> bool:
         response_id = event.get('response_id', '')
-        return (response_id not in self._blocked_responses
-                and (self._conversation_open or response_id in self._allowed_responses))
+        return (not self._silenced and not self._stopped
+                and response_id not in self._blocked_responses
+                and response_id in self._allowed_responses)
 
     async def _submit(self, command: _Command) -> None:
         async with self._response_lock:
             await self._idle.wait()
+            if self._revocation is not None:
+                await asyncio.shield(self._revocation)
+            if (command.generation != self._permission_generation
+                    or command.number in self._blocked_commands):
+                self._commands.pop(command.number, None)
+                if not command.done.done():
+                    command.done.set_result('cancelled')
+                return
             if self._stopped:
                 raise RealtimeError('The voice connection ended.')
+            if not self._permission and not command.opener:
+                command.response.update(output_modalities=['text'], tools=[
+                    tool for tool in self._tools if tool.get('name') == 'permission'],
+                    tool_choice={'type': 'function', 'name': 'permission'})
+                command.response['instructions'] = (
+                    'Use only permission(decision=granted/refused/transfer) to classify the '
+                    'callee reply to the notice. Ambiguous input grants nothing. Do not speak '
+                    'or start the inquiry.')
             self._idle.clear()
             self._pending = command
             await self._send('response_create', event_id='jpcall-' + command.number,
                              response=command.response)
 
-    def _background(self, coroutine) -> None:
+    def _background(self, coroutine) -> asyncio.Task:
         task = asyncio.create_task(coroutine)
         self._side_tasks.add(task)
 
@@ -279,9 +348,10 @@ class RealtimeClient:
             if not done.cancelled():
                 done.exception()  # Errors are handled by the owning call's connection monitor.
         task.add_done_callback(finished)
+        return task
 
     async def respond(self, *, instructions: str | None = None,
-                      out_of_band: bool = False) -> asyncio.Future:
+                      out_of_band: bool = False, _opener: bool = False) -> asyncio.Future:
         self._response_seq += 1
         number = str(self._response_seq)
         response = {'metadata': {'jpcall_command': number}}
@@ -289,8 +359,25 @@ class RealtimeClient:
             response['instructions'] = instructions
         if out_of_band:
             response.update(conversation='none', input=[], tools=[], tool_choice='none')
-        command = _Command(number, response, asyncio.get_running_loop().create_future())
+        command = _Command(number, response, asyncio.get_running_loop().create_future(),
+                           self._permission_generation, _opener)
         self._commands[number] = command
+
+        def cancelled(done):
+            if done.cancelled() and not self._stopped:
+                self._blocked_commands.add(number)
+                responses = tuple(response_id for response_id, command_number
+                                  in self._response_commands.items() if command_number == number)
+                self._blocked_responses.update(responses)
+
+                async def cancel():
+                    for response_id in responses:
+                        await self._send('response_cancel', response_id=response_id)
+                    if responses:
+                        await self._barge_in()
+
+                self._background(cancel())
+        command.done.add_done_callback(cancelled)
         try:
             await self._submit(command)
         except BaseException:
@@ -302,10 +389,12 @@ class RealtimeClient:
             raise
         return command.done
 
-    async def say(self, text_ja: str, *, out_of_band: bool = False) -> asyncio.Future:
+    async def say(self, text_ja: str, *, out_of_band: bool = False,
+                  _opener: bool = False) -> asyncio.Future:
         return await self.respond(instructions=(
             self.config.language.instructions + '\n' + self.config.language.say_prefix
-            + json.dumps(text_ja, ensure_ascii=False)), out_of_band=out_of_band)
+            + json.dumps(text_ja, ensure_ascii=False)), out_of_band=out_of_band,
+            _opener=_opener)
 
     async def drain(self, timeout_s: float = 8) -> None:
         async with asyncio.timeout(timeout_s):
@@ -376,6 +465,7 @@ class RealtimeClient:
                 if recent is not None:
                     self._remember_speech(part.item_id, recent)
                 await self._flush_transcript(key)
+                self._confirm_response(part.response_id)
         self._update_idle()
 
     async def _barge_in(self) -> None:
@@ -401,16 +491,17 @@ class RealtimeClient:
             self._update_idle()
 
     async def _utterance(self, item_id: str, speaker: str, text: str,
-                         started_at: float) -> None:
+                         started_at: float, *, ended_at: float | None = None,
+                         delivery: str = 'complete') -> None:
         key = speaker, item_id
         if key in self._utterances:
             return
         self._utterances.add(key)
-        if speaker == 'fri':
+        if speaker == 'fri' and delivery == 'complete':
             self._remember_speech(item_id, text)
         self.timeline.record('transcript', speaker=speaker, item_id=item_id, text=text)
         await self.events.emit(Utterance(self.brief.request_id, item_id, speaker,
-                                         text, started_at))
+                                         text, started_at, ended_at, delivery))
 
     @staticmethod
     def _normalized(text: str) -> str:
@@ -424,10 +515,8 @@ class RealtimeClient:
         # Common short answers (はい / 네 / いいえ) are not evidence of an echo.
         if len(normalized) < 6:
             return False
-        for _, _, spoken in self._recent_speech:
-            match = SequenceMatcher(None, normalized, spoken, autojunk=False)
-            if match.ratio() >= 0.6:
-                return True
+        if any(normalized == spoken for _, _, spoken in self._recent_speech):
+            return True
         return False
 
     def _remember_speech(self, item_id: str, text: str) -> None:
@@ -436,24 +525,104 @@ class RealtimeClient:
                                    maxlen=64)
         self._recent_speech.append((self._clock(), item_id, self._normalized(text)))
 
+    def _schedule_reply(self) -> None:
+        if (self._reply_needed and self._conversation_open and not self._turn_pending
+                and not self._silenced and not self._stopped):
+            self._turn_pending = True
+            self._background(self._reply_to_callee())
+
     async def _reply_to_callee(self) -> None:
         try:
+            await self._idle.wait()
             if not self._stopped and not self._silenced:
+                self._reply_needed = False
                 await self.respond()
         finally:
             self._turn_pending = False
+            self._schedule_reply()
+
+    def _confirm_response(self, response_id: str) -> None:
+        if (not response_id or response_id not in self._completed_responses
+                or response_id in self._delivered_responses
+                or response_id in self._blocked_responses or self._silenced or self._stopped):
+            return
+        parts = [part for part in self._playout.values() if part.response_id == response_id]
+        if not parts or any(part.generation != self._permission_generation
+                            or not part.sent_bytes or part.played_bytes < part.sent_bytes
+                            or part.item_id in self._interrupted
+                            or (part.item_id, part.content_index) in self._generating
+                            for part in parts):
+            return
+        self._delivered_responses.add(response_id)
+        if response_id not in self._opener_responses and self._on_callee_response:
+            self._on_callee_response()
+
+    async def _asr_timeout(self, item: str) -> None:
+        await asyncio.sleep(ASR_TIMEOUT_S)
+        self._asr_timers.pop(item, None)
+        if item not in self._input_seen and item not in self._asr_failed_items:
+            self._asr_failed_items.add(item)
+            if item not in self._preopening_items:
+                self._asr_failed()
+
+    def _asr_failed(self) -> None:
+        if self._silenced or self._stopped or not self._opener_requested:
+            return
+        if self._asr_recovery is None or self._asr_recovery.done():
+            self._asr_ok.clear()
+            self._asr_recovery = self._background(self._recover_asr())
+
+    async def _exhaust_asr(self) -> None:
+        self.silence()
+        await self._barge_in()
+        if self._on_asr_failure:
+            await self._on_asr_failure()
+        else:
+            await self._close_media()
+
+    async def _recover_asr(self) -> None:
+        if self._asr_clarified:
+            await self._exhaust_asr()
+            return
+        self._asr_clarified = True
+        if self._asr_ok.is_set():
+            return
+        try:
+            async with asyncio.timeout(ASR_TIMEOUT_S):
+                await self._idle.wait()
+                if self._permission:
+                    done = await self.respond(out_of_band=True, instructions=(
+                        self.config.language.instructions + '\nIn '
+                        + self.config.language.name
+                        + ', briefly say you could not hear and ask the callee to repeat. '
+                        'Do not state or confirm any inquiry facts.'))
+                else:
+                    done = await self.say(self.brief.opener_ja, _opener=True)
+                if await done != 'completed':
+                    raise RealtimeError('The voice service could not clarify.')
+                await self.drain(timeout_s=ASR_TIMEOUT_S)
+            async with asyncio.timeout(ASR_TIMEOUT_S):
+                await self._asr_ok.wait()
+        except (TimeoutError, RealtimeError):
+            await self._exhaust_asr()
 
     async def _flush_transcript(self, key: tuple[str, int]) -> None:
         if key not in self._transcripts:
             return
         part = self._playout.get(key)
         interrupted = key[0] in self._interrupted
-        if part and not interrupted and (part.played_bytes < part.sent_bytes
-                                         or key in self._generating):
+        if part is None or part.generation != self._permission_generation:
+            self._transcripts.pop(key, None)
             return
-        text = self._transcripts.pop(key) + (' …' if interrupted else '')
-        await self._utterance(key[0], 'fri', text,
-                              part.started_at if part else self._clock() - self._answered_at)
+        if not interrupted and (part.played_bytes < part.sent_bytes
+                                or key in self._generating):
+            return
+        text = self._transcripts.pop(key)
+        if not part.played_bytes:
+            return
+        await self._utterance(key[0], 'fri', text, part.started_at,
+                              ended_at=self._clock() - self._answered_at,
+                              delivery='interrupted' if interrupted else 'complete')
 
     async def handle_event(self, event: dict) -> None:
         kind = event.get('type')
@@ -467,52 +636,91 @@ class RealtimeClient:
             number = (response.get('metadata') or {}).get('jpcall_command')
             if self._pending and self._pending.number == number:
                 self._pending = None
-            explicit = (self._opener_requested and number in self._commands
+            command = self._commands.get(number)
+            if command is not None:
+                self._response_commands[response['id']] = number
+            explicit = (command is not None and command.opener
+                        and command.generation == self._permission_generation
                         and number not in self._blocked_commands)
-            if self._conversation_open or explicit:
+            if explicit:
+                self._opener_responses.add(response['id'])
+            if explicit or (self._permission and self._conversation_open):
                 self._allowed_responses.add(response['id'])
-            else:
+            if (self._silenced or (not explicit and not self._conversation_open)
+                    or number in self._blocked_commands):
                 self._blocked_responses.add(response['id'])
                 await self._send('response_cancel', response_id=response['id'])
         elif kind == EVENTS['speech_started']:
             self.timeline.record('speech_started', item_id=event['item_id'],
                                  audio_start_ms=event['audio_start_ms'])
             self._starts[event['item_id']] = max(0, event['audio_start_ms'] / 1000)
-            if not self._conversation_open:
+            if not self._opener_requested:
                 self._preopening_items.add(event['item_id'])
             if self._on_speech:
                 self._on_speech(True, event['item_id'])
         elif kind == EVENTS['speech_stopped']:
             self.timeline.record('speech_stopped', item_id=event['item_id'],
                                  audio_end_ms=event.get('audio_end_ms'))
+            item = event['item_id']
+            self._ends[item] = max(0, event.get(
+                'audio_end_ms', (self._clock() - self._answered_at) * 1000) / 1000)
+            if item not in self._input_seen and item not in self._asr_timers:
+                self._asr_timers[item] = self._background(self._asr_timeout(item))
             if self._on_speech:
-                self._on_speech(False, event['item_id'])
+                self._on_speech(False, item)
+        elif kind == EVENTS['input_transcript_failed']:
+            item = event['item_id']
+            if item not in self._input_seen and item not in self._asr_failed_items:
+                self._asr_failed_items.add(item)
+                timer = self._asr_timers.pop(item, None)
+                if timer is not None:
+                    timer.cancel()
+                if self._on_speech:
+                    self._on_speech(False, item)
+                if item not in self._preopening_items:
+                    self._asr_failed()
         elif kind == EVENTS['input_transcript']:
             item = event['item_id']
             if item in self._input_seen:
                 return
             self._input_seen.add(item)
-            was_open = self._conversation_open and item not in self._preopening_items
+            eligible = self._opener_requested and item not in self._preopening_items
+            timer = self._asr_timers.pop(item, None)
+            if timer is not None:
+                timer.cancel()
             self._preopening_items.discard(item)
             self.meter.transcription(event.get('usage'), self.config.transcribe_model, item)
             text = event['transcript']
-            if self._is_echo(text):
-                self.timeline.record('echo_drop', item_id=item, text=text)
-                await self._send('item_delete', item_id=item)
-                return
             if self._on_speech:
                 self._on_speech(False, item)
+            if not text.strip():
+                if eligible:
+                    self._asr_failed()
+                return
+            echo = self._is_echo(text)
+            if echo:
+                self.timeline.record('echo_uncertain', item_id=item, text=text)
             await self._utterance(item, 'callee', text,
-                                  self._starts.get(item, self._clock() - self._answered_at))
-            if was_open and not self._silenced and text.strip():
-                # Confirmed speech interrupts; raw VAD noise/self-echo does not.
-                for response_id in tuple(self._active_responses):
-                    self._blocked_responses.add(response_id)
-                    await self._send('response_cancel', response_id=response_id)
-                await self._barge_in()
-                if not self._turn_pending:
-                    self._turn_pending = True
-                    self._background(self._reply_to_callee())
+                                  self._starts.get(item, self._clock() - self._answered_at),
+                                  ended_at=self._ends.get(item),
+                                  delivery='unknown' if echo else 'complete')
+            if eligible and not self._silenced:
+                if echo:
+                    self._asr_failed()
+                    return
+                self._asr_ok.set()
+                self._asr_clarified = False
+                if self._asr_recovery is not None:
+                    self._asr_recovery.cancel()
+                    self._asr_recovery = None
+                if self._conversation_open:
+                    # Confirmed speech interrupts; raw VAD noise does not.
+                    for response_id in tuple(self._active_responses):
+                        self._blocked_responses.add(response_id)
+                        await self._send('response_cancel', response_id=response_id)
+                    await self._barge_in()
+                self._reply_needed = True
+                self._schedule_reply()
         elif kind == EVENTS['output_audio']:
             if not self._output_allowed(event):
                 return
@@ -530,13 +738,14 @@ class RealtimeClient:
                     return
                 part = self._playout.setdefault(key, _Playout(
                     item, key[1], started_at=self._clock() - self._answered_at,
-                    response_id=event.get('response_id', '')))
+                    response_id=event.get('response_id', ''),
+                    generation=self._permission_generation))
                 self.has_spoken = True
                 await self._media.send_audio(ulaw)
+                part.sent_bytes += len(ulaw)
                 if not self._output_allowed(event):
                     return
                 self.audio_sink.push('fri', ulaw_to_pcm16(ulaw))
-                part.sent_bytes += len(ulaw)
                 self._mark_seq += 1
                 name = str(self._mark_seq)
                 self._marks[name] = key, part.sent_bytes
@@ -545,6 +754,9 @@ class RealtimeClient:
             key = event['item_id'], event['content_index']
             self._generating.discard(key)
             await self._flush_transcript(key)
+            part = self._playout.get(key)
+            if part:
+                self._confirm_response(part.response_id)
             self._update_idle()
         elif kind == EVENTS['output_transcript_delta']:
             if self._output_allowed(event):
@@ -569,7 +781,11 @@ class RealtimeClient:
                                      part.response_id == response.get('id')
                                      and part.item_id in self._interrupted
                                      for part in self._playout.values()))
-            self._active_responses.discard(response.get('id', ''))
+            response_id = response.get('id', '')
+            if response.get('status') == 'completed':
+                self._completed_responses.add(response_id)
+                self._confirm_response(response_id)
+            self._active_responses.discard(response_id)
             self._busy_unknown = False
             number = (response.get('metadata') or {}).get('jpcall_command')
             command = self._commands.pop(number, None)
@@ -596,6 +812,8 @@ class RealtimeClient:
                             raise ValueError
                     except (ValueError, TypeError):
                         self._background(self.tool_result(call_id, {'error': 'Invalid arguments'}))
+                        continue
+                    if not self._permission and item['name'] != 'permission':
                         continue
                     await self._on_tool_call(item['name'], arguments, call_id)
         elif kind == EVENTS['error']:
@@ -632,10 +850,11 @@ class RealtimeClient:
         for command in self._commands.values():
             command.done.cancel()
         self._commands.clear()
-        for task in tuple(self._side_tasks):
+        tasks = tuple(task for task in self._side_tasks if task is not asyncio.current_task())
+        for task in tasks:
             task.cancel()
-        if self._side_tasks:
-            await asyncio.gather(*self._side_tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._side_tasks.clear()
         if self._ws is not None:
             await self._ws.close()
@@ -651,6 +870,12 @@ class RealtimeClient:
         self._playout.clear()
         self._marks.clear()
         self._starts.clear()
+        self._ends.clear()
+        self._asr_timers.clear()
+        self._asr_failed_items.clear()
+        self._input_seen.clear()
+        self._preopening_items.clear()
+        self._transcripts.clear()
         self._recent_speech.clear()
         self._partial_transcripts.clear()
         self.timeline.close()

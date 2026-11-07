@@ -29,6 +29,7 @@ from fri.jpcall.contract import (
 )
 from fri.jpcall.engine import JpcallEngine
 from fri.jpcall.realtime import EVENTS, RealtimeClient
+from fri.jpcall.recovery import AttemptJournal
 
 OPENING_NOTICES = CALL_LANGUAGES['ja'].opener
 
@@ -169,7 +170,7 @@ class Provider:
         else:
             self.order.append('hangup')
             self.hangups += 1
-        return httpx.Response(200, json={'sid': SID})
+        return httpx.Response(200, json={'sid': SID, 'status': 'completed' if 'To' not in form else 'queued'})
 
 
 class Runner:
@@ -231,6 +232,8 @@ async def make_engine(tmp_path, monkeypatch, provider=None, *, call_language='ja
     config = JpcallConfig.from_env(environment() | {'FRI_DATA': str(tmp_path),
                                                    'JPCALL_ALLOWED_USER_IDS': '12',
                                                    'JPCALL_CALL_LANGUAGE': call_language})
+    if not (tmp_path / 'jpcall' / 'recovery.initialized').exists():
+        AttemptJournal.initialize(tmp_path / 'jpcall')
     http = httpx.AsyncClient(transport=httpx.MockTransport(provider.handle))
     engine = JpcallEngine(config, http_client=http)
     runner = Runner()
@@ -271,6 +274,7 @@ async def answer_phone(call):
                                  'audio_start_ms': 0})
     await call._rt.handle_event({'type': EVENTS['speech_stopped'], 'item_id': 'hello'})
     await settled(lambda: call._rt._conversation_open)
+    await call._handle_tool('permission', {'decision': 'granted'}, 'fixture-permission')
     await settled(lambda: bool(call._transcript))
     return media
 
@@ -287,31 +291,30 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(
             assert brief.opener_ja == language.opener
             assert 'Fri' not in brief.opener_ja
             assert brief.share == request().share and brief.never == request().never
-            request_body = json.loads(provider.requests[0].content)
-            assert 'app supplies the fixed opener' in request_body['input'][0]['content']
-            assert set(request_body['text']['format']['schema']['properties']) == {'summary_en'}
+            assert brief.summary_en == request().goal
+            assert not any(r.url.host == 'api.openai.com' for r in provider.requests)
             assert provider.order.index('realtime_connect') < provider.order.index('create')
             assert not peer.responses
-            assert [line.component for line in call._meter.lines()] == ['brief']
+            assert not call._meter.lines()
             await answer_phone(call)
             opener = peer.responses[0]['instructions']
             assert opener.count(language.opener) == 1
             assert json.loads(opener.rsplit(language.say_prefix, 1)[1]) == language.opener
             assert 'Fri' not in opener
             await settled(lambda: call._rt._idle.is_set())
-            assert len(peer.responses) == 1  # Wait for the callee; never append a purpose response.
+            response_start = len(peer.responses)
             peer.tool('ask_group', {'question_en': 'Which time?', 'options': ['noon', 'one']})
             await settled(lambda: any(isinstance(e, QuestionAsked) for e in events.items))
             question = next(e for e in events.items if isinstance(e, QuestionAsked))
             assert question.deadline_s == 60
-            await settled(lambda: len(peer.responses) >= 2)
-            assert peer.responses[1]['conversation'] == 'none'
-            assert language.hold in peer.responses[1]['instructions']
+            await settled(lambda: len(peer.responses) >= response_start + 1)
+            assert peer.responses[response_start]['conversation'] == 'none'
+            assert language.hold in peer.responses[response_start]['instructions']
             clock.advance(45)
-            await settled(lambda: len(peer.responses) >= 3)
-            assert language.apology in peer.responses[2]['instructions']
-            assert peer.responses[2]['conversation'] == 'none'
-            answers = await asyncio.gather(call.answer(question.question_id, 'noon', 34),
+            await settled(lambda: len(peer.responses) >= response_start + 2)
+            assert language.apology in peer.responses[response_start + 1]['instructions']
+            assert peer.responses[response_start + 1]['conversation'] == 'none'
+            answers = await asyncio.gather(call.answer(question.question_id, 'noon', 12),
                                            call.answer(question.question_id, 'one', 56))
             assert answers == [True, False]
             assert not await call.answer('unknown', 'noon', 34)
@@ -344,7 +347,8 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(
             assert twilio.exact and twilio.usd == .25 and update.usage_final
             files = list((tmp_path / 'jpcall').glob('*'))
             assert {path.name for path in files} == {
-                'daily-counts.lock', 'daily-counts.json', 'jpcall-usage.jsonl'}
+                'daily-counts.lock', 'daily-counts.json', 'jpcall-usage.jsonl',
+                'recovery.json', 'recovery.lock', 'recovery.initialized'}
             data = '\n'.join(path.read_text() for path in files
                               if path.is_file())
             assert 'ランチ' not in data and request().goal not in data and '+8190' not in data
@@ -388,9 +392,11 @@ def test_hold_expiry_and_hangup_close_question(tmp_path, monkeypatch, expired):
             if expired:
                 clock.advance(60)
                 await call._hold.tick()
-                await settled(lambda: any(e['type'] == EVENTS['item_create'] for e in peer.sent))
-                result = next(e for e in peer.sent if e['type'] == EVENTS['item_create'])
-                assert 'offer to call back' in result['item']['output']
+                await asyncio.wait_for(call._finished.wait(), 1)
+                assert 'did not answer' in next(e.outcome_en for e in events.items
+                                               if isinstance(e, CallFinished))
+                assert not any('offer to call back' in e.get('item', {}).get('output', '')
+                               for e in peer.sent)
             await call.hang_up()
             closed = [e for e in events.items if isinstance(e, QuestionClosed)]
             assert len(closed) == 1 and closed[0].reason == ('expired' if expired else 'call_ended')
@@ -692,7 +698,8 @@ def test_model_cannot_change_the_fixed_opener(tmp_path, monkeypatch, call_langua
         try:
             brief = await engine.plan(request())
             assert brief.opener_ja == engine.config.language.opener
-            assert 'Full request' in brief.summary_en
+            assert brief.summary_en == request().goal
+            assert not provider.requests
             assert 'create' not in provider.order
         finally:
             await engine.close()

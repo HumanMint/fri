@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import struct
+import time
 
 import discord
 from discord import app_commands
@@ -54,14 +55,20 @@ class FakeSession:
         self.answer_future = asyncio.get_running_loop().create_future()
         self.question_open = False
         self.ended = False
+        self.publication_allowed = True
+        self.consent_generation = 1
+        self.deadline_at = None
+        self.started_at = time.monotonic()
         self.task = None
         self._finish_lock = asyncio.Lock()
 
-    async def emit(self, event_type, *args):
-        await self.events.emit(event_type(self.request.request_id, *args))
+    async def emit(self, event_type, *args, **kwargs):
+        await self.events.emit(event_type(self.request.request_id, *args, **kwargs))
 
     async def speak(self, item_id, speaker, original, english, frequency):
-        await self.emit(Utterance, item_id, speaker, original, 0.0)
+        started = time.monotonic() - self.started_at
+        await self.emit(Utterance, item_id, speaker, original, started,
+                        ended_at=started + .5, delivery='complete')
         # Keep tone phase continuous across frames. Synthetic audio only.
         for frame in range(25):
             pcm = struct.pack('<160h', *(int(TONE_PEAK * math.sin(2 * math.pi * frequency *
@@ -72,7 +79,9 @@ class FakeSession:
         await self.emit(Translation, item_id, english)
 
     async def answer(self, question_id, answer, answered_by):
-        if (question_id != 'time' or not self.question_open or self.ended
+        if (answered_by != self.request.requester_id
+                or (self.deadline_at is not None and time.monotonic() >= self.deadline_at)
+                or question_id != 'time' or not self.question_open or self.ended
                 or self.answer_future.done() or not answer.strip()):
             return False
         self.question_open = False
@@ -81,6 +90,8 @@ class FakeSession:
         return True
 
     async def hang_up(self, reason='requested'):
+        self.publication_allowed = False
+        self.consent_generation += 1
         if self.task is not None and self.task is not asyncio.current_task():
             self.task.cancel()
             try:
@@ -106,10 +117,13 @@ class FakeSession:
             if self.ended:
                 return
             self.ended = True
+            self.publication_allowed = False
+            self.consent_generation += 1
             if self.question_open:
                 self.question_open = False
                 await self.emit(QuestionClosed, 'time', 'call_ended')
-            await self.emit(CallFinished, outcome, duration_s, self.usage(), usage_final)
+            await self.emit(CallFinished, outcome, duration_s, self.usage(), usage_final,
+                            termination_confirmed=True)
 
     async def run(self):
         try:
@@ -121,8 +135,10 @@ class FakeSession:
             await self.speak('2', 'callee', self.originals[1], 'six pm is available.', 660)
             self.question_open = True
             await self.emit(StatusChanged, CallState.ON_HOLD)
+            self.deadline_at = time.monotonic() + 30
             await self.emit(QuestionAsked, 'time', 'does six pm work?', ('yes, six is fine',
-                                                                       'ask about seven'), 30.0)
+                                                                       'ask about seven'), 30.0,
+                            deadline_at=self.deadline_at, text_original=self.originals[1])
             try:
                 answer = await asyncio.wait_for(asyncio.shield(self.answer_future), 30)
             except TimeoutError:
@@ -132,8 +148,11 @@ class FakeSession:
             await self.emit(StatusChanged, CallState.IN_PROGRESS)
             await self.speak('3', 'fri', self.originals[2], 'thank you.', 440)
             await self.finish(f'fake outcome · {answer}. no booking was made.')
+            usage_sink = getattr(self.events, 'usage_sink', None)
+            late_usage = usage_sink() if usage_sink is not None else self.events.emit
             await asyncio.sleep(1)
-            await self.emit(UsageUpdated, self.usage(phone_posted=True), True)
+            await late_usage(UsageUpdated(self.request.request_id,
+                                         self.usage(phone_posted=True), True))
         except asyncio.CancelledError:
             raise
 
@@ -161,6 +180,7 @@ class FakeEngine:
         self.sessions = []
         self.audio_check = audio_check
         self.originals = CALL_LINES[call_language]
+        self.language_name = {'ja': 'Japanese', 'ko': 'Korean'}[call_language]
 
     async def open(self):
         pass
@@ -250,12 +270,7 @@ def main():
         engine = FakeEngine(audio_check=args.audio_check, call_language=language)
         limits = Limits(allowed_user_ids=frozenset(args.allow_user))
     else:
-        try:
-            config = load_config()
-        except ModuleNotFoundError as exc:
-            if exc.name != 'fri.jpcall.config':
-                raise
-            parser.error('jpcall engine configuration is not installed.')
+        config = load_config()
         if not config.enabled:
             parser.error(disabled_message(config))
         engine, limits = None, config.limits

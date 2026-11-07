@@ -42,7 +42,8 @@ def test_rest_api_key_auth_twiml_hangup_and_posted_billing():
             form = parse_qs(requests[0].content.decode())
             assert form['To'] == ['+81312345678']
             assert not any('record' in key.lower() for key in form)
-            assert form['TimeLimit'] == ['900']
+            assert form['TimeLimit'] == ['600']
+            assert form['Timeout'] == ['30']
             assert form['MachineDetection'] == ['Enable'] and form['AsyncAmd'] == ['true']
             assert form['AsyncAmdStatusCallbackMethod'] == ['POST']
             assert form['AsyncAmdStatusCallback'] == form['StatusCallback']

@@ -171,13 +171,13 @@ def test_voice_command_uses_own_allowlist_and_engine_without_gene_calls(monkeypa
         event.followup = SimpleNamespace(send=AsyncMock())
         assert await bot.tree.interaction_check(event)
         command = bot.tree.get_command('jpcall', guild=discord.Object(id=1))
-        await command.callback(event, '+810000000000', 'dinner')
+        await command.callback(event, '+81300000000', 'dinner')
         engine.plan.assert_awaited_once()
         text.send.assert_awaited_once()
         voice.send.assert_not_called()
         assert bot.api.await_count == 1
         event.user.id = 11
-        await command.callback(event, '+810000000000', 'dinner')
+        await command.callback(event, '+81300000000', 'dinner')
         event.followup.send.assert_awaited_once()
         assert event.followup.send.call_args.kwargs['ephemeral'] is True
         assert engine.plan.await_count == bot.api.await_count == 1
@@ -278,16 +278,10 @@ def test_devbot_main_uses_process_config_and_real_engine_mode(monkeypatch):
     assert seen[0].engine is None and seen[0].limits is cfg.limits
 
 
-def test_optional_config_only_tolerates_the_absent_engine_module(monkeypatch):
+def test_load_config_propagates_missing_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, 'fri.jpcall.config', None)
-    assert discord_runtime.optional_config() is None
-
-    def broken():
-        raise ModuleNotFoundError('synthetic dependency missing', name='missing_dependency')
-
-    monkeypatch.setattr(discord_runtime, 'load_config', broken)
-    with pytest.raises(ModuleNotFoundError, match='synthetic dependency missing'):
-        discord_runtime.optional_config()
+    with pytest.raises(ModuleNotFoundError):
+        discord_runtime.load_config()
 
 
 @pytest.mark.parametrize('failure', ['open', 'sync'])

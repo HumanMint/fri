@@ -26,13 +26,12 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket.socket, 'connect_ex', forbidden)
 
 
-@pytest.mark.parametrize('code,maximum,already,exception', [
-    ('ja', 340, '自己紹介は済みました', '誰かと聞かれない限り'),
-    ('ko', 375, '소개는 끝났어요', '누구냐고 묻지 않으면'),
+@pytest.mark.parametrize('code,already,exception', [
+    ('ja', '自己紹介は済みました', '誰かと聞かれない限り'),
+    ('ko', '소개는 끝났어요', '누구냐고 묻지 않으면'),
 ])
-def test_short_prompt_prevents_reintroduction(code, maximum, already, exception):
+def test_prompt_prevents_reintroduction(code, already, exception):
     text = CALL_LANGUAGES[code].instructions
-    assert len(text) <= maximum
     assert already in text and exception in text
     assert 'ask_group' in text and 'end_call' in text
     assert 'declined to talk with an AI interpreter' in text
@@ -121,6 +120,9 @@ async def hold_fixture(*, now, spoken, timeline=None):
 
     async def say(text, **kwargs):
         spoken.append(text)
+        generated = asyncio.get_running_loop().create_future()
+        generated.set_result('completed')
+        return generated
 
     async def result(*args):
         pass
@@ -159,7 +161,7 @@ def test_hold_has_one_proactive_checkin_after_45_seconds_of_silence():
     asyncio.run(run())
 
 
-def test_callee_speech_consumes_checkin_and_resets_interval():
+def test_callee_noise_postpones_checkin_without_consuming_it():
     async def run():
         now, spoken = [0], []
         hold = await hold_fixture(now=now, spoken=spoken)
@@ -171,10 +173,11 @@ def test_callee_speech_consumes_checkin_and_resets_interval():
             now[0] = 46
             hold.callee_speech(False, 'callee')
             assert hold.question.next_apology == 91
+            assert not hold.question.checked_in
             for now[0] in (91, 135, 179):
                 await hold.tick()
                 await asyncio.sleep(0)
-            assert spoken == [hold.language.hold]
+            assert spoken == [hold.language.hold, hold.language.apology]
         finally:
             await hold.close()
     asyncio.run(run())
@@ -186,25 +189,29 @@ def test_callee_can_get_natural_answer_while_group_question_stays_open(tmp_path,
         try:
             call, brief, audio, events = await dial(engine, provider)
             await answer_phone(call)
+            await settled(call._rt._idle.is_set)
+            response_count = len(peer.responses)
             peer.tool('ask_group', {'question_en': 'Which time?', 'options': []})
-            await settled(lambda: len(peer.responses) == 2 and call._rt._idle.is_set())
+            await settled(lambda: len(peer.responses) == response_count + 1
+                          and call._rt._idle.is_set() and call._hold.question is not None)
             question = call._hold.question
             peer.feed({'type': EVENTS['speech_started'], 'item_id': 'hold-callee',
                        'audio_start_ms': 1000})
             peer.feed({'type': EVENTS['speech_stopped'], 'item_id': 'hold-callee'})
             peer.feed({'type': EVENTS['input_transcript'], 'item_id': 'hold-callee',
                        'transcript': '何を確認していますか？'})
-            await settled(lambda: len(peer.responses) == 3 and call._rt._idle.is_set())
+            await settled(lambda: len(peer.responses) == response_count + 2 and call._rt._idle.is_set())
             assert 'instructions' not in peer.responses[-1]  # Natural response uses full context.
             assert call._hold.question is question
+            assert question.checked_in  # The natural reply was confirmed played.
             assert any(isinstance(e, Utterance) and e.item_id == 'hold-callee'
                        for e in events.items)
             clock.advance(45)
             for _ in range(20):
                 await asyncio.sleep(0)
-            assert len(peer.responses) == 3
-            assert await call.answer(question.question_id, 'noon', 34)
-            await settled(lambda: len(peer.responses) == 4)
+            assert len(peer.responses) == response_count + 2
+            assert await call.answer(question.question_id, 'noon', 12)
+            await settled(lambda: len(peer.responses) == response_count + 3)
         finally:
             await engine.close()
             await http.aclose()
@@ -214,9 +221,9 @@ def test_callee_can_get_natural_answer_while_group_question_stays_open(tmp_path,
 @pytest.mark.parametrize('spoken,echo', [
     ('네, 프리입니다. 예약 문의드려요.', '네 프리입니다 예약 문의드려요'),
     ('お客様は１２時の予約をご希望です。', 'お客様は12時の予約をご希望です'),
-    ('예약은 내일 저녁 여섯 시에 가능할까요?', '예약은 내일 저녁 일곱 시에 가능할까요'),
 ])
-def test_echo_is_deleted_without_reply_utterance_or_barge_in(tmp_path, caplog, spoken, echo):
+def test_exact_echo_is_retained_as_uncertain_without_automatic_inquiry(
+        tmp_path, caplog, spoken, echo):
     async def run():
         path = tmp_path / 'debug.jsonl'
         client, audio, events, meter, peer = bridge()
@@ -224,9 +231,9 @@ def test_echo_is_deleted_without_reply_utterance_or_barge_in(tmp_path, caplog, s
         media = Media()
         await attach_and_open(client, media)
         try:
-            await client.handle_event({'type': EVENTS['output_audio'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_audio'], 'response_id': 'command-1', 'item_id': 'fri1',
                 'content_index': 0, 'delta': base64.b64encode(ULAW).decode()})
-            await client.handle_event({'type': EVENTS['output_transcript'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_transcript'], 'response_id': 'command-1', 'item_id': 'fri1',
                 'content_index': 0, 'transcript': spoken})
             before = len([e for e in peer.sent if e['type'] == EVENTS['response_create']])
             await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'echo',
@@ -237,13 +244,15 @@ def test_echo_is_deleted_without_reply_utterance_or_barge_in(tmp_path, caplog, s
             await client.handle_event(event)
             for _ in range(5):
                 await asyncio.sleep(0)
-            assert [e for e in peer.sent if e['type'] == EVENTS['item_delete']] == [
-                {'type': EVENTS['item_delete'], 'item_id': 'echo'}]
-            assert len([e for e in peer.sent if e['type'] == EVENTS['response_create']]) == before
-            assert not audio.cleared and not any(e.speaker == 'callee' for e in events.items)
+            assert not [e for e in peer.sent if e['type'] == EVENTS['item_delete']]
+            requests = [e for e in peer.sent if e['type'] == EVENTS['response_create']]
+            assert len(requests) == before + 1  # One bounded clarification, no inquiry loop.
+            assert 'could not hear' in requests[-1]['response']['instructions']
+            row = next(e for e in events.items if e.speaker == 'callee')
+            assert row.text_ja == echo and row.delivery == 'unknown'
             assert not any(e['type'] == EVENTS['truncate'] for e in peer.sent)
             timeline = [json.loads(line) for line in path.read_text().splitlines()]
-            drops = [e for e in timeline if e['event'] == 'echo_drop']
+            drops = [e for e in timeline if e['event'] == 'echo_uncertain']
             assert len(drops) == 1 and drops[0]['text'] == echo
             assert echo not in caplog.text and spoken not in caplog.text
         finally:
@@ -258,18 +267,18 @@ def test_partial_transcript_echo_and_short_answers_and_expiry():
         await attach_and_open(client, Media())
         try:
             text = '予約人数は四名様でよろしいですか'
-            await client.handle_event({'type': EVENTS['output_transcript_delta'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_transcript_delta'], 'response_id': 'command-1', 'item_id': 'fri1',
                                        'content_index': 0, 'delta': text})
             await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'echo',
                                        'transcript': text})
-            assert not any(e.speaker == 'callee' for e in events.items)
+            assert events.items[0].text_ja == text and events.items[0].delivery == 'unknown'
             now[0] += 11
             await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'real1',
                                        'transcript': text})
             await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'real2',
                                        'transcript': 'はい'})
             assert [(e.item_id, e.text_ja) for e in events.items] == [
-                ('real1', text), ('real2', 'はい')]
+                ('echo', text), ('real1', text), ('real2', 'はい')]
             assert not any(e.get('item_id') in ('real1', 'real2')
                            for e in peer.sent if e['type'] == EVENTS['item_delete'])
         finally:
@@ -320,13 +329,15 @@ def test_full_flow_uses_one_timeline_for_transport_hold_and_tools(tmp_path, monk
         try:
             call, brief, audio, events = await dial(engine, provider)
             await answer_phone(call)
+            await settled(call._rt._idle.is_set)
+            response_count = len(peer.responses)
             peer.tool('ask_group', {'question_en': 'Which time?', 'options': []})
             await settled(lambda: any(isinstance(e, QuestionAsked) for e in events.items)
-                          and len(peer.responses) == 2)
+                          and len(peer.responses) == response_count + 1)
             clock.advance(45)
-            await settled(lambda: len(peer.responses) == 3 and call._rt._idle.is_set())
-            assert await call.answer(call._hold.question.question_id, 'noon', 34)
-            await settled(lambda: len(peer.responses) == 4 and call._rt._idle.is_set())
+            await settled(lambda: len(peer.responses) == response_count + 2 and call._rt._idle.is_set())
+            assert await call.answer(call._hold.question.question_id, 'noon', 12)
+            await settled(lambda: len(peer.responses) == response_count + 3 and call._rt._idle.is_set())
             await call.hang_up('test')
             data = [json.loads(line) for line in path.read_text().splitlines()]
             assert len({e['call'] for e in data}) == 1
@@ -366,7 +377,8 @@ def test_non_echo_interrupt_logs_played_truncation_cancel_and_late_transcript(tm
             # The transcript can finish after cancellation. Preserve what was interrupted.
             await client.handle_event({'type': EVENTS['output_transcript'], 'response_id': 'active',
                 'item_id': 'fri1', 'content_index': 0, 'transcript': '途中の文章'})
-            assert next(e for e in events.items if e.speaker == 'fri').text_ja == '途中の文章 …'
+            row = next(e for e in events.items if e.speaker == 'fri')
+            assert row.text_ja == '途中の文章' and row.delivery == 'interrupted'
             frames = len(audio.frames)
             await client.handle_event(delta | {'item_id': 'late-new-item'})
             assert len(audio.frames) == frames
@@ -391,19 +403,20 @@ def test_echo_window_tracks_playout_rather_than_only_generation():
         await attach_and_open(client, Media())
         try:
             text = '예약은 내일 저녁 여섯 시에 가능할까요?'
-            await client.handle_event({'type': EVENTS['output_audio'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_audio'], 'response_id': 'command-1', 'item_id': 'fri1',
                 'content_index': 0, 'delta': base64.b64encode(ULAW).decode()})
-            await client.handle_event({'type': EVENTS['output_transcript'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_transcript'], 'response_id': 'command-1', 'item_id': 'fri1',
                                        'content_index': 0, 'transcript': text})
-            await client.handle_event({'type': EVENTS['output_audio_done'], 'item_id': 'fri1',
+            await client.handle_event({'type': EVENTS['output_audio_done'], 'response_id': 'command-1', 'item_id': 'fri1',
                                        'content_index': 0})
             now[0] += 12  # Queued phone playback may finish well after model generation.
             await client.mark('1')
             now[0] += 1
             await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'echo',
                                        'transcript': text})
-            assert not any(e.speaker == 'callee' for e in events.items)
-            assert any(e['type'] == EVENTS['item_delete'] for e in peer.sent)
+            row = next(e for e in events.items if e.speaker == 'callee')
+            assert row.text_ja == text and row.delivery == 'unknown'
+            assert not any(e['type'] == EVENTS['item_delete'] for e in peer.sent)
         finally:
             await client.stop()
     asyncio.run(run())

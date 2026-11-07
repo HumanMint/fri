@@ -28,9 +28,13 @@ class TranscriptPager:
     never in a tight retry loop. Nothing is persisted outside Discord.
     """
 
-    def __init__(self, send, edit, *, interval=1.5, clock=time.monotonic):
+    def __init__(self, send, edit, *, interval=1.5, clock=time.monotonic, allowed=None):
         self.send, self.edit = send, edit
         self.interval, self.clock = interval, clock
+        self.allowed = allowed
+        self._generations = {}
+        self._committed = {}
+        self._times = {}
         self._rows = []
         self._items = {}
         self._translations = {}
@@ -41,26 +45,42 @@ class TranscriptPager:
         self._lock = asyncio.Lock()
         self._flush_requested = asyncio.Event()
 
-    async def emit(self, event):
+    async def emit(self, event, *, generation=None):
+        if generation is not None and self.allowed is not None and not self.allowed(generation):
+            return
         if isinstance(event, Utterance):
             if event.item_id in self._items:
                 return
-            row = [f'{event.speaker} · {event.text_ja}', '']
+            uncertain = (' · interrupted; wording uncertain' if event.delivery == 'interrupted'
+                         else ' · delivery unknown' if event.delivery == 'unknown' else '')
+            row = [f'{event.speaker}{uncertain} · {event.text_ja}', '\n↳ translation pending']
             self._items[event.item_id] = row
             if event.item_id in self._translations:
-                row[1] = f'\n↳ {self._translations.pop(event.item_id)}'
+                row[1] = self._translations.pop(event.item_id)
+            self._generations[id(row)] = generation
+            self._times[id(row)] = event.started_at
+            # Reinsert only speech rows: progress and group questions keep their anchors.
+            speech = sorted([*self._items.values()], key=lambda item: self._times[id(item)])
             self._rows.append(row)
+            ordered = iter(speech)
+            self._rows = [next(ordered) if id(item) in self._times else item
+                          for item in self._rows]
         elif isinstance(event, Translation):
+            english = ('\n↳ translation unavailable' if event.status == 'unavailable'
+                       or not event.text_en.strip() else f'\n↳ {event.text_en}')
             if event.item_id in self._items:
-                self._items[event.item_id][1] = f'\n↳ {event.text_en}'
+                self._items[event.item_id][1] = english
             else:
-                self._translations[event.item_id] = event.text_en
+                self._translations[event.item_id] = english
                 return
         elif isinstance(event, StatusChanged):
             detail = f' · {event.detail}' if event.detail else ''
             self._rows.append([f'call · {event.state.value.replace("_", " ")}{detail}'])
         elif isinstance(event, QuestionAsked):
-            row = [f'group · {event.text_en}']
+            text = (f'{event.text_original}\n↳ {event.text_en}'
+                    if event.text_original else event.text_en)
+            row = [f'group · {text}']
+            self._generations[id(row)] = generation
             self._questions[event.question_id] = row
             self._rows.append(row)
         elif isinstance(event, QuestionClosed):
@@ -78,7 +98,11 @@ class TranscriptPager:
         # Join complete lines where possible; split unusually long lines without loss.
         pages, current = [], ''
         for row in self._rows:
-            text = ''.join(row)
+            generation = self._generations.get(id(row))
+            permitted = (generation is None or self.allowed is None or self.allowed(generation))
+            text = ''.join(row) if permitted else self._committed.get(id(row), '')
+            if not text:
+                continue
             combined = f'{current}\n\n{text}' if current else text
             if len(chunks(combined)) <= 1:
                 current = combined
@@ -94,27 +118,47 @@ class TranscriptPager:
 
     async def _publish(self, force=False):
         async with self._lock:
-            contents = self._contents()
-            # Reflow may reduce page count; remove stale duplicate text by editing it.
-            contents += ['transcript continued above.'] * (len(self.pages) - len(contents))
+            index = 0
+            revision = self._revision
             try:
-                for index, content in enumerate(contents):
-                    if index == len(self.pages):
-                        message = await self.send(content)
-                        self.pages.append(Page(message, content, self.clock()))
-                    elif self.pages[index].content != content:
+                while True:
+                    contents = self._contents()
+                    contents += ['transcript continued above.'] * (len(self.pages) - len(contents))
+                    if index >= len(contents):
+                        break
+                    content = contents[index]
+                    if index < len(self.pages):
                         page = self.pages[index]
+                        if page.content == content:
+                            index += 1
+                            continue
                         wait = self.interval - (self.clock() - page.edited_at)
                         if not force and wait > 0:
                             try:
                                 await asyncio.wait_for(self._flush_requested.wait(), wait)
                             except TimeoutError:
                                 pass
+                    # Consent can change during the throttle or a previous page's HTTP await.
+                    current = self._contents()
+                    current += ['transcript continued above.'] * (len(self.pages) - len(current))
+                    if current != contents:
+                        index = 0
+                        continue
+                    if index == len(self.pages):
+                        message = await self.send(content)
+                        self.pages.append(Page(message, content, self.clock()))
+                    else:
                         await self.edit(page.message, content)
                         page.content, page.edited_at = content, self.clock()
+                    index += 1
             except discord.HTTPException as exc:
                 LOG.warning('jpcall transcript write failed: HTTP %s', exc.status)
                 return False
+            if revision == self._revision:
+                for row in self._rows:
+                    generation = self._generations.get(id(row))
+                    if generation is None or self.allowed is None or self.allowed(generation):
+                        self._committed[id(row)] = ''.join(row)
             return True
 
     async def _drain(self):

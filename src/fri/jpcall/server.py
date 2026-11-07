@@ -77,6 +77,7 @@ class _Call:
     call_sid: str = ''
     ws: web.WebSocketResponse | None = None
     routes: CallRoutes = field(default_factory=lambda: CallRoutes('', ''))
+    relay_allowed: Callable[[], bool] = field(default=lambda: True, repr=False)
 
 
 class JpcallServer:
@@ -85,6 +86,7 @@ class JpcallServer:
         self._clock = clock
         self._media: dict[str, _Call] = {}
         self._status: dict[str, _Call] = {}
+        self.recovery_status = None
         self.app = web.Application(client_max_size=16 * 1024)
         self.app.router.add_post('/jpcall/status/{token}', self._status_callback)
         self.app.router.add_get('/jpcall/media/{token}', self._media_socket)
@@ -92,12 +94,13 @@ class JpcallServer:
 
     def register(self, audio: AudioSink, handler: MediaHandler,
                  on_status: Callable[[dict[str, str]], Awaitable[None]],
-                 *, ttl_s: float = 60) -> CallRoutes:
+                 *, ttl_s: float = 60, relay_allowed: Callable[[], bool] = lambda: True) -> CallRoutes:
         if ttl_s <= 0:
             raise ValueError('Call routing lifetime must be positive')
         self._prune()
         routes = CallRoutes(secrets.token_urlsafe(32), secrets.token_urlsafe(32))
-        call = _Call(audio, handler, on_status, self._clock() + ttl_s, routes=routes)
+        call = _Call(audio, handler, on_status, self._clock() + ttl_s, routes=routes,
+                     relay_allowed=relay_allowed)
         self._media[routes.media_token] = call
         self._status[routes.status_token] = call
         return routes
@@ -152,21 +155,27 @@ class JpcallServer:
         params = await request.post()
         if not self._authenticated(request, params.items()):
             raise web.HTTPForbidden()
-        self._prune()
-        call = self._status.get(request.match_info['token'])
-        if call is None or call.expires <= self._clock():
-            raise web.HTTPNotFound()
-        # No permissive duplicate fields in authority-bearing callback data.
         if any(len(params.getall(key)) != 1 for key in params):
             raise web.HTTPBadRequest()
         if (params.get('AccountSid') != self.config.twilio_account_sid
-                or not re.fullmatch(r'CA[0-9a-fA-F]{32}', params.get('CallSid', ''))
-                or (call.call_sid and params.get('CallSid') != call.call_sid)):
+                or not re.fullmatch(r'CA[0-9a-fA-F]{32}', params.get('CallSid', ''))):
+            raise web.HTTPForbidden()
+        safe = {key: params[key] for key in ('CallSid', 'CallStatus', 'CallDuration',
+                                            'SequenceNumber', 'AnsweredBy') if key in params}
+        self._prune()
+        call = self._status.get(request.match_info['token'])
+        if call is None or call.expires <= self._clock():
+            if self.recovery_status is not None:
+                try:
+                    if self.recovery_status(request.match_info['token'], safe):
+                        return web.Response(status=204)
+                except Exception:
+                    raise web.HTTPServiceUnavailable() from None
+            raise web.HTTPNotFound()
+        if call.call_sid and params.get('CallSid') != call.call_sid:
             raise web.HTTPForbidden()
         self.bind(call.routes, params['CallSid'])
         # A whitelist avoids passing member data/phone numbers into status consumers.
-        safe = {key: params[key] for key in ('CallSid', 'CallStatus', 'CallDuration',
-                                            'SequenceNumber', 'AnsweredBy') if key in params}
         try:
             await call.on_status(safe)
         except Exception:
@@ -219,7 +228,8 @@ class JpcallServer:
                     if event['media'].get('track') != 'inbound':
                         raise ValueError
                     ulaw = base64.b64decode(event['media']['payload'], validate=True)
-                    call.audio.push('callee', ulaw_to_pcm16(ulaw))
+                    if call.relay_allowed():
+                        call.audio.push('callee', ulaw_to_pcm16(ulaw))
                     await call.handler.audio(ulaw)
                 elif kind == TWILIO_EVENTS['mark']:
                     await call.handler.mark(event['mark']['name'])

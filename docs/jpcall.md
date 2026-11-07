@@ -30,13 +30,17 @@ jpcall is Fri-only. It does not use the Gene controller.
 ## Rules
 
 - Calls open with a short AI-interpreter introduction and ask whether the callee will talk.
-  Fri waits for consent; a refusal ends the call with a plain decline outcome. Recording questions
+  The notice includes AI processing, group listening and retained transcription.
+  Callee relay/text is suppressed until explicit permission; withdrawal fences
+  queued output. Permission recognition remains model inference, not a perfect detector.
+  A refusal ends the call with a plain decline outcome. Recording questions
   are answered truthfully: no audio is recorded, and the group gets a text transcript.
 - Only allowlisted members can start calls. Numbers must be Japanese (`+81`) unless listed as test numbers.
   Emergency and premium-rate prefixes are refused.
-- Fri never pays, gives card numbers, or accepts fees or cancellation terms on its own; those become questions.
-- Holds are app-timed: at most one check-in after 45 s of callee silence, with a call-back
-  fallback after the hold limit. Callee speech replaces that check-in with a natural answer.
+- Fri only gathers information. It never books, pays, gives card numbers, or accepts fees or cancellation terms; group answers cannot expand that authority.
+- Holds are app-timed: at most one check-in after 45 s of callee silence, with an unresolved
+  ending after the hold limit. A delivered natural response replaces the check-in;
+  raw VAD noise only postpones it. No automatic callback is made.
 - Transcripts include third parties. By default they live only in Discord messages; jpcall
   persists no call content. The optional development timeline below retains text when enabled.
   Audio is never recorded or persisted. The usage ledger stores counts and costs only.
@@ -67,7 +71,7 @@ uv run python -m fri.jpcall.devbot --fake-engine --allow-user MEMBER_ID
 In fake mode, repeat `--allow-user` for each member who may start a call; the default
 allows nobody. The brief, transcript, questions, outcome and costs go in the channel where
 `/jpcall` was invoked (including a voice channel's own chat). Fri joins the requester's voice
-channel. Only the requester can confirm or cancel the brief. Anyone currently in that voice channel may answer call questions.
+channel. Only the requester can confirm or cancel the brief. Only the requester may approve an answer; other members may suggest facts in chat.
 The bot needs guild and voice-state intents, the applications.commands scope, and view
 channel, send messages and embed links permissions in the invoking channel, plus connect
 and speak permissions in the test voice channel. It connects self-deafened and never receives or forwards member audio.
@@ -92,8 +96,10 @@ operations do not use the Gene controller. Disabled configuration keeps the exis
 and channel behavior. The isolated Discord branch also treats an absent engine configuration
 module as unavailable; real mode requires the separately implemented engine modules.
 
-The public final report has the call duration, one to three short outcome lines and a cost
-total. Busy, no-answer and voicemail outcomes get a plain `call didn't connect` line. Exact
+The public final report has the call duration, a compact outcome and cost embed.
+The complete outcome/conditions/reference are attached as call-result.txt;
+persistent controls retain costs, not the outcome. Unknown phone termination is
+shown separately from local closure. Late price updates edit only the cost embed. Busy, no-answer and voicemail outcomes get a plain `call didn't connect` line. Exact
 phone prices edit that same message; repeated finish events never create additional reports.
 `cost details` opens the per-component/model units and USD privately, including input/output
 token totals across models. Cached counts are included once, with `~` for estimates and
@@ -157,11 +163,10 @@ Hold lines run out of band with only the short phone rules and the exact line to
 Server VAD remains enabled, with automatic responses and interruptions disabled.
 Higher activation threshold and near-field filtering reduce noise triggers. Replies and
 barge-in wait for a final non-echo transcript; this adds transcription latency to genuine
-interruptions, but keeps raw VAD noise and playback echo from cutting off Fri. Final input
-that resembles recent Fri speech is deleted from the model conversation and omitted from
-the public transcript. Matching uses normalized character overlap of at least 0.6 over a
-10-second window; answers under six characters are exempt. This is a heuristic, so a callee
-repeating a longer phrase can also be suppressed. Use headphones during development calls.
+interruptions, but keeps raw VAD noise and playback echo from cutting off Fri. Changed numbers, negations and conditions are preserved. Exact recent repeats
+remain uncertain transcript evidence rather than being deleted; bounded recovery
+avoids treating ambiguous echo as a confirmed answer. Interrupted generated text
+is labelled uncertain; zero-played output contributes no spoken fact. Use headphones during development calls.
 
 `JPCALL_REALTIME_REASONING` is omitted from the session when unset, retaining the provider's
 documented `low` default. Greater effort can increase latency and output tokens; it does not
@@ -185,3 +190,33 @@ private conversation text, including dropped echoes; keep it outside the checkou
 access and delete it after diagnosis. It has no automatic retention policy. It is separate
 from the counts/costs-only usage ledger. A write failure logs a fixed message and does not
 end the call. Normal logs never include timeline transcripts or paths.
+
+## Recovery and development validation
+
+Calling requires explicitly initialized recovery state in the configured
+private jpcall data directory. For a genuinely new installation, run
+`python -m fri.jpcall.recovery <private-jpcall-data-directory>` before enabling
+calling. Never delete/reset this record to unlock a pending attempt. Missing,
+corrupt or unknown-version state disables admission. An installation fuse
+prevents ordinary journal deletion from being treated as a new installation.
+
+One process owns calling. Attempt intent and callback correlation are durable
+before create. A failed hangup or lost create acknowledgement blocks another
+dial until authenticated terminal evidence or owner reconciliation exists.
+The engine's owner-only `recovery_status()` and `reconcile()` operations inspect
+or terminate an existing call; they never originate one. An unknown SID remains
+blocked. Local stop, TTL, restart and billing completion are not termination
+evidence. Rollback preserves the record and must disable calling if older code
+cannot honor it. No call resumes after restart.
+
+Confirmation uses the exact original goal and approved facts without a paid
+pre-call paraphrase. Request/brief equality and expiry still prevent stale
+confirmation. Ringing is bounded at 30 seconds, permission/media readiness at
+20 seconds, and the attempt at at most 600 seconds. Stop works during connection.
+No verified dollar spending cap is claimed; estimates and actual posted prices
+remain distinct.
+
+Current development validation is simulated. Use the
+[evaluation checklist and log schema](jpcall-evaluation.md) to distinguish fake
+peers, model-simulated dialogue and later authorized live voice. Passing tests
+does not establish Japanese naturalness or real-path latency.

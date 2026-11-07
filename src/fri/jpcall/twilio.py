@@ -97,13 +97,23 @@ class TwilioClient:
             'AsyncAmdStatusCallback': base + '/jpcall/status/' + status_token,
             'AsyncAmdStatusCallbackMethod': 'POST',
             'StatusCallbackEvent': ['initiated', 'ringing', 'answered', 'completed'],
-            'TimeLimit': str(self.config.limits.max_call_s),
+            'TimeLimit': str(min(600, self.config.limits.max_call_s)),
+            'Timeout': '30',
         })
         return self._sid(result.get('sid', ''))
 
-    async def hang_up(self, call_sid: str) -> None:
-        await self._request('POST', '/' + self._sid(call_sid) + '.json',
-                            data={'Status': 'completed'})
+    async def hang_up(self, call_sid: str) -> bool:
+        result = await self._request('POST', '/' + self._sid(call_sid) + '.json',
+                                     data={'Status': 'completed'})
+        return result.get('sid') == call_sid and result.get('status') == 'completed'
+
+    async def call_status(self, call_sid: str) -> str:
+        result = await self._request('GET', '/' + self._sid(call_sid) + '.json')
+        status = result.get('status')
+        if result.get('sid') != call_sid or status not in {
+                'queued', 'ringing', 'in-progress', 'completed', 'busy', 'no-answer', 'failed', 'canceled'}:
+            raise TwilioError('The phone service returned invalid call status.')
+        return status
 
     async def call_price(self, call_sid: str) -> CallPrice:
         result = await self._request('GET', '/' + self._sid(call_sid) + '.json')
