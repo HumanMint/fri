@@ -5,9 +5,10 @@ from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
-from test_engine_flow import SID, dial, make_engine, request
+from test_engine_flow import SID, answer_phone, dial, make_engine, request, settled
 
-from fri.jpcall.contract import CallFinished, CallRejected, Utterance
+from fri.jpcall.contract import CallFinished, CallRejected, CallState, StatusChanged, Utterance
+from fri.jpcall.realtime import EVENTS
 from fri.jpcall.twilio import TwilioError
 
 
@@ -44,7 +45,8 @@ def test_permission_fences_callee_publication_and_requester_answers(tmp_path, mo
             assert call.publication_allowed
             generation = call.consent_generation
             await call.emit(Utterance(call.request.request_id, 'uncertain', 'callee',
-                                      'uncertain echo', 1, delivery='unknown'))
+                                      'uncertain echo', 1, delivery='unknown',
+                                      consent_generation=generation))
             assert not any(row['item_id'] == 'uncertain' for row in call._transcript)
             call._hold.answer = AsyncMock(return_value=True)
             assert not await call.answer('q', 'yes', 99)
@@ -54,6 +56,118 @@ def test_permission_fences_callee_publication_and_requester_answers(tmp_path, mo
             assert call.consent_generation > generation and not call.publication_allowed
             await call.emit(Utterance(call.request.request_id, 'after', 'callee', 'private', 2))
             assert not any(row['item_id'] in ('before', 'after') for row in call._transcript)
+            await call.hang_up()
+        finally:
+            await engine.close()
+            await http.aclose()
+    asyncio.run(run())
+
+
+def test_capture_and_engine_queue_never_acquire_new_consent(tmp_path, monkeypatch):
+    async def run():
+        engine, provider, peer, http, clock, runner = await make_engine(tmp_path, monkeypatch)
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+        try:
+            call, brief, audio, events = await dial(engine, provider)
+            await call._rt.handle_event({'type': EVENTS['speech_started'],
+                                        'item_id': 'pregrant', 'audio_start_ms': 0})
+            await call._handle_tool('permission', {'decision': 'granted'}, 'consent')
+            await call._rt.handle_event({'type': EVENTS['input_transcript'],
+                                        'item_id': 'pregrant', 'transcript': 'private before permission'})
+            assert not any(row['item_id'] == 'pregrant' for row in call._transcript)
+            assert not any(isinstance(e, Utterance) and e.item_id == 'pregrant' for e in events.items)
+            original_emit = events.emit
+
+            async def block_status(event):
+                if isinstance(event, StatusChanged) and event.detail == 'block':
+                    entered.set()
+                    await gate.wait()
+                await original_emit(event)
+            events.emit = block_status
+            await call._emit(StatusChanged(call._request_id, CallState.IN_PROGRESS, 'block'))
+            await entered.wait()
+            source_generation = call.consent_generation
+            await call.emit(Utterance(call._request_id, 'queued-old', 'callee', 'old source', 1,
+                                      consent_generation=source_generation))
+            call._permission(False)
+            call._permission(True)
+            gate.set()
+            await call._event_queue.join()
+            assert not any(isinstance(e, Utterance) and e.item_id == 'queued-old' for e in events.items)
+            assert not any(row['item_id'] == 'queued-old' for row in call._transcript)
+            await call.hang_up()
+        finally:
+            gate.set()
+            await engine.close()
+            await http.aclose()
+    asyncio.run(run())
+
+
+def test_forced_session_cleanup_survives_stalled_stop(tmp_path, monkeypatch):
+    async def run():
+        engine, provider, peer, http, clock, runner = await make_engine(tmp_path, monkeypatch)
+        try:
+            call, brief, audio, events = await dial(engine, provider)
+            await answer_phone(call)
+            retained_rt = call._rt
+            receive, watch = retained_rt._task, call._watch_task
+
+            async def stalled():
+                await asyncio.Event().wait()
+            retained_rt.stop = stalled
+            await asyncio.wait_for(call.hang_up(), 10)
+            assert call._finished.is_set() and not engine._sessions
+            assert not engine._server._status and not engine._server._media
+            assert receive.done() and watch.done()
+            assert retained_rt.brief is None and retained_rt._goal == ''
+            assert retained_rt.events is None and retained_rt._on_tool_call is None
+            assert not call.request.goal and not call._number
+            assert not engine._cleanup_failed
+        finally:
+            await engine.close()
+            await http.aclose()
+    asyncio.run(run())
+
+
+def test_transfer_renews_notice_and_closes_the_old_group_question(tmp_path, monkeypatch):
+    async def run():
+        engine, provider, peer, http, clock, runner = await make_engine(tmp_path, monkeypatch)
+        try:
+            call, brief, audio, events = await dial(engine, provider)
+            await answer_phone(call)
+            await settled(lambda: call._rt._idle.is_set())
+            old_hold = call._hold
+            assert await old_hold.ask('old-question', 'Which time?', (),
+                                      consent_generation=call.consent_generation)
+            question_id = old_hold.question.question_id
+            await settled(lambda: call._rt._idle.is_set() and not old_hold._speech)
+            generation = call.consent_generation
+            before = len(peer.responses)
+            peer.tool('permission', {'decision': 'transfer'}, 'transfer')
+            await settled(lambda: call._hold is not old_hold and len(peer.responses) > before
+                          and call._rt._conversation_open)
+            assert not call.publication_allowed and call.consent_generation > generation
+            assert old_hold._ended and old_hold.question is None
+            assert call._hold is not old_hold and call._hold_started is None
+            assert not await call.answer(question_id, 'noon', 12)
+            requests = peer.responses[before:]
+            assert len(requests) == 1
+            assert brief.opener_ja in requests[0]['instructions']
+            assert requests[0].get('output_modalities') != ['text']
+            assert any(e.get('item', {}).get('call_id') == 'transfer'
+                       for e in peer.sent if e['type'] == EVENTS['item_create'])
+            await call._rt.handle_event({'type': EVENTS['speech_started'],
+                                        'item_id': 'new-person', 'audio_start_ms': 1000})
+            await call._rt.handle_event({'type': EVENTS['speech_stopped'], 'item_id': 'new-person'})
+            await call._rt.handle_event({'type': EVENTS['input_transcript'],
+                                        'item_id': 'new-person', 'transcript': 'はい、どうぞ。'})
+            await settled(lambda: len(peer.responses) == before + 2)
+            classifier = peer.responses[-1]
+            assert classifier['output_modalities'] == ['text']
+            assert classifier['tool_choice']['name'] == 'permission'
+            assert not any(isinstance(e, Utterance) and e.item_id == 'new-person'
+                           for e in events.items)
             await call.hang_up()
         finally:
             await engine.close()

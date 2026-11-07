@@ -68,6 +68,8 @@ def test_fake_engine_script_audio_question_and_late_usage(monkeypatch):
         assert {speaker for speaker, _ in audio.frames} == {'fri', 'callee'}
         assert [e.item_id for e in events if isinstance(e, Utterance)] == ['1', '2', '3']
         assert [e.item_id for e in events if isinstance(e, Translation)] == ['1', '2', '3']
+        assert all(e.consent_generation == 1 for e in events
+                   if isinstance(e, (Utterance, Translation, QuestionAsked)))
         finished = next(e for e in events if isinstance(e, CallFinished))
         assert not finished.usage_final and finished.usage[-1].usd is None
         assert isinstance(events[-1], UsageUpdated) and events[-1].usage_final
@@ -198,4 +200,20 @@ def test_korean_fake_mode_uses_the_same_process_language_setting(monkeypatch):
         session.task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await session.task
+    asyncio.run(run())
+
+
+def test_fake_translation_keeps_speech_source_generation_across_awaits():
+    async def run():
+        events = []
+
+        async def emit(event):
+            events.append(event)
+            if isinstance(event, Utterance):
+                session.consent_generation = 3
+
+        session = devbot.FakeSession(request(), Audio(), SimpleNamespace(emit=emit))
+        await session.speak('source', 'callee', 'synthetic original', 'synthetic English', 440)
+        assert [event.consent_generation for event in events] == [1, 1]
+        assert session.consent_generation == 3
     asyncio.run(run())

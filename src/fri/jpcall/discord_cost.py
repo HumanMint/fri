@@ -13,6 +13,8 @@ from .contract import CallFinished, CallState, StatusChanged, UsageUpdated
 from .discord_text import chunks
 
 LOG = logging.getLogger(__name__)
+FINAL_REPORT_TIMEOUT_S = 5
+FINAL_SEND_TIMEOUT_S = 2
 
 
 def token_totals(units):
@@ -155,6 +157,8 @@ class CostSummary:
         self._event_type = 'CallFinished'
         self._send_attempts = 0
         self._publish_task = None
+        self._text_fallback = False
+        self._fallback_page = 0
 
     @property
     def usage(self):
@@ -189,39 +193,72 @@ class CostSummary:
         # A cancelled waiter must not orphan an already accepted Discord message.
         await asyncio.shield(self._publish_task)
 
-    async def _publish(self):
-        try:
-            while True:
-                revision = self._revision
-                event_type = self._event_type
-                text = render_final(self.finished, self.usage, self.usage_final, self.failure)
-                embed = render_cost(self.usage, self.usage_final)
-                if self.message is None:
-                    self._send_attempts += 1
-                    # Discord hosts the full result; persistent controls retain only usage.
-                    outcome = self.finished.outcome_en or 'no confirmed outcome.'
+    async def _send_retry(self, content, *, nonce, outcome=None, **kwargs):
+        for attempt in range(2):
+            try:
+                async with asyncio.timeout(FINAL_SEND_TIMEOUT_S):
+                    if nonce == self._nonce:
+                        self._send_attempts += 1
+                    if outcome is None:
+                        return await self.send(content, nonce=nonce, **kwargs)
                     with io.BytesIO(outcome.encode('utf-8')) as body:
                         attachment = discord.File(body, filename='call-result.txt')
                         try:
-                            self.message = await self.send(
-                                text, embed=embed, view=self.view, nonce=self._nonce,
-                                file=attachment)
+                            return await self.send(content, nonce=nonce, file=attachment, **kwargs)
                         finally:
                             attachment.close()
-                    if self._send_attempts > 1:
-                        # Nonce deduplication can return the earlier accepted message's
-                        # old body. Reconcile it with the newest price after recovering its ID.
+            except discord.HTTPException as exc:
+                if exc.status == 403 or attempt == 1:
+                    raise
+            except Exception:
+                if attempt == 1:
+                    raise
+
+    async def _initial_report(self, text, embed):
+        outcome = self.finished.outcome_en or 'no confirmed outcome.'
+        if not self._text_fallback:
+            try:
+                return await self._send_retry(text, nonce=self._nonce, outcome=outcome,
+                                              embed=embed, view=self.view)
+            except discord.HTTPException as exc:
+                if exc.status != 403:
+                    raise
+                self._text_fallback = True
+        # No attachment permission: post the complete result, with stable identity per page.
+        pages = chunks(outcome, 1900)
+        while self._fallback_page < len(pages):
+            index = self._fallback_page
+            await self._send_retry(f'full result · {index + 1}/{len(pages)}\n{pages[index]}',
+                                   nonce=(self._nonce + index + 1) % (2 ** 64))
+            self._fallback_page += 1
+        return await self._send_retry(text, nonce=self._nonce, embed=embed, view=self.view)
+
+    async def _publish(self):
+        event_type = self._event_type
+        try:
+            # Recovery belongs to final publication: late billing holds only the receipt.
+            async with asyncio.timeout(FINAL_REPORT_TIMEOUT_S):
+                while True:
+                    revision = self._revision
+                    event_type = self._event_type
+                    text = render_final(self.finished, self.usage, self.usage_final, self.failure)
+                    embed = render_cost(self.usage, self.usage_final)
+                    if self.message is None:
+                        self.message = await self._initial_report(text, embed)
+                        self.receipt.message_id = getattr(self.message, 'id', None)
+                        if self._send_attempts > 1:
+                            # A nonce retry may recover an accepted message with an older price.
+                            await self.edit(self.message, text, embed=embed, view=self.view)
+                    else:
                         await self.edit(self.message, text, embed=embed, view=self.view)
-                else:
-                    await self.edit(self.message, text, embed=embed, view=self.view)
-                self.receipt.message_id = getattr(self.message, 'id', None)
-                # A price may arrive while the initial Discord send is pending.
-                if self.receipt.revision:
-                    await self.receipt.publish()
-                if revision == self._revision:
-                    return
+                    self.receipt.message_id = getattr(self.message, 'id', None)
+                    # A price may arrive while the initial Discord send is pending.
+                    if self.receipt.revision:
+                        await self.receipt.publish()
+                    if revision == self._revision:
+                        return
         except Exception as exc:
-            # Retain the message ID and pending state; never send a replacement for a failed edit.
+            # Never replace a known message after a failed edit; nonce retry is bounded above.
             LOG.warning('jpcall final report failed: %s %s', event_type, type(exc).__name__)
 
     async def flush(self):

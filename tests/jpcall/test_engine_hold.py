@@ -250,3 +250,34 @@ def test_expiry_hook_ends_instead_of_restarting_model_inquiry():
         finally:
             await hold.close()
     asyncio.run(run())
+
+
+def test_question_keeps_supplied_consent_before_delayed_state_publication():
+    async def run():
+        from fri.jpcall.contract import QuestionAsked
+
+        events = []
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def emit(event):
+            events.append(event)
+
+        async def state(held):
+            if held:
+                entered.set()
+                await release.wait()
+
+        async def noop(*args, **kwargs):
+            pass
+
+        hold = HoldController('request1', Limits(), emit, noop, noop, state)
+        question = asyncio.create_task(hold.ask('tool1', 'When?', (), consent_generation=1))
+        try:
+            await entered.wait()
+            release.set()  # Parent may now be in generation 3; the captured value stays 1.
+            await question
+            assert next(e for e in events if isinstance(e, QuestionAsked)).consent_generation == 1
+        finally:
+            release.set()
+            await hold.close()
+    asyncio.run(run())

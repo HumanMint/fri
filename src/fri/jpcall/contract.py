@@ -82,6 +82,7 @@ class Utterance:
     started_at: float           # seconds since the call was answered
     ended_at: float | None = None
     delivery: Literal['complete', 'interrupted', 'unknown'] = 'complete'
+    consent_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,7 @@ class Translation:
     item_id: str
     text_en: str
     status: Literal['ready', 'unavailable'] = 'ready'
+    consent_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,7 @@ class QuestionAsked:
     deadline_s: float = 60.0
     deadline_at: float | None = None  # Authoritative process-monotonic expiry.
     text_original: str = ''
+    consent_generation: int | None = None
 
 
 @dataclass(frozen=True)

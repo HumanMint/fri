@@ -27,6 +27,8 @@ from .contract import (
     CallRequest,
     CallState,
     EventSink,
+    QuestionAsked,
+    QuestionClosed,
     StatusChanged,
     Translation,
     UsageUpdated,
@@ -155,6 +157,7 @@ class JpcallEngine:
         self._lifecycle_lock = asyncio.Lock()
         self._opened = False
         self._closing = False
+        self._cleanup_failed = False
 
     async def open(self) -> None:
         async with self._lifecycle_lock:
@@ -182,7 +185,7 @@ class JpcallEngine:
             raise
 
     def _validate(self, request: CallRequest) -> str:
-        if not self._opened or self._closing:
+        if not self._opened or self._closing or self._cleanup_failed:
             raise CallRejected('Calling is not available right now.')
         if request.requester_id not in self.config.limits.allowed_user_ids:
             raise CallRejected('You are not on the call allowlist.')
@@ -349,12 +352,11 @@ class _Session:
                                   on_speech=self._speech_event, goal=request.goal,
                                   on_asr_failure=self._asr_failed,
                                   on_callee_response=self._callee_response,
+                                  publication_context=lambda: (
+                                      self.consent_generation if self.publication_allowed else None),
                                   timeline=timeline)
-        self._hold = HoldController(request.request_id, engine.config.limits, self._emit,
-                                     self._rt.say, self._rt.tool_result, self._hold_state,
-                                     clock=engine._clock, sleep=engine._sleep,
-                                     language=engine.config.language, timeline=timeline,
-                                     on_expired=self._hold_expired)
+        self._timeline = timeline
+        self._hold = self._new_hold()
         self._routes: CallRoutes | None = None
         self._sid = ''
         self._dial_task: asyncio.Task | None = None
@@ -389,6 +391,14 @@ class _Session:
         self._events_closed = False
         self._event_task = asyncio.create_task(self._deliver_events())
 
+    def _new_hold(self) -> HoldController:
+        engine = self.engine
+        return HoldController(self._request_id, engine.config.limits, self._emit,
+                                     self._rt.say, self._rt.tool_result, self._hold_state,
+                                     clock=engine._clock, sleep=engine._sleep,
+                                     language=engine.config.language, timeline=self._timeline,
+                                     on_expired=self._hold_expired)
+
     @property
     def publication_allowed(self) -> bool:
         return self._publication_allowed and not self._ending
@@ -399,6 +409,9 @@ class _Session:
         self._rt.set_permission(allowed)
         if not allowed:
             self._audio.clear('callee')
+            if not self._ending:
+                self._transcript.clear()
+                self._outcome_hint = ''
 
     async def _asr_failed(self) -> None:
         self._begin_finish(failed=True, detail='Speech transcription was unavailable.')
@@ -425,7 +438,15 @@ class _Session:
         task.add_done_callback(done)
         return task
 
-    async def _deliver_event(self, event: CallEvent) -> None:
+    async def _deliver_event(self, event: CallEvent, generation: int | None = None) -> None:
+        if isinstance(event, (Utterance, Translation, QuestionAsked)):
+            if (generation is None or not self.publication_allowed
+                    or generation != self.consent_generation
+                    or event.consent_generation != generation):
+                return
+        elif isinstance(event, QuestionClosed) and event.answer:
+            if generation is None or not self.publication_allowed or generation != self.consent_generation:
+                return
         try:
             async with asyncio.timeout(5):
                 await self._events.emit(event)
@@ -434,26 +455,30 @@ class _Session:
 
     async def _deliver_events(self) -> None:
         while True:
-            event = await self._event_queue.get()
+            event, generation = await self._event_queue.get()
             try:
-                await self._deliver_event(event)
+                await self._deliver_event(event, generation)
             finally:
                 self._event_queue.task_done()
 
     async def _emit(self, event: CallEvent) -> None:
+        generation = (event.consent_generation if isinstance(event, (
+            Utterance, Translation, QuestionAsked)) else
+            self.consent_generation if self.publication_allowed else None)
         if self._events_closed:
-            await self._deliver_event(event)
+            await self._deliver_event(event, generation)
         else:
             try:
-                self._event_queue.put_nowait(event)
+                self._event_queue.put_nowait((event, generation))
             except asyncio.QueueFull:
                 self._begin_finish(failed=True, detail='Call updates could not keep up.')
 
     async def emit(self, event: CallEvent) -> None:
         if isinstance(event, Utterance):
-            if event.speaker == 'callee' and not self.publication_allowed:
+            if (not self.publication_allowed or event.consent_generation is None
+                    or event.consent_generation != self.consent_generation):
                 return
-            generation = self.consent_generation
+            generation = event.consent_generation
             if event.delivery == 'complete':
                 self._transcript.append({'item_id': event.item_id, 'speaker': event.speaker,
                                          'text_ja': event.text_ja, 'started_at': event.started_at})
@@ -463,8 +488,10 @@ class _Session:
                 result = await self.engine._text.translate(event, self._meter)
                 if generation != self.consent_generation or not self.publication_allowed:
                     return
-                await self._emit(result if result is not None else Translation(
-                    event.request_id, event.item_id, '', status='unavailable'))
+                await self._emit(replace(result, consent_generation=generation)
+                    if result is not None else Translation(
+                        event.request_id, event.item_id, '', status='unavailable',
+                        consent_generation=generation))
             self._spawn(translate(), translation=True)
         else:
             await self._emit(event)
@@ -682,10 +709,14 @@ class _Session:
         # The Realtime reader must keep consuming audio/response events during a hold.
         if name == 'permission' and arguments.get('decision') in ('refused', 'transfer'):
             self._permission(False)
-        self._spawn(self._handle_tool(name, arguments, call_id))
+        self._spawn(self._handle_tool(name, arguments, call_id,
+                                      generation=self.consent_generation))
 
-    async def _handle_tool(self, name: str, arguments: dict, call_id: str) -> None:
-        if self._ending:
+    async def _handle_tool(self, name: str, arguments: dict, call_id: str,
+                           *, generation: int | None = None) -> None:
+        if generation is None:
+            generation = self.consent_generation
+        if self._ending or generation != self.consent_generation:
             return
         if name == 'permission':
             decision = arguments.get('decision')
@@ -695,8 +726,14 @@ class _Session:
             elif decision == 'refused':
                 self._begin_finish(detail='The recipient declined to share the call.')
             elif decision == 'transfer':
+                await self._hold.close()
+                await self._hold_state(False)
+                if self._ending or generation != self.consent_generation:
+                    return
+                self._hold = self._new_hold()
                 self._spawn(self._permission_limit())
-                await self._rt.tool_result(call_id, {'permission': 'renew required notice before continuing'})
+                await self._rt.tool_result(call_id, {'permission': 'new notice required'}, respond=False)
+                await self._rt.repeat_notice()
             else:
                 await self._rt.tool_result(call_id, {'error': 'Explicit permission is required'})
             return
@@ -708,7 +745,8 @@ class _Session:
             if (isinstance(text, str) and text.strip() and isinstance(options, list)
                     and all(isinstance(option, str) for option in options)):
                 if await self._hold.ask(call_id, text.strip(), tuple(options),
-                                        text_original=arguments.get('question_original', '')):
+                                        text_original=arguments.get('question_original', ''),
+                                        consent_generation=generation):
                     return
         elif name == 'end_call' and isinstance(arguments.get('outcome_en'), str):
             self._outcome_hint = arguments['outcome_en']
@@ -846,6 +884,25 @@ class _Session:
         except (Exception, asyncio.CancelledError):
             LOG.warning('jpcall bounded local cleanup incomplete')
         finally:
+            # Release local ownership even if a transport close ignored its deadline.
+            owned = set(self._tasks) | self._translations
+            for task in (self._watch_task, self._dial_task, self._opener_task):
+                if task is not None:
+                    owned.add(task)
+            for task in owned:
+                if task is not asyncio.current_task():
+                    task.cancel()
+            self._rt.force_cleanup()
+            if self._routes is not None:
+                with suppress(Exception):
+                    async with asyncio.timeout(.5):
+                        await self.engine._server.revoke(self._routes)
+                self._routes = None
+            if owned:
+                _, pending = await asyncio.wait(owned, timeout=.25)
+                self.engine._cleanup_failed |= bool(pending)
+            self._tasks.clear()
+            self._translations.clear()
             if not self._termination_confirmed and self._attempt:
                 with suppress(CallRejected):
                     self.engine._recovery.update(self._attempt, sid=self._sid, phase='uncertain')

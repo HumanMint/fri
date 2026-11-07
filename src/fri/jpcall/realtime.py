@@ -58,6 +58,7 @@ FATAL_CODES = frozenset({'invalid_api_key', 'authentication_error', 'permission_
                          'session_expired', 'session_not_found', 'invalid_session',
                          'model_not_found'})
 ASR_TIMEOUT_S = 5
+TRANSPORT_CLOSE_TIMEOUT_S = 1
 BUSY_CODES = frozenset({'conversation_already_has_active_response', 'response_in_progress'})
 ToolHook = Callable[[str, dict, str], Awaitable[None]]
 
@@ -75,6 +76,7 @@ class _Playout:
     started_at: float = 0
     response_id: str = ''
     generation: int = 0
+    consent_generation: int | None = None
 
 
 @dataclass
@@ -83,6 +85,7 @@ class _Command:
     response: dict
     done: asyncio.Future = field(repr=False)
     generation: int = 0
+    consent_generation: int | None = None
     opener: bool = False
 
 
@@ -103,7 +106,8 @@ class RealtimeClient:
                  on_speech: Callable[[bool, str], None] | None = None,
                  goal: str = '', timeline: DebugTimeline | None = None,
                  on_asr_failure: Callable[[], Awaitable[None]] | None = None,
-                 on_callee_response: Callable[[], None] | None = None):
+                 on_callee_response: Callable[[], None] | None = None,
+                 publication_context: Callable[[], int | None] | None = None):
         self.config, self.brief = config, brief
         self.audio_sink, self.events, self.meter = audio, events, meter
         self._session = session
@@ -117,6 +121,7 @@ class RealtimeClient:
         self._on_speech = on_speech
         self._on_asr_failure = on_asr_failure
         self._on_callee_response = on_callee_response
+        self._publication_context = publication_context
         self._goal = goal
         self.timeline = timeline or DebugTimeline(config.debug_timeline_path, clock=clock)
         self._recent_speech: deque[tuple[float, str, str]] = deque(maxlen=64)
@@ -131,6 +136,8 @@ class RealtimeClient:
         self._mark_seq = 0
         self._interrupted: set[str] = set()
         self._starts: dict[str, float] = {}
+        self._input_context: dict[str, int | None] = {}
+        self._response_context: dict[str, int | None] = {}
         self._ends: dict[str, float] = {}
         self._asr_timers: dict[str, asyncio.Task] = {}
         self._asr_failed_items: set[str] = set()
@@ -257,6 +264,13 @@ class RealtimeClient:
         if self._opener_requested or self._silenced or self._stopped or self._media is None:
             return
         self._opener_requested = True
+        await self.repeat_notice()
+
+    async def repeat_notice(self) -> None:
+        """Renew the actual notice after transfer, before classifying the new reply."""
+        if self._silenced or self._stopped or self._media is None:
+            return
+        self._conversation_open = False
         generated = await self.say(self.brief.opener_ja, _opener=True)
         if await generated != 'completed':
             raise RealtimeError('The voice service could not speak the opening.')
@@ -266,6 +280,8 @@ class RealtimeClient:
 
     def set_permission(self, granted: bool) -> None:
         """Fence queued speech before the caller awaits any consent cleanup."""
+        if self._stopped:
+            return
         if granted:
             self._permission = True
             return
@@ -293,7 +309,8 @@ class RealtimeClient:
     def silence(self) -> None:
         """Fence output synchronously before voicemail cleanup can await anything."""
         self._silenced = True
-        self.audio_sink.clear('fri')
+        if self.audio_sink is not None:
+            self.audio_sink.clear('fri')
         self._marks.clear()
         self._conversation_open = False
         self._blocked_commands.update(self._commands)
@@ -360,7 +377,9 @@ class RealtimeClient:
         if out_of_band:
             response.update(conversation='none', input=[], tools=[], tool_choice='none')
         command = _Command(number, response, asyncio.get_running_loop().create_future(),
-                           self._permission_generation, _opener)
+                           self._permission_generation,
+                           self._publication_context() if self._publication_context else None,
+                           _opener)
         self._commands[number] = command
 
         def cancelled(done):
@@ -440,9 +459,11 @@ class RealtimeClient:
         self._media_closed = True
         with suppress(Exception):
             await self._media.clear()
-        self.audio_sink.clear('fri')
-        with suppress(Exception):
-            await self._media.close()
+        if self.audio_sink is not None:
+            self.audio_sink.clear('fri')
+        if self._media is not None:
+            with suppress(Exception):
+                await self._media.close()
 
     async def wait(self) -> None:
         if self._task is not None:
@@ -492,7 +513,8 @@ class RealtimeClient:
 
     async def _utterance(self, item_id: str, speaker: str, text: str,
                          started_at: float, *, ended_at: float | None = None,
-                         delivery: str = 'complete') -> None:
+                         delivery: str = 'complete',
+                         consent_generation: int | None = None) -> None:
         key = speaker, item_id
         if key in self._utterances:
             return
@@ -501,7 +523,8 @@ class RealtimeClient:
             self._remember_speech(item_id, text)
         self.timeline.record('transcript', speaker=speaker, item_id=item_id, text=text)
         await self.events.emit(Utterance(self.brief.request_id, item_id, speaker,
-                                         text, started_at, ended_at, delivery))
+                                         text, started_at, ended_at, delivery,
+                                         consent_generation=consent_generation))
 
     @staticmethod
     def _normalized(text: str) -> str:
@@ -622,9 +645,12 @@ class RealtimeClient:
             return
         await self._utterance(key[0], 'fri', text, part.started_at,
                               ended_at=self._clock() - self._answered_at,
-                              delivery='interrupted' if interrupted else 'complete')
+                              delivery='interrupted' if interrupted else 'complete',
+                              consent_generation=part.consent_generation)
 
     async def handle_event(self, event: dict) -> None:
+        if self._stopped:
+            return
         kind = event.get('type')
         if kind == EVENTS['response_created']:
             response = event['response']
@@ -637,6 +663,8 @@ class RealtimeClient:
             if self._pending and self._pending.number == number:
                 self._pending = None
             command = self._commands.get(number)
+            self._response_context.setdefault(response['id'],
+                command.consent_generation if command is not None else None)
             if command is not None:
                 self._response_commands[response['id']] = number
             explicit = (command is not None and command.opener
@@ -654,6 +682,8 @@ class RealtimeClient:
             self.timeline.record('speech_started', item_id=event['item_id'],
                                  audio_start_ms=event['audio_start_ms'])
             self._starts[event['item_id']] = max(0, event['audio_start_ms'] / 1000)
+            self._input_context.setdefault(event['item_id'],
+                self._publication_context() if self._publication_context else None)
             if not self._opener_requested:
                 self._preopening_items.add(event['item_id'])
             if self._on_speech:
@@ -703,7 +733,8 @@ class RealtimeClient:
             await self._utterance(item, 'callee', text,
                                   self._starts.get(item, self._clock() - self._answered_at),
                                   ended_at=self._ends.get(item),
-                                  delivery='unknown' if echo else 'complete')
+                                  delivery='unknown' if echo else 'complete',
+                                  consent_generation=self._input_context.get(item))
             if eligible and not self._silenced:
                 if echo:
                     self._asr_failed()
@@ -739,7 +770,8 @@ class RealtimeClient:
                 part = self._playout.setdefault(key, _Playout(
                     item, key[1], started_at=self._clock() - self._answered_at,
                     response_id=event.get('response_id', ''),
-                    generation=self._permission_generation))
+                    generation=self._permission_generation,
+                    consent_generation=self._response_context.get(event.get('response_id', ''))))
                 self.has_spoken = True
                 await self._media.send_audio(ulaw)
                 part.sent_bytes += len(ulaw)
@@ -836,41 +868,64 @@ class RealtimeClient:
                         command.done.set_result(None)
             self._update_idle()
 
-    async def tool_result(self, call_id: str, result: dict) -> None:
+    async def tool_result(self, call_id: str, result: dict, *, respond: bool = True) -> None:
         self.timeline.record('tool_result', call_id=call_id, result=result)
         await self._send('item_create', item={'type': 'function_call_output',
                                              'call_id': call_id, 'output': json.dumps(result)})
-        await self.respond()
+        if respond:
+            await self.respond()
 
-    async def stop(self) -> None:
-        if self._stopped:
-            return
+    def force_cleanup(self) -> None:
+        """Drop local content and cancel work even if a transport refuses to close."""
         self._stopped = True
+        self._silenced = True
+        self._permission = self._conversation_open = False
         self._idle.set()
+        self._drained.set()
         for command in self._commands.values():
             command.done.cancel()
+            command.response.clear()
         self._commands.clear()
-        tasks = tuple(task for task in self._side_tasks if task is not asyncio.current_task())
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        self._pending = None
+        current = asyncio.current_task()
+        for task in (*self._side_tasks, self._task):
+            if task is not None and task is not current:
+                task.cancel()
         self._side_tasks.clear()
-        if self._ws is not None:
-            await self._ws.close()
-        if self._task is not None:
-            if self._task is not asyncio.current_task():
-                self._task.cancel()
-                with suppress(asyncio.CancelledError, RealtimeError):
-                    await self._task
-        await self._close_media()
-        for key in tuple(self._transcripts):
-            self._interrupted.add(key[0])
-            await self._flush_transcript(key)
+        self._task = self._revocation = self._asr_recovery = None
+        if self.audio_sink is not None:
+            with suppress(Exception):
+                self.audio_sink.clear('fri')
+        self._media_closed = True
+        # Abort the HTTP response before attempting the WebSocket closing handshake.
+        response = getattr(self._ws, '_response', None)
+        if response is not None:
+            with suppress(Exception):
+                response.close()
+        self._ws = self._media = self._session = None
+        self.config = self.brief = self.events = self.audio_sink = None
+        self._on_speech = self._on_tool_call = None
+        self._on_asr_failure = self._on_callee_response = self._publication_context = None
+        self._goal, self._tools = '', ()
+        self._clock = time.monotonic
         self._playout.clear()
         self._marks.clear()
+        self._generating.clear()
+        self._active_responses.clear()
+        self._response_commands.clear()
+        self._allowed_responses.clear()
+        self._blocked_responses.clear()
+        self._blocked_commands.clear()
+        self._opener_responses.clear()
+        self._completed_responses.clear()
+        self._delivered_responses.clear()
+        self._utterances.clear()
+        self._tools_seen.clear()
+        self._interrupted.clear()
         self._starts.clear()
         self._ends.clear()
+        self._input_context.clear()
+        self._response_context.clear()
         self._asr_timers.clear()
         self._asr_failed_items.clear()
         self._input_seen.clear()
@@ -879,5 +934,30 @@ class RealtimeClient:
         self._recent_speech.clear()
         self._partial_transcripts.clear()
         self.timeline.close()
-        if self._owned and self._session is not None:
-            await self._session.close()
+
+    @staticmethod
+    async def _close_transport(transport, *, clear: bool = False) -> None:
+        if clear:
+            with suppress(Exception):
+                async with asyncio.timeout(TRANSPORT_CLOSE_TIMEOUT_S):
+                    await transport.clear()
+        with suppress(Exception):
+            async with asyncio.timeout(TRANSPORT_CLOSE_TIMEOUT_S):
+                await transport.close()
+
+    async def stop(self) -> None:
+        tasks = tuple(task for task in (*self._side_tasks, self._task)
+                      if task is not None and task is not asyncio.current_task())
+        transports = [(transport, clear) for transport, clear in (
+            (self._ws, False), (self._media, True),
+            (self._session if self._owned else None, False)) if transport is not None]
+        self.force_cleanup()
+        try:
+            async with asyncio.timeout(2 * TRANSPORT_CLOSE_TIMEOUT_S):
+                await asyncio.gather(*tasks, *(self._close_transport(transport, clear=clear)
+                                              for transport, clear in transports),
+                                     return_exceptions=True)
+        except TimeoutError:
+            pass
+        finally:
+            self.force_cleanup()

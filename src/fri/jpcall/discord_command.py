@@ -162,7 +162,7 @@ class QuestionView(Controls):
         super().__init__(timeout=max(0.001, deadline - time.monotonic()))
         self.call, self.question_id = call, event.question_id
         self.deadline = deadline
-        self.generation = call.generation()
+        self.generation = event.consent_generation
         self.message = None
         self.closed = False
         self.token = uuid.uuid5(uuid.NAMESPACE_OID,
@@ -438,14 +438,15 @@ class DiscordCall:
                 self.phase = 'ended'
                 if self.audio is not None:
                     self.audio.close()
-            generation = self.generation()
+            generation = (event.consent_generation if isinstance(
+                event, (Utterance, Translation, QuestionAsked)) else None)
             if isinstance(event, Utterance):
                 if not self.publication_allowed(generation):
                     return
                 self._event_generations[event.item_id] = generation
             elif isinstance(event, Translation):
-                generation = self._event_generations.get(event.item_id)
-                if not self.publication_allowed(generation):
+                if (not self.publication_allowed(generation)
+                        or self._event_generations.get(event.item_id) != generation):
                     return
             elif isinstance(event, QuestionAsked) and not self.publication_allowed(generation):
                 return
@@ -494,7 +495,7 @@ class DiscordCall:
             return
         if isinstance(event, (Utterance, Translation)):
             if self.publication_allowed(generation):
-                await self.pager.emit(event, generation=generation)
+                await self.pager.emit(event)
             return
         if isinstance(event, QuestionClosed):
             await self.pager.emit(event)
@@ -515,7 +516,7 @@ class DiscordCall:
                 not self.publication_allowed(generation)
                 or (event.deadline_at is not None and time.monotonic() >= event.deadline_at)):
             return
-        await self.pager.emit(event, generation=generation)
+        await self.pager.emit(event)
         if isinstance(event, QuestionAsked):
             view = QuestionView(self, event)
             self.questions[event.question_id] = view

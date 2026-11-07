@@ -66,9 +66,10 @@ class FakeSession:
         await self.events.emit(event_type(self.request.request_id, *args, **kwargs))
 
     async def speak(self, item_id, speaker, original, english, frequency):
+        generation = self.consent_generation if self.publication_allowed else None
         started = time.monotonic() - self.started_at
         await self.emit(Utterance, item_id, speaker, original, started,
-                        ended_at=started + .5, delivery='complete')
+                        ended_at=started + .5, delivery='complete', consent_generation=generation)
         # Keep tone phase continuous across frames. Synthetic audio only.
         for frame in range(25):
             pcm = struct.pack('<160h', *(int(TONE_PEAK * math.sin(2 * math.pi * frequency *
@@ -76,7 +77,7 @@ class FakeSession:
                                         for sample in range(160)))
             self.audio.push(speaker, pcm)
             await asyncio.sleep(0.02)
-        await self.emit(Translation, item_id, english)
+        await self.emit(Translation, item_id, english, consent_generation=generation)
 
     async def answer(self, question_id, answer, answered_by):
         if (answered_by != self.request.requester_id
@@ -133,12 +134,14 @@ class FakeSession:
                              'i am an ai interpreter calling for the group. may i ask a question?',
                              440)
             await self.speak('2', 'callee', self.originals[1], 'six pm is available.', 660)
+            question_generation = self.consent_generation if self.publication_allowed else None
             self.question_open = True
             await self.emit(StatusChanged, CallState.ON_HOLD)
             self.deadline_at = time.monotonic() + 30
             await self.emit(QuestionAsked, 'time', 'does six pm work?', ('yes, six is fine',
                                                                        'ask about seven'), 30.0,
-                            deadline_at=self.deadline_at, text_original=self.originals[1])
+                            deadline_at=self.deadline_at, text_original=self.originals[1],
+                            consent_generation=question_generation)
             try:
                 answer = await asyncio.wait_for(asyncio.shield(self.answer_future), 30)
             except TimeoutError:

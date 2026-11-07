@@ -301,7 +301,7 @@ def test_question_membership_modal_first_answer_and_close():
     async def run():
         setup = Setup()
         call = await setup.start()
-        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?', ('yes', 'no')))
+        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?', ('yes', 'no'), consent_generation=1))
         view = call.questions['q']
         outsider = setup.interaction(11)
         outsider.user.voice = None
@@ -324,7 +324,7 @@ def test_membership_rechecked_after_defer_and_terminal_status_closes_question():
     async def run():
         setup = Setup()
         call = await setup.start()
-        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?'))
+        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?', consent_generation=1))
         view = call.questions['q']
         member = setup.interaction()
 
@@ -348,7 +348,7 @@ def test_event_sink_http_failure_does_not_escape_and_still_disconnects():
         call = await setup.start()
         setup.channel.send.side_effect = discord.HTTPException(
             SimpleNamespace(status=429, reason='rate limit'), 'try later')
-        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?'))
+        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?', consent_generation=1))
         await deliver(call, CallFinished(call.request.request_id, 'done.', 10))
         assert not setup.calls.active and call.audio.read() == b''
         setup.voice.disconnect.assert_awaited_once_with(force=True)
@@ -424,9 +424,9 @@ def test_late_translation_after_finish_is_not_published():
     async def run():
         setup = Setup()
         call = await setup.start()
-        await deliver(call, Utterance(call.request.request_id, '1', 'callee', 'はい', 0))
+        await deliver(call, Utterance(call.request.request_id, '1', 'callee', 'はい', 0, consent_generation=1))
         await deliver(call, CallFinished(call.request.request_id, 'done.', 10))
-        await deliver(call, Translation(call.request.request_id, '1', 'yes'))
+        await deliver(call, Translation(call.request.request_id, '1', 'yes', consent_generation=1))
         await call.pager.flush()
         assert '↳ yes' not in call.pager.pages[0].message.content
         assert not setup.calls.active
@@ -517,7 +517,7 @@ def test_all_controls_and_modals_have_stable_prefixed_ids():
 
         setup = Setup()
         call = await setup.start()
-        event = QuestionAsked(call.request.request_id, 'q' * 200, 'six?', ('yes', 'no'))
+        event = QuestionAsked(call.request.request_id, 'q' * 200, 'six?', ('yes', 'no'), consent_generation=1)
         await deliver(call, event)
         view = call.questions[event.question_id]
         duplicate = QuestionView(call, event)
@@ -592,9 +592,9 @@ def test_all_messages_use_invoking_text_channel_while_voice_and_answers_stay_in_
         assert call.voice_channel is setup.channel and call.text_channel is text
         await call.brief_view.dial.callback(setup.interaction())
         assert setup.channel.connect.await_count == 1
-        await deliver(call, Utterance(call.request.request_id, '1', 'callee', 'はい', 0))
-        await deliver(call, Translation(call.request.request_id, '1', 'yes'))
-        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?', ('yes', 'no')))
+        await deliver(call, Utterance(call.request.request_id, '1', 'callee', 'はい', 0, consent_generation=1))
+        await deliver(call, Translation(call.request.request_id, '1', 'yes', consent_generation=1))
+        await deliver(call, QuestionAsked(call.request.request_id, 'q', 'six?', ('yes', 'no'), consent_generation=1))
         question = call.questions['q']
         outsider = setup.interaction(11)
         outsider.user.voice = None

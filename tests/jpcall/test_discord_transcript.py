@@ -38,10 +38,10 @@ def test_late_translation_reflows_long_pages_without_losing_text():
         messages = Messages()
         pager = TranscriptPager(messages.send, messages.edit)
         for i in range(4):
-            await pager.emit(Utterance('r', str(i), 'callee', f'line-{i}' + '日' * 800, i))
+            await pager.emit(Utterance('r', str(i), 'callee', f'line-{i}' + '日' * 800, i, consent_generation=1))
         await pager.flush()
         original = len(messages.contents)
-        await pager.emit(Translation('r', '0', 'late english ' + '🦉' * 1300))
+        await pager.emit(Translation('r', '0', 'late english ' + '🦉' * 1300, consent_generation=1))
         await pager.close()
         assert len(messages.contents) > original
         assert all(len(text.encode('utf-16-le')) // 2 <= 2000 for text in messages.contents)
@@ -57,10 +57,10 @@ def test_reordered_translation_status_and_question():
     async def run():
         messages = Messages()
         pager = TranscriptPager(messages.send, messages.edit)
-        await pager.emit(Translation('r', 'x', 'hello'))
-        await pager.emit(Utterance('r', 'x', 'fri', 'こんにちは', 0))
+        await pager.emit(Translation('r', 'x', 'hello', consent_generation=1))
+        await pager.emit(Utterance('r', 'x', 'fri', 'こんにちは', 0, consent_generation=1))
         await pager.emit(StatusChanged('r', CallState.ON_HOLD))
-        await pager.emit(QuestionAsked('r', 'q', 'six or seven?', ('six', 'seven')))
+        await pager.emit(QuestionAsked('r', 'q', 'six or seven?', ('six', 'seven'), consent_generation=1))
         await pager.emit(QuestionClosed('r', 'q', 'answered', 'six'))
         await pager.close()
         text = ''.join(messages.contents)
@@ -73,11 +73,11 @@ def test_coalesces_edits_and_flushes_at_end():
     async def run():
         messages = Messages()
         pager = TranscriptPager(messages.send, messages.edit, interval=0.1)
-        await pager.emit(Utterance('r', '0', 'fri', 'first', 0))
+        await pager.emit(Utterance('r', '0', 'fri', 'first', 0, consent_generation=1))
         await asyncio.sleep(0)
         assert len(messages.writes) == 1
         for i in range(1, 10):
-            await pager.emit(Utterance('r', str(i), 'fri', f'line-{i}', i))
+            await pager.emit(Utterance('r', str(i), 'fri', f'line-{i}', i, consent_generation=1))
         await asyncio.sleep(0.02)
         assert len(messages.writes) == 1
         await pager.close()
@@ -91,13 +91,13 @@ def test_failed_writes_preserve_pending_lines_without_spinning():
         messages = Messages()
         messages.fail = True
         pager = TranscriptPager(messages.send, messages.edit)
-        await pager.emit(Utterance('r', '0', 'callee', 'retained', 0))
+        await pager.emit(Utterance('r', '0', 'callee', 'retained', 0, consent_generation=1))
         await asyncio.sleep(0)
         assert pager._task.done()
         messages.fail = False
         assert await pager.flush()
         messages.fail = True
-        await pager.emit(Translation('r', '0', 'also retained'))
+        await pager.emit(Translation('r', '0', 'also retained', consent_generation=1))
         assert not await pager.flush()
         messages.fail = False
         assert await pager.close()
@@ -116,7 +116,7 @@ def test_flush_does_not_cancel_or_duplicate_an_inflight_send():
             return await messages.send(content)
 
         pager = TranscriptPager(send, messages.edit)
-        await pager.emit(Utterance('r', '0', 'fri', 'one line', 0))
+        await pager.emit(Utterance('r', '0', 'fri', 'one line', 0, consent_generation=1))
         await started.wait()
         closing = asyncio.create_task(pager.close())
         await asyncio.sleep(0)
@@ -131,8 +131,8 @@ def test_call_language_original_and_english_have_neutral_labels():
     async def run():
         messages = Messages()
         pager = TranscriptPager(messages.send, messages.edit)
-        await pager.emit(Utterance('r', 'ko', 'fri', '안녕하세요', 0))
-        await pager.emit(Translation('r', 'ko', 'hello'))
+        await pager.emit(Utterance('r', 'ko', 'fri', '안녕하세요', 0, consent_generation=1))
+        await pager.emit(Translation('r', 'ko', 'hello', consent_generation=1))
         await pager.close()
         assert messages.contents == ['fri · 안녕하세요\n↳ hello']
     asyncio.run(run())

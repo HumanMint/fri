@@ -45,8 +45,11 @@ class TranscriptPager:
         self._lock = asyncio.Lock()
         self._flush_requested = asyncio.Event()
 
-    async def emit(self, event, *, generation=None):
-        if generation is not None and self.allowed is not None and not self.allowed(generation):
+    async def emit(self, event):
+        protected = isinstance(event, (Utterance, Translation, QuestionAsked))
+        generation = event.consent_generation if protected else None
+        if protected and (generation is None or (self.allowed is not None
+                                                 and not self.allowed(generation))):
             return
         if isinstance(event, Utterance):
             if event.item_id in self._items:

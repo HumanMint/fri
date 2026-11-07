@@ -314,3 +314,186 @@ def test_delivered_reply_callback_requires_completed_generation_and_all_phone_ma
         finally:
             await client.stop()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('initial,duplicate_start', [(None, False), (None, True), (1, False)])
+def test_late_asr_keeps_capture_consent_instead_of_current_permission(initial, duplicate_start):
+    async def run():
+        context = [initial]
+        client, audio, events, meter, peer = bridge(publication_context=lambda: context[0])
+        await attach_and_open(client, Media())
+        try:
+            await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'late',
+                                       'audio_start_ms': 100})
+            client.set_permission(False)
+            context[0] = 3
+            client.set_permission(True)
+            if duplicate_start:
+                await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'late',
+                                           'audio_start_ms': 100})
+            await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'late',
+                                       'transcript': '七名です。'})
+            row = next(e for e in events.items if e.item_id == 'late')
+            assert row.consent_generation == initial
+            assert row.consent_generation != context[0]
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('capture,callback', [(False, True), (True, False)])
+def test_missing_capture_or_publication_callback_is_not_consent_evidence(capture, callback):
+    async def run():
+        client, audio, events, meter, peer = bridge(
+            publication_context=(lambda: 7) if callback else None)
+        await attach_and_open(client, Media())
+        try:
+            if capture:
+                await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'x',
+                                           'audio_start_ms': 100})
+            await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'x',
+                                       'transcript': '七名です。'})
+            assert events.items[-1].consent_generation is None
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_fri_transcript_keeps_command_creation_consent_across_queue_wait():
+    async def run():
+        context = [1]
+        client, audio, events, meter, peer = bridge(publication_context=lambda: context[0])
+        await attach_and_open(client, Media())
+        pending = None
+        try:
+            await client.handle_event({'type': EVENTS['response_created'],
+                                       'response': {'id': 'busy'}})
+            pending = asyncio.create_task(client.say('確認しています。'))
+            await turns()
+            context[0] = 3
+            await client.handle_event({'type': EVENTS['response_done'], 'response': {
+                'id': 'busy', 'status': 'completed', 'output': []}})
+            generated = await pending
+            await generated
+            await output(client, response='command-2', item='late-fri', played=1)
+            row = next(e for e in events.items if e.item_id == 'late-fri')
+            assert row.consent_generation == 1
+        finally:
+            if pending is not None:
+                pending.cancel()
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_uncorrelated_fri_output_has_no_publication_evidence():
+    async def run():
+        client, audio, events, meter, peer = bridge(publication_context=lambda: 7)
+        await attach_and_open(client, Media())
+        try:
+            await client.handle_event({'type': EVENTS['response_created'],
+                                       'response': {'id': 'uncorrelated'}})
+            await output(client, response='uncorrelated', item='unknown-source', played=1)
+            assert events.items[-1].consent_generation is None
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_transfer_notice_speaks_before_tool_only_classification_of_the_next_reply():
+    async def run():
+        client, audio, events, meter, peer = bridge()
+        media = Media()
+        await attach_and_open(client, media)
+        try:
+            notice = client.brief.opener_ja
+            client.set_permission(False)
+            before = sum(e['type'] == EVENTS['response_create'] for e in peer.sent)
+            await client.repeat_notice()
+            request = [e for e in peer.sent if e['type'] == EVENTS['response_create']][-1]
+            assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == before + 1
+            assert request['response'].get('output_modalities') != ['text']
+            assert notice in request['response']['instructions']
+            await output(client, response='command-2', item='renewed-notice', text=notice, played=1)
+            assert len(audio.frames) == 1 and not client._permission
+            await callee(client, 'new-recipient', 'はい、どうぞ。')
+            await turns()
+            request = [e for e in peer.sent if e['type'] == EVENTS['response_create']][-1]
+            assert request['response']['output_modalities'] == ['text']
+            assert request['response']['tool_choice']['name'] == 'permission'
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('outer_cancel', [False, True])
+def test_stalled_close_cannot_retain_content_or_receive_and_watch_tasks(monkeypatch, outer_cancel):
+    import gc
+    import weakref
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(realtime, 'TRANSPORT_CLOSE_TIMEOUT_S', .02)
+
+    async def run():
+        close_entered, aborted = asyncio.Event(), []
+        client, audio, events, meter, peer = bridge()
+
+        async def stalled_close():
+            close_entered.set()
+            await asyncio.Event().wait()
+
+        peer.close = stalled_close
+        peer._response = SimpleNamespace(close=lambda: aborted.append(True))
+
+        class Owner:
+            async def emit(self, event):
+                pass
+
+            def context(self):
+                return 1
+
+            def speech(self, *args):
+                pass
+
+            async def tool(self, *args):
+                pass
+
+            async def failed(self):
+                pass
+
+        owner = Owner()
+        retained = weakref.ref(owner)
+        client.events = owner
+        client._publication_context = owner.context
+        client._on_speech, client._on_callee_response = owner.speech, owner.speech
+        client._on_tool_call, client._on_asr_failure = owner.tool, owner.failed
+        client._goal = 'synthetic private goal'
+        media = Media()
+        await attach_and_open(client, media)
+        receive = client._task
+        watch = asyncio.create_task(client.wait())
+        side = client._background(asyncio.Event().wait())
+        client._transcripts[('pending', 0)] = 'synthetic private transcript'
+        client._partial_transcripts['pending'] = 'synthetic partial'
+        client._recent_speech.append((0, 'pending', 'synthetic private speech'))
+        del owner
+        stopper = asyncio.create_task(client.stop())
+        await close_entered.wait()
+        # This check runs while close is still stalled, before any close timeout.
+        assert aborted == [True]
+        assert client.brief is None and client._goal == ''
+        assert client.events is None and client.audio_sink is None
+        assert client._on_tool_call is None and client._publication_context is None
+        assert client._session is None and client._ws is None and client._media is None
+        assert not client._transcripts and not client._partial_transcripts and not client._recent_speech
+        if outer_cancel:
+            stopper.cancel()
+        await asyncio.gather(stopper, watch, return_exceptions=True)
+        assert receive.done() and watch.done() and side.done()
+        assert not client._side_tasks and client._task is None
+        gc.collect()
+        assert retained() is None
+        client.force_cleanup()  # Parent finally and repeated stop remain safe.
+        await client.stop()
+        await turns()
+        assert media.closed if not outer_cancel else not client._media
+    asyncio.run(run())

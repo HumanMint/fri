@@ -222,7 +222,7 @@ def test_failed_edit_never_posts_a_replacement_and_retry_send_reuses_nonce():
         edit.side_effect = discord.HTTPException(SimpleNamespace(status=404, reason='missing'), 'gone')
         message = cost.message
         await cost.emit(update)
-        assert cost.message is message and send.await_count == 2
+        assert cost.message is message and send.await_count == 3
         from discord.http import handle_message_parameters
         with handle_message_parameters(nonce=nonce) as params:
             assert params.payload['enforce_nonce'] is True

@@ -118,6 +118,10 @@ class JpcallServer:
         call = self._status.pop(routes.status_token, None)
         self._media.pop(routes.media_token, None)
         if call and call.ws is not None:
+            request = getattr(call.ws, '_req', None)
+            transport = getattr(request, 'transport', None)
+            if transport is not None:
+                transport.close()
             await call.ws.close()
 
     def _prune(self) -> None:

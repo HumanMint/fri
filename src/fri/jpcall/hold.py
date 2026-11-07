@@ -48,7 +48,7 @@ class HoldController:
         self._callee_waiting = False
 
     async def ask(self, call_id: str, text_en: str, options: tuple[str, ...], *,
-                  text_original: str = '') -> bool:
+                  text_original: str = '', consent_generation: int | None = None) -> bool:
         if self._ended or self.question is not None or self._transitioning:
             return False
         now = self.clock()
@@ -64,7 +64,7 @@ class HoldController:
             return False
         await self.emit(QuestionAsked(self.request_id, question.question_id, text_en,
                                       options, max(0, question.deadline - self.clock()),
-                                      question.deadline, text_original))
+                                      question.deadline, text_original, consent_generation))
         return True
 
     def _reset_timer(self, question: _Question) -> None:
