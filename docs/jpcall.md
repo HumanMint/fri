@@ -51,6 +51,8 @@ jpcall is Fri-only. It does not use the Gene controller.
 ## Discord development
 
 The runtime image needs libopus (for example, the `libopus0` system package on Debian).
+For an Apple Silicon Homebrew installation, include `/opt/homebrew/lib` in
+`DYLD_FALLBACK_LIBRARY_PATH` when launching the runner so discord.py can find libopus.
 The pinned discord.py voice extra supplies PyNaCl and DAVE support; `davey` is also pinned
 to 0.1.7 explicitly: discord.py 2.7.1 does not implement davey 0.2's explicit MLS
 transition API. The incompatible pair leaves encryption keys inactive even after connection
@@ -86,6 +88,7 @@ then run `uv run python -m fri.jpcall.devbot`. No env files are loaded. Disabled
 exits with setting names only. The runner lazily constructs `JpcallEngine(load_config())`,
 opens it before command registration, and closes it at shutdown. Real mode uses the engine's
 configured allowlist; `--allow-user` is only for fake mode.
+Ctrl-C and SIGTERM both unwind the client's call cleanup before the runner exits.
 
 `register(tree, client, engine, guild_ids, limits=limits)` returns the Discord call
 manager; call its async `close()` on shutdown. Supply the configured `Limits` explicitly;

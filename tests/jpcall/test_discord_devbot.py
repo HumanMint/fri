@@ -217,3 +217,51 @@ def test_fake_translation_keeps_speech_source_generation_across_awaits():
         assert [event.consent_generation for event in events] == [1, 1]
         assert session.consent_generation == 3
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('signum', ['SIGINT', 'SIGTERM'])
+def test_runner_process_signals_unwind_client_and_engine(tmp_path, signum):
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    script = '''
+import asyncio
+from pathlib import Path
+import sys
+from fri.jpcall import devbot
+marker = Path(sys.argv.pop())
+async def start(self, *args, **kwargs):
+    marker.with_suffix('.ready').write_text('ready')
+    await asyncio.Event().wait()
+async def close(self):
+    marker.write_text('engine closed')
+devbot.DevBot.start = start
+devbot.FakeEngine.close = close
+sys.argv = ['devbot', '--fake-engine']
+devbot.main()
+'''
+    marker = tmp_path / 'shutdown.txt'
+    env = {'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1',
+           'PYTHONPATH': str(Path(devbot.__file__).resolve().parents[2])
+               + os.pathsep + os.environ.get('PYTHONPATH', ''),
+           'JPCALL_DEV_DISCORD_TOKEN': 'synthetic-unused', 'JPCALL_DEV_GUILD_ID': '1'}
+    process = subprocess.Popen([sys.executable, '-c', script, str(marker)], env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 5
+        while not marker.with_suffix('.ready').exists():
+            if process.poll() is not None or time.monotonic() >= deadline:
+                pytest.fail(f'runner failed to start: {process.communicate(timeout=1)}')
+            time.sleep(.01)
+        process.send_signal(getattr(signal, signum))
+        output = process.communicate(timeout=5)
+        assert process.returncode == 0, output
+        assert marker.read_text() == 'engine closed'
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()

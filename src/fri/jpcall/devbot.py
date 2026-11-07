@@ -9,6 +9,7 @@ import asyncio
 import logging
 import math
 import os
+import signal
 import struct
 import time
 
@@ -279,7 +280,12 @@ def main():
         engine, limits = None, config.limits
     logging.basicConfig(level=logging.INFO)
     bot = DevBot(engine, int(guild), limits, config=config, audio_check=args.audio_check)
-    bot.run(token, log_handler=None)
+    # Client.run already unwinds its async context on KeyboardInterrupt.
+    previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
+    try:
+        bot.run(token, log_handler=None)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == '__main__':
