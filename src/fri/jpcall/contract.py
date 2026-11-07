@@ -80,6 +80,8 @@ class Utterance:
     speaker: Speaker
     text_ja: str
     started_at: float           # seconds since the call was answered
+    ended_at: float | None = None
+    delivery: Literal['complete', 'interrupted', 'unknown'] = 'complete'
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class Translation:
     request_id: str
     item_id: str
     text_en: str
+    status: Literal['ready', 'unavailable'] = 'ready'
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,8 @@ class QuestionAsked:
     text_en: str
     options: tuple[str, ...] = ()   # quick-reply choices; free text is always allowed
     deadline_s: float = 60.0
+    deadline_at: float | None = None  # Authoritative process-monotonic expiry.
+    text_original: str = ''
 
 
 @dataclass(frozen=True)
@@ -124,6 +129,7 @@ class CallFinished:
     duration_s: float
     usage: tuple[UsageLine, ...] = ()
     usage_final: bool = False   # False while late prices (Twilio) are still pending
+    termination_confirmed: bool | None = None
 
 
 @dataclass(frozen=True)
