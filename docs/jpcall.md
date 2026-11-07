@@ -163,9 +163,13 @@ Hold lines run out of band with only the short phone rules and the exact line to
 | `JPCALL_REALTIME_REASONING` | unset | `minimal`, `low`, `medium`, `high`, `xhigh` |
 
 Server VAD remains enabled, with automatic responses and interruptions disabled.
-Higher activation threshold and near-field filtering reduce noise triggers. Replies and
-barge-in wait for a final non-echo transcript; this adds transcription latency to genuine
-interruptions, but keeps raw VAD noise and playback echo from cutting off Fri. Changed numbers, negations and conditions are preserved. Exact recent repeats
+During an approved inquiry the app stops phone and Discord playback on speech-start,
+cancels queued speech and truncates the old response to its acknowledged played duration.
+Only a current final non-echo transcript releases the next reply, in the same conversation.
+The prepermission notice keeps its existing interruption behavior. Higher activation
+threshold and near-field filtering reduce noise triggers, but echo or noise can still
+cause a cutoff; actual fluidity needs a controlled voice test. Changed numbers, negations
+and conditions are preserved. Exact recent repeats
 remain uncertain transcript evidence rather than being deleted; bounded recovery
 avoids treating ambiguous echo as a confirmed answer. Interrupted generated text
 is labelled uncertain; zero-played output contributes no spoken fact. Use headphones during development calls.
@@ -222,3 +226,17 @@ Current development validation is simulated. Use the
 [evaluation checklist and log schema](jpcall-evaluation.md) to distinguish fake
 peers, model-simulated dialogue and later authorized live voice. Passing tests
 does not establish Japanese naturalness or real-path latency.
+
+### Owner-only Korean recording test
+
+`scripts/jpcall_owner_recording.py` is an import-only operator helper for a separately
+approved owner test. It never loads credentials, creates a client or dials. Its context
+requires explicit go and recording consent, an exact allowlisted owner destination and
+an existing matching call, Korean language, and a call limit of at most 120 seconds.
+The run-local recording language must be supplied through the existing configuration's
+`language` property before planning; ordinary no-recording prompts remain unchanged.
+The helper starts one provider recording, downloads verified completed dual-channel WAV
+into a new private directory outside Git, and offers separate manual stop/deletion.
+Provider-side media is not proof of handset audibility; Stream channel contents need a
+controlled check. Recording/storage add costs; the helper does not enforce a total dollar
+budget. A supplied number or recording consent alone never authorizes starting a call.

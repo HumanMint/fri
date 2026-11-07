@@ -250,7 +250,7 @@ def test_exact_echo_is_retained_as_uncertain_without_automatic_inquiry(
             assert 'could not hear' in requests[-1]['response']['instructions']
             row = next(e for e in events.items if e.speaker == 'callee')
             assert row.text_ja == echo and row.delivery == 'unknown'
-            assert not any(e['type'] == EVENTS['truncate'] for e in peer.sent)
+            assert any(e['type'] == EVENTS['truncate'] for e in peer.sent)  # VAD stops playback.
             timeline = [json.loads(line) for line in path.read_text().splitlines()]
             drops = [e for e in timeline if e['event'] == 'echo_uncertain']
             assert len(drops) == 1 and drops[0]['text'] == echo
@@ -371,7 +371,7 @@ def test_non_echo_interrupt_logs_played_truncation_cancel_and_late_transcript(tm
             await client.handle_event(delta)
             await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'callee1',
                                        'audio_start_ms': 100})
-            assert not audio.cleared
+            assert audio.cleared == ['fri']
             await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'callee1',
                                        'transcript': '予約できますか。'})
             # The transcript can finish after cancellation. Preserve what was interrupted.

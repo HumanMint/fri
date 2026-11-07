@@ -170,13 +170,17 @@ def test_realtime_ga_session_input_output_and_final_transcripts():
                                                'input_token_details': {'audio_tokens': 10}}})
             assert [(e.item_id, e.started_at) for e in events.items] == [('callee2', 2.4),
                                                                        ('callee1', 1.2)]
-            await client.handle_event({'type': EVENTS['output_audio'], 'response_id': 'command-1', 'item_id': 'fri1',
+            for _ in range(20):
+                await asyncio.sleep(0)
+            response_id = 'command-' + next(e['response']['metadata']['jpcall_command']
+                for e in reversed(peer.sent) if e['type'] == EVENTS['response_create'])
+            await client.handle_event({'type': EVENTS['output_audio'], 'response_id': response_id, 'item_id': 'fri1',
                                        'content_index': 0,
                                        'delta': base64.b64encode(ULAW).decode()})
             assert audio.frames == [('fri', ulaw_to_pcm16(ULAW))]
             assert audio.loop is asyncio.get_running_loop()
             assert media.sent[-2:] == [('media', ULAW), ('mark', '1')]
-            transcript = {'type': EVENTS['output_transcript'], 'response_id': 'command-1', 'item_id': 'fri1',
+            transcript = {'type': EVENTS['output_transcript'], 'response_id': response_id, 'item_id': 'fri1',
                           'content_index': 0, 'transcript': 'ありがとうございます。'}
             await client.handle_event(transcript)
             await client.handle_event(transcript)
@@ -208,7 +212,7 @@ def test_barge_in_truncates_only_acknowledged_audio_and_ignores_clear_acks():
             await client.handle_event(delta)  # next 20 ms still queued
             await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'callee1',
                                        'audio_start_ms': 100})
-            assert not audio.cleared  # A raw VAD event cannot distinguish echo.
+            assert audio.cleared == ['fri']  # Stop before final ASR, including ambiguous VAD.
             await client.handle_event({'type': EVENTS['input_transcript'], 'item_id': 'callee1',
                                        'transcript': '予約できますか。'})
             assert peer.sent[-1] == {'type': EVENTS['truncate'], 'item_id': 'fri1',

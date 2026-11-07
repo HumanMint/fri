@@ -130,6 +130,7 @@ class RealtimeClient:
         self._preopening_items: set[str] = set()
         self._turn_pending = False
         self._reply_generation: int | None = None
+        self._speech_pending: set[str] = set()
         self._playout: dict[tuple[str, int], _Playout] = {}
         self._generating: set[tuple[str, int]] = set()
         self._marks: dict[str, tuple[tuple[str, int], int]] = {}
@@ -286,6 +287,7 @@ class RealtimeClient:
         if self._stopped:
             return
         self._permission_generation += 1
+        self._speech_pending.clear()
         self._reply_generation = None
         for timer in self._asr_timers.values():
             timer.cancel()
@@ -349,7 +351,8 @@ class RealtimeClient:
             if self._revocation is not None:
                 await asyncio.shield(self._revocation)
             if (command.generation != self._permission_generation
-                    or command.number in self._blocked_commands):
+                    or command.number in self._blocked_commands
+                    or (self._speech_pending and not command.opener)):
                 self._commands.pop(command.number, None)
                 if not command.done.done():
                     command.done.set_result('cancelled')
@@ -403,10 +406,11 @@ class RealtimeClient:
                 self._blocked_responses.update(responses)
 
                 async def cancel():
+                    if any(part.response_id in responses and part.item_id not in self._interrupted
+                           for part in self._playout.values()):
+                        await self._barge_in()
                     for response_id in responses:
                         await self._send('response_cancel', response_id=response_id)
-                    if responses:
-                        await self._barge_in()
 
                 self._background(cancel())
         command.done.add_done_callback(cancelled)
@@ -502,16 +506,17 @@ class RealtimeClient:
                 self._confirm_response(part.response_id)
         self._update_idle()
 
-    async def _barge_in(self) -> None:
+    async def _barge_in(self, *, clear_discord: bool = True) -> None:
+        self._marks.clear()
+        if clear_discord:
+            self.audio_sink.clear('fri')
         async with self._output_lock:
             # Invalidate marks BEFORE awaiting clear: Twilio echoes cleared marks.
             pending = [part for key, part in self._playout.items()
                        if (part.sent_bytes > part.played_bytes or key in self._generating)
                        and part.item_id not in self._interrupted]
             self._interrupted.update(part.item_id for part in pending)
-            self._marks.clear()
             self._generating.clear()
-            self.audio_sink.clear('fri')
             if self._media is not None:
                 await self._media.clear()
             for part in pending:
@@ -563,7 +568,7 @@ class RealtimeClient:
 
     def _schedule_reply(self) -> None:
         if (self._reply_generation == self._permission_generation
-                and self._conversation_open and not self._turn_pending
+                and self._conversation_open and not self._speech_pending and not self._turn_pending
                 and not self._silenced and not self._stopped):
             self._turn_pending = True
             self._background(self._reply_to_callee(self._reply_generation))
@@ -573,7 +578,7 @@ class RealtimeClient:
             await self._idle.wait()
             if (not self._stopped and not self._silenced
                     and generation == self._permission_generation
-                    and self._reply_generation == generation):
+                    and not self._speech_pending and self._reply_generation == generation):
                 self._reply_generation = None
                 await self.respond()
         finally:
@@ -599,6 +604,7 @@ class RealtimeClient:
     async def _asr_timeout(self, item: str) -> None:
         await asyncio.sleep(ASR_TIMEOUT_S)
         self._asr_timers.pop(item, None)
+        self._speech_pending.discard(item)
         if item not in self._input_seen and item not in self._asr_failed_items:
             self._asr_failed_items.add(item)
             if (item not in self._preopening_items
@@ -606,7 +612,8 @@ class RealtimeClient:
                 self._asr_failed()
 
     def _asr_failed(self) -> None:
-        if self._silenced or self._stopped or not self._opener_requested:
+        if (self._silenced or self._stopped or not self._opener_requested
+                or self._speech_pending):
             return
         if self._asr_recovery is None or self._asr_recovery.done():
             self._asr_ok.clear()
@@ -689,13 +696,15 @@ class RealtimeClient:
                         and number not in self._blocked_commands)
             if explicit:
                 self._opener_responses.add(response['id'])
-            if explicit or (self._permission and self._conversation_open):
+            if explicit or (self._permission and self._conversation_open and not self._speech_pending):
                 self._allowed_responses.add(response['id'])
             if (self._silenced or (not explicit and not self._conversation_open)
                     or number in self._blocked_commands):
                 self._blocked_responses.add(response['id'])
                 await self._send('response_cancel', response_id=response['id'])
         elif kind == EVENTS['speech_started']:
+            item = event['item_id']
+            fresh = item not in self._input_generations and item not in self._input_seen
             self.timeline.record('speech_started', item_id=event['item_id'],
                                  audio_start_ms=event['audio_start_ms'])
             self._starts[event['item_id']] = max(0, event['audio_start_ms'] / 1000)
@@ -704,8 +713,27 @@ class RealtimeClient:
             self._input_generations.setdefault(event['item_id'], self._permission_generation)
             if not self._opener_requested:
                 self._preopening_items.add(event['item_id'])
-            if self._on_speech:
-                self._on_speech(True, event['item_id'])
+            if (fresh and self._permission and self._conversation_open
+                    and self._input_generations.get(item) == self._permission_generation):
+                # VAD stops inquiry playback immediately; only final ASR may start a reply.
+                # The pre-permission notice keeps its existing ASR-gated interruption route.
+                self._speech_pending.add(item)
+                self._reply_generation = None
+                self._blocked_commands.update(self._commands)
+                responses = tuple(self._active_responses - self._blocked_responses)
+                self._blocked_responses.update(self._active_responses)
+                self._blocked_responses.update(self._allowed_responses)
+                if self._asr_recovery is not None:
+                    self._asr_recovery.cancel()
+                    self._asr_recovery = None
+                if self._on_speech:
+                    self._on_speech(True, item)
+                self._marks.clear()
+                self.audio_sink.clear('fri')
+                await asyncio.gather(self._barge_in(clear_discord=False), *(self._send(
+                    'response_cancel', response_id=response_id) for response_id in responses))
+            elif self._on_speech:
+                self._on_speech(True, item)
         elif kind == EVENTS['speech_stopped']:
             self.timeline.record('speech_stopped', item_id=event['item_id'],
                                  audio_end_ms=event.get('audio_end_ms'))
@@ -719,6 +747,7 @@ class RealtimeClient:
                 self._on_speech(False, item)
         elif kind == EVENTS['input_transcript_failed']:
             item = event['item_id']
+            self._speech_pending.discard(item)
             if item not in self._input_seen and item not in self._asr_failed_items:
                 self._asr_failed_items.add(item)
                 timer = self._asr_timers.pop(item, None)
@@ -735,6 +764,8 @@ class RealtimeClient:
             if item in self._input_seen:
                 return
             self._input_seen.add(item)
+            interrupted_at_start = item in self._speech_pending
+            self._speech_pending.discard(item)
             generation = self._input_generations.get(item)
             eligible = (self._opener_requested and item not in self._preopening_items
                         and generation == self._permission_generation)
@@ -767,8 +798,8 @@ class RealtimeClient:
                 if self._asr_recovery is not None:
                     self._asr_recovery.cancel()
                     self._asr_recovery = None
-                if self._conversation_open:
-                    # Confirmed speech interrupts; raw VAD noise does not.
+                if self._conversation_open and not interrupted_at_start:
+                    # Pre-permission notice replies retain the existing ASR gate.
                     for response_id in tuple(self._active_responses):
                         self._blocked_responses.add(response_id)
                         await self._send('response_cancel', response_id=response_id)
@@ -844,6 +875,9 @@ class RealtimeClient:
             self._busy_unknown = False
             number = (response.get('metadata') or {}).get('jpcall_command')
             command = self._commands.pop(number, None)
+            if (number in self._blocked_commands
+                    or (command is not None and command.generation != self._permission_generation)):
+                self._blocked_responses.add(response_id)
             if command:
                 if self._pending is command:
                     self._pending = None
@@ -953,6 +987,7 @@ class RealtimeClient:
         self._ends.clear()
         self._input_context.clear()
         self._input_generations.clear()
+        self._speech_pending.clear()
         self._reply_generation = None
         self._response_context.clear()
         self._asr_timers.clear()
