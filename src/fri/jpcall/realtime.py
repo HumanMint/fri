@@ -852,8 +852,12 @@ class RealtimeClient:
                 self._remember_speech(item, text)
         elif kind == EVENTS['output_transcript']:
             key = event['item_id'], event['content_index']
+            part = self._playout.get(key)
             if (not self._output_allowed(event) and not (
-                    not self._silenced and key in self._playout and key[0] in self._interrupted)):
+                    not self._silenced and part is not None
+                    and part.generation == self._permission_generation and part.played_bytes > 0
+                    and (key[0] in self._interrupted or (
+                        part.played_bytes == part.sent_bytes and key not in self._generating)))):
                 return
             self._partial_transcripts.pop(key[0], None)
             self._remember_speech(key[0], event['transcript'])

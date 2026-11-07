@@ -1,11 +1,12 @@
 """Korean interruption fixtures exercise transport/control, never a live voice model."""
 
 import asyncio
+import base64
 from dataclasses import replace
 
 import pytest
 from test_engine_speech_regressions import callee, output, turns
-from test_engine_transport import EVENTS, Media, attach_and_open, bridge
+from test_engine_transport import EVENTS, ULAW, Media, attach_and_open, bridge
 
 import fri.jpcall.realtime as realtime
 from fri.jpcall.contract import Limits
@@ -48,6 +49,46 @@ async def acknowledge_cancel(client, resource):
     await client.handle_event({'type': EVENTS['response_done'],
                               'response': resource | {'status': 'cancelled'}})
     await turns()
+
+
+@pytest.mark.parametrize('before_vad,guard', [
+    (True, 'current'), (False, 'current'), (False, 'revoked'),
+    (False, 'silenced'), (False, 'unplayed'),
+])
+def test_delayed_fully_played_transcript_keeps_delivery_evidence(before_vad, guard):
+    async def run():
+        client, audio, events, peer, media, resource, generated = await inquiry()
+        try:
+            common = dict(response_id=resource['id'], item_id='heard', content_index=0)
+            peer.feed(common | {'type': EVENTS['output_audio'],
+                               'delta': base64.b64encode(ULAW).decode()})
+            peer.feed(common | {'type': EVENTS['output_audio_done']})
+            await turns()
+            if guard != 'unplayed':
+                for mark in list(client._marks):
+                    await client.mark(mark)
+                part = client._playout['heard', 0]
+                assert part.played_bytes == part.sent_bytes == len(ULAW)
+            if guard == 'revoked':
+                client.set_permission(False)
+            elif guard == 'silenced':
+                client.silence()
+            transcript = common | {'type': EVENTS['output_transcript'],
+                                    'transcript': '일곱 시에 가능할까요?'}
+            vad = {'type': EVENTS['speech_started'], 'item_id': 'interrupt', 'audio_start_ms': 100}
+            for event in ([transcript, vad] if before_vad else [vad, transcript]):
+                peer.feed(event)
+            await turns()
+            assert client._task and not client._task.done()
+            rows = [e for e in events.items if e.item_id == 'heard']
+            if guard == 'current':
+                assert len(rows) == 1 and rows[0].delivery == 'complete'
+                assert rows[0].consent_generation == 9
+            else:
+                assert not rows
+        finally:
+            await client.stop()
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize('played', [0, 1, 2])
