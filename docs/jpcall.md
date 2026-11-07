@@ -17,7 +17,7 @@ jpcall is Fri-only. It does not use the Gene controller.
 | Call audio | Twilio Media Streams, bidirectional, 8 kHz mono PCMU |
 | Voice | OpenAI Realtime (`gpt-realtime-2.1`), g711_ulaw in/out, tools for asking the group and ending the call |
 | Callee transcript | Realtime input audio transcription with a named model, language from `JPCALL_CALL_LANGUAGE` |
-| Translation, brief, outcome | OpenAI text model, configurable, low reasoning effort for live lines |
+| Translation and outcome | OpenAI text model, configurable, low reasoning effort for live lines |
 | Discord audio | `discord.py[voice]` with DAVE (`davey`), libopus, send-only |
 
 ## Layout
@@ -93,8 +93,7 @@ the default is deny-all. Main Fri enables voice-state intent and opens/registers
 only when its configuration is enabled. `/jpcall` and `jpcall:` component/modal IDs pass the
 usual channel filter into their own allowlist, requester and voice membership checks. Call
 operations do not use the Gene controller. Disabled configuration keeps the existing command
-and channel behavior. The isolated Discord branch also treats an absent engine configuration
-module as unavailable; real mode requires the separately implemented engine modules.
+and channel behavior.
 
 The public final report has the call duration, a compact outcome and cost embed.
 The complete outcome/conditions/reference are attached as call-result.txt;

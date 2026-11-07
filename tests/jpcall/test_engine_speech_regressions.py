@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 
 import pytest
 from test_engine_transport import EVENTS, ULAW, Media, attach_and_open, bridge
@@ -131,6 +132,8 @@ def test_valid_asr_after_clarification_recovers_without_ending(monkeypatch):
         client, audio, events, meter, peer = bridge(on_asr_failure=failure)
         await attach_and_open(client, Media())
         try:
+            await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'x',
+                                       'audio_start_ms': 100})
             await client.handle_event({'type': EVENTS['input_transcript_failed'], 'item_id': 'x'})
             await turns()
             assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == 2
@@ -420,6 +423,83 @@ def test_transfer_notice_speaks_before_tool_only_classification_of_the_next_repl
             request = [e for e in peer.sent if e['type'] == EVENTS['response_create']][-1]
             assert request['response']['output_modalities'] == ['text']
             assert request['response']['tool_choice']['name'] == 'permission'
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_pending_reply_does_not_cross_a_permission_change():
+    async def run():
+        client, audio, events, meter, peer = bridge()
+        await attach_and_open(client, Media())
+        try:
+            await client.handle_event({'type': EVENTS['response_created'],
+                                       'response': {'id': 'busy'}})
+            await callee(client, 'old', '七名です。')
+            before = sum(e['type'] == EVENTS['response_create'] for e in peer.sent)
+            client.set_permission(False)
+            await client.repeat_notice()
+            await turns()
+            assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == before + 1
+            assert not client._permission
+            await callee(client, 'new', 'はい、どうぞ。')
+            await turns()
+            requests = [e for e in peer.sent if e['type'] == EVENTS['response_create']]
+            assert len(requests) == before + 2
+            assert requests[-1]['response']['tool_choice']['name'] == 'permission'
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+def test_transfer_invalidates_remaining_tools_in_the_same_response():
+    async def run():
+        decisions = []
+
+        async def tool(name, arguments, call_id):
+            decisions.append(arguments['decision'])
+            if arguments['decision'] == 'transfer':
+                client.set_permission(False)
+
+        client, audio, events, meter, peer = bridge(on_tool_call=tool)
+        await attach_and_open(client, Media())
+        try:
+            await client.handle_event({'type': EVENTS['response_created'],
+                                       'response': {'id': 'current-tools'}})
+            await client.handle_event({'type': EVENTS['response_done'], 'response': {
+                'id': 'current-tools', 'status': 'completed', 'output': [
+                    {'type': 'function_call', 'status': 'completed', 'name': 'permission',
+                     'call_id': decision, 'arguments': json.dumps({'decision': decision})}
+                    for decision in ('transfer', 'granted')]}})
+            assert decisions == ['transfer'] and not client._permission
+        finally:
+            await client.stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('capture', ['unknown', 'old', 'before_notice'])
+@pytest.mark.parametrize('event', ['input_transcript', 'input_transcript_failed', 'speech_stopped'])
+def test_unknown_or_old_input_cannot_trigger_reply_or_recovery(capture, event, monkeypatch):
+    monkeypatch.setattr(realtime, 'ASR_TIMEOUT_S', .01)
+
+    async def run():
+        client, audio, events, meter, peer = bridge()
+        await attach_and_open(client, Media())
+        try:
+            if capture == 'old':
+                await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'old',
+                                           'audio_start_ms': 100})
+            client.set_permission(False)
+            if capture == 'before_notice':
+                await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'old',
+                                           'audio_start_ms': 100})
+            await client.repeat_notice()
+            before = len(peer.sent)
+            await client.handle_event({'type': EVENTS[event], 'item_id': 'old',
+                                       'transcript': 'はい、どうぞ。', 'audio_end_ms': 200})
+            await asyncio.sleep(.03)
+            assert not any(e['type'] == EVENTS['response_create'] for e in peer.sent[before:])
+            assert client._asr_recovery is None and not client._silenced
         finally:
             await client.stop()
     asyncio.run(run())

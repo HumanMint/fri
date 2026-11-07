@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import json
 import weakref
 from dataclasses import replace
 from unittest.mock import AsyncMock
@@ -73,8 +74,13 @@ def test_capture_and_engine_queue_never_acquire_new_consent(tmp_path, monkeypatc
             await call._rt.handle_event({'type': EVENTS['speech_started'],
                                         'item_id': 'pregrant', 'audio_start_ms': 0})
             await call._handle_tool('permission', {'decision': 'granted'}, 'consent')
+            await settled(lambda: call._rt._idle.is_set())
+            before = len(peer.responses)
             await call._rt.handle_event({'type': EVENTS['input_transcript'],
                                         'item_id': 'pregrant', 'transcript': 'private before permission'})
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert len(peer.responses) == before
             assert not any(row['item_id'] == 'pregrant' for row in call._transcript)
             assert not any(isinstance(e, Utterance) and e.item_id == 'pregrant' for e in events.items)
             original_emit = events.emit
@@ -168,6 +174,60 @@ def test_transfer_renews_notice_and_closes_the_old_group_question(tmp_path, monk
             assert classifier['tool_choice']['name'] == 'permission'
             assert not any(isinstance(e, Utterance) and e.item_id == 'new-person'
                            for e in events.items)
+            await call.hang_up()
+        finally:
+            await engine.close()
+            await http.aclose()
+    asyncio.run(run())
+
+
+def test_old_asr_cannot_grant_permission_for_a_new_recipient(tmp_path, monkeypatch):
+    async def run():
+        engine, provider, peer, http, clock, runner = await make_engine(tmp_path, monkeypatch)
+        try:
+            call, brief, audio, events = await dial(engine, provider)
+            await answer_phone(call)
+            await settled(lambda: call._rt._idle.is_set())
+            await call._rt.handle_event({'type': EVENTS['speech_started'],
+                                        'item_id': 'old', 'audio_start_ms': 100})
+            await call._rt.handle_event({'type': EVENTS['speech_stopped'],
+                                        'item_id': 'old', 'audio_end_ms': 200})
+            before = len(peer.responses)
+            peer.tool('permission', {'decision': 'transfer'}, 'transfer')
+            await settled(lambda: len(peer.responses) > before and not call.publication_allowed
+                          and call._rt._conversation_open and call._rt._idle.is_set())
+            before = len(peer.responses)
+            original = peer.send_json
+
+            async def accept_current_reply(event):
+                if (event['type'] == EVENTS['response_create']
+                        and event['response'].get('output_modalities') == ['text']):
+                    peer.sent.append(event)
+                    peer.responses.append(event['response'])
+                    resource = {'id': 'classifier', 'status': 'completed', 'usage': None,
+                        'metadata': event['response']['metadata'], 'output': [{
+                            'type': 'function_call', 'status': 'completed', 'name': 'permission',
+                            'call_id': 'new-grant', 'arguments': json.dumps({'decision': 'granted'})}]}
+                    peer.feed({'type': EVENTS['response_created'], 'response': resource})
+                    peer.feed({'type': EVENTS['response_done'], 'response': resource})
+                else:
+                    await original(event)
+            peer.send_json = accept_current_reply
+            await call._rt.handle_event({'type': EVENTS['input_transcript'],
+                                        'item_id': 'old', 'transcript': 'はい、どうぞ。'})
+            for _ in range(100):
+                await asyncio.sleep(0)
+            assert len(peer.responses) == before and not call.publication_allowed
+            relay_allowed = engine._server._status[call._routes.status_token].relay_allowed
+            assert not relay_allowed()
+            await call._rt.handle_event({'type': EVENTS['speech_started'],
+                                        'item_id': 'new', 'audio_start_ms': 300})
+            await call._rt.handle_event({'type': EVENTS['speech_stopped'],
+                                        'item_id': 'new', 'audio_end_ms': 400})
+            await call._rt.handle_event({'type': EVENTS['input_transcript'],
+                                        'item_id': 'new', 'transcript': 'はい、どうぞ。'})
+            await settled(lambda: call.publication_allowed)
+            assert relay_allowed()
             await call.hang_up()
         finally:
             await engine.close()

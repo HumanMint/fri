@@ -129,7 +129,7 @@ class RealtimeClient:
         self._input_seen: set[str] = set()
         self._preopening_items: set[str] = set()
         self._turn_pending = False
-        self._reply_needed = False
+        self._reply_generation: int | None = None
         self._playout: dict[tuple[str, int], _Playout] = {}
         self._generating: set[tuple[str, int]] = set()
         self._marks: dict[str, tuple[tuple[str, int], int]] = {}
@@ -137,6 +137,8 @@ class RealtimeClient:
         self._interrupted: set[str] = set()
         self._starts: dict[str, float] = {}
         self._input_context: dict[str, int | None] = {}
+        # Notice replies need an epoch even before publication is permitted.
+        self._input_generations: dict[str, int] = {}
         self._response_context: dict[str, int | None] = {}
         self._ends: dict[str, float] = {}
         self._asr_timers: dict[str, asyncio.Task] = {}
@@ -270,6 +272,7 @@ class RealtimeClient:
         """Renew the actual notice after transfer, before classifying the new reply."""
         if self._silenced or self._stopped or self._media is None:
             return
+        self._opener_requested = True
         self._conversation_open = False
         generated = await self.say(self.brief.opener_ja, _opener=True)
         if await generated != 'completed':
@@ -282,11 +285,21 @@ class RealtimeClient:
         """Fence queued speech before the caller awaits any consent cleanup."""
         if self._stopped:
             return
+        self._permission_generation += 1
+        self._reply_generation = None
+        for timer in self._asr_timers.values():
+            timer.cancel()
+        self._asr_timers.clear()
+        if self._asr_recovery is not None:
+            self._asr_recovery.cancel()
+            self._asr_recovery = None
+        self._asr_ok.clear()
+        self._asr_clarified = False
         if granted:
             self._permission = True
             return
         self._permission = False
-        self._permission_generation += 1
+        self._opener_requested = self._conversation_open = False
         self._blocked_commands.update(self._commands)
         self._blocked_responses.update(self._active_responses)
         self._blocked_responses.update(self._allowed_responses)
@@ -549,16 +562,19 @@ class RealtimeClient:
         self._recent_speech.append((self._clock(), item_id, self._normalized(text)))
 
     def _schedule_reply(self) -> None:
-        if (self._reply_needed and self._conversation_open and not self._turn_pending
+        if (self._reply_generation == self._permission_generation
+                and self._conversation_open and not self._turn_pending
                 and not self._silenced and not self._stopped):
             self._turn_pending = True
-            self._background(self._reply_to_callee())
+            self._background(self._reply_to_callee(self._reply_generation))
 
-    async def _reply_to_callee(self) -> None:
+    async def _reply_to_callee(self, generation: int) -> None:
         try:
             await self._idle.wait()
-            if not self._stopped and not self._silenced:
-                self._reply_needed = False
+            if (not self._stopped and not self._silenced
+                    and generation == self._permission_generation
+                    and self._reply_generation == generation):
+                self._reply_generation = None
                 await self.respond()
         finally:
             self._turn_pending = False
@@ -585,7 +601,8 @@ class RealtimeClient:
         self._asr_timers.pop(item, None)
         if item not in self._input_seen and item not in self._asr_failed_items:
             self._asr_failed_items.add(item)
-            if item not in self._preopening_items:
+            if (item not in self._preopening_items
+                    and self._input_generations.get(item) == self._permission_generation):
                 self._asr_failed()
 
     def _asr_failed(self) -> None:
@@ -684,6 +701,7 @@ class RealtimeClient:
             self._starts[event['item_id']] = max(0, event['audio_start_ms'] / 1000)
             self._input_context.setdefault(event['item_id'],
                 self._publication_context() if self._publication_context else None)
+            self._input_generations.setdefault(event['item_id'], self._permission_generation)
             if not self._opener_requested:
                 self._preopening_items.add(event['item_id'])
             if self._on_speech:
@@ -694,7 +712,8 @@ class RealtimeClient:
             item = event['item_id']
             self._ends[item] = max(0, event.get(
                 'audio_end_ms', (self._clock() - self._answered_at) * 1000) / 1000)
-            if item not in self._input_seen and item not in self._asr_timers:
+            if (item not in self._input_seen and item not in self._asr_timers
+                    and self._input_generations.get(item) == self._permission_generation):
                 self._asr_timers[item] = self._background(self._asr_timeout(item))
             if self._on_speech:
                 self._on_speech(False, item)
@@ -705,23 +724,27 @@ class RealtimeClient:
                 timer = self._asr_timers.pop(item, None)
                 if timer is not None:
                     timer.cancel()
-                if self._on_speech:
+                if (self._on_speech
+                        and self._input_generations.get(item) == self._permission_generation):
                     self._on_speech(False, item)
-                if item not in self._preopening_items:
+                if (item not in self._preopening_items
+                        and self._input_generations.get(item) == self._permission_generation):
                     self._asr_failed()
         elif kind == EVENTS['input_transcript']:
             item = event['item_id']
             if item in self._input_seen:
                 return
             self._input_seen.add(item)
-            eligible = self._opener_requested and item not in self._preopening_items
+            generation = self._input_generations.get(item)
+            eligible = (self._opener_requested and item not in self._preopening_items
+                        and generation == self._permission_generation)
             timer = self._asr_timers.pop(item, None)
             if timer is not None:
                 timer.cancel()
             self._preopening_items.discard(item)
             self.meter.transcription(event.get('usage'), self.config.transcribe_model, item)
             text = event['transcript']
-            if self._on_speech:
+            if self._on_speech and generation == self._permission_generation:
                 self._on_speech(False, item)
             if not text.strip():
                 if eligible:
@@ -735,7 +758,7 @@ class RealtimeClient:
                                   ended_at=self._ends.get(item),
                                   delivery='unknown' if echo else 'complete',
                                   consent_generation=self._input_context.get(item))
-            if eligible and not self._silenced:
+            if eligible and generation == self._permission_generation and not self._silenced:
                 if echo:
                     self._asr_failed()
                     return
@@ -750,7 +773,7 @@ class RealtimeClient:
                         self._blocked_responses.add(response_id)
                         await self._send('response_cancel', response_id=response_id)
                     await self._barge_in()
-                self._reply_needed = True
+                self._reply_generation = generation
                 self._schedule_reply()
         elif kind == EVENTS['output_audio']:
             if not self._output_allowed(event):
@@ -829,7 +852,11 @@ class RealtimeClient:
             self._update_idle()
             if (self._conversation_open and response.get('id') not in self._blocked_responses
                     and response.get('status') == 'completed' and self._on_tool_call is not None):
+                generation = self._permission_generation
                 for item in response.get('output', []):
+                    if (generation != self._permission_generation
+                            or response_id in self._blocked_responses):
+                        break
                     if item.get('type') != 'function_call' or item.get('status') != 'completed':
                         continue
                     call_id = item['call_id']
@@ -925,6 +952,8 @@ class RealtimeClient:
         self._starts.clear()
         self._ends.clear()
         self._input_context.clear()
+        self._input_generations.clear()
+        self._reply_generation = None
         self._response_context.clear()
         self._asr_timers.clear()
         self._asr_failed_items.clear()
