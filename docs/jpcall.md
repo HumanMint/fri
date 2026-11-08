@@ -217,8 +217,11 @@ cannot honor it. No call resumes after restart.
 
 Confirmation uses the exact original goal and approved facts without a paid
 pre-call paraphrase. Request/brief equality and expiry still prevent stale
-confirmation. Ringing is bounded at 30 seconds, permission/media readiness at
-20 seconds, and the attempt at at most 600 seconds. Stop works during connection.
+confirmation. Ringing is bounded at 30 seconds and media readiness at 20 seconds.
+Notice delivery has a 30-second bound; the recipient then has 20 seconds to
+answer after phone playback drains. A transfer gets a new notice and response
+deadline. The whole attempt remains bounded at at most 600 seconds. Stop works
+during connection.
 No verified dollar spending cap is claimed; estimates and actual posted prices
 remain distinct.
 

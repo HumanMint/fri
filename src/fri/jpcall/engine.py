@@ -373,6 +373,7 @@ class _Session:
         self._amd_result: str | None = None
         self._opening_changed = asyncio.Event()
         self._opener_task: asyncio.Task | None = None
+        self._notice_delivered_generation: int | None = None
         self._opener_started = False
         self._voicemail = False
         self._ending = False
@@ -599,7 +600,7 @@ class _Session:
             self._meter.amd()
             await self._status(CallState.IN_PROGRESS)
             self._spawn(self._time_limit())
-            self._spawn(self._permission_limit())
+            self._spawn(self._notice_limit(self.consent_generation))
             self._spawn(self._media_limit())
             self._opener_task = self._spawn(self._await_opener())
 
@@ -635,7 +636,9 @@ class _Session:
             amd = self._amd_result in ('human', 'unknown') or elapsed >= 4
             if self._media_ready and hello and amd and not self._callee_speaking:
                 self._opener_started = True  # Claim the one opener before any await.
+                generation = self.consent_generation
                 await self._rt.open_conversation()
+                await self._notice_delivered(generation)
                 return
             deadlines = []
             if self._greeting_item is None and elapsed < 3:
@@ -683,9 +686,29 @@ class _Session:
         if not self._media_ready:
             self._begin_finish(failed=True, detail='Telephone audio did not become ready.')
 
-    async def _permission_limit(self) -> None:
+    async def _notice_limit(self, generation: int) -> None:
+        await self.engine._sleep(30)
+        if (not self._ending and generation == self.consent_generation
+                and not self._publication_allowed
+                and self._notice_delivered_generation != generation):
+            self._begin_finish(failed=True, detail='The call notice could not be delivered.')
+
+    async def _notice_delivered(self, generation: int) -> None:
+        try:
+            await self._rt.drain(timeout_s=30)
+        except TimeoutError:
+            if not self._ending and generation == self.consent_generation:
+                self._begin_finish(failed=True, detail='The call notice could not be delivered.')
+            return
+        if (not self._ending and generation == self.consent_generation
+                and self._notice_delivered_generation != generation):
+            self._notice_delivered_generation = generation
+            self._spawn(self._permission_limit(generation))
+
+    async def _permission_limit(self, generation: int) -> None:
         await self.engine._sleep(20)
-        if not self._publication_allowed:
+        if (not self._ending and generation == self.consent_generation
+                and not self._publication_allowed):
             self._begin_finish(detail='Permission to share the call was not established.')
 
     async def _hold_state(self, held: bool) -> None:
@@ -731,9 +754,10 @@ class _Session:
                 if self._ending or generation != self.consent_generation:
                     return
                 self._hold = self._new_hold()
-                self._spawn(self._permission_limit())
+                self._spawn(self._notice_limit(generation))
                 await self._rt.tool_result(call_id, {'permission': 'new notice required'}, respond=False)
                 await self._rt.repeat_notice()
+                await self._notice_delivered(generation)
             else:
                 await self._rt.tool_result(call_id, {'error': 'Explicit permission is required'})
             return
