@@ -48,13 +48,10 @@ from .usage import UsageMeter
 LOG = logging.getLogger(__name__)
 TOOLS = (
     {'type': 'function', 'name': 'permission',
-     'description': 'Report explicit permission to AI processing, group listening and retained '
-                    'transcription. Never grant on ambiguous input. Report refusal or a transfer.',
      'parameters': {'type': 'object', 'properties': {
          'decision': {'type': 'string', 'enum': ['granted', 'refused', 'transfer']}},
          'required': ['decision'], 'additionalProperties': False}},
     {'type': 'function', 'name': 'ask_group',
-     'description': 'Politely hold the callee and ask the listening group for a decision.',
      'parameters': {'type': 'object', 'properties': {
          'question_en': {'type': 'string'},
          'question_original': {'type': 'string'},
@@ -347,8 +344,12 @@ class _Session:
         self._reserved_at = engine._clock()
         self._audio, self._events, self._meter = audio, events, meter
         timeline = DebugTimeline(engine.config.debug_timeline_path, clock=engine._clock)
+        descriptions = {'permission': engine.config.language.permission_description,
+                        'ask_group': engine.config.language.question_description}
+        tools = tuple({**tool, 'description': descriptions.get(tool['name'], tool.get('description'))}
+                      for tool in TOOLS)
         self._rt = RealtimeClient(engine.config, brief, audio, self, meter,
-                                  on_tool_call=self._tool, tools=TOOLS, clock=engine._clock,
+                                  on_tool_call=self._tool, tools=tools, clock=engine._clock,
                                   on_speech=self._speech_event, goal=request.goal,
                                   on_asr_failure=self._asr_failed,
                                   on_callee_response=self._callee_response,

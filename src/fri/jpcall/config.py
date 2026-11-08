@@ -25,6 +25,10 @@ class CallLanguage:
     hold: str
     apology: str
     farewell: str
+    permission_description: str = (
+        'Report explicit permission to AI processing, group listening and retained '
+        'transcription. Never grant on ambiguous input. Report refusal or a transfer.')
+    question_description: str = 'Politely hold the callee and ask the listening group for a decision.'
 
 
 # All language-specific call text lives here. Contract fields retain their _ja names.

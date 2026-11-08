@@ -120,7 +120,8 @@ def test_import_and_language_replacement_have_no_io_or_default_mutation(monkeypa
     assert len(test_language.opener) <= 45
     assert '일행 청취·문자 저장에 명확히 동의하면' not in test_language.instructions
     assert '동의한 AI 녹음 테스트 시작에 명확히 동의하면' in test_language.instructions
-    assert test_language.hold == original.hold and test_language.farewell == original.farewell
+    assert test_language.hold == '잠시만요, 확인할게요.'
+    assert test_language.farewell == original.farewell
     tree = ast.parse(Path(recording.__file__).read_text())
     assert not any(isinstance(node, ast.Attribute) and node.attr == 'create_call'
                    for node in ast.walk(tree))
@@ -130,7 +131,9 @@ def test_import_and_language_replacement_have_no_io_or_default_mutation(monkeypa
 
 def test_run_local_recording_notice_reaches_confirmed_brief_and_real_engine(tmp_path, monkeypatch):
     from test_engine_config import environment
-    from test_engine_flow import CallAudio, CallEvents, answer_phone, make_engine, request, settled
+    from test_engine_flow import CallAudio, CallEvents, make_engine, request, settled
+    from test_engine_permission import notice
+    from test_engine_transport import EVENTS
 
     async def run():
         original = CALL_LANGUAGES['ko']
@@ -148,10 +151,40 @@ def test_run_local_recording_notice_reaches_confirmed_brief_and_real_engine(tmp_
             audio, events = CallAudio(provider.order), CallEvents(provider.order)
             call = await engine.start(brief, req, audio, events)
             await settled(lambda: bool(call._sid))
-            await answer_phone(call)
+            media = await notice(call)
+            await media.finish_playback()
             assert brief.opener_ja in peer.responses[0]['instructions']
+            await call._rt.handle_event({'type': EVENTS['speech_started'],
+                                        'item_id': 'owner-ready', 'audio_start_ms': 2000})
+            await call._rt.handle_event({'type': EVENTS['speech_stopped'],
+                                        'item_id': 'owner-ready', 'audio_end_ms': 2500})
+            await call._rt.handle_event({'type': EVENTS['input_transcript'],
+                                        'item_id': 'owner-ready', 'transcript': '네, 시작해 주세요.'})
+            await settled(lambda: len(peer.responses) >= 2 and call._rt._idle.is_set())
+            classifier = peer.responses[1]
+            assert classifier['output_modalities'] == ['text']
+            assert classifier['tool_choice'] == {'type': 'function', 'name': 'permission'}
+            assert len(classifier['tools']) == 1
+            assert 'owner' in classifier['tools'][0]['description']
+            assert 'recording test' in classifier['tools'][0]['description']
+            assert 'group listening' not in classifier['tools'][0]['description']
+            await call._tool('permission', {'decision': 'granted'}, 'owner-start')
+            await settled(lambda: call.publication_allowed and call._rt._idle.is_set())
+            await media.finish_playback()
+            await call._tool('ask_group', {'question_en': 'Which time should I ask for?',
+                                         'question_original': '몇 시가 좋으세요?',
+                                         'options': ['noon', 'one']}, 'missing-owner-fact')
+            await settled(lambda: any(profile.language.hold in r.get('instructions', '')
+                                      for r in peer.responses))
+            hold_request = next(r['instructions'] for r in peer.responses
+                                if profile.language.hold in r.get('instructions', ''))
+            assert '일행분들께' not in hold_request
             instructions = call._rt.session_update()['session']['instructions']
             assert '녹음 없이' not in instructions and 'Twilio' in instructions
+            question_tool = next(tool for tool in call._rt.session_update()['session']['tools']
+                                 if tool['name'] == 'ask_group')
+            assert 'owner' in question_tool['description']
+            assert 'listening group' not in question_tool['description']
             assert not any('/Recordings' in str(r.url) for r in provider.requests)
             assert CALL_LANGUAGES['ko'] is original and '녹음 없이' in original.instructions
             await call.hang_up()

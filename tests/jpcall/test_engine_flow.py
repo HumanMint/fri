@@ -289,6 +289,12 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(
             call, brief, audio, events = await dial(engine, provider)
             language = engine.config.language
             assert brief.opener_ja == language.opener
+            tools = call._rt.session_update()['session']['tools']
+            assert tools[0]['description'] == (
+                'Report explicit permission to AI processing, group listening and retained '
+                'transcription. Never grant on ambiguous input. Report refusal or a transfer.')
+            assert tools[1]['description'] == (
+                'Politely hold the callee and ask the listening group for a decision.')
             assert 'Fri' not in brief.opener_ja
             assert brief.share == request().share and brief.never == request().never
             assert brief.summary_en == request().goal

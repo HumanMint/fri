@@ -48,13 +48,19 @@ def owner_recording_language(*, context=None) -> CallLanguage:
     base = CALL_LANGUAGES['ko']
     original = '녹음 없이 문자로 공유하고 일행도 통화를 들어요.'
     permission = 'AI 처리·일행 청취·문자 저장에 명확히 동의하면'
-    if base.instructions.count(original) != 1 or base.instructions.count(permission) != 1:
+    question = '부족한 정보는 ask_group으로 확인하세요.'
+    if any(base.instructions.count(text) != 1 for text in (original, permission, question)):
         raise TwilioError('The Korean test notice needs review before use.')
     return replace(base, instructions=base.instructions.replace(original,
         '소유자가 동의한 개인 한국어 테스트예요. 녹음 기능이 작동하면 통화 음성을 Twilio에 '
         '녹음하고 개인 평가용 파일로 저장해요. 녹음하지 않는다고 말하지 마세요. '
         '다른 사람에게 통화나 채팅을 공유하는 테스트가 아니에요.').replace(
-            permission, '동의한 AI 녹음 테스트 시작에 명확히 동의하면'),
+            permission, '동의한 AI 녹음 테스트 시작에 명확히 동의하면').replace(
+            question, '부족한 정보는 ask_group으로 소유자에게 확인하세요.'),
+        permission_description='Report the owner\'s explicit consent to this AI recording test. '
+                               'Never grant on ambiguous input. Report refusal or a transfer.',
+        question_description='Politely hold the callee and ask the owner by text for a missing fact.',
+        hold='잠시만요, 확인할게요.',
         opener='안녕하세요, AI 프리예요. 동의하신 녹음 테스트, 시작해도 될까요?')
 
 
