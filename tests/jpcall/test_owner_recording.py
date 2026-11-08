@@ -115,7 +115,11 @@ def test_import_and_language_replacement_have_no_io_or_default_mutation(monkeypa
     test_language = recording.owner_recording_language(context=context())
     assert test_language is not original and CALL_LANGUAGES['ko'] is original
     assert '녹음 없이' in original.instructions and '녹음 없이' not in test_language.instructions
-    assert 'Twilio' in test_language.instructions and '녹음 기능이 작동하면' in test_language.opener
+    assert 'Twilio' in test_language.instructions and '녹음 기능이 작동하면' in test_language.instructions
+    assert test_language.opener == '안녕하세요, AI 프리예요. 동의하신 녹음 테스트, 시작해도 될까요?'
+    assert len(test_language.opener) <= 45
+    assert '일행 청취·문자 저장에 명확히 동의하면' not in test_language.instructions
+    assert '동의한 AI 녹음 테스트 시작에 명확히 동의하면' in test_language.instructions
     assert test_language.hold == original.hold and test_language.farewell == original.farewell
     tree = ast.parse(Path(recording.__file__).read_text())
     assert not any(isinstance(node, ast.Attribute) and node.attr == 'create_call'
@@ -140,7 +144,7 @@ def test_run_local_recording_notice_reaches_confirmed_brief_and_real_engine(tmp_
             req = request(number_e164=DESTINATION)
             brief = await engine.plan(req)
             assert brief.opener_ja == profile.language.opener
-            assert '녹음 기능이 작동하면' in brief.opener_ja
+            assert brief.opener_ja == '안녕하세요, AI 프리예요. 동의하신 녹음 테스트, 시작해도 될까요?'
             audio, events = CallAudio(provider.order), CallEvents(provider.order)
             call = await engine.start(brief, req, audio, events)
             await settled(lambda: bool(call._sid))

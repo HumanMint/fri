@@ -238,6 +238,9 @@ requires explicit go and recording consent, an exact allowlisted owner destinati
 an existing matching call, Korean language, and a call limit of at most 120 seconds.
 The run-local recording language must be supplied through the existing configuration's
 `language` property before planning; ordinary no-recording prompts remain unchanged.
+Use this profile only for the owner's isolated phone test without Discord relay or
+publication. Its short opener identifies fri as AI and asks to start the previously
+consented recording test; recording failure must still be reported accurately.
 The helper starts one provider recording, downloads verified completed dual-channel WAV
 into a new private directory outside Git, and offers separate manual stop/deletion.
 Provider-side media is not proof of handset audibility; Stream channel contents need a

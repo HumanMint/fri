@@ -43,19 +43,19 @@ def _context(context):
 
 
 def owner_recording_language(*, context=None) -> CallLanguage:
-    """Return a run-local language value; caller must use it before plan/confirmation."""
+    """Owner-only test without Discord relay; use before plan/confirmation."""
     _context(context)
     base = CALL_LANGUAGES['ko']
     original = '녹음 없이 문자로 공유하고 일행도 통화를 들어요.'
-    if base.instructions.count(original) != 1:
+    permission = 'AI 처리·일행 청취·문자 저장에 명확히 동의하면'
+    if base.instructions.count(original) != 1 or base.instructions.count(permission) != 1:
         raise TwilioError('The Korean test notice needs review before use.')
     return replace(base, instructions=base.instructions.replace(original,
         '소유자가 동의한 개인 한국어 테스트예요. 녹음 기능이 작동하면 통화 음성을 Twilio에 '
         '녹음하고 개인 평가용 파일로 저장해요. 녹음하지 않는다고 말하지 마세요. '
-        '일행도 통화를 듣고 원문과 영어 번역을 채팅에 저장해요.'),
-        opener='안녕하세요. 한국어 통화 테스트를 도와드리는 AI 프리예요. '
-               '동의하신 테스트에서 녹음 기능이 작동하면 음성을 녹음해 개인 평가용으로 저장해요. '
-               '일행이 통화를 듣고 원문과 영어 번역도 채팅에 저장해요. 계속해도 괜찮으실까요?')
+        '다른 사람에게 통화나 채팅을 공유하는 테스트가 아니에요.').replace(
+            permission, '동의한 AI 녹음 테스트 시작에 명확히 동의하면'),
+        opener='안녕하세요, AI 프리예요. 동의하신 녹음 테스트, 시작해도 될까요?')
 
 
 def _guard(api, context):
