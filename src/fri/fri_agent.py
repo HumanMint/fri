@@ -1608,6 +1608,11 @@ class Agent:
             return False
         if standing and not standing():
             return False
+        # A DM's notice is held to the DM switch as it stands after the reads above, as any DM send is; a memory
+        # control is told how it went with DMs off too (fri #396).
+        if (message.guild is None and not self.config['support_dms'] and
+                memory_intent(message.content or '') not in MEMORY_CONTROLS):
+            return False
         now = time.monotonic()
         self.unreachable_notices = {k: v for k, v in self.unreachable_notices.items() if v is None or now-v < 300}
         if message.channel.id in self.unreachable_notices:
