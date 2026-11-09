@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 
 from compat_tests.test_api import headers
-from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import dm_owner, learning  # noqa: F401 (the fixture)
 from compat_tests.test_fri_panel_and_learning_fences import batch
 from compat_tests.test_fri_reports import complete
 from fri.fri_agent import Agent
@@ -78,7 +78,7 @@ def reporting(learning, *, owner_cached=True, during=None):  # noqa: F811
     owner is looked up, or, with owner_cached, right after the report is fetched."""
     _, store, settings, scheduler, report = complete(learning)
     client = TestClient(create_app(settings))
-    owner = SimpleNamespace(send=AsyncMock())
+    owner = dm_owner()
     holder = {}
 
     async def api(method, path, payload=None):
@@ -98,7 +98,16 @@ def reporting(learning, *, owner_cached=True, during=None):  # noqa: F811
     return agent, owner, scheduler, report, store
 
 
+def sources_kept(store):
+    """Whether this controller records what a report read (gene #247), which the deployed one may not yet."""
+    with store.connection() as db:
+        return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fri_learning_sources'")
+                    .fetchone())
+
+
 def read_by(store, report):
+    if not sources_kept(store):
+        pytest.skip('this controller keeps no record of what a report read (gene #247)')
     with store.connection() as db:
         row = db.execute("SELECT messages FROM fri_learning_sources WHERE kind='report' AND item=?",
                          (report['id'],)).fetchone()
@@ -193,6 +202,7 @@ def test_fri_health_says_summaries_resume_once_the_controller_offers_it_all(monk
     async def scenario():
         w = world(monkeypatch, tmp_path)
         try:
+            w.fri.capabilities |= {'summary-sources', 'summary-rechecks', 'summary-holds'}  # Upgraded since.
             w.fri.agent.summaries_wait_for_gene = True  # As a build on the older one left it.
             line = next(line for line in (await Watch(w.fri).report()).splitlines() if 'member summaries' in line)
             assert 'next build' in line and 'summary-' not in line

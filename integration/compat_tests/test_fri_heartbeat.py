@@ -11,6 +11,7 @@ import discord
 import pytest
 
 from compat_tests.test_api import actor, headers
+from compat_tests.test_fri_learning import dm_owner
 from compat_tests.test_fri_runtime import configured
 from compat_tests.test_split_contract import Session
 from fri import feedback as commands
@@ -30,7 +31,7 @@ def heartbeat(monkeypatch, tmp_path):
     monkeypatch.setattr('fri.fri_workspace.deliver_one', AsyncMock())
     monkeypatch.setattr('fri.fri_social.deliver_one', AsyncMock())
     monkeypatch.setattr('fri.fri_fixes.check', AsyncMock())
-    owner = SimpleNamespace(send=AsyncMock())
+    owner = dm_owner()
     reports = []
 
     async def api(method, path, payload=None):

@@ -49,6 +49,9 @@ NOTED_SECONDS = 90*86400  # As long as it keeps a note, which a controller offer
 MOST = 20000  # Bounds memory only: the controller keeps six exchanges per member and conversation.
 MARKED_SECONDS = 3600  # As Agent.withdrawn: longer than any turn that could still hold a copy runs.
 FRI = 'fri'  # The author marked for one of Fri's own replies (see marked_by): never a member's.
+# A summary of the member's that saved context quoted but no request carried: when it was made isn't known, so any
+# message of theirs taken back may be one of its sources (see summary_sources; fri #383 item 2).
+UNDATED = {'refreshed': None}
 # Seconds before Fri's clock an edit's own time (Discord's) still counts as just made: clock skew and gateway delay.
 FRESH = 15*60
 BATCH = 10  # As many IDs as /chat/turn/withdraw/saved takes at once.
@@ -390,11 +393,13 @@ class SavedTurns:
         """How many times the member said "forget me": a save sent before one answers too late to record (see kept)."""
         return self.erasures.get(str(user), 0)
 
-    def kept(self, payload, saved, began, erasure=None):
+    def kept(self, payload, saved, began, erasure=None, unknown=False):
         """The controller saved this turn, or may have (`saved` None: no answer came). `began`: time.time() and
         time.monotonic() just before it was sent. One of its messages withdrawn since went while the save was on its
         way, before anything here knew of it, so its exchange goes now. erasure: the member's (see erasure) as it was
-        sent; once they've said "forget me" since, the controller erased it, so nothing of it is recorded here."""
+        sent; once they've said "forget me" since, the controller erased it, so nothing of it is recorded here.
+        unknown: the saved context its requests carried drew on what this can't tell (see dependencies), so what it
+        drew on can't be told either, wherever it's read again (fri #383 item 1)."""
         if not self.offered() or payload.get('mention_grant'):  # A mention keeps only a placeholder.
             return
         if erasure is not None and self.erasure(payload.get('user_id')) != erasure:
@@ -423,7 +428,8 @@ class SavedTurns:
             own = {int(item['id']) for item in sources if str(item.get('id', '')).isdigit()}
             for i in [*own, *([int(reply)] if reply.isdigit() else [])]:
                 self.drawn.pop(i, None)
-                self.drawn[i] = (now, scope['user_id'], frozenset(str(item) for item in drew if str(item).isdigit()))
+                self.drawn[i] = (now, scope['user_id'], frozenset(str(item) for item in drew if str(item).isdigit()),
+                                 bool(unknown))
             while self.drawn and (next(iter(self.drawn.values()))[0] < now-KEPT_SECONDS or len(self.drawn) > MOST):
                 del self.drawn[next(iter(self.drawn))]
         wall, monotonic = began
@@ -518,8 +524,10 @@ class SavedTurns:
 
     def depends_on(self, messages):
         """What saved replies with these messages (strings) drew on, as far as this Fri saved them, and what those drew
-        on in turn, through Fri's own replies among them (see drawn), or None for one of them it can't tell: a saved
-        reply it didn't save itself. Each read once, so a cycle ends."""
+        on in turn, through Fri's own replies among them (see drawn); and whether one of them drew on what it can't
+        tell: a saved reply it didn't save itself, or one it saved whose own requests carried such a reply (see kept's
+        unknown), however far back (fri #383 item 1). What's known stands either way, so a reply known to draw on a
+        message taken back goes with it (Sol round 1 of #386, B1). Each read once, so a cycle ends."""
         found, todo, unknown = set(), [str(i) for i in messages if str(i).isdigit()], False
         known = [i for i in todo if int(i) in self.drawn]
         if todo and not known:
@@ -530,11 +538,21 @@ class SavedTurns:
             if i in seen:
                 continue
             seen.add(i)
+            unknown = unknown or self.drawn[int(i)][3]
             for item in self.drawn[int(i)][2]:
                 found.add(item)
                 if int(item) in self.drawn and item not in seen:
                     known.append(item)
-        return None if unknown else found
+        return found, unknown
+
+    @staticmethod
+    def quotes(turn, member=None):
+        """Whether a saved reply drew on the member's summary, any generation of it, as the controller names it (its
+        `summaries`, a covered rebuild's too); with no member known, anyone's (fri #383 item 2). One whose `summaries`
+        can't be read (see unreadable) may have quoted anyone's."""
+        if unreadable(turn):
+            return True
+        return any(member is None or str(item['user_id']) == str(member) for item in turn.get('summaries') or ())
 
     def dependencies(self, context):
         """What the saved context a request carried drew on (fri #332): each saved exchange's reply, as its messages
@@ -542,11 +560,9 @@ class SavedTurns:
         can't tell. Exchanges elsewhere hold only the member's own words, never a reply. Never what a model reads."""
         found, unknown = set(), False
         for messages in (exchange(turn) for turn in context.get('turns', []) if turn.get('reply')):
-            drew = self.depends_on(messages - {''})
-            if drew is None:
-                unknown = True
-            else:
-                found |= drew
+            drew, cant_tell = self.depends_on(messages - {''})
+            found |= drew
+            unknown = unknown or cant_tell
         return found, unknown
 
     def summary_sources(self, summary, member=None, taken=None):
@@ -675,16 +691,27 @@ class SavedTurns:
             return set()
         found = held(context)
         gone = self.withheld(found)
-        drew = [self.depends_on(exchange(turn) - {''}) or set() for turn in context.get('turns', [])]
+        drew = [self.depends_on(exchange(turn) - {''})[0] for turn in context.get('turns', [])]
         taken = self.withheld({i for ids in drew for i in ids})
-        if context.get('member_summary') and self.summary_sources(context['member_summary'], member):
+        summary = context.get('member_summary')
+        if summary and self.summary_sources(summary, member):
             context['member_summary'] = None
-        if not gone and not taken:
+        # A saved reply that quoted the member's summary, any generation of it, goes with it, while a message taken back
+        # may be one of its sources; with no summary here to date it by, any of theirs (fri #383 item 2). So do the
+        # replies that drew on that one, as on a message taken back.
+        quoting = [self.quotes(turn, member) for turn in context.get('turns', [])]
+        if any(quoting) and self.summary_sources(summary or UNDATED, member):
+            taken |= {i for turn, quotes in zip(context.get('turns', []), quoting) if quotes for i in exchange(turn) - {''}}
+        else:
+            # One whose summaries can't be read can't be dated or tied to anyone: it goes, and what drew on it (S4).
+            quoting = [unreadable(turn) for turn in context.get('turns', [])]
+            taken |= {i for turn, bad in zip(context.get('turns', []), quoting) if bad for i in exchange(turn) - {''}}
+        if not gone and not taken and not any(quoting):
             return set(found)
         said, history = ([] if said is None else said), []
-        for turn, depends in zip(context.get('turns', []), drew):
+        for turn, depends, quotes in zip(context.get('turns', []), drew, quoting):
             rows = turn.get('burst') or ()
-            if not exchange(turn) & gone and not depends & taken:
+            if not exchange(turn) & gone and not depends & taken and not quotes:
                 history.append(turn)
                 continue
             said += [row.get('text', '') for row in rows if str((row.get('source') or {}).get('id')) in gone]
@@ -1258,6 +1285,14 @@ def fresh(edited_at, now):
 def saved_lately(message_id):
     """Sent recently enough that the controller may keep an exchange holding it, from the time in its Discord ID."""
     return sent_at(message_id) > time.time()-KEPT_SECONDS
+
+
+def unreadable(turn):
+    """Whether a saved reply's `summaries` aren't as the controller writes them, a list of {'user_id', 'generation'}: whose
+    summary it quoted, or when, can't be told then (Sol round 1 of #386, S4)."""
+    items = turn.get('summaries')
+    return items is not None and not (isinstance(items, list) and all(
+        isinstance(item, dict) and str(item.get('user_id', '')).isdigit() for item in items))
 
 
 def exchange(turn):

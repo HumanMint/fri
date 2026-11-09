@@ -14,6 +14,7 @@ from gene.api import create_app
 from compat_tests.test_api import headers
 from compat_tests.test_fri_learning import (
     GONE,
+    dm_owner,
     learning,  # noqa: F401 (the fixture)
 )
 from compat_tests.test_fri_panel_and_learning_fences import batch
@@ -250,7 +251,7 @@ def explorer(learning, moved):  # noqa: F811
 
     async def scenario():
         fri_runtime = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                                      get_user=lambda _: SimpleNamespace(send=AsyncMock()), capabilities=frozenset(offered),
+                                      get_user=lambda _: dm_owner(), capabilities=frozenset(offered),
                                       http=SimpleNamespace(request=http), chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri_runtime)
         agents.append(agent)
