@@ -251,13 +251,19 @@ class DiscordCall:
         self._stop_reason = None
         self._engine_starting = False
         self._event_generations = {}
+        self._final = False  # The engine's terminal status arrived: no later transcript text.
 
     def generation(self):
         return getattr(self.session, 'consent_generation', None)
 
     def publication_allowed(self, generation):
-        return (self.phase != 'ended' and self._stop_reason is None and self.session is not None
-                and self.session.publication_allowed
+        """Live call interaction: closed once the call ends or is stopped."""
+        return (self.phase != 'ended' and self._stop_reason is None
+                and self.text_allowed(generation))
+
+    def text_allowed(self, generation):
+        """Transcript text: only consent withdrawal hides it; an ordinary end or Stop does not."""
+        return (self.session is not None and self.session.publication_allowed
                 and generation is not None and generation == self.generation())
 
     def usage_sink(self):
@@ -299,10 +305,10 @@ class DiscordCall:
         if interaction.guild.voice_client is not None:
             raise CallRejected('i am already using voice here.')
         self.audio = CallAudioSource()
-        self.pager = TranscriptPager(self.send, self.edit, allowed=self.publication_allowed)
+        self.pager = TranscriptPager(self.send, self.edit, allowed=self.text_allowed)
         self.cost = CostSummary(self.send, self.edit,
                                 http=self.text_channel._state.http,
-                                channel_id=self.text_channel.id)
+                                channel_id=self.text_channel.id, allowed=self.text_allowed)
         def capture_voice(client, channel):
             # Keep the client even if the handshake raises or is cancelled.
             self.voice = CallVoiceClient(client, channel)
@@ -350,7 +356,8 @@ class DiscordCall:
                 self.release()
 
     async def watchdog(self):
-        await asyncio.sleep(self.owner.limits.max_call_s)
+        # Backstop only: the engine closes by its own attempt deadline, then cleans up.
+        await asyncio.sleep(self.owner.limits.attempt_s + 30)
         await self.stop('time_limit')
 
     async def stop(self, reason):
@@ -439,16 +446,17 @@ class DiscordCall:
             if isinstance(event, CallFinished) or (isinstance(event, StatusChanged)
                     and event.state in (CallState.ENDED, CallState.FAILED)):
                 self.phase = 'ended'
+                self._final = True
                 if self.audio is not None:
                     self.audio.close()
             generation = (event.consent_generation if isinstance(
                 event, (Utterance, Translation, QuestionAsked)) else None)
             if isinstance(event, Utterance):
-                if not self.publication_allowed(generation):
+                if self._final or not self.text_allowed(generation):
                     return
                 self._event_generations[event.item_id] = generation
             elif isinstance(event, Translation):
-                if (not self.publication_allowed(generation)
+                if (self._final or not self.text_allowed(generation)
                         or self._event_generations.get(event.item_id) != generation):
                     return
             elif isinstance(event, QuestionAsked) and not self.publication_allowed(generation):
@@ -491,13 +499,13 @@ class DiscordCall:
             try:
                 await self.cleanup()
                 if self.pager is not None:
-                    await self.pager.close()
+                    await self.pager.close(final=True)
             finally:
                 if self.cost is not None:
                     await self.cost.emit(event)
             return
         if isinstance(event, (Utterance, Translation)):
-            if self.publication_allowed(generation):
+            if self.text_allowed(generation):
                 await self.pager.emit(event)
             return
         if isinstance(event, QuestionClosed):
@@ -608,7 +616,7 @@ class DiscordCalls:
                     'information only · no bookings, payments, fees or cancellation terms.\n'
                     f'answers approved by · requester {request.requester_id}\n'
                     'notice · AI assistant; group listens and text remains in this chat.\n'
-                    f'limits · {self.limits.max_call_s:g}s call; '
+                    f'limits · {self.limits.attempt_s:g}s call; '
                     f'{self.limits.max_hold_s:g}s per answer.\n'
                     'cost · metered estimate / pending; not a spending cap.')
             pages = chunks(text)

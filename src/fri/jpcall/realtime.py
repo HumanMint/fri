@@ -156,7 +156,11 @@ class RealtimeClient:
         self._asr_failed_items: set[str] = set()
         self._asr_recovery: asyncio.Task | None = None
         self._asr_clarified = False
-        self._asr_ok = asyncio.Event()
+        self._asr_outage = False  # A failed or missing transcription since the last valid one.
+        self._transcribed = asyncio.Event()
+        self._closing = False
+        self._halted = False  # Requester Stop: no further Fri audio, without touching consent.
+        self._tool_responses: dict[str, str] = {}
         self._utterances: set[tuple[str, str]] = set()
         self._tools_seen: set[str] = set()
         self._stopped = False
@@ -282,7 +286,7 @@ class RealtimeClient:
 
     async def repeat_notice(self) -> None:
         """Renew the actual notice after transfer, before classifying the new reply."""
-        if self._silenced or self._stopped or self._media is None:
+        if self._silenced or self._stopped or self._closing or self._media is None:
             return
         self._opener_requested = True
         self._conversation_open = False
@@ -331,8 +335,7 @@ class RealtimeClient:
         if self._asr_recovery is not None:
             self._asr_recovery.cancel()
             self._asr_recovery = None
-        self._asr_ok.clear()
-        self._asr_clarified = False
+        self._asr_clarified = self._asr_outage = False
         if granted:
             self._permission = True
             return
@@ -358,6 +361,49 @@ class RealtimeClient:
 
             self._revocation = self._background(revoke())
 
+    def close_turns(self) -> None:
+        """Ordinary closing: no new turns, tools or recovery; queued phone audio keeps playing."""
+        self._closing = True
+        self._reply_generation = None
+        for timer in self._asr_timers.values():
+            timer.cancel()
+        self._asr_timers.clear()
+        if self._asr_recovery is not None:
+            self._asr_recovery.cancel()
+            self._asr_recovery = None
+
+    def halt(self) -> None:
+        """Requester Stop: fence active, queued and new speech now; played audio stays evidence."""
+        self.close_turns()
+        self._halted = True
+        self._marks.clear()
+        if self.audio_sink is not None:
+            self.audio_sink.clear('fri')
+        if self._media is not None and not self._stopped:
+            responses = tuple(self._active_responses)
+
+            async def cut():  # Clear the phone and truncate at the acknowledged played length.
+                for response_id in responses:
+                    await self._send('response_cancel', response_id=response_id)
+                await self._barge_in()
+
+            self._background(cut())
+
+    def spoke_with(self, call_id: str) -> bool:
+        """Whether the response carrying this tool call sent uninterrupted audio to the phone."""
+        response_id = self._tool_responses.get(call_id)
+        return any(part.response_id == response_id and part.sent_bytes
+                   and part.item_id not in self._interrupted for part in self._playout.values())
+
+    async def settle_transcripts(self, timeout_s: float) -> None:
+        """Closing: bounded wait for the final ASR of consented speech that already ended."""
+        with suppress(TimeoutError):
+            async with asyncio.timeout(timeout_s):
+                while any(item not in self._input_seen and item not in self._asr_failed_items
+                          and self._input_context.get(item) is not None for item in self._ends):
+                    self._transcribed.clear()
+                    await self._transcribed.wait()
+
     def silence(self) -> None:
         """Fence output synchronously before voicemail cleanup can await anything."""
         self._silenced = True
@@ -378,7 +424,7 @@ class RealtimeClient:
 
     def _output_allowed(self, event: dict) -> bool:
         response_id = event.get('response_id', '')
-        return (not self._silenced and not self._stopped
+        return (not self._silenced and not self._stopped and not self._halted
                 and response_id not in self._blocked_responses
                 and response_id in self._allowed_responses)
 
@@ -389,7 +435,7 @@ class RealtimeClient:
                 await asyncio.shield(self._revocation)
             if (command.generation != self._permission_generation
                     or command.number in self._blocked_commands
-                    or (self._speech_pending and not command.opener)
+                    or (self._speech_pending and not command.opener) or self._halted
                     or (not self._permission and not command.opener
                         and not self._current_notice(command.reply_to))):
                 self._commands.pop(command.number, None)
@@ -621,14 +667,14 @@ class RealtimeClient:
     def _schedule_reply(self) -> None:
         if (self._reply_generation == self._permission_generation
                 and self._conversation_open and not self._speech_pending and not self._turn_pending
-                and not self._silenced and not self._stopped):
+                and not self._silenced and not self._stopped and not self._closing):
             self._turn_pending = True
             self._background(self._reply_to_callee(self._reply_generation))
 
     async def _reply_to_callee(self, generation: int) -> None:
         try:
             await self._idle.wait()
-            if (not self._stopped and not self._silenced
+            if (not self._stopped and not self._silenced and not self._closing
                     and generation == self._permission_generation
                     and not self._speech_pending and self._reply_generation == generation):
                 self._reply_generation = None
@@ -661,16 +707,26 @@ class RealtimeClient:
         self._speech_pending.discard(item)
         if item not in self._input_seen and item not in self._asr_failed_items:
             self._asr_failed_items.add(item)
+            self._transcribed.set()
             if (item not in self._preopening_items
                     and self._input_generations.get(item) == self._permission_generation):
                 self._asr_failed()
 
-    def _asr_failed(self) -> None:
-        if (self._silenced or self._stopped or not self._opener_requested
+    def _asr_failed(self, *, outage: bool = True) -> None:
+        """Ask once per streak; only a repeated outage (failed or missing ASR) ends the call.
+
+        Noise (an empty transcript), echo and silence after the clarification never end it.
+        """
+        if (self._silenced or self._stopped or self._closing or not self._opener_requested
                 or self._speech_pending):
             return
-        if self._asr_recovery is None or self._asr_recovery.done():
-            self._asr_ok.clear()
+        if outage and self._asr_outage:
+            if self._asr_recovery is not None:
+                self._asr_recovery.cancel()
+            self._asr_recovery = self._background(self._exhaust_asr())
+            return
+        self._asr_outage |= outage
+        if not self._asr_clarified and (self._asr_recovery is None or self._asr_recovery.done()):
             self._asr_recovery = self._background(self._recover_asr())
 
     async def _exhaust_asr(self) -> None:
@@ -682,30 +738,19 @@ class RealtimeClient:
             await self._close_media()
 
     async def _recover_asr(self) -> None:
-        if self._asr_clarified:
-            await self._exhaust_asr()
+        """One short request to repeat; before consent, the notice's one repeat per phase."""
+        if not self._permission:
+            self._asr_clarified = True
+            await self.clarify_notice()  # Within the notice and permission deadlines.
             return
-        self._asr_clarified = True
-        if self._asr_ok.is_set():
-            return
-        try:
-            async with asyncio.timeout(ASR_TIMEOUT_S):
-                await self._idle.wait()
-                if self._permission:
-                    done = await self.respond(out_of_band=True, instructions=(
-                        self.config.language.instructions + '\nIn '
-                        + self.config.language.name
-                        + ', briefly say you could not hear and ask the callee to repeat. '
-                        'Do not state or confirm any inquiry facts.'))
-                else:
-                    done = await self.say(self.brief.opener_ja, _opener=True, _notice=True)
-                if await done != 'completed':
-                    raise RealtimeError('The voice service could not clarify.')
-                await self.drain(timeout_s=ASR_TIMEOUT_S)
-            async with asyncio.timeout(ASR_TIMEOUT_S):
-                await self._asr_ok.wait()
-        except (TimeoutError, RealtimeError):
-            await self._exhaust_asr()
+        async with asyncio.timeout(ASR_TIMEOUT_S):
+            await self._idle.wait()
+        self._asr_clarified = True  # A recovery cancelled by new speech before this point retries.
+        await (await self.respond(out_of_band=True, instructions=(
+            self.config.language.instructions + '\nIn '
+            + self.config.language.name
+            + ', briefly say you could not hear and ask the callee to repeat. '
+            'Do not state or confirm any inquiry facts.')))
 
     async def _flush_transcript(self, key: tuple[str, int]) -> None:
         if key not in self._transcripts:
@@ -754,9 +799,10 @@ class RealtimeClient:
                 self._opener_responses.add(response['id'])
                 if command.notice == self._notice_seq:
                     self._notice_response = response['id']
-            if explicit or (self._permission and self._conversation_open and not self._speech_pending):
+            turns = self._conversation_open and not self._closing  # Closing starts no new turn.
+            if explicit or (self._permission and turns and not self._speech_pending):
                 self._allowed_responses.add(response['id'])
-            if (self._silenced or (not explicit and not self._conversation_open)
+            if (self._silenced or (not explicit and not turns)
                     or number in self._blocked_commands):
                 self._blocked_responses.add(response['id'])
                 await self._send('response_cancel', response_id=response['id'])
@@ -773,7 +819,7 @@ class RealtimeClient:
                 item, self._notice_seq if self._notice_delivered.is_set() else None)
             if not self._opener_requested:
                 self._preopening_items.add(event['item_id'])
-            if (fresh and self._permission and self._conversation_open
+            if (fresh and self._permission and self._conversation_open and not self._closing
                     and self._input_generations.get(item) == self._permission_generation):
                 # VAD stops inquiry playback immediately; only final ASR may start a reply.
                 # The pre-permission notice keeps its existing ASR-gated interruption route.
@@ -810,6 +856,7 @@ class RealtimeClient:
             self._speech_pending.discard(item)
             if item not in self._input_seen and item not in self._asr_failed_items:
                 self._asr_failed_items.add(item)
+                self._transcribed.set()
                 timer = self._asr_timers.pop(item, None)
                 if timer is not None:
                     timer.cancel()
@@ -824,6 +871,7 @@ class RealtimeClient:
             if item in self._input_seen:
                 return
             self._input_seen.add(item)
+            self._transcribed.set()
             interrupted_at_start = item in self._speech_pending
             self._speech_pending.discard(item)
             generation = self._input_generations.get(item)
@@ -839,7 +887,7 @@ class RealtimeClient:
                 self._on_speech(False, item)
             if not text.strip():
                 if eligible:
-                    self._asr_failed()
+                    self._asr_failed(outage=False)  # Noise, not an outage.
                 return
             echo = self._is_echo(text)
             if echo:
@@ -850,12 +898,12 @@ class RealtimeClient:
                                   ended_at=self._ends.get(item),
                                   delivery='unknown' if echo else 'complete',
                                   consent_generation=self._input_context.get(item))
-            if eligible and generation == self._permission_generation and not self._silenced:
+            if (eligible and generation == self._permission_generation and not self._silenced
+                    and not self._closing):
                 if echo:
-                    self._asr_failed()
+                    self._asr_failed(outage=False)
                     return
-                self._asr_ok.set()
-                self._asr_clarified = False
+                self._asr_clarified = self._asr_outage = False
                 if self._asr_recovery is not None:
                     self._asr_recovery.cancel()
                     self._asr_recovery = None
@@ -985,6 +1033,10 @@ class RealtimeClient:
                     if not self._permission and (item['name'] != 'permission'
                                                  or not self._current_notice(notice)):
                         continue  # Before consent only a reply classifier for this notice decides.
+                    if self._closing and not (item['name'] == 'permission' and arguments.get(
+                            'decision') in ('refused', 'transfer')):
+                        continue  # Closing takes no new action; a withdrawal still fences text.
+                    self._tool_responses[call_id] = response_id
                     await self._on_tool_call(item['name'], arguments, call_id)
         elif kind == EVENTS['error']:
             code = self._log_error(event)
@@ -1073,6 +1125,8 @@ class RealtimeClient:
         self._reply_generation = None
         self._response_context.clear()
         self._response_notice.clear()
+        self._tool_responses.clear()
+        self._transcribed.set()  # Wakes a closing wait; nothing is left to transcribe.
         self._asr_timers.clear()
         self._asr_failed_items.clear()
         self._input_seen.clear()

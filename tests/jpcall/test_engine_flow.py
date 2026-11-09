@@ -498,8 +498,11 @@ def test_translation_and_summary_failures_have_fallbacks(tmp_path, monkeypatch):
             assert not call._ending
             await call.hang_up()
             finish = next(e for e in events.items if isinstance(e, CallFinished))
-            assert finish.outcome_en and audio.closed
-            assert not any(isinstance(e, Translation) for e in events.items)
+            assert finish.outcome_en.endswith('Summary unavailable; see the transcript.')
+            assert audio.closed
+            # An ordinary end shows the failed English line instead of withholding it.
+            assert any(isinstance(e, Translation) and e.status == 'unavailable'
+                       for e in events.items)
         finally:
             await engine.close()
             await http.aclose()

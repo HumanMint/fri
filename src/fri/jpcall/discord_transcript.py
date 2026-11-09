@@ -11,6 +11,7 @@ from .contract import QuestionAsked, QuestionClosed, StatusChanged, Translation,
 from .discord_text import chunks
 
 LOG = logging.getLogger(__name__)
+PENDING, UNAVAILABLE = '\n↳ translation pending', '\n↳ translation unavailable'
 
 
 @dataclass
@@ -56,7 +57,7 @@ class TranscriptPager:
                 return
             uncertain = (' · interrupted; wording uncertain' if event.delivery == 'interrupted'
                          else ' · delivery unknown' if event.delivery == 'unknown' else '')
-            row = [f'{event.speaker}{uncertain} · {event.text_ja}', '\n↳ translation pending']
+            row = [f'{event.speaker}{uncertain} · {event.text_ja}', PENDING]
             self._items[event.item_id] = row
             if event.item_id in self._translations:
                 row[1] = self._translations.pop(event.item_id)
@@ -69,7 +70,7 @@ class TranscriptPager:
             self._rows = [next(ordered) if id(item) in self._times else item
                           for item in self._rows]
         elif isinstance(event, Translation):
-            english = ('\n↳ translation unavailable' if event.status == 'unavailable'
+            english = (UNAVAILABLE if event.status == 'unavailable'
                        or not event.text_en.strip() else f'\n↳ {event.text_en}')
             if event.item_id in self._items:
                 self._items[event.item_id][1] = english
@@ -181,5 +182,10 @@ class TranscriptPager:
         finally:
             self._flush_requested.clear()
 
-    async def close(self):
+    async def close(self, *, final=False):
+        if final:  # The call's result is in: an English line that never came is unavailable.
+            for row in self._items.values():
+                if row[1] == PENDING:
+                    row[1] = UNAVAILABLE
+                    self._revision += 1
         return await self.flush()

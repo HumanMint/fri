@@ -22,6 +22,13 @@ class TwilioError(RuntimeError):
     """Fixed, safe error text; upstream bodies and authenticated URLs stay private."""
 
 
+class TwilioRejected(TwilioError):
+    """Provably not acted on: never sent (no connection) or refused as unauthenticated (401).
+
+    Other client errors stay ambiguous: Twilio does not document that they created nothing.
+    """
+
+
 def validate_signature(auth_token: str, url: str, params: Iterable[tuple[str, str]],
                        signature: str) -> bool:
     if not auth_token or not signature or not signature.isascii():
@@ -61,11 +68,15 @@ class TwilioClient:
                                     self.config.twilio_api_key_secret),
                 follow_redirects=False,
             )
+            if response.status_code == 401:
+                raise TwilioRejected('The phone service refused the credentials.') from None
             response.raise_for_status()
             result = response.json()
             if not isinstance(result, dict):
                 raise ValueError
             return result
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            raise TwilioRejected('The phone service could not be reached.') from None
         except (httpx.HTTPError, ValueError):
             raise TwilioError('The phone service request failed.') from None
 
@@ -97,7 +108,7 @@ class TwilioClient:
             'AsyncAmdStatusCallback': base + '/jpcall/status/' + status_token,
             'AsyncAmdStatusCallbackMethod': 'POST',
             'StatusCallbackEvent': ['initiated', 'ringing', 'answered', 'completed'],
-            'TimeLimit': str(min(600, self.config.limits.max_call_s)),
+            'TimeLimit': str(self.config.limits.attempt_s),
             'Timeout': '30',
         })
         return self._sid(result.get('sid', ''))

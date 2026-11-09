@@ -37,7 +37,7 @@ jpcall is Fri-only. It does not use the Gene controller.
   the notice or an unclear reply grants nothing and gets at most one repeat of the
   notice per consent phase, within the existing deadlines.
   Permission recognition remains model inference, not a perfect detector.
-  A refusal ends the call with a plain decline outcome. Recording questions
+  A refusal ends the call with a plain decline outcome and the fixed goodbye. Recording questions
   are answered truthfully: no audio is recorded, and the group gets a text transcript.
 - Twilio webhooks never decompress request bodies; encoded or undecodable status bodies
   are refused before parsing and signature checks.
@@ -45,8 +45,18 @@ jpcall is Fri-only. It does not use the Gene controller.
   Emergency and premium-rate prefixes are refused.
 - Fri only gathers information. It never books, pays, gives card numbers, or accepts fees or cancellation terms; group answers cannot expand that authority.
 - Holds are app-timed: at most one check-in after 45 s of callee silence, with an unresolved
-  ending after the hold limit. A delivered natural response replaces the check-in;
-  raw VAD noise only postpones it. No automatic callback is made.
+  ending and the fixed goodbye after the hold limit. A delivered natural response replaces the
+  check-in; raw VAD noise only postpones it. No automatic callback is made.
+- An ordinary end (the callee hangs up, `end_call`, a limit, or the requester's Stop) is not a
+  withdrawal. Live callee relay, new capture and new turns stop at once; text captured under
+  consent, its final transcription (up to 2 s), its translations and queued transcript writes
+  still finish inside the 8-second cleanup bound. A refusal, transfer or other withdrawal, even
+  while closing, still revokes queued text, translations and the summary, up to the final
+  report's actual send. Fri says exactly one goodbye: the one spoken with `end_call`, otherwise
+  the fixed farewell (at most 5 s). A callee hang-up and failures end without one. The
+  requester's Stop says none and silences Fri at once, before the hang-up request: no further
+  Fri audio reaches the phone or the group, the phone buffer is cleared, and speech already
+  played stays in the transcript, marked interrupted.
 - Transcripts include third parties. By default they live only in Discord messages; jpcall
   persists no call content. The optional development timeline below retains text when enabled.
   Audio is never recorded or persisted. The usage ledger stores counts and costs only.
@@ -108,6 +118,12 @@ operations do not use the Gene controller. Disabled configuration keeps the exis
 and channel behavior.
 
 The public final report has the call duration, a compact outcome and cost embed.
+The summary runs beside the goodbye and hang-up and must finish within the same cleanup bound.
+If it is unavailable, the outcome says `Summary unavailable; see the transcript.`, adding
+`end_call`'s own description only as `Fri’s unverified note`. An outcome built from call text
+carries its consent generation; the report checks it again before every send and retry, and
+withheld details are never restored. A transcript line whose English never arrived is marked
+`translation unavailable` in the final transcript.
 The complete outcome/conditions/reference are attached as call-result.txt;
 persistent controls retain costs, not the outcome. Unknown phone termination is
 shown separately from local closure. Late price updates edit only the cost embed. Busy, no-answer and voicemail outcomes get a plain `call didn't connect` line. Exact
@@ -175,7 +191,10 @@ Server VAD remains enabled, with automatic responses and interruptions disabled.
 During an approved inquiry the app stops phone and Discord playback on speech-start,
 cancels queued speech and truncates the old response to its acknowledged played duration.
 Only a current final non-echo transcript releases the next reply, in the same conversation.
-The prepermission notice keeps its existing interruption behavior. Higher activation
+The prepermission notice keeps its existing interruption behavior. A lost, empty or echoed
+transcript gets one short request to repeat (before consent: the notice's one repeat per
+phase); silence afterwards, noise and echo never end the call. Only a second failed or missing
+transcription without a valid one in between ends it as failed. Higher activation
 threshold and near-field filtering reduce noise triggers, but echo or noise can still
 cause a cutoff; actual fluidity needs a controlled voice test. Changed numbers, negations
 and conditions are preserved. Exact recent repeats
@@ -221,18 +240,41 @@ One process owns calling. Attempt intent and callback correlation are durable
 before create. A failed hangup or lost create acknowledgement blocks another
 dial until authenticated terminal evidence or owner reconciliation exists.
 The engine's owner-only `recovery_status()` and `reconcile()` operations inspect
-or terminate an existing call; they never originate one. An unknown SID remains
-blocked. Local stop, TTL, restart and billing completion are not termination
-evidence. Rollback preserves the record and must disable calling if older code
+or terminate an existing call; they never originate one. A Stop during call creation keeps
+waiting for the create within the cleanup bound and hangs up the call it returns. A create
+counts as never made only when it was provably not sent (no connection) or was refused as
+unauthenticated (HTTP 401): the attempt is then closed and calling stays available. Every
+other create failure (other 4xx and 5xx, timeouts, lost acknowledgements) stays blocked,
+because Twilio does not document that it created nothing. While the runtime runs, a signed
+status callback for such an attempt records its SID; a non-final one also asks Twilio to end
+that call.
+An unknown SID remains blocked. Local stop, TTL, restart and billing completion are not
+termination evidence. Rollback preserves the record and must disable calling if older code
 cannot honor it. No call resumes after restart.
+
+Owner reconciliation, with every calling runtime stopped and the same process environment
+and `FRI_DATA` (it never dials and prints status only):
+
+```sh
+python -m fri.jpcall.engine
+```
+
+It takes the journal's exclusive lock, so it refuses while a runtime runs. An attempt still
+`reserved` (creation was never started) is closed as not created. An attempt with a known SID
+is checked with Twilio and ended if needed, which records termination evidence. An attempt in
+`creating`/`uncertain` with `sid_known: false` stays blocked: start the runtime where Twilio
+can reach it so a signed callback can record the call, then reconcile again. Never delete or
+reset the record.
 
 Confirmation uses the exact original goal and approved facts without a paid
 pre-call paraphrase. Request/brief equality and expiry still prevent stale
 confirmation. Ringing is bounded at 30 seconds and media readiness at 20 seconds.
 Notice delivery has a 30-second bound; the recipient then has 20 seconds to
 answer after the complete notice is acknowledged as played. A transfer gets a new notice and response
-deadline. The whole attempt remains bounded at at most 600 seconds. Stop works
-during connection.
+deadline. The whole attempt has one deadline, from reservation: `JPCALL_MAX_CALL_S`
+(default and maximum 600 seconds; larger values are a configuration error). The brief shows it,
+Twilio's `TimeLimit` uses it, and the engine starts closing 8 seconds before it, for one goodbye
+and the hang-up. Stop works during connection and never waits for a goodbye.
 No verified dollar spending cap is claimed; estimates and actual posted prices
 remain distinct.
 

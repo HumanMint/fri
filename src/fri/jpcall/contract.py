@@ -133,6 +133,7 @@ class CallFinished:
     usage: tuple[UsageLine, ...] = ()
     usage_final: bool = False   # False while late prices (Twilio) are still pending
     termination_confirmed: bool | None = None
+    consent_generation: int | None = None  # Set when the outcome carries consented call content.
 
 
 @dataclass(frozen=True)
@@ -190,11 +191,19 @@ class CallRejected(Exception):
     """Member-safe reason a request can't be planned or started."""
 
 
+MAX_ATTEMPT_S = 600  # The whole telephone attempt from reservation; also the phone TimeLimit.
+
+
 @dataclass
 class Limits:
-    max_call_s: int = 15 * 60
+    max_call_s: int = MAX_ATTEMPT_S
     max_hold_s: int = 60
     hold_apology_every_s: int = 45
     max_calls_per_user_per_day: int = 5
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)   # empty = nobody
     test_numbers: frozenset[str] = field(default_factory=frozenset)       # non-+81 numbers allowed for testing
+
+    @property
+    def attempt_s(self) -> int:
+        """The effective attempt deadline: preview, engine and phone all use this capped value."""
+        return min(MAX_ATTEMPT_S, self.max_call_s)

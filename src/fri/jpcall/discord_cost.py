@@ -6,6 +6,7 @@ import logging
 import re
 import textwrap
 import uuid
+from dataclasses import replace
 
 import discord
 
@@ -15,6 +16,11 @@ from .discord_text import chunks
 LOG = logging.getLogger(__name__)
 FINAL_REPORT_TIMEOUT_S = 5
 FINAL_SEND_TIMEOUT_S = 2
+WITHHELD = 'Call details are withheld: sharing permission was withdrawn.'
+
+
+class _Withdrawn(Exception):
+    """Consent changed between renders: render the withheld result again before sending."""
 
 
 def token_totals(units):
@@ -147,8 +153,9 @@ class UsageReceipt:
 class CostSummary:
     """One public report; the breakdown lives in the ephemeral details view."""
 
-    def __init__(self, send, edit, *, http=None, channel_id=None):
+    def __init__(self, send, edit, *, http=None, channel_id=None, allowed=None):
         self.send, self.edit = send, edit
+        self.allowed = allowed  # The consent check for an outcome that carries call content.
         self.finished = self.failure = self.message = None
         self.receipt = UsageReceipt(http, channel_id)
         self.view = CostDetails(self.receipt)
@@ -159,6 +166,15 @@ class CostSummary:
         self._publish_task = None
         self._text_fallback = False
         self._fallback_page = 0
+
+    def _fence(self):
+        """Withdrawn consent replaces the outcome before any render or send; never restored."""
+        finished = self.finished
+        if (finished is None or finished.consent_generation is None or self.allowed is None
+                or self.allowed(finished.consent_generation)):
+            return False
+        self.finished = replace(finished, outcome_en=WITHHELD, consent_generation=None)
+        return True
 
     @property
     def usage(self):
@@ -195,6 +211,8 @@ class CostSummary:
 
     async def _send_retry(self, content, *, nonce, outcome=None, **kwargs):
         for attempt in range(2):
+            if self._fence():
+                raise _Withdrawn
             try:
                 async with asyncio.timeout(FINAL_SEND_TIMEOUT_S):
                     if nonce == self._nonce:
@@ -241,10 +259,14 @@ class CostSummary:
                 while True:
                     revision = self._revision
                     event_type = self._event_type
+                    self._fence()
                     text = render_final(self.finished, self.usage, self.usage_final, self.failure)
                     embed = render_cost(self.usage, self.usage_final)
                     if self.message is None:
-                        self.message = await self._initial_report(text, embed)
+                        try:
+                            self.message = await self._initial_report(text, embed)
+                        except _Withdrawn:
+                            continue
                         self.receipt.message_id = getattr(self.message, 'id', None)
                         if self._send_attempts > 1:
                             # A nonce retry may recover an accepted message with an older price.

@@ -202,7 +202,7 @@ class JpcallServer:
             raise web.HTTPNotFound()
         self._media.pop(request.match_info['token'])
         # Status callbacks remain valid for the bounded call and billing grace period.
-        call.expires = self._clock() + self.config.limits.max_call_s + 120
+        call.expires = self._clock() + self.config.limits.attempt_s + 120
         ws = web.WebSocketResponse(max_msg_size=64 * 1024, heartbeat=30)
         call.ws = ws
         started = False

@@ -62,7 +62,7 @@ def test_corrections_are_retained_and_receive_a_response(spoken, answer):
     asyncio.run(run())
 
 
-def test_exact_echo_is_retained_uncertain_and_repeated_answer_has_bounded_recovery(monkeypatch):
+def test_exact_echo_is_retained_uncertain_and_repeated_answer_clarifies_once(monkeypatch):
     monkeypatch.setattr(realtime, 'ASR_TIMEOUT_S', .02)
 
     async def run():
@@ -78,21 +78,33 @@ def test_exact_echo_is_retained_uncertain_and_repeated_answer_has_bounded_recove
             await output(client, text=text, played=1)
             for item in ('repeat1', 'repeat2'):
                 await callee(client, item, 'お客様は12時の予約をご希望です')
-            await asyncio.wait_for(exhausted.wait(), 1)
+            await asyncio.sleep(.1)
             rows = [e for e in events.items if e.speaker == 'callee']
             assert len(rows) == 2 and all(e.delivery == 'unknown' for e in rows)
             requests = [e for e in peer.sent if e['type'] == EVENTS['response_create']]
             assert len(requests) == 2  # Opening plus one clarification, no echo loop.
             assert 'could not hear' in requests[-1]['response']['instructions']
             assert not any(e['type'] == EVENTS['item_delete'] for e in peer.sent)
-            assert client._silenced
+            # Uncertain echo is not a transcription outage: it never ends the call.
+            assert not exhausted.is_set() and not client._silenced
         finally:
             await client.stop()
     asyncio.run(run())
 
 
+async def lose_transcript(client, item, failure):
+    await client.handle_event({'type': EVENTS['speech_started'], 'item_id': item,
+                               'audio_start_ms': 100})
+    await client.handle_event({'type': EVENTS['speech_stopped'], 'item_id': item,
+                               'audio_end_ms': 200})
+    if failure != 'missing':
+        await client.handle_event({'type': EVENTS[
+            'input_transcript' if failure == 'empty' else 'input_transcript_failed'],
+            'item_id': item, 'transcript': ''})
+
+
 @pytest.mark.parametrize('failure', ['missing', 'empty', 'failed'])
-def test_missing_empty_and_failed_asr_clarify_once_then_end(monkeypatch, failure):
+def test_lost_asr_clarifies_once_and_only_a_repeated_outage_ends(monkeypatch, failure):
     monkeypatch.setattr(realtime, 'ASR_TIMEOUT_S', .02)
 
     async def run():
@@ -104,17 +116,18 @@ def test_missing_empty_and_failed_asr_clarify_once_then_end(monkeypatch, failure
         client, audio, events, meter, peer = bridge(on_asr_failure=failed)
         await attach_and_open(client, Media())
         try:
-            await client.handle_event({'type': EVENTS['speech_started'], 'item_id': 'lost',
-                                       'audio_start_ms': 100})
-            await client.handle_event({'type': EVENTS['speech_stopped'], 'item_id': 'lost',
-                                       'audio_end_ms': 200})
-            if failure != 'missing':
-                await client.handle_event({'type': EVENTS[
-                    'input_transcript' if failure == 'empty' else 'input_transcript_failed'],
-                    'item_id': 'lost', 'transcript': ''})
-            await asyncio.wait_for(exhausted.wait(), 1)
-            assert not events.items
+            await lose_transcript(client, 'lost1', failure)
+            await asyncio.sleep(.1)  # Silence after the clarification is not a failure.
+            assert not events.items and not exhausted.is_set() and not client._silenced
             assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == 2
+            await lose_transcript(client, 'lost2', failure)
+            if failure == 'empty':  # Noise never ends the call or asks again.
+                await asyncio.sleep(.1)
+                assert not exhausted.is_set() and not client._silenced
+                assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == 2
+            else:  # A repeated failed or missing transcription is still a bounded outage.
+                await asyncio.wait_for(exhausted.wait(), 1)
+                assert client._silenced
         finally:
             await client.stop()
     asyncio.run(run())

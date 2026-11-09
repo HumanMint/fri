@@ -259,8 +259,8 @@ def test_pending_vad_releases_on_asr_failure_or_deadline_with_bounded_recovery(m
                 await client.handle_event({'type': EVENTS[
                     'input_transcript_failed' if failure == 'failed' else 'input_transcript'],
                     'item_id': 'lost', 'transcript': ''})
-            await asyncio.wait_for(exhausted.wait(), 1)
-            assert not client._speech_pending and client._silenced
+            await asyncio.sleep(.1)  # Five ASR deadlines of silence after the clarification.
+            assert not client._speech_pending and not client._silenced and not exhausted.is_set()
             assert len(requests(peer)) == 3  # Opening, interrupted inquiry, one clarification.
         finally:
             await client.stop()

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .contract import CallRejected, Limits
+from .contract import MAX_ATTEMPT_S, CallRejected, Limits
 from .numbers import normalize_number
 
 
@@ -236,7 +236,7 @@ class JpcallConfig:
             errors.append('JPCALL_TEST_NUMBERS must contain safe E.164 numbers')
             tests = frozenset()
         values['limits'] = Limits(
-            max_call_s=positive('JPCALL_MAX_CALL_S', 900),
+            max_call_s=positive('JPCALL_MAX_CALL_S', MAX_ATTEMPT_S, MAX_ATTEMPT_S),
             max_hold_s=positive('JPCALL_MAX_HOLD_S', 60),
             hold_apology_every_s=positive('JPCALL_HOLD_APOLOGY_EVERY_S', 45),
             max_calls_per_user_per_day=positive('JPCALL_MAX_CALLS_PER_USER_PER_DAY', 5),
