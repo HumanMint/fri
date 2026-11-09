@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 
+from .fri_errors import message_gone
 from .privacy import clean
 
 PAGE_SIZE = 10
@@ -338,7 +339,9 @@ class HistorySearch:
                 continue
             try:
                 message = await channel.fetch_message(int(row['id']))
-            except discord.NotFound:
+            except discord.NotFound as exc:  # Left out either way.
+                if message_gone(exc):  # Deleted, though the index still lists it: taken back as its event would (fri #358).
+                    a.agent.unsend(channel.id, [int(row['id'])], a.guild)
                 continue
             carries = media(message)  # A meme with no caption is still a find.
             if (message.author.bot or message.webhook_id or started_a_thread(message) or
@@ -377,6 +380,7 @@ class HistorySearch:
             return await self._valid(channels)
 
     async def _valid(self, channels):
+        import discord
         for (channel_id, message_id), (user, content, edited, attachments) in self.evidence.items():
             if channel_id not in channels:
                 return False
@@ -384,7 +388,12 @@ class HistorySearch:
             permissions = channel.permissions_for(channel.guild.me)
             if not permissions.view_channel or not permissions.read_message_history:
                 return False
-            message = await channel.fetch_message(message_id)
+            try:
+                message = await channel.fetch_message(message_id)
+            except discord.NotFound as exc:  # Refused either way, as before.
+                if message_gone(exc):  # Deleted since it was shown: taken back first, as its event would (fri #358).
+                    self.actions.agent.unsend(channel.id, [message_id], self.actions.guild)
+                raise
             if (message.author.id != user or message.content != content or message.author.bot or message.webhook_id or
                     getattr(message, 'edited_at', None) != edited or attachment_ids(message) != attachments):
                 return False

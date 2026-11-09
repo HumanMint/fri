@@ -15,6 +15,7 @@ from gene.store import Store
 
 from compat_tests.test_api import actor, headers
 from compat_tests.test_fri_chat import response_event
+from compat_tests.test_fri_learning import dm_owner
 from fri.fri_agent import ERASED, Agent, BehaviorPreview
 from fri.fri_agent_model import SUMMARY, analyze
 from fri.fri_chat import Chat
@@ -214,7 +215,8 @@ def test_behavior_preview_rejects_nonowner_and_spoofed_message():
 def test_fri_chat_archive_never_enters_startup_learning(monkeypatch):
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=AsyncMock(),
-            get_channel=lambda _: SimpleNamespace(id=789), wait_until_ready=AsyncMock())
+            get_channel=lambda _: SimpleNamespace(id=789), wait_until_ready=AsyncMock(),
+            capabilities=frozenset({'learning-withdrawals'}))  # Else no batch is asked for (fri #346).
         agent = Agent(fri)
         agent.dedicated = 789
         agent.state['channels'] = ['789']
@@ -399,13 +401,13 @@ def test_history_search_cannot_quote_a_different_channel_publicly():
 
 def test_failed_report_delivery_keeps_outbox_pending():
     async def scenario():
-        owner = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError('DM unavailable')))
+        owner = dm_owner(AsyncMock(side_effect=RuntimeError('DM unavailable')))
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456,
             api=AsyncMock(return_value=[{'id': 'a'*32, 'body': 'Learning pass'}]), get_user=lambda _: owner)
         with pytest.raises(RuntimeError):
             await Agent(fri).send_reports()
-        assert fri.api.await_count == 1
-        assert fri.api.await_args.args == ('GET', '/agent/reports')
+        # Looked at, then fetched again once the owner is found (fri #373); never marked delivered.
+        assert [call.args for call in fri.api.await_args_list] == [('GET', '/agent/reports')]*2
     asyncio.run(scenario())
 
 
@@ -426,7 +428,7 @@ def test_attention_skips_messages_the_direct_path_is_answering():
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
         agent = Agent(fri)
         agent.state['config']['enabled'] = True
-        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'removed_at': 0})  # See test_fri_actions.
         agent.respond = AsyncMock()
         agent.run = AsyncMock(return_value=({'action': 'quiet', 'source_id': '', 'reason': ''}, {}, 'completed'))
         def message(mid, content):
@@ -455,7 +457,7 @@ def test_attention_skips_followups_in_an_active_window():
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}))
         agent = Agent(fri)
         agent.state['config']['enabled'] = True
-        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'removed_at': 0})  # See test_fri_actions.
         agent.respond = AsyncMock()
         agent.run = AsyncMock()
         agent.active[(456, 11)] = time.time()+120
@@ -478,7 +480,7 @@ def test_attention_yields_when_the_direct_path_takes_its_pick_meanwhile():
                               user=SimpleNamespace(id=99), api=AsyncMock(return_value={'pending': False}), busy=set())
         agent = Agent(fri)
         agent.state['config'].update(enabled=True, proactive=True)
-        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0})
+        agent.profile = AsyncMock(return_value={'enabled': True, 'revision': 0, 'removed_at': 0})  # See test_fri_actions.
         agent.respond = AsyncMock()
         message = SimpleNamespace(id=100, guild=SimpleNamespace(id=123), channel=channel,
             content='anyone know why the build is broken?', author=SimpleNamespace(id=11, bot=False, display_name='friend'),

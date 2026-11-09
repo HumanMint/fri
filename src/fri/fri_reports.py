@@ -1,6 +1,7 @@
 """Compact owner learning DMs with persistent, read-only detail navigation."""
 
 import re
+from contextlib import nullcontext
 
 import discord
 
@@ -10,6 +11,13 @@ from .privacy import clean
 
 NO_MENTIONS = discord.AllowedMentions.none()
 REPORT_ID = re.compile(r'^fri:learning:(?P<report_id>[a-f0-9]{32}):(?P<page>summary|[0-9]{1,2})$')
+
+
+def privacy_change(agent):
+    """A privacy change's trip to the controller, held as one (see Agent.privacy_change): owner reports wait for it.
+    With no agent, there's nothing to hold."""
+    change = getattr(agent, 'privacy_change', None)
+    return change() if callable(change) else nullcontext()
 
 
 def safe(text, limit=200):
@@ -93,13 +101,26 @@ class ReportButton(discord.ui.DynamicItem[discord.ui.Button], template=REPORT_ID
             await interaction.followup.send('server access is needed to open this report.', ephemeral=True,
                                              allowed_mentions=NO_MENTIONS)
             return
+        report = None
         try:
-            report = await fri.api('POST', f'/agent/reports/{self.report_id}/view',
-                                  {'guild_id': str(fri.guild_id), 'user_id': str(fri.owner_id)})
+            # Something taken back while it answered (a withdrawal, a privacy control) may have changed it since:
+            # it's read again once, and not shown if that moves too (fri #385; see Agent.taken_back_mark). Nor while
+            # reports are held: a privacy change on its way, or every saved context held back (fri #390).
+            for _ in range(2):
+                before = fri.agent.taken_back_mark()
+                fetched = await fri.api('POST', f'/agent/reports/{self.report_id}/view',
+                                       {'guild_id': str(fri.guild_id), 'user_id': str(fri.owner_id)})
+                if fri.agent.taken_back_mark() == before and not fri.agent.reports_held():
+                    report = fetched
+                    break
         except commands.UserFeedbackCheckFailure:
             await interaction.followup.send('i couldn’t load that report. it may have expired or been cleared; '
                                              'if it’s recent, try again in a moment.',
                                              ephemeral=True, allowed_mentions=NO_MENTIONS)
+            return
+        if report is None:
+            await interaction.followup.send('that report shifted while it loaded, since something was just taken '
+                                             'back. try again in a moment.', ephemeral=True, allowed_mentions=NO_MENTIONS)
             return
         content, view = report_message(report, self.page)
         await interaction.edit_original_response(content=content, embed=None, attachments=[], view=view,

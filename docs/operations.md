@@ -266,6 +266,19 @@ advertises it, so the controller must be released first.
   window, rebuilt from the live view. An unreachable controller fails the attention stage, as before.
   An older controller gets the per-author profile reads, which an erasure through Gene during them
   can still slip past.
+- **A learning pass's last check.** Signed in, before its summary request, a learning or exploration
+  pass reads its batch again from Discord: the same history, or each archived message by its ID (the
+  archive's search index can lag a deletion). A message that's gone, or reads otherwise now, is
+  dropped, so a deletion or edit whose event never reached Fri doesn't go (fri #335). Then a
+  controller offering `learning-withdrawals` says which of the messages it knows were withdrawn
+  (`/agent/learning/{batch}/withdrawn`, what the pass's finish would refuse), and those go too; the
+  planner's historical topics are checked the same way. Only the IDs it was asked about count: an answer
+  with anything else (null, an object, a number, another ID) can't be trusted, so nothing is sent, and the
+  pass stops as a failed read does and keeps its progress, its batch read again (fri #346). A controller
+  without it can't say, so no batch is asked for: a scheduled pass skips, the owner's run is refused
+  saying why, and `fri health` says learning waits for it. Its contract is read again before each pass
+  (at most once a minute), so learning resumes once it's offered. One that stops offering it after a
+  batch was claimed holds the pass back as a failed read does.
 - **Withdrawn messages' saved exchanges.** When a member's message Fri saved an exchange with is
   edited, however long ago Fri last carried it (fri #174), or deleted, Fri asks a controller that
   offers `turn-withdrawal` to drop that exchange through `/chat/turn/withdraw`, so the old words stop
@@ -314,17 +327,31 @@ advertises it, so the controller must be released first.
   and answers. The deadline is written first, to `withdrawals.closed.json`; only then is the record set
   aside unread as `withdrawals.unreadable-<time>.json` (the newest three are kept, none past 90 days).
   Until both are done the record stays where it is and no write replaces it: queued withdrawals stay in
-  memory, and each attempt to save them moves the deadline to 90 days from then. A deadline past 90 days
-  from now (a clock set back since) is cut to that once and written back. `fri health` shows the end
-  date while it lasts, and whether new withdrawals are being saved. To end it early, recover the
+  memory, and each attempt to save them moves the deadline to 90 days from then. A deadline once written
+  down is never cut short, one past 90 days from now (a clock set back since) included, and nor is when a
+  withdrawal was queued (fri #339). `fri health` shows the end
+  date while it lasts, and whether new withdrawals are being saved; one past any date Fri sets (more
+  than 90 days from now) is flagged instead of shown, with this way to end it (fri #343). To end it
+  early, recover the
   entries by hand into `withdrawals.json` (or confirm nothing in the set-aside file matters; an
   unreadable record still in place as `withdrawals.json` has to be fixed or moved too), then remove
   `withdrawals.closed.json`; the next start reads normally. The queue keeps an entry only as
   long as what it names can
-  be kept (a week, or a note's 90 days, below), and at most 20,000. Past that the oldest messages' go
-  first, but none is released before the controller took it (fri #256): every saved context is held back
-  until nothing those name can be kept, that deadline written to `withdrawals.closed.json` first (as for an
-  unreadable record, above), and if it can't be written none goes.
+  be kept (a week, or a note's 90 days, below), counted from when it was queued, which each entry keeps on
+  disk as `queued_at` (whole seconds), or from its message's time if that's later (fri #329): what a turn
+  saved from a message lasts from the save, which is before the message was taken back. An entry an older
+  Fri wrote, without one, counts from the start that reads it, which saves the queue then, so later starts
+  keep that date instead of dating it again (fri #343); a save that fails leaves the record as it was, for
+  the next start to date, no earlier. At most 20,000 are kept. Past that, those
+  whose names can be kept least long go first, but none is released before the controller took it (fri
+  #256): every saved context is held back until nothing those name can be kept, that deadline written to
+  `withdrawals.closed.json` first (as for an unreadable record, above), and if it can't be written none
+  goes. The same holds where a start reads more than 40,000 from disk, more than it holds while reading:
+  what it lets go is held back the same way, and until that's written down the record isn't replaced, so
+  the next start reads all of it again. `withdrawals.closed.json` also says why (`why`: `unreadable`,
+  `capacity`), which `fri health` shows; one an older Fri wrote doesn't say. Rolled back to a Fri from
+  before fri #329, the record reads as before, but that Fri counts each entry from its message's time
+  again and cuts a deadline past 90 days from now, as it always did.
   A member's "forget me" drops their queued withdrawals and what Fri knew of their saved exchanges; one
   already on its way carries the revision it was saved under, which the erasure moved, so the
   controller writes nothing for it, and a save whose answer comes after it records nothing. A withdrawal
@@ -347,8 +374,13 @@ advertises it, so the controller must be released first.
   breadcrumb of the saved reply, and of one that carried Fri's reply to it; Fri's own echo of such a reply
   leaves the channel's live view at once, in memory, and so does the echo of its reply to the message
   itself. An edit leaves those replies and echoes, as before (gene #150). Since a note lasts 90 days,
-  such a controller is asked by ID about messages up to 90 days old. An older controller gets neither
-  field and is asked about a week back, as before.
+  such a controller is asked by ID about edits of messages up to 90 days old. An older controller gets
+  neither field and is asked about a week back, as before. A deletion is asked about whatever its
+  message's age (fri #342): what drew on a message can be saved long after it was sent, a note learned
+  from an old message quoted in a newer conversation say, and the entry lasts from when it was queued, as
+  every entry does. Usually the controller takes it at once; while it can't, it waits like any other, and
+  a burst past the queue's capacity closes as above. An edit keeps the message-age bound: an update of an
+  old message that was edited long ago (a pin, say) looks the same to the queue as a fresh edit.
 - **What a turn drawing on the member summary writes or keeps.** A turn whose model request had Fri's
   summary of the member carries its generation (gene #91). Before every tool step, Fri checks that
   generation with `/chat/turn/check`, whether or not typing had already started, so a step the model
@@ -515,7 +547,35 @@ Fri's replies, DMs, the panel or restricted channels, plus the earlier summary. 
 channel that isn't readable by everyone now, sends the rest to the summary model (`summary_model` /
 `summary_effort`, Luna at medium by default) and reports the result, recorded as `summary` usage. The
 controller allows one call per member a day and 50 a day in all, and keeps the result only if nobody's
-privacy changed since the claim. A summary lasts 30 days after its last update. "What do you remember"
+privacy changed since the claim. The claim names each exchange's Discord messages and when it was saved,
+and those the earlier summary drew on (`summary-sources`): Fri reads each again from Discord first, and
+one that's gone, or edited more than a few seconds after its exchange was saved, is withdrawn as its event
+would have withdrawn it, though Fri never heard of it, and left out, with the earlier summary if it drew
+on one. One edited before the save, or too close to it to tell, is only left out, never withdrawn, since
+it may be the version saved. Once those reads are back, every channel is checked readable by everyone
+again. An earlier summary whose messages aren't known isn't carried on. Once the model answers, and again
+after its usage is recorded, a summary any of whose messages was taken back meanwhile, or while every
+saved context is held back, isn't kept (fri #333). Without `summary-sources` (an older controller), Fri
+claims nothing, and `fri health` says summaries wait for it. What a summary drew on goes with it, by a
+trigger in the controller's database, however it goes, a rolled-back controller's deletes included.
+A kept summary is read again against what it drew on even when nothing rebuilds it (fri #349, controller
+capability `summary-rechecks`): a rebuild needs new exchanges, so one whose exchanges aged out was never
+checked again. Each heartbeat (whatever learning does) claims a few from the controller
+(`/agent/member-summary/recheck`), each due 12 hours after its last check, and reads their messages from
+Discord, with no model call. A claim names at most 50 messages past its first summary; that first one names
+up to 100 (the most a summary records), so one claim reads at most 100. One gone, or edited after its
+exchange was saved, is withdrawn as its event would have withdrawn it, and the summary goes. One that can't
+be read now (Discord fails, its channel isn't everyone's now, or its withdrawal is still queued), or that
+changes so while the reads are out, holds the summary back until a later recheck reads it; the controller
+looks again at what it knows was taken back as it takes the answer. The controller drops, as it claims, a
+summary whose sources aren't known (one built before they were recorded can never be checked) and one of
+whose messages it knows was taken back after its exchange was saved. A summary the member wrote in My memory
+draws on no message, so it's never dropped for that. Fri's first claim after it starts holds every summary
+back until it's rechecked, since deletions Fri never heard of happen while it's down. A build by a Fri that
+read its messages again counts as a check. Until that first claim, and without `summary-rechecks` (an older
+controller), Fri uses and shows no summary (requests, "what do you remember" and My memory alike) and builds
+none, and `fri health` says so for the latter.
+A summary lasts 30 days after its last update. "What do you remember"
 shows it in a DM and, in a public channel everyone can read, only says one exists. My memory shows it
 with Edit summary and Clear summary; either clears the member's saved chats across the server, like a
 server-wide note edit. "Forget me", memory off and Forget my chats wipe it.

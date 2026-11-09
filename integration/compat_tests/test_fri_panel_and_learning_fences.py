@@ -16,7 +16,7 @@ from gene.fri_agent_store import AgentStore
 
 from compat_tests.test_api import headers
 from compat_tests.test_fri_edit_reanswer import model
-from compat_tests.test_fri_learning import HistoryChannel, learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import HistoryChannel, dm_owner, learning  # noqa: F401 (the fixture)
 from compat_tests.test_fri_mentions import environment
 from fri import fri as runtime
 from fri.fri_agent import Agent
@@ -26,6 +26,7 @@ from fri.fri_notices import notice_text
 from fri.panels import PrivatePanels
 
 QUESTION = 'what is the current Python release?'
+LEARNING_WITHDRAWALS = 'learning-withdrawals'  # Gene says which messages a pass holds it knows were withdrawn.
 
 
 def panel(fri):
@@ -269,15 +270,20 @@ def test_a_memory_control_from_the_panel_still_hears_how_it_went(monkeypatch, tm
     asyncio.run(scenario())
 
 
-def batch(learning, monkeypatch):  # noqa: F811 (the fixture's value)
+def batch(learning, monkeypatch, older=False):  # noqa: F811 (the fixture's value)
     """Members 11 and 14 each with a public message in channel 1, a learning pass over them, the real fenced model call
-    (Agent.run) with the summary request captured, and what the pass finished with."""
+    (Agent.run) with the summary request captured, and what the pass finished with. A pass sends only once Gene says
+    which of its messages it knows were withdrawn (learning-withdrawals, fri #335), so this needs a controller that
+    can; `older`: as one that can't, whatever this one offers."""
     clock, store, settings, scheduler = learning
     settings = replace(settings, agent_history_channels='1')
     scheduler = AgentStore(store, settings)
     channel = HistoryChannel()
     first, second = channel.add(clock[0]-100, user=11), channel.add(clock[0]-90, user=14, text='I like chess')
     client = TestClient(create_app(settings))
+    offered = set(client.get('/fri/contract', headers=headers('fri')).json()['capabilities']) & {LEARNING_WITHDRAWALS}
+    if not offered and not older:
+        pytest.skip('needs a controller offering '+LEARNING_WITHDRAWALS)
     finishes, asked, signing = [], [], []
 
     async def api(method, path, payload=None):
@@ -287,8 +293,9 @@ def batch(learning, monkeypatch):  # noqa: F811 (the fixture's value)
             finishes.append(payload)
         return response.json()
 
-    fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api,
-                          get_channel=lambda _: channel, get_user=lambda _: SimpleNamespace(send=AsyncMock()))
+    fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, capabilities=frozenset(
+                              () if older else offered),
+                          get_channel=lambda _: channel, get_user=lambda _: dm_owner())
     agent = Agent(fri)
     agent.state = scheduler.state()
     agent.member = AsyncMock(return_value=SimpleNamespace(roles=[SimpleNamespace(id=90)]))
@@ -402,9 +409,10 @@ def test_an_exploration_passs_summary_request_carries_no_record_whose_author_era
     model the same way, and was checked the same way, not at all. It's held to the same fence (see Agent.unmoved): the
     member erasing during its sign-in, here or through Gene, or during the archive search (one baseline, taken before
     it, fri #290's round 1), leaves nothing to send, so nothing is: an empty batch, not a failed one."""
-    from compat_tests.test_fri_exploration import archive, row
+    from compat_tests.test_fri_exploration import archive, by_id, offered, row
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
+    capabilities = offered(client)
     old = row(clock[0]-120*86400)
     channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()),
                               permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True))
@@ -439,8 +447,8 @@ def test_an_exploration_passs_summary_request_carries_no_record_whose_author_era
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), http=SimpleNamespace(request=http),
-                              chat=SimpleNamespace(headers=sign_in))
+                              get_user=lambda _: dm_owner(), capabilities=capabilities,
+                              http=SimpleNamespace(request=by_id(http, [old])), chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri)
         agents.append(agent)
         agent.state = scheduler.state()

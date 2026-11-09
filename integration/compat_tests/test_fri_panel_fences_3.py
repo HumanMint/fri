@@ -7,7 +7,6 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import discord
 import pytest
 
 from compat_tests.test_fri_actions import harness
@@ -85,7 +84,8 @@ def test_a_dm_replys_preview_takes_its_baseline_before_the_turn_waits(monkeypatc
     """fri #322 (2): the owner's DM makes a voice preview carrying member 30's words through an ordinary reply.
     During the DM's membership check after the model answered, member 30's "forget me" lands here, before Gene has
     it. The preview's fence took its baseline after that, so Next showed their marker. Its baseline is every
-    member's erasures here as the turn began: nothing more of it shows."""
+    member's erasures here as the turn began: nothing more of it shows. Since fri #324 item 1, nothing of it goes out
+    at all: its first page is held to that fence too."""
     async def scenario():
         fri, agent, store, _, _, _, _, rows = environment(monkeypatch, tmp_path, channel_id=1)
         channel, message = direct(fri, agent, rows)
@@ -109,9 +109,12 @@ def test_a_dm_replys_preview_takes_its_baseline_before_the_turn_waits(monkeypatc
         dm.reply.return_value = SimpleNamespace(id=dm.id+100, content='okay', edit=AsyncMock())
         try:
             await agent.handle(dm)
+            assert bool(erased) is (moved == 'local')
+            if moved == 'local':  # fri #324 item 1: its first page is held to the turn's whole fence too.
+                assert 'view' not in dm.reply.await_args.kwargs and MARKER not in str(dm.reply.await_args_list)
+                return
             view = dm.reply.await_args.kwargs['view']
             assert len(view.pages) == 2 and MARKER not in view.content
-            assert bool(erased) is (moved == 'local')
             view.interaction_check = AsyncMock(return_value=True)
             pressed = click()
             await view.next(pressed)
@@ -131,7 +134,8 @@ def test_my_memorys_summary_waits_for_a_withdrawal_fri_took_in(monkeypatch, tmp_
     async def scenario():
         w = world(monkeypatch, tmp_path)
         try:
-            source = {'kind': 'discord_message', 'id': str(discord.utils.time_snowflake(discord.utils.utcnow())),
+            posted = w.message(GENERAL, 'ash says the raid is at nine')  # Discord holds it (fri #333).
+            source = {'kind': 'discord_message', 'id': str(posted.id),
                       'user_id': '20', 'display_name': 'friend', 'channel_id': str(GENERAL), 'guild_id': '123'}
             w.store.save_chat('123', 'public:1', '20', 0, 'ash says the raid is at nine', 'ok', 'm', 'high',
                               source=source, provenance=[ASH], audience='server')

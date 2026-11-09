@@ -10,7 +10,8 @@ import httpx
 
 from . import feedback as commands
 from .fri_context import discord_source
-from .fri_errors import ControllerRejected
+from .fri_errors import HELD, ControllerRejected
+from .guild_channels import guild_channels
 from .privacy import clean
 from .subscription import private_json
 
@@ -37,7 +38,8 @@ async def capabilities(fri, target_id=''):
     members = [await guild.fetch_member(user) for user in (fri.owner_id, fri.user.id)]
     fresh_guild = copy.copy(guild)
     fresh_guild._roles = {role.id: role for role in await guild.fetch_roles()}
-    channels = [await fri.fetch_channel(int(target_id))] if target_id else await guild.fetch_channels()
+    # One of a type discord.py doesn't know is listed, and left out below as no text channel (fri #397).
+    channels = [await fri.fetch_channel(int(target_id))] if target_id else await guild_channels(guild)
     result = {}
     for channel in channels:
         if not isinstance(channel, discord.TextChannel) or channel.guild.id != fri.guild_id or channel.nsfw:
@@ -220,7 +222,12 @@ async def deliver_one(fri):
         original = await dm.fetch_message(int(source['id']))
         if original.author.id != fri.owner_id or original.edited_at is not None:
             raise ValueError('Original request changed')
-        await fri.api('POST', f"/workspace/posts/{post['id']}/sending", {'lease': post['lease']})
+        try:
+            await fri.api('POST', f"/workspace/posts/{post['id']}/sending", {'lease': post['lease']})
+        except ControllerRejected as exc:
+            if getattr(exc, 'status', None) == HELD:  # Put back unsent until its draft's summary checks out:
+                return  # it's claimed and sent then, so nothing is recorded (fri #355).
+            raise
         sending = True
         result = await send_once(fri, post)
         message_id, state = str(int(result['id'])), 'sent'

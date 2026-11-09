@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -30,8 +31,17 @@ STALL = 900
 GENE = frozenset({'stale', 'offline', 'stopped'})
 NOT_TAKING = 'gene isn’t taking commands right now, so i didn’t send that.'
 NOT_OFFERED = 'gene isn’t offering that command right now, so i didn’t send it.'
+# Why every saved context is held back, as far as it's known (SavedTurns.status()'s closed_for): fri health and the
+# owner's paused learning run say the same (fri #329, #361).
+HELD_FOR = (('unreadable', "a withdrawals record couldn't be read"),
+            ('capacity', 'more withdrawals were queued than Fri keeps'))
 HEALTH = re.compile(r"(?:(?:show|check|run|give)\s+(?:me\s+)?)?(?:(?:your|fri'?s|system)\s+)?"
                     r"health(?:\s*check)?(?:\s+(?:report|status|rn|please|pls))*")
+
+
+def held_for(why):
+    """The reasons HELD_FOR gives for these causes, in its order; none for causes it doesn't know, or none at all."""
+    return [text for cause, text in HELD_FOR if cause in (why or ())]
 
 
 def health_requested(text):
@@ -361,13 +371,55 @@ class Watch:
             waiting = '?'
         lines.append(f'- usage receipts waiting: {waiting}')
         turns = getattr(agent, 'saved_turns', None) if agent else None
-        if turns is not None and (held := turns.status())['closed_until']:  # A withdrawals record couldn't be read.
-            until = int(held['closed_until'])
-            lines.append(f"- saved context: held back until <t:{until}:f> (<t:{until}:R>), a withdrawals record "
-                         "couldn't be read" + ('' if held['saved_to_disk'] else
-                                               "; it couldn't be set aside, so new withdrawals aren't saved to disk")
+        if turns is not None and (held := turns.status())['closed_until']:  # Every saved context is held back.
+            from .fri_turn_withdrawal import CLOSED_SECONDS
+            until, why = held['closed_until'], held.get('closed_for') or []
+            # Kept as written, never cut short (fri #339), but one later than any Fri sets from now isn't printed as a
+            # date: it's flagged, with the way to end it by hand (fri #343). Fri sets one from the time rounded up to
+            # a whole second, so that's what it's compared with (fri #347).
+            past = until > math.ceil(time.time())+CLOSED_SECONDS
+            when = (f'past any date Fri sets (more than {CLOSED_SECONDS//86400} days from now: the clock was set back '
+                    'since, or withdrawals.closed.json was edited)' if past else
+                    f'until <t:{int(until)}:f> (<t:{int(until)}:R>)')
+            # Why, as far as it's known: a deadline an older Fri wrote doesn't say (fri #329).
+            causes = held_for(why) or ["withdrawals Gene hasn't taken may name any of it"]
+            unsaved = {'unreadable': "; it couldn't be set aside, so new withdrawals aren't saved to disk",
+                       'capacity': "; that couldn't be written down, so new withdrawals aren't saved to disk"}
+            lines.append(f"- saved context: held back {when}, " + ' and '.join(causes)
+                         + ('' if held['saved_to_disk'] else unsaved.get(held.get('unsaved_for'), unsaved['unreadable']))
                          # A scheduled pass skipped for it asks for no batch until then (fri #335).
-                         + ('; learning passes wait until then' if getattr(agent, 'learning_paused', False) else ''))
+                         + ('; learning passes wait until then' if getattr(agent, 'learning_paused', False) else '')
+                         + ('; to end it early, remove withdrawals.closed.json once nothing it holds back matters (see '
+                            'docs/operations.md)' if past else ''))
+        channels = getattr(agent, 'channel_withdrawals', None) if agent else None
+        if channels is not None and (state := channels.status())['holding']:  # Every saved context (fri #372 r2, S1).
+            parts = []
+            if state['pending']:
+                parts.append(f"{state['pending']} waits for the controller to take it" if state['pending'] == 1
+                             else f"{state['pending']} wait for the controller to take them")
+            if state['recovering']:
+                parts.append('the queue is recovering (it couldn\'t be read, or wasn\'t written down in full): '
+                             + (f"{state['answered']} of {state['held']} held channels answered by Discord so far"
+                                if state['held'] is not None else 'no sweep has read the held channels yet')
+                             + '; it ends once every one is answered and the controller took what was gone')
+            if not state['offered']:
+                parts.append("the controller doesn't take channels yet, so it stays until one that does is back")
+            lines.append('- saved context: held back for deleted channels: ' + '; '.join(parts))
+        if getattr(agent, 'summaries_wait_for_gene', False):  # A build skipped for it (fri #333, #348 r1, #349).
+            from .fri_member_summary import HOLDS, RECHECKS, SOURCES
+            needs = {SOURCES: "name a summary's messages", RECHECKS: 'recheck kept ones',
+                     HOLDS: "hold back what was made from one while it's checked"}
+            # Only what the controller lacks, as its contract says now (fri #381).
+            missing = [name for name in needs if name not in getattr(fri, 'capabilities', ())]
+            lines.append("- member summaries: paused and none used, the controller doesn't "
+                         + ' or '.join(needs[name] for name in missing)
+                         + f" ({', '.join(missing)}), so none can be checked; they resume once it does" if missing else
+                         '- member summaries: paused and none used until the next build, now that the controller '
+                         'offers what checking them needs')
+        if getattr(agent, 'learning_waits_for_gene', False):  # A scheduled pass skipped for it (fri #346).
+            lines.append("- learning: paused, the controller doesn't say which messages it knows were taken back "
+                         "(learning-withdrawals); its contract is read again before each pass, and learning resumes "
+                         'once it does')
         if agent:
             from .fri_ledger import describe, describe_forwards
             outcomes = agent.ledger.snapshot()

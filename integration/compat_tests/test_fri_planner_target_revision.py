@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 
 from compat_tests.test_api import headers
-from compat_tests.test_fri_learning import learning  # noqa: F401 (the fixture)
+from compat_tests.test_fri_learning import dm_owner, learning  # noqa: F401 (the fixture)
 from compat_tests.test_fri_learning_cutoffs import remove_a_preference, saved_preference
 from fri.fri_agent import Agent
 from fri.fri_errors import ControllerRejected
@@ -20,9 +20,10 @@ def planned_pass(learning, monkeypatch, moved):  # noqa: F811
     """Two exploration passes over member 11, as test_fri_exploration's: the first reads their history broadly and notes
     a topic, the second may ask the planner with it. moved: what happens while the second pass's target is assigned.
     Returns the planner requests, the second pass's target and the plan it asked Gene for."""
-    from compat_tests.test_fri_exploration import archive, row
+    from compat_tests.test_fri_exploration import archive, by_id, offered, row
     clock, store, settings, scheduler = archive(learning)
     client = TestClient(create_app(settings))
+    capabilities = offered(client)
     old, later = row(clock[0]-120*86400), row(clock[0]-160*86400, text='minecraft redstone was fun')
     channel = SimpleNamespace(id=1, name='memba-chat', guild=SimpleNamespace(id=123, me=object()),
                               permissions_for=lambda _: SimpleNamespace(view_channel=True, read_message_history=True))
@@ -65,7 +66,8 @@ def planned_pass(learning, monkeypatch, moved):  # noqa: F811
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api, get_channel=lambda _: channel,
-                              get_user=lambda _: SimpleNamespace(send=AsyncMock()), http=SimpleNamespace(request=http),
+                              get_user=lambda _: dm_owner(), capabilities=capabilities,
+                              http=SimpleNamespace(request=by_id(http, [old, later])),
                               chat=SimpleNamespace(headers=sign_in))
         agent = Agent(fri)
         agent.state = scheduler.state()

@@ -144,13 +144,14 @@ def test_what_fri_couldnt_have_saved_asks_nothing(monkeypatch, tmp_path):
             await delete(w, unrelated.id, channel=2)
             await edit(w, edited(unrelated), guild=456, channel=3)  # Another server.
             await edit(w, edited(unrelated), guild=456, channel=4)  # One whose channel Fri hasn't cached.
-            # Older than any exchange the controller keeps, or any note, which one offering withdrawal-sources drops
-            # with its message too (gene #141).
+            # An update of one older than any exchange the controller keeps, or any note, which one offering
+            # withdrawal-sources drops with its message too (gene #141), repeating an edit made long ago (a pin, say). A
+            # fresh edit of it is asked about (fri #358 E1, see test_fri_fresh_edits).
             days = 91 if 'withdrawal-sources' in w.fri.capabilities else 8
-            old = SimpleNamespace(id=discord.utils.time_snowflake(discord.utils.utcnow()-dt.timedelta(days=days)),
-                                  content='x', edited_at=discord.utils.utcnow(), author=SimpleNamespace(id=20, bot=False))
+            sent = discord.utils.utcnow()-dt.timedelta(days=days)
+            old = SimpleNamespace(id=discord.utils.time_snowflake(sent), content='x', edited_at=sent+dt.timedelta(days=1),
+                                  author=SimpleNamespace(id=20, bot=False))
             await edit(w, old)
-            await delete(w, old.id)
             card = copy.copy(unrelated)  # A link card or embed update: no edit of theirs.
             await edit(w, card)
             await w.fri.on_raw_message_edit(SimpleNamespace(channel_id=1, message=edited(unrelated)))  # Names no server.
@@ -158,6 +159,10 @@ def test_what_fri_couldnt_have_saved_asks_nothing(monkeypatch, tmp_path):
             assert not asked(w)
             await edit(w, edited(unrelated))  # Where Fri chats: asked, and nothing holds it.
             assert asked(w) == [{'guild_id': '123', 'message_ids': [str(unrelated.id)]}]
+            # Its deletion is asked about, whatever its age: a note learned from it may be newer (fri #342).
+            await delete(w, old.id)
+            assert asked(w)[1:] == [{'guild_id': '123', 'message_ids': [str(old.id)],
+                                     **({'deleted': True} if 'withdrawal-sources' in w.fri.capabilities else {})}]
         finally:
             await w.fri.close()
     asyncio.run(scenario())

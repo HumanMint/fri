@@ -17,6 +17,17 @@ from gene.store import Store
 from compat_tests.test_api import headers
 from fri.fri_agent import Agent
 
+GONE = {'code': 10008, 'message': 'Unknown Message'}  # Discord's 404 for a message that's gone, as it answers it.
+
+
+def dm_owner(send=None):
+    """The owner, as their discord.User with the DM channel open: create_dm hands that back, as discord.py's does, and
+    a report goes through it (fri #385). send(): it, so a test can read what was sent from either."""
+    owner = SimpleNamespace(send=send or AsyncMock())
+    owner.dm_channel = owner
+    owner.create_dm = AsyncMock(return_value=owner)
+    return owner
+
 
 @pytest.fixture
 def learning(tmp_path, monkeypatch):
@@ -32,6 +43,13 @@ def learning(tmp_path, monkeypatch):
     return clock, store, settings, agent
 
 
+def needs_learning_withdrawals(client):
+    """A pass asks for a batch only from a controller that says which messages it knows were withdrawn (fri #346): a
+    test of one that learns skips against a controller that doesn't."""
+    if 'learning-withdrawals' not in client.get('/fri/contract', headers=headers('fri')).json()['capabilities']:
+        pytest.skip('needs a controller offering learning-withdrawals')
+
+
 def value(store, key):
     with store.connection() as db:
         return AgentStore.get(db, key)
@@ -43,7 +61,7 @@ class HistoryChannel(discord.abc.Messageable):
     def __init__(self):
         self.id, self.guild = 1, SimpleNamespace(id=123)
         self.rows, self.reads = [], []
-        self._state = SimpleNamespace(http=SimpleNamespace(logs_from=self.logs),
+        self._state = SimpleNamespace(http=SimpleNamespace(logs_from=self.logs, get_message=self.message),
             create_message=lambda channel, data: data['message'])
 
     async def _get_channel(self):
@@ -55,6 +73,13 @@ class HistoryChannel(discord.abc.Messageable):
                 and (after is None or row.id > int(after))]
         rows = sorted(rows, key=lambda row: row.id, reverse=after is None)[:limit]
         return [{'id': str(row.id), 'message': row} for row in sorted(rows, key=lambda row: row.id, reverse=True)]
+
+    async def message(self, channel, message_id):
+        """One message by its ID, as Discord answers it: a 404 once it's gone."""
+        row = next((row for row in self.rows if row.id == int(message_id)), None)
+        if row is None:
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), GONE)
+        return {'id': str(row.id), 'message': row}
 
     def add(self, at, user=11, bot=False, text='I love trance'):
         row = SimpleNamespace(id=int(snowflake_floor(at))+1,
@@ -72,8 +97,9 @@ def test_initial_scan_then_new_messages_drain_without_skips_after_restart(learni
     channel = HistoryChannel()
     old = channel.add(clock[0]-100)
     store.personal_control('13', 'disable')
-    owner = SimpleNamespace(send=AsyncMock())
+    owner = dm_owner()
     client = TestClient(create_app(settings))
+    needs_learning_withdrawals(client)
     requests, summaries = [], []
 
     async def api(method, path, payload=None):
@@ -288,6 +314,7 @@ def test_learning_keeps_what_a_member_is_working_on_in_its_channel(learning):
     channel = HistoryChannel()
     channel.add(clock[0]-100, text="I'm building a Factorio mod")
     client = TestClient(create_app(settings))
+    needs_learning_withdrawals(client)
     asked = []
 
     async def api(method, path, payload=None):
@@ -302,7 +329,7 @@ def test_learning_keeps_what_a_member_is_working_on_in_its_channel(learning):
 
     async def scenario():
         fri = SimpleNamespace(owner_id=10, guild_id=123, workshop_id=456, api=api,
-            get_channel=lambda _: channel, get_user=lambda _: SimpleNamespace(send=AsyncMock()))
+            get_channel=lambda _: channel, get_user=lambda _: dm_owner())
         agent = Agent(fri)
         agent.state = scheduler.state()
         agent.member = AsyncMock(return_value=SimpleNamespace(roles=[SimpleNamespace(id=90)]))
