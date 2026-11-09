@@ -268,12 +268,14 @@ async def landed(dm, me, chunk, after, taken):
 
 
 async def destination(client, *, owner_id, guild_id, channel):
-    """The owner's DM, or the one text channel of the guild with this name: two with the name is a refusal."""
+    """The owner's DM, or the one text channel of the guild with this name: two with the name is a refusal. A channel
+    of a type discord.py doesn't know is never one (see guild_channels, fri #397)."""
     if channel is None:
         owner = await client.fetch_user(owner_id)
         return await owner.create_dm()
+    from .guild_channels import guild_channels
     guild = await client.fetch_guild(guild_id)
-    found = [c for c in await guild.fetch_channels() if c.type == discord.ChannelType.text and c.name == channel]
+    found = [c for c in await guild_channels(guild) if c.type == discord.ChannelType.text and c.name == channel]
     if len(found) != 1:
         raise NotesRefused(f'the server has {len(found)} text channels named #{channel}; need exactly one')
     return found[0]
