@@ -69,7 +69,7 @@ jpcall is Fri-only. It does not use the Gene controller.
 
 ## Discord development
 
-The runtime image needs libopus (for example, the `libopus0` system package on Debian).
+The runtime image installs `libopus0` and checks an Opus encode/decode as the runtime user during the build.
 For an Apple Silicon Homebrew installation, include `/opt/homebrew/lib` in
 `DYLD_FALLBACK_LIBRARY_PATH` when launching the runner so discord.py can find libopus.
 The pinned discord.py voice extra supplies PyNaCl and DAVE support; `davey` is also pinned
@@ -81,6 +81,27 @@ PCM sources use the normal `VoiceClient.play` path: the player encodes PCM
 to Opus, then `_get_voice_packet` applies DAVE encryption before transport encryption.
 This path was checked against the installed discord.py 2.7.1 source; a live encrypted
 voice session still needs a manual development-guild check.
+
+### Main Fri group trial
+
+Main Fri is the selected group-trial identity. Keep the normal `/fri` command, chat,
+memory controls and controller contract; `/jpcall` is enabled only with its complete
+configuration and an explicit caller allowlist. Missing or invalid call configuration
+disables calling without disabling ordinary Fri. A call does not take over an existing
+voice connection, and only its requester can confirm, answer or stop it.
+
+Before enabling the first trial, qualify the combined source against current main and
+its pinned controller. Build the selected runtime image, check its codec/DAVE path,
+signed callback routing, durable recovery directory and shutdown, then exercise the
+full group flow with a consenting test recipient. The owner-only recording profile
+does not disclose group sharing and must not be used for that flow. Group recording
+stays off. Keep the existing brief notice covering AI processing, group listening and
+retained original/English text; show it before dialing.
+
+Release main Fri through the existing Gene maintainer batch and maintenance window.
+Do not run a second process with main Fri's token. The call and chat paths share the
+container's resource limit, so a live trial must also check ordinary Fri responsiveness.
+Offline tests and a phone-only owner test do not establish that shared-runtime behavior.
 
 Run the standalone development identity with `JPCALL_DEV_DISCORD_TOKEN` and
 `JPCALL_DEV_GUILD_ID` supplied by the environment:
