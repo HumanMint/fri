@@ -2299,8 +2299,12 @@ class Agent:
         if fence and (reason := await self.erasure(message.author.id, fence[0],
                                                    fence[1] if invitation or dm or not since else None)):
             return await self.dropped(message, events, reason, invitation, fence, burst)
-        if dm and memory_intent(text) not in MEMORY_CONTROLS and not self.config['support_dms']:
-            return missed('dms off')  # Gone off during that read, as dm_closed checks after its lookup.
+        def dms_off():
+            """DMs turned off since: a DM's reply doesn't go out, as dm_closed checks after its lookup. A memory
+            control is carried out either way. Read after each awaited fence from here to the send (fri #379 item 1)."""
+            return dm and memory_intent(text) not in MEMORY_CONTROLS and not self.config['support_dms']
+        if dms_off():
+            return missed('dms off')  # Gone off during that read.
         def taken_back():
             """Why what the model made can't go out, or be saved, now: a message it answers or one it was shown,
             deleted since. Checked again after each wait below, up to the save (the delivered part stays)."""
@@ -2384,22 +2388,42 @@ class Agent:
         # here since the turn began, then Gene's check of the whole turn (a summary's generation included: fri #375's
         # round 1, S1), then those erasures again, here, after the last awaited read. Then what was taken back here
         # while Gene answered: from there to the send, nothing is awaited (round 1, B1). What was delivered is held to
-        # all of it again before it's recorded. A public reply awaits nothing past talk's fence, and a ping's turn
-        # names no one (its grant and its own reads fence it). A DM drawing only on its requester's own words, with no
-        # summary, keeps its hot path: their erasure, or a note of theirs removed, moves their revision, which the
-        # read above (erasure) takes after the lookup.
+        # the local part again before it's recorded, and the save's own validation to the rest (see below). A public
+        # reply awaits nothing past talk's fence.
+        #
+        # A DM drawing on saved messages, even only its requester's, or a ping in a chat channel drawing on a summary
+        # or on saved messages, is held to it too (fri #379 items 2 and 3): Gene withdrawing one of those (deleted, or
+        # a summary's source) moves no revision, and the DM's lookup or the ping's own reads came after talk's fence.
+        # A ping's own reads fence only the posts it read. An outside ping's turn names neither (see invited_talk): its
+        # grant, which Gene's check doesn't take, and its reads fence it. A DM drawing on nothing saved, nor anyone
+        # else's words, nor a summary, keeps its hot path: their erasure, or a note of theirs removed, moves their
+        # revision, which the read above (erasure) takes after the lookup.
         from .fri import PANEL_SKIPPED, draws_on_summary
-        author = str(message.author.id)
-        drew = {str(row.get('user_id')) for row in (result.turn or {}).get('provenance') or []}
+        author, turn = str(message.author.id), result.turn or {}
+        drew = {str(row.get('user_id')) for row in turn.get('provenance') or []}
+        saved = draws_on_summary(turn) or bool(turn.get('drew_on'))
         fenced = turn_fence(self, result.turn, message.author.id, counts)  # Kept apart: saving clears result.turn.
-        whole = fenced if dm and (drew - {author} or draws_on_summary(result.turn or {})) else None
+        held = (dm and (drew - {author} or saved)) or (invitation and saved)
+        whole = fenced if held else None
         if whole:
-            if not await whole():
+            still = await whole()
+            if dms_off():  # Turned off while Gene answered: nothing goes out, quietly.
+                return missed('dms off')
+            if not still and fenced.unavailable:
+                # The controller didn't answer: an outage, as at talk's fence, not a change. Nothing of the reply
+                # goes out, since nothing checked it (fri #379's round 1, S2).
+                return await outage()
+            if not still:
                 # Their own erasure, here or through Gene (round 1, S2): nothing goes out, quietly. A failed read
                 # of it counts as one.
                 if (self.forgotten.get(message.author.id, 0) != counts.get(author, 0) or
                         (fence and fence[1] is not None and await self.erasure(message.author.id, *fence))):
                     return missed('author privacy changed')
+                if invitation:  # A ping hears it as for a nearby post that changed, while it still stands.
+                    return await self.withheld(message, events, 'nearby privacy changed', invitation,
+                                               fenced=since is not None, control=since is None)
+                if dms_off():  # Turned off during that read (fri #379's round 1, S1).
+                    return missed('dms off')
                 await message.reply(PANEL_SKIPPED, allowed_mentions=NO_MENTIONS, mention_author=False)
                 self.explained(events, 'source privacy changed')  # Nothing of what changed, or whose, is said.
                 await self.fri.waiting_notices.clear(message.author.id)
@@ -2409,14 +2433,16 @@ class Agent:
 
         async def standing():
             """The whole turn, then what was taken back here, with nothing awaited after: right before an image goes
-            out, after its own check reads (round 1, B3), and before the first-memory notice sends the reply's words
-            again in an edit (B2)."""
-            return await fenced() and taken_back() is None
+            out, after its own check reads (round 1, B3), or goes again after a refused upload, and before the
+            first-memory notice sends the reply's words again in an edit (B2). A DM's, while DMs are still on (fri
+            #379 item 1). A settings preview's later pages and Apply are held to it too (item 4)."""
+            return await fenced() and taken_back() is None and not dms_off()
 
         async def delivered():  # A preview is answered once posted, even if binding it fails next.
             self.answered(events)
-            # Deleted, or someone it drew on erased, while it posted: the card stays, but isn't saved.
-            if not taken_back() and (whole is None or (await whole() and not taken_back())):
+            # Deleted, or someone it drew on erased, while it posted: the card stays, but isn't saved (see the save
+            # below for why Gene isn't asked again first).
+            if not taken_back() and (whole is None or fenced.unmoved()):
                 await self.fri.record_turn(result)
 
         if result.post_preview:
@@ -2439,8 +2465,9 @@ class Agent:
         view = None
         if result.settings_preview:
             view = BehaviorPreview(self, **result.settings_preview)
-            # Later pages and Apply too (fri #316), held to the erasures here as the turn began (fri #322).
-            view.still = turn_fence(self, result.turn, message.author.id, counts)
+            # Later pages and Apply too (fri #316), held to the erasures here as the turn began (fri #322), and to what
+            # was taken back here since, as the first page was (fri #379 item 4).
+            view.still = standing
         elif result.memory_scope:
             from .fri_memory_panel import MemoryLauncher
             view = MemoryLauncher(self.fri, result.memory_scope)
@@ -2470,7 +2497,10 @@ class Agent:
             self.answered(events, told=COOLDOWN if result.status == 'cooldown' else None)  # Its one notice.
             self.last_spoke[message.channel.id] = time.time()  # Ambient attention won't answer it again.
             # Deleted, or someone it drew on erased, while it was sent: the reply stays, but isn't saved or echoed.
-            saved = (None if taken_back() or (whole and not (await whole() and not taken_back()))
+            # Held to the fence's local part, what was taken back and erased here: the save's own validation is
+            # Gene's check of the rest, which refuses what that would, so Gene isn't asked again first (fri #379's
+            # round 1, S3).
+            saved = (None if taken_back() or (whole and not fenced.unmoved())
                      else await self.fri.record_turn(result, sent, still=standing))
             # Nothing kept means nothing echoed: e.g. a message sent before the member edited their memory,
             # or a save that failed, whose reply may carry exactly what the controller would have refused.
