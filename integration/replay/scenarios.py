@@ -139,9 +139,10 @@ KEYWORDS = Scenario(
            lambda r: route(r, 'memory')['kind'] == 'local-memory' and route(r, 'memory')['model_calls'] == 0),
      Check('learning chat is conversation, not a settings command',
            lambda r: route(r, 'learning')['kind'] == 'model'),
-     Check('tone change becomes an owner settings preview',
+     Check('public tone-note changes stay private and redirect the owner to DMs',
            lambda r: route(r, 'tone')['kind'] == 'owner-control'
-           and any(d.view for d in r.step('tone').deliveries)
+           and not any(d.view for d in r.step('tone').deliveries)
+           and any(d.text == 'dm me for that one.' for d in r.step('tone').deliveries)
            and [m['model'] for m in r.step('tone').model] == ['gpt-6-luna', 'gpt-6.1-sol']),
      Check('owner banter with a settings word costs one cheap check, not the Sol settings call',
            lambda r: route(r, 'banter')['kind'] == 'model'

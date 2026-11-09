@@ -354,6 +354,8 @@ def test_only_a_complete_acknowledged_notice_lets_a_reply_be_classified(case):
                 assert new[0]['output_modalities'] == ['text']
                 assert new[0]['tool_choice'] == {'type': 'function', 'name': 'permission'}
                 assert 'unclear' in new[0]['instructions']
+                assert 'latest reply after the last complete notice' in new[0]['instructions']
+                assert 'earlier speech does not count' in new[0]['instructions']
             else:  # Never classified: one repeat of the unchanged notice instead.
                 assert new[0].get('output_modalities') != ['text']
                 assert notice in new[0]['instructions']

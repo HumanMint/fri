@@ -404,7 +404,8 @@ class RealtimeClient:
                     tool_choice={'type': 'function', 'name': 'permission'})
                 command.response['instructions'] = (
                     'Use only permission(decision=granted/refused/transfer/unclear) to classify '
-                    'the callee reply to the notice. Anything not explicit is unclear. Do not '
+                    "only the callee's latest reply after the last complete notice; earlier speech "
+                    'does not count. Anything not explicit is unclear. Do not '
                     'speak or start the inquiry.')
             self._idle.clear()
             self._pending = command
