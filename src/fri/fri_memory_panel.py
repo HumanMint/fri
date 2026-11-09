@@ -9,6 +9,7 @@ from . import feedback as commands
 from .fri_context import discord_source
 from .fri_member_summary import usable as summaries_usable
 from .fri_memory import MOVES, SOURCES, clip, note_place, profiled, units
+from .fri_reports import privacy_change
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
@@ -307,9 +308,10 @@ class MemoryView(discord.ui.View):
             return
         try:
             erased, channels = forgets(self.cog.agent), channel_generation(self.cog)  # Before it's read (fri #315).
-            state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
-                **self.scope, 'source': discord_source(interaction).model_dump(), 'revision': self.state['revision'],
-                'action': 'remove'})
+            with privacy_change(self.cog.agent):  # Owner reports wait for it (fri #390).
+                state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
+                    **self.scope, 'source': discord_source(interaction).model_dump(),
+                    'revision': self.state['revision'], 'action': 'remove'})
             self.cog.agent.forget(interaction.user.id)
             await show(self.cog, interaction, self.scope, state=state, notice='Removed that preference.', erased=erased, channels=channels)
         except commands.UserFeedbackCheckFailure as exc:
@@ -332,9 +334,10 @@ class MemoryView(discord.ui.View):
             return
         try:
             erased, channels = forgets(self.cog.agent), channel_generation(self.cog)  # Before it's read (fri #315).
-            state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
-                **self.scope, 'source': discord_source(interaction).model_dump(), 'revision': self.state['revision'],
-                'action': action})
+            with privacy_change(self.cog.agent):  # Owner reports wait for it (fri #390).
+                state = await self.cog.api('POST', '/chat/memory/notes/'+str(self.selected['id']), {
+                    **self.scope, 'source': discord_source(interaction).model_dump(),
+                    'revision': self.state['revision'], 'action': action})
             if action == 'keep':  # It no longer shows in the server, so nothing Fri holds there may keep it.
                 self.cog.agent.forget(interaction.user.id)
             await show(self.cog, interaction, self.scope, state=state, notice=notice, erased=erased, channels=channels)
@@ -358,9 +361,10 @@ async def summarized(view, interaction, action, text, notice):
     """The member's edit or clear of Fri's summary; like a server-wide note's, it clears their saved chats."""
     try:
         erased, channels = forgets(view.cog.agent), channel_generation(view.cog)  # Before it's read (fri #315).
-        state = await view.cog.api('POST', '/chat/memory/summary', {
-            **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
-            'action': action, 'text': text})
+        with privacy_change(view.cog.agent):  # Owner reports wait for it (fri #390).
+            state = await view.cog.api('POST', '/chat/memory/summary', {
+                **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
+                'action': action, 'text': text})
         view.cog.agent.forget(interaction.user.id)
         await show(view.cog, interaction, view.scope, state=state, notice=notice, erased=erased, channels=channels)
     except commands.UserFeedbackCheckFailure as exc:
@@ -401,9 +405,10 @@ class EditMemory(discord.ui.Modal):
         view = self.view
         try:
             erased, channels = forgets(view.cog.agent), channel_generation(view.cog)  # Before it's read (fri #315).
-            state = await view.cog.api('POST', '/chat/memory/notes/'+str(view.selected['id']), {
-                **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
-                'action': 'replace', 'evidence': self.preference.value})
+            with privacy_change(view.cog.agent):  # Owner reports wait for it (fri #390).
+                state = await view.cog.api('POST', '/chat/memory/notes/'+str(view.selected['id']), {
+                    **view.scope, 'source': discord_source(interaction).model_dump(),
+                    'revision': view.state['revision'], 'action': 'replace', 'evidence': self.preference.value})
             view.cog.agent.forget(interaction.user.id)
             await show(view.cog, interaction, view.scope, state=state, notice='Updated that preference.', erased=erased, channels=channels)
         except commands.UserFeedbackCheckFailure as exc:

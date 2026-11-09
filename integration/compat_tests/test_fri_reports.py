@@ -95,7 +95,7 @@ def event(report):
     interaction = create_autospec(discord.Interaction, instance=True)
     fri = SimpleNamespace(owner_id=10, guild_id=123, user=SimpleNamespace(id=99),
         api=AsyncMock(return_value=report), agent=SimpleNamespace(member=AsyncMock(return_value=object()),
-                                                                taken_back_mark=lambda: 0))
+                                                                taken_back_mark=lambda: 0, reports_held=lambda: False))
     interaction.client, interaction.guild_id = fri, None
     interaction.type = discord.InteractionType.component
     interaction.user = SimpleNamespace(id=10)

@@ -679,7 +679,9 @@ class Fri(discord.Client):
                 raise GateClosed('message deleted')
             # With the message or interaction that asked: its snowflake dates the erasure on Discord's clock, which
             # every message is compared with (fri #337 items 4 and 5). A controller that doesn't read it ignores it.
-            await self.api('POST', '/chat/memory/control', {**scope, 'action': intent, 'source': source.model_dump()})
+            from .fri_reports import privacy_change
+            with privacy_change(self.agent):  # Owner reports wait for it (fri #390).
+                await self.api('POST', '/chat/memory/control', {**scope, 'action': intent, 'source': source.model_dump()})
             if self.agent:
                 self.agent.forget(user_id, erased=intent == 'disable')
                 self.agent.carried_out(user_id, event, intent)
