@@ -28,6 +28,7 @@ import aiohttp
 import discord
 
 from .fri_errors import ControllerRejected, ControllerUnavailable
+from .guild_channels import guild_channels
 from .subscription import private_json
 
 CAPABILITY = 'channel-withdrawals'
@@ -250,7 +251,8 @@ class ChannelWithdrawals:
                 parents[row['id']] = str(channel.parent_id)
         listed = set()
         if missing:
-            listed = {str(channel.id) for channel in await guild.fetch_channels()}
+            # A channel of a type discord.py doesn't know is listed too, so it's never taken for deleted (fri #397).
+            listed = {str(channel.id) for channel in await guild_channels(guild)}
             if not listed:  # A server with no channels while the cache holds some: nothing it says can be trusted.
                 return False
         unread = [row for row in missing if row['id'] not in listed]
