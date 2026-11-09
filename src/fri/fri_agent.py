@@ -12,7 +12,7 @@ import time
 import uuid
 import weakref
 from collections import Counter, defaultdict, deque
-from contextlib import AsyncExitStack, closing, nullcontext
+from contextlib import AsyncExitStack, closing, contextmanager, nullcontext
 from types import SimpleNamespace
 
 import aiohttp
@@ -237,6 +237,7 @@ class Agent:
         self.forgotten = {}  # member: how many times forget() ran, so waiting messages notice.
         self.erased = {}  # member: how many of those erased their chats ("forget me"), not just a cache reset.
         self.privacy_controls = 0  # How many went through here, of anyone (see privacy_control_taken).
+        self.privacy_pending = 0  # How many are on their way to the controller now (see privacy_change).
         self.turns = Turns(fri)  # Held by a direct reply through its delivery and save.
         self.controls = defaultdict(asyncio.Lock)  # member: held while a privacy control of theirs is carried out.
         self.memory_controls = Arrivals()  # Memory controls still coming in, so they take effect in send order.
@@ -2545,14 +2546,14 @@ class Agent:
         withdrawn while Fri looked them up goes as the controller holds it now (fri #373). A channel's withdrawal
         accepted, or a message's queued here, during that fetch leaves it for the next round, when the controller has
         it (fri #378). Their DM channel is opened before it as well: a User's send() opens one it hasn't got first, a
-        wait after the last check (fri #385)."""
+        wait after the last check (fri #385). Nor does one go while reports are held (see reports_held, fri #390)."""
         if not await self.fri.api('GET', '/agent/reports'):
             return
         owner = self.fri.get_user(self.fri.owner_id) or await self.fri.fetch_user(self.fri.owner_id)
         channel = await owner.create_dm()  # The cached one when it's open, with no wait.
         before = self.taken_back_mark()
         for report in await self.fri.api('GET', '/agent/reports'):
-            if self.taken_back_mark() != before:
+            if self.taken_back_mark() != before or self.reports_held():
                 return
             content, view = report_message(report)
             await channel.send(content, view=view, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
@@ -2569,6 +2570,26 @@ class Agent:
         """A member's privacy control went through here: "forget me", a cleared chat, an edited note or summary. The
         controller deletes pending learning reports with each, as they can quote anyone (fri #385)."""
         self.privacy_controls += 1
+
+    @contextmanager
+    def privacy_change(self):
+        """A member's privacy change on its way to the controller: "forget me" or memory back on, a cleared chat, a
+        note's or the summary's edit. The controller may commit it, and delete every pending report with it, before
+        its answer comes back. No report is sent or shown while one is (see reports_held), and the mark moves as it
+        finishes, so a report read while it was on its way is read again (fri #390 item 1). A read that began before
+        it is caught either way: it answers while the change is on its way, or after it finished."""
+        self.privacy_pending += 1
+        try:
+            yield
+        finally:
+            self.privacy_pending -= 1
+            self.privacy_control_taken()
+
+    def reports_held(self):
+        """Whether no report may be sent or shown now, whatever the mark says: a privacy change on its way (see
+        privacy_change), or every saved context held back (SavedTurns.closed), a channel deleted and its withdrawal
+        not taken yet, say, which moves the mark only once the controller takes it (fri #390 item 2)."""
+        return self.privacy_pending > 0 or self.saved_turns.closed()
 
 
     def watching(self):
