@@ -56,7 +56,10 @@ async def authorized(cog, interaction, user_id=None, owner=False):
     # Red's command checks or the slash-command tree's interaction_check.
     channel = getattr(interaction.channel, 'parent_id', None) or interaction.channel_id
     in_scope = channel == cog.workshop_id or (getattr(cog, 'agent', None) and cog.agent.allowed(interaction.channel))
-    if interaction.guild_id != cog.guild_id or not in_scope:
+    if interaction.guild_id != cog.guild_id:
+        return False  # Another server hears nothing about this one.
+    if not in_scope:  # Discord lists /fri in every channel here: say where it opens instead of failing silently.
+        await notice(interaction, f'Open /fri in <#{cog.workshop_id}> or a channel where Fri chats.')
         return False
     if user_id is not None and interaction.user.id != user_id:
         await notice(interaction, 'This menu belongs to another person. Open your own Fri panel.')

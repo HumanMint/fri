@@ -171,20 +171,51 @@ def test_expired_or_temporarily_unavailable_report_keeps_original_message_retrya
     asyncio.run(scenario())
 
 
-def test_real_dispatch_accepts_owner_report_dm_but_not_other_members(monkeypatch, learning):
+def test_real_gateway_routes_owner_report_dm_but_not_other_members(monkeypatch, learning):
+    """Through discord.py's own parser, which runs dynamic items before any dispatch: the button's check is the gate."""
+    from discord.webhook.async_ import AsyncWebhookAdapter
     _, _, _, _, report = complete(learning)
+    sent = []
+    posted = {'id': '1420000000000000001', 'channel_id': '70', 'type': 0, 'content': '', 'flags': 0,
+              'author': {'id': '99', 'username': 'fri', 'discriminator': '0', 'avatar': None, 'bot': True},
+              'attachments': [], 'embeds': [], 'mentions': [], 'mention_roles': [], 'pinned': False,
+              'mention_everyone': False, 'tts': False, 'timestamp': '2026-11-09T00:00:00+00:00',
+              'components': [{'type': 1, 'components': [  # The button the click is on, as Discord sends it.
+                  {'type': 2, 'style': 2, 'label': 'Details', 'custom_id': f"fri:learning:{report['id']}:0"}]}],
+              'edited_timestamp': None}
+
+    async def request(adapter, route, session=None, *, payload=None, **kwargs):  # Discord's HTTP, recorded.
+        sent.append((route.method, route.path))
+        if route.path.endswith('/callback'):
+            return {'interaction': {'id': str(route.webhook_id), 'type': 6}}
+        return posted
+
+    def click(user):
+        person = {'id': str(user), 'username': 'someone', 'discriminator': '0', 'avatar': None}
+        message = posted
+        return {'id': '1420000000000000003', 'application_id': '99', 'type': 3, 'token': 'synthetic', 'version': 1,
+                'channel': {'id': '70', 'type': 1, 'recipients': [person]}, 'user': person, 'message': message,
+                'data': {'custom_id': f"fri:learning:{report['id']}:0", 'component_type': 2},
+                'locale': 'en-US', 'attachment_size_limit': 8388608, 'app_permissions': '0', 'entitlements': []}
 
     async def scenario():
         fri = configured(monkeypatch)
-        fri._connection.user = SimpleNamespace(id=99)
-        _, interaction = event(report)
-        interaction.channel_id = 999
-        with patch.object(discord.Client, 'dispatch') as dispatch:
-            fri.dispatch('interaction', interaction)
-            dispatch.assert_called_once()
-            interaction.user.id = 11
-            fri.dispatch('interaction', interaction)
-            assert dispatch.call_count == 1
+        fri._connection.user = discord.ClientUser(state=fri._connection, data={
+            'id': '99', 'username': 'fri', 'discriminator': '0', 'avatar': None, 'bot': True})
+        fri.agent = SimpleNamespace(member=AsyncMock(return_value=object()), close=lambda: None,
+                                    taken_back_mark=lambda: 0, reports_held=lambda: False)
+        fri.api = AsyncMock(return_value=report)
+        await fri._async_setup_hook()
+        fri.add_dynamic_items(ReportButton)
+        with patch.object(AsyncWebhookAdapter, 'request', request):
+            for user, reads in ((11, 0), (10, 1)):
+                fri._connection.parse_interaction_create(click(user))
+                for _ in range(30):
+                    await asyncio.sleep(0)
+                assert fri.api.await_count == reads
+        fri.api.assert_awaited_once_with('POST', f"/agent/reports/{report['id']}/view",
+                                         {'guild_id': '123', 'user_id': '10'})
+        assert ('PATCH', '/webhooks/{webhook_id}/{webhook_token}/messages/@original') in sent
         await fri.close()
     asyncio.run(scenario())
 

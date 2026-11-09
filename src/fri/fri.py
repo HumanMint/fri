@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 import uuid
 from pathlib import Path
@@ -15,7 +16,6 @@ from discord.ext import tasks
 
 from . import feedback as commands
 from .fri_actions import Actions
-from .fri_addressing import addressed_text
 from .fri_chat import Chat, ChatResult, submittable
 from .fri_context import discord_source
 from .fri_errors import (
@@ -47,18 +47,16 @@ from .fri_memory import (
     profiled,
     server_wide,
 )
-from .fri_notices import Busy, ReplyInProgress, WaitingNotices, notice_text
+from .fri_notices import Busy, ReplyInProgress, WaitingNotices
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
 from .fri_protocol import PROTOCOL, compatible
-from .fri_reports import ReportButton, report_component
-from .fri_requests import request_dm_component
+from .fri_reports import ReportButton
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
 from .fri_turn_withdrawal import exchange, held, unreadable
 from .fri_usage import describe_usage, usage_query, usage_requested, window_applied
 from .panels import defer_panel
 from .privacy import clean
-from .reviews import owner_dm_component
 from .subscription import Subscription, private_json
 
 LOG = logging.getLogger('fri')
@@ -200,10 +198,18 @@ def turn_provenance(context, speaker, actions=None):
 
 class FriTree(app_commands.CommandTree):
     async def interaction_check(self, interaction):
+        calls = getattr(self.client, 'jpcall_calls', None)
+        if calls is not None and calls.accepts(interaction):
+            return True
         return await authorized(self.client, interaction)
 
     async def on_error(self, interaction, error):
         LOG.warning('Fri command failed: %s', type(error).__name__)
+        calls = getattr(self.client, 'jpcall_calls', None)
+        if calls is not None and calls.accepts(interaction):
+            from .jpcall.discord_command import tell
+            await tell(interaction, 'that call did not go through. try again.')
+            return
         await reply(self.client, interaction, 'That action did not complete. Please try again.')
 
 
@@ -238,7 +244,17 @@ def persistent_buttons():
 
 class Fri(discord.Client):
     def __init__(self):
+        self.jpcall_engine = self.jpcall_calls = None
+        try:
+            from .jpcall.discord_runtime import load_config
+            self.jpcall_config = load_config()
+            jpcall_enabled = self.jpcall_config is not None and self.jpcall_config.enabled
+        except Exception as exc:
+            LOG.warning('jpcall disabled: %s', type(exc).__name__)
+            self.jpcall_config = None
+            jpcall_enabled = False
         intents = discord.Intents.none()
+        intents.voice_states = jpcall_enabled
         intents.guilds = intents.guild_messages = intents.dm_messages = True
         intents.message_content = True
         visibility = discord.Status.online if os.getenv('FRI_PRESENCE') == 'online' else discord.Status.invisible
@@ -315,39 +331,33 @@ class Fri(discord.Client):
                 'I can keep small preferences you share; ask what I remember or tell me to forget you.'),
                 view=HomeView(self, interaction.user.id))
 
+        if self.jpcall_config is not None and self.jpcall_config.enabled:
+            try:
+                from .jpcall.discord_command import register
+                from .jpcall.engine import JpcallEngine
+                self.jpcall_engine = JpcallEngine(self.jpcall_config)
+                await self.jpcall_engine.open()
+                self.jpcall_calls = register(self.tree, self, self.jpcall_engine,
+                                             [self.guild_id], limits=self.jpcall_config.limits)
+            except BaseException as exc:
+                engine, self.jpcall_engine = self.jpcall_engine, None
+                self.jpcall_config = self.jpcall_calls = None
+                self.tree.remove_command('jpcall', guild=discord.Object(id=self.guild_id))
+                # setup_hook precedes gateway identification; Client.intents returns a copy.
+                self._connection._intents.voice_states = False
+                self._connection.member_cache_flags.voice = False
+                try:
+                    if engine is not None:
+                        await engine.close()
+                except Exception as cleanup_error:
+                    LOG.warning('jpcall cleanup failed: %s', type(cleanup_error).__name__)
+                if not isinstance(exc, Exception):
+                    raise
+                LOG.warning('jpcall disabled: %s', type(exc).__name__)
         await self.tree.sync(guild=discord.Object(id=self.guild_id))
         self.health.start()
         self.owner_reviews.start()
         self.watching = asyncio.create_task(self.keep_watch())
-
-    def dispatch(self, event, /, *args, **kwargs):
-        if event == 'interaction' and args:
-            interaction = args[0]
-            channel = getattr(interaction.channel, 'parent_id', None) or interaction.channel_id
-            allowed = interaction.guild_id == self.guild_id and (channel == self.workshop_id or
-                (self.agent and self.agent.allowed(interaction.channel)))
-            behavior = (interaction.user.id == self.owner_id and
-                str((interaction.data or {}).get('custom_id', '')).startswith('fri:behavior:') and
-                getattr(getattr(interaction, 'message', None), 'author', None) and
-                interaction.message.author.id == getattr(self.user, 'id', None))
-            if behavior:
-                allowed = True
-            from .fri_memory_panel import memory_component
-            from .fri_workspace import post_component
-            if post_component(interaction, getattr(self.user, 'id', None), self.owner_id):
-                allowed = True
-            if memory_component(interaction, getattr(self.user, 'id', None)):
-                allowed = True
-            from .fri_social import component as social_component
-            if social_component(interaction, getattr(self.user, 'id', None)):
-                allowed = True
-            from .fri_fixes import tell_component
-            if (not allowed and not owner_dm_component(interaction, getattr(self.user, 'id', None), self.owner_id)
-                    and not tell_component(interaction, getattr(self.user, 'id', None), self.owner_id)
-                    and not report_component(interaction, getattr(self.user, 'id', None), self.owner_id)
-                    and not request_dm_component(interaction, getattr(self.user, 'id', None))):
-                return
-        super().dispatch(event, *args, **kwargs)
 
     async def is_owner(self, user):
         return user.id == self.owner_id
@@ -1593,40 +1603,10 @@ class Fri(discord.Client):
     async def on_message(self, message):
         from .fri_fixes import seen
         seen(self, message)  # A requester notice whose send's answer was lost, as Discord posted it (fri #221).
-        if self.agent:
-            try:
-                await self.agent.handle(message)
-            except (commands.UserFeedbackCheckFailure, discord.HTTPException) as exc:
-                LOG.warning('Fri interaction could not complete: %s', type(exc).__name__)
-            return
-        if (message.author.bot or getattr(message, 'webhook_id', None) or not message.guild or
-                message.guild.id != self.guild_id):
-            return
-        if (getattr(message.channel, 'parent_id', None) or message.channel.id) != self.workshop_id:
-            return
-        text = await addressed_text(message, self.user.id)
-        if text is None:
-            return
-        if memory_intent(text) in ('disable', 'enable'):
-            # Without the agent nothing fences an edit or delete that takes a control back while it runs, and an
-            # erasure can't be undone, so memory changes go through the /fri panel here.
-            await message.reply('can’t change memory from here right now. use /fri for that.', mention_author=False,
-                                allowed_mentions=NO_MENTIONS)
-            return
         try:
-            async with message.channel.typing():
-                result = await self.talk(message.guild.id, message.channel.id, message.author.id, text, 'public',
-                                         message.author.display_name, event=message)
-            view = DraftView(self, message.author.id, result.draft, public=True, fence=result.turn) if result.draft else None
-            sent = await message.reply(result.reply, view=view, mention_author=False, allowed_mentions=NO_MENTIONS,
-                                       suppress_embeds=True)
-            await self.record_turn(result, sent)
-            await self.waiting_notices.clear(message.author.id)
-        except ReplyInProgress:
-            await self.waiting_notices.send(message)
-        except commands.UserFeedbackCheckFailure as exc:
-            await message.reply(notice_text(str(exc))[:1800], mention_author=False, allowed_mentions=NO_MENTIONS)
-            await self.waiting_notices.clear(message.author.id)
+            await self.agent.handle(message)
+        except (commands.UserFeedbackCheckFailure, discord.HTTPException) as exc:
+            LOG.warning('Fri interaction could not complete: %s', type(exc).__name__)
 
     async def subscription_notice(self):
         """One owner DM per refused sign-in, counting a usable token in between as the end of one."""
@@ -1714,18 +1694,30 @@ class Fri(discord.Client):
         await self.wait_until_ready()
 
     async def close(self):
-        if self.agent:
-            self.agent.close()
-        self.health.cancel()
-        self.owner_reviews.cancel()
-        if self.watching:
-            self.watching.cancel()
-        if self.sign_in_notice:
-            self.sign_in_notice.cancel()
-        await sessions(self).close_all()
-        if self.session:
-            await self.session.close()
-        await super().close()
+        try:
+            try:
+                if self.jpcall_calls is not None:
+                    await self.jpcall_calls.close()
+            finally:
+                try:
+                    if self.jpcall_engine is not None:
+                        await self.jpcall_engine.close()
+                finally:
+                    if self.jpcall_calls is not None:
+                        await self.jpcall_calls.flush_events()
+        finally:
+            if self.agent:
+                self.agent.close()
+            self.health.cancel()
+            self.owner_reviews.cancel()
+            if self.watching:
+                self.watching.cancel()
+            if self.sign_in_notice:
+                self.sign_in_notice.cancel()
+            await sessions(self).close_all()
+            if self.session:
+                await self.session.close()
+            await super().close()
 
 
 def main():
@@ -1734,7 +1726,12 @@ def main():
     configure()
     from .fri_instance import instance_lock
     with instance_lock(os.getenv('FRI_DATA', '/data')):
-        Fri().run(os.environ['DISCORD_TOKEN'], log_handler=None)  # configure() already set up logging.
+        # Use asyncio.run's Ctrl-C path so cleanup can still await in-flight call tasks.
+        previous = signal.signal(signal.SIGTERM, lambda *_: signal.raise_signal(signal.SIGINT))
+        try:
+            Fri().run(os.environ['DISCORD_TOKEN'], log_handler=None)  # configure() already set up logging.
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == '__main__':

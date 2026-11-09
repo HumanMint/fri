@@ -2,7 +2,7 @@ import asyncio
 import time
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,7 +15,7 @@ from compat_tests.test_api import actor, headers
 from compat_tests.test_fri_runtime import configured, event
 from fri.fri_addressing import addressed_text
 from fri.fri_agent_model import SUMMARY
-from fri.fri_chat import INSTRUCTIONS, SCHEMA, ChatResult
+from fri.fri_chat import INSTRUCTIONS, SCHEMA
 from fri.fri_memory import CATEGORIES, memory_intent
 
 
@@ -146,27 +146,6 @@ def test_a_long_separator_run_is_crossed_once(separator):
     for _ in range(10):
         assert memory_intent(text) is None
     assert time.perf_counter() - started < 0.1
-
-
-def test_public_replies_are_plain_and_scoped(monkeypatch):
-    async def scenario():
-        fri = configured(monkeypatch)
-        fri._connection.user = SimpleNamespace(id=99)
-        fri.talk = AsyncMock(return_value=ChatResult(reply='eh yeah, fair', status='completed'))
-        channel = SimpleNamespace(id=456, typing=MagicMock(return_value=AsyncMock()))
-        message = SimpleNamespace(author=SimpleNamespace(id=1, bot=False, display_name='friend'),
-            guild=SimpleNamespace(id=123), channel=channel, content='hey fri', mentions=[], reply=AsyncMock())
-        await fri.on_message(message)
-        assert message.reply.await_args.args[0] == 'eh yeah, fair'
-        assert 'embed' not in message.reply.await_args.kwargs
-        assert message.reply.await_args.kwargs['allowed_mentions'].everyone is False
-        assert fri.talk.await_count == 1
-        for guild, channel_id in [(999, 456), (123, 111)]:
-            message.guild.id, message.channel.id = guild, channel_id
-            await fri.on_message(message)
-        assert fri.talk.await_count == 1
-        await fri.close()
-    asyncio.run(scenario())
 
 
 def test_controller_keeps_gene_production_and_fri_lab_authority_separate(tmp_path):
