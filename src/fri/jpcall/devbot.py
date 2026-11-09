@@ -276,8 +276,8 @@ def main():
         engine, limits = None, config.limits
     logging.basicConfig(level=logging.INFO)
     bot = DevBot(engine, int(guild), limits, config=config, audio_check=args.audio_check)
-    # Client.run already unwinds its async context on KeyboardInterrupt.
-    previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
+    # Use asyncio.run's Ctrl-C path so cleanup can still await in-flight call tasks.
+    previous = signal.signal(signal.SIGTERM, lambda *_: signal.raise_signal(signal.SIGINT))
     try:
         bot.run(token, log_handler=None)
     finally:

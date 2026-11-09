@@ -202,7 +202,8 @@ def test_real_gateway_routes_owner_report_dm_but_not_other_members(monkeypatch, 
         fri = configured(monkeypatch)
         fri._connection.user = discord.ClientUser(state=fri._connection, data={
             'id': '99', 'username': 'fri', 'discriminator': '0', 'avatar': None, 'bot': True})
-        fri.agent = SimpleNamespace(member=AsyncMock(return_value=object()), close=lambda: None)
+        fri.agent = SimpleNamespace(member=AsyncMock(return_value=object()), close=lambda: None,
+                                    taken_back_mark=lambda: 0, reports_held=lambda: False)
         fri.api = AsyncMock(return_value=report)
         await fri._async_setup_hook()
         fri.add_dynamic_items(ReportButton)

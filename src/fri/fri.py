@@ -1726,8 +1726,8 @@ def main():
     configure()
     from .fri_instance import instance_lock
     with instance_lock(os.getenv('FRI_DATA', '/data')):
-        # Docker stop must unwind Client.run's async context, including any active call.
-        previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
+        # Use asyncio.run's Ctrl-C path so cleanup can still await in-flight call tasks.
+        previous = signal.signal(signal.SIGTERM, lambda *_: signal.raise_signal(signal.SIGINT))
         try:
             Fri().run(os.environ['DISCORD_TOKEN'], log_handler=None)  # configure() already set up logging.
         finally:

@@ -32,7 +32,7 @@ async def closed(name):
 class Runner(runtime.Fri):
     def __init__(self):
         discord.Client.__init__(self, intents=discord.Intents.none())
-        self.jpcall_calls = SimpleNamespace(close=lambda: closed('calls'), flush_events=lambda: closed('reports'))
+        self.jpcall_calls = SimpleNamespace(close=self.hang_up, flush_events=lambda: closed('reports'))
         self.jpcall_engine = SimpleNamespace(close=lambda: closed('engine'))
         if sys.argv[2] == 'False':
             self.jpcall_calls = self.jpcall_engine = None
@@ -40,7 +40,11 @@ class Runner(runtime.Fri):
         self.health = self.owner_reviews = SimpleNamespace(cancel=lambda: None)
         self.watching = self.sign_in_notice = None
         self.session = SimpleNamespace(close=lambda: closed('http'))
+    async def hang_up(self):
+        await self.in_flight
+        record('calls')
     async def start(self, *args, **kwargs):
+        self.in_flight = asyncio.create_task(asyncio.sleep(.2))
         marker.with_suffix('.ready').touch()
         await asyncio.Event().wait()
 runtime.Fri = Runner

@@ -235,9 +235,11 @@ import sys
 from fri.jpcall import devbot
 marker = Path(sys.argv.pop())
 async def start(self, *args, **kwargs):
+    self.engine.in_flight = asyncio.create_task(asyncio.sleep(.2))
     marker.with_suffix('.ready').write_text('ready')
     await asyncio.Event().wait()
 async def close(self):
+    await self.in_flight
     marker.write_text('engine closed')
 devbot.DevBot.start = start
 devbot.FakeEngine.close = close
