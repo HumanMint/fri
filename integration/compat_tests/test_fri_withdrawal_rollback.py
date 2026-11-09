@@ -815,7 +815,10 @@ def test_a_record_main_reads_is_read_whole_however_large(monkeypatch, tmp_path):
             padded(tmp_path)
             turns = w.agent.saved_turns = SavedTurns(w.agent)
             assert str(earlier.id) in turns.pending and not turns.closed()
-            assert MARKER not in await next_request(w) and history(w) > 0  # Only that exchange is held back.
+            # Not closed: what this Fri can tell about is read. The exchange saved before the restart isn't, while
+            # the withdrawal waits, since what it drew on can't be told here now (fri #387); one saved since is.
+            await w.agent.handle(w.said('fri and dinner?'))
+            assert MARKER not in await next_request(w) and history(w) > 0
             assert not list(tmp_path.glob('withdrawals.unreadable-*.json'))
         finally:
             await w.fri.close()
