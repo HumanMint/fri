@@ -82,11 +82,11 @@ def test_declining_ai_interpreter_is_shown_plainly():
         async def edit(message, content, **kwargs):
             messages[message] = content
 
-        for outcome in ('declined to talk with an AI interpreter',
-                        'they declined to talk with an ai interpreter.'):
-            summary = CostSummary(send, edit)
-            await summary.emit(CallFinished('r', outcome, 12))
-            assert messages[-1].splitlines()[1] == outcome
+        # The engine's refusal outcome (permission refused), the one refusal route.
+        summary = CostSummary(send, edit)
+        await summary.emit(CallFinished('r', 'The recipient declined to share the call.', 12))
+        assert messages[-1].splitlines() == ['call ended · 0.2 min',
+                                             'the recipient declined to share the call.']
     asyncio.run(run())
 
 
@@ -117,6 +117,17 @@ def test_failed_call_has_one_plain_failure_line_and_cost(detail, outcome, durati
     failure = StatusChanged('r', CallState.FAILED, detail) if detail else None
     assert render_final(finished, usage, False, failure) == (
         f"call didn't connect · {reason}")
+
+
+@pytest.mark.parametrize('detail,shown', [
+    ('Speech transcription was unavailable.', 'Speech transcription was unavailable.'),
+    ('The voice connection ended.', 'the voice connection ended.'),
+])
+def test_a_failure_after_the_call_was_answered_keeps_its_partial_result(detail, shown):
+    finished = CallFinished('r', f'{detail} Six works for two; nothing was booked.', 180)
+    failure = StatusChanged('r', CallState.FAILED, detail)
+    assert render_final(finished, (), False, failure).splitlines() == [
+        'call ended · 3.0 min', f'{shown} Six works for two; nothing was booked.']
 
 
 def test_breakdown_is_private_and_tracks_late_exact_phone_price():

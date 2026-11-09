@@ -196,8 +196,7 @@ class RealtimeClient:
 
     def session_update(self) -> dict:
         language = self.config.language
-        plan = json.dumps({'goal': self._goal, 'summary_en': self.brief.summary_en,
-                           'share': self.brief.share,
+        plan = json.dumps({'goal': self._goal, 'share': self.brief.share,
                            'never': self.brief.never}, ensure_ascii=False)
         session = {
             'type': 'realtime', 'model': self.config.realtime_model,
@@ -416,12 +415,6 @@ class RealtimeClient:
         self._blocked_responses.update(self._allowed_responses)
         self._allowed_responses.clear()
 
-    async def interrupt(self) -> None:
-        self.silence()
-        for response_id in tuple(self._active_responses):
-            await self._send('response_cancel', response_id=response_id)
-        await self._barge_in()
-
     def _output_allowed(self, event: dict) -> bool:
         response_id = event.get('response_id', '')
         return (not self._silenced and not self._stopped and not self._halted
@@ -519,10 +512,10 @@ class RealtimeClient:
 
     async def say(self, text_ja: str, *, out_of_band: bool = False,
                   _opener: bool = False, _notice: bool = False) -> asyncio.Future:
+        """A fixed line: only the literal-speech prefix and the exact text, no conversation rules."""
         return await self.respond(instructions=(
-            self.config.language.instructions + '\n' + self.config.language.say_prefix
-            + json.dumps(text_ja, ensure_ascii=False)), out_of_band=out_of_band,
-            _opener=_opener, _notice=_notice)
+            self.config.language.say_prefix + json.dumps(text_ja, ensure_ascii=False)),
+            out_of_band=out_of_band, _opener=_opener, _notice=_notice)
 
     async def drain(self, timeout_s: float = 8) -> None:
         async with asyncio.timeout(timeout_s):

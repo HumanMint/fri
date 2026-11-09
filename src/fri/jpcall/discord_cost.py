@@ -76,7 +76,7 @@ def failure_reason(finished, failure):
     if re.match(r'^(?:(?:the call |call )?(?:went (?:straight )?to |reached ))?'
                 r'voicemail(?:[.!;:]|$)', text):
         return 'went to voicemail'
-    if failure is None and finished.duration_s > 0:
+    if finished.duration_s > 0:  # Answered: a later failure is not a failure to connect.
         return None
     detail = (failure.detail if failure is not None else finished.outcome_en).casefold()
     if 'busy' in detail:

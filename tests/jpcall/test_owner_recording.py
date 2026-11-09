@@ -4,6 +4,7 @@ import ast
 import asyncio
 import importlib
 import io
+import json
 import socket
 import stat
 import wave
@@ -118,8 +119,10 @@ def test_import_and_language_replacement_have_no_io_or_default_mutation(monkeypa
     assert 'Twilio' in test_language.instructions and '녹음 기능이 작동하면' in test_language.instructions
     assert test_language.opener == '안녕하세요, AI 프리예요. 동의하신 녹음 테스트, 시작해도 될까요?'
     assert len(test_language.opener) <= 45
-    assert '일행 청취·문자 저장에 명확히 동의하면' not in test_language.instructions
-    assert '동의한 AI 녹음 테스트 시작에 명확히 동의하면' in test_language.instructions
+    # Consent is classified only by the owner-specific classifier tool, which grants nothing unclear.
+    assert '명확히 동의하면' not in test_language.instructions
+    assert 'recording test' in test_language.permission_description
+    assert 'unclear and grants nothing' in test_language.permission_description
     assert test_language.hold == '잠시만요, 확인할게요.'
     assert test_language.farewell == original.farewell
     tree = ast.parse(Path(recording.__file__).read_text())
@@ -153,7 +156,8 @@ def test_run_local_recording_notice_reaches_confirmed_brief_and_real_engine(tmp_
             await settled(lambda: bool(call._sid))
             media = await notice(call)
             await media.finish_playback()
-            assert brief.opener_ja in peer.responses[0]['instructions']
+            assert peer.responses[0]['instructions'] == (  # Only the literal prefix and notice.
+                profile.language.say_prefix + json.dumps(brief.opener_ja, ensure_ascii=False))
             await call._rt.handle_event({'type': EVENTS['speech_started'],
                                         'item_id': 'owner-ready', 'audio_start_ms': 2000})
             await call._rt.handle_event({'type': EVENTS['speech_stopped'],
@@ -185,6 +189,7 @@ def test_run_local_recording_notice_reaches_confirmed_brief_and_real_engine(tmp_
                                  if tool['name'] == 'ask_group')
             assert 'owner' in question_tool['description']
             assert 'listening group' not in question_tool['description']
+            assert 'the app asks the callee to wait' in question_tool['description']
             assert not any('/Recordings' in str(r.url) for r in provider.requests)
             assert CALL_LANGUAGES['ko'] is original and '녹음 없이' in original.instructions
             await call.hang_up()

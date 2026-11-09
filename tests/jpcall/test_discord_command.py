@@ -630,7 +630,7 @@ def test_brief_shows_short_opener_and_request_fields_without_a_script_claim():
         assert ('opener · 안녕하세요.\n\ngoal · ' + goal + '\n\n'
                 'share · Name: Alex\nnever · No payment') in text
         assert 'no bookings, payments, fees or cancellation terms' in text
-        assert 'requester 10' in text and 'text remains in this chat' in text
+        assert 'approved by · <@10>' in text and 'text remains in this chat' in text
         await setup.calls.close()
     asyncio.run(run())
 

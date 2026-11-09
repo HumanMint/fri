@@ -21,16 +21,13 @@ class TextClient:
         self.config, self.client = config, client
 
     async def generate(self, component: str, meter: UsageMeter, instructions: str,
-                       data: dict, *, schema: dict | None = None) -> str:
+                       data: dict) -> str:
         body = {
             'model': self.config.text_model, 'store': False,
             'reasoning': {'effort': self.config.text_effort}, 'max_output_tokens': 1200,
             'input': [{'role': 'developer', 'content': instructions},
                       {'role': 'user', 'content': json.dumps(data, ensure_ascii=False)}],
         }
-        if schema is not None:
-            body['text'] = {'format': {'type': 'json_schema', 'name': 'call_brief',
-                                       'strict': True, 'schema': schema}}
         accounted = False
         try:
             response = await self.client.post(

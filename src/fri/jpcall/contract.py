@@ -45,7 +45,7 @@ class CallRequest:
 class CallBrief:
     """The engine's plan, shown to members before dialing."""
     request_id: str
-    summary_en: str             # one paragraph members confirm
+    summary_en: str             # the member's goal as confirmed
     opener_ja: str              # first thing Fri says, includes AI + listening/transcription notice
     share: tuple[str, ...]
     never: tuple[str, ...]

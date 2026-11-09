@@ -125,14 +125,17 @@ def test_phone_rhythm_and_stop_after_opener(code, phrases):
 
 
 @pytest.mark.parametrize('code', ['ja', 'ko'])
-def test_agreement_decline_and_recording_instructions(code):
+def test_refusal_and_recording_instructions(code):
     instructions = CALL_LANGUAGES[code].instructions
-    assert 'end_call' in instructions and 'declined to talk with an AI interpreter' in instructions
+    # One refusal route, the withdrawal; consent itself is classified in the classifier lane.
+    assert 'end_call' not in instructions and 'decision="granted"' not in instructions
+    assert 'permission(decision="refused")' in instructions
+    assert 'permission(decision="transfer")' in instructions
     if code == 'ja':
-        assert '了承後' in instructions and '断られたら' in instructions
+        assert 'AI通訳との通話や共有を断られたら' in instructions
         assert '録音はせず' in instructions and '文字を共有' in instructions
         assert 'グループも通話を聞きます' in instructions
     else:
-        assert '동의하면' in instructions and '거절하면' in instructions
+        assert 'AI 통역 통화나 공유를 거절하면' in instructions
         assert '녹음 없이' in instructions and '문자로 공유' in instructions
         assert '일행도 통화를 들어요' in instructions

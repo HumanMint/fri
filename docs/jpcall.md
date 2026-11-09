@@ -37,14 +37,16 @@ jpcall is Fri-only. It does not use the Gene controller.
   the notice or an unclear reply grants nothing and gets at most one repeat of the
   notice per consent phase, within the existing deadlines.
   Permission recognition remains model inference, not a perfect detector.
-  A refusal ends the call with a plain decline outcome and the fixed goodbye. Recording questions
+  A refusal, before or during the inquiry, is one permission withdrawal: it ends the call with a
+  plain decline outcome and the fixed goodbye. Recording questions
   are answered truthfully: no audio is recorded, and the group gets a text transcript.
 - Twilio webhooks never decompress request bodies; encoded or undecodable status bodies
   are refused before parsing and signature checks.
 - Only allowlisted members can start calls. Numbers must be Japanese (`+81`) unless listed as test numbers.
   Emergency and premium-rate prefixes are refused.
 - Fri only gathers information. It never books, pays, gives card numbers, or accepts fees or cancellation terms; group answers cannot expand that authority.
-- Holds are app-timed: at most one check-in after 45 s of callee silence, with an unresolved
+- Holds are app-timed, and the app tells the callee to wait; the model only asks the group.
+  At most one check-in follows after 45 s of callee silence, with an unresolved
   ending and the fixed goodbye after the hold limit. A delivered natural response replaces the
   check-in; raw VAD noise only postpones it. No automatic callback is made.
 - An ordinary end (the callee hangs up, `end_call`, a limit, or the requester's Stop) is not a
@@ -90,7 +92,8 @@ uv run python -m fri.jpcall.devbot --fake-engine --allow-user MEMBER_ID
 In fake mode, repeat `--allow-user` for each member who may start a call; the default
 allows nobody. The brief, transcript, questions, outcome and costs go in the channel where
 `/jpcall` was invoked (including a voice channel's own chat). Fri joins the requester's voice
-channel. Only the requester can confirm or cancel the brief. Only the requester answers a question, with its buttons;
+channel. Only the requester can confirm or cancel the brief; it names them by mention without notifying anyone.
+Only the requester answers a question, with its buttons;
 other members may suggest facts in chat. Chat isn't passed to the call. In main Fri, a reply to a running call's
 post isn't chat with Fri, and Fri's own chat channel stops answering unaddressed lines while a call posts there.
 Privacy controls ("forget me", "remember me again", "what do you remember about me?") keep their usual path.
@@ -127,7 +130,8 @@ change during report delivery. A transcript line whose English never arrived is 
 `translation unavailable` in the final transcript.
 The complete outcome/conditions/reference are attached as call-result.txt;
 persistent controls retain costs, not the outcome. Unknown phone termination is
-shown separately from local closure. Late price updates edit only the cost embed. Busy, no-answer and voicemail outcomes get a plain `call didn't connect` line. Exact
+shown separately from local closure. Late price updates edit only the cost embed. Busy, no-answer and voicemail outcomes get a plain `call didn't connect` line;
+a failure after the call was answered keeps `call ended`, its duration and the partial outcome. Exact
 phone prices edit that same message; repeated finish events never create additional reports.
 `cost details` opens the per-component/model units and USD privately, including input/output
 token totals across models. Cached counts are included once, with `~` for estimates and
@@ -168,17 +172,19 @@ show `fri` or `callee`, the original line, then the English translation on the n
 with an arrow; they do not name the source language.
 
 The brief shows the short opener separately from the member's goal and share/never facts.
-The goal is context for the conversation, rather than a script to read aloud. The outcome
-renderer also preserves a callee's refusal to talk with an AI interpreter plainly. Discord
+The goal is context for the conversation, rather than a script to read aloud. A refusal is
+reported plainly as the recipient declining to share the call. Discord
 UI references to the bot use `fri`; spoken-name pronunciation belongs to the engine.
 
 ### Conversation settings
 
 The voice defaults are `JPCALL_REALTIME_MODEL=gpt-realtime-2.1`,
 `JPCALL_REALTIME_VOICE=coral`, and `JPCALL_REALTIME_SPEED=1.15` (valid range 0.25–1.5).
-The session receives the original member goal alongside the English plan, as data.
+The session receives the original member goal once, with the approved share/never facts, as data.
 Fri introduces itself once, waits for permission, then asks one concrete question at a time.
-Hold lines run out of band with only the short phone rules and the exact line to say.
+Fixed lines (the notice, hold, check-in and fixed goodbye) carry only the short literal-speech
+prefix and the exact text; conversation and authority rules stay in the session. Consent is
+classified only by the permission classifier, where anything not explicit is `unclear` and grants nothing.
 
 | Setting | Default | Accepted values |
 |---|---|---|

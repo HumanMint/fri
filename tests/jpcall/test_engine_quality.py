@@ -33,13 +33,12 @@ def no_network(monkeypatch):
 def test_prompt_prevents_reintroduction(code, already, exception):
     text = CALL_LANGUAGES[code].instructions
     assert already in text and exception in text
-    assert 'ask_group' in text and 'end_call' in text
-    assert 'declined to talk with an AI interpreter' in text
+    assert 'ask_group' in text and 'permission(decision="refused")' in text
     assert 'Fri' not in text
 
 
 @pytest.mark.parametrize('code', ['ja', 'ko'])
-def test_original_goal_first_and_oob_context_contains_only_short_prompt_and_line(
+def test_original_goal_once_and_oob_context_contains_only_short_prompt_and_line(
         tmp_path, monkeypatch, code):
     async def run():
         engine, provider, peer, http, clock, runner = await make_engine(
@@ -50,9 +49,9 @@ def test_original_goal_first_and_oob_context_contains_only_short_prompt_and_line
             text = peer.sent[0]['session']['instructions']
             data, rules = text[len(language.plan_label):].split('\n', 1)
             plan = json.loads(data)
-            # Original injection-like goal stays JSON data.
-            assert plan['goal'] == call.request.goal
-            assert plan['summary_en'] == brief.summary_en
+            # The original injection-like goal stays JSON data, sent once with its share/never.
+            assert list(plan) == ['goal', 'share', 'never']
+            assert plan['goal'] == call.request.goal and text.count(call.request.goal) == 1
             assert plan['share'] == list(brief.share) and plan['never'] == list(brief.never)
             assert rules == language.instructions
             await answer_phone(call)
@@ -62,8 +61,8 @@ def test_original_goal_first_and_oob_context_contains_only_short_prompt_and_line
                 response = peer.responses[-1]
                 assert response['conversation'] == 'none' and response['input'] == []
                 assert response['tools'] == [] and response['tool_choice'] == 'none'
-                assert response['instructions'] == (language.instructions + '\n'
-                    + language.say_prefix + json.dumps(line, ensure_ascii=False))
+                assert response['instructions'] == (
+                    language.say_prefix + json.dumps(line, ensure_ascii=False))
                 assert call.request.goal not in response['instructions']
         finally:
             await engine.close()

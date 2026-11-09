@@ -614,7 +614,7 @@ class DiscordCalls:
                     f'share · {"; ".join(request.share) or "nothing extra"}\n'
                     f'never · {"; ".join(request.never) or "no extra limits"}\n\n'
                     'information only · no bookings, payments, fees or cancellation terms.\n'
-                    f'answers approved by · requester {request.requester_id}\n'
+                    f'answers approved by · <@{request.requester_id}>\n'
                     'notice · AI assistant; group listens and text remains in this chat.\n'
                     f'limits · {self.limits.attempt_s:g}s call; '
                     f'{self.limits.max_hold_s:g}s per answer.\n'

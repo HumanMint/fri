@@ -128,7 +128,6 @@ class Provider:
         self.requests = []
         self.prices = [None, '-0.25']
         self.create_gate = None
-        self.brief_gate = None
         self.bad_translation = False
         self.bad_summary = False
         self.hangups = 0
@@ -139,12 +138,7 @@ class Provider:
             body = json.loads(request.content)
             assert body['store'] is False and body['reasoning'] == {'effort': 'low'}
             instructions = body['input'][0]['content']
-            if instructions.startswith('Prepare'):
-                self.order.append('brief')
-                if self.brief_gate is not None:
-                    await self.brief_gate.wait()
-                text = json.dumps({'summary_en': 'Ask whether lunch is available.'})
-            elif instructions.startswith('Translate'):
+            if instructions.startswith('Translate'):
                 self.order.append('translation')
                 if self.bad_translation:
                     return httpx.Response(500)
@@ -292,9 +286,9 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(
             tools = call._rt.session_update()['session']['tools']
             assert tools[0]['description'] == (
                 'Report explicit permission to AI processing, group listening and retained '
-                'transcription. Never grant on ambiguous input. Report refusal or a transfer.')
+                'transcription, a refusal or a transfer. Anything else is unclear and grants nothing.')
             assert tools[1]['description'] == (
-                'Politely hold the callee and ask the listening group for a decision.')
+                'Ask the listening group for a missing fact; the app asks the callee to wait.')
             assert 'Fri' not in brief.opener_ja
             assert brief.share == request().share and brief.never == request().never
             assert brief.summary_en == request().goal
@@ -304,8 +298,7 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(
             assert not call._meter.lines()
             await answer_phone(call)
             opener = peer.responses[0]['instructions']
-            assert opener.count(language.opener) == 1
-            assert json.loads(opener.rsplit(language.say_prefix, 1)[1]) == language.opener
+            assert opener == language.say_prefix + json.dumps(language.opener, ensure_ascii=False)
             assert 'Fri' not in opener
             await settled(lambda: call._rt._idle.is_set())
             response_start = len(peer.responses)
