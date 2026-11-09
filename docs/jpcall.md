@@ -102,6 +102,9 @@ Release main Fri through the existing Gene maintainer batch and maintenance wind
 Do not run a second process with main Fri's token. The call and chat paths share the
 container's resource limit, so a live trial must also check ordinary Fri responsiveness.
 Offline tests and a phone-only owner test do not establish that shared-runtime behavior.
+The main entrypoint handles Docker's stop signal through Discord's normal cleanup;
+Compose allows 30 seconds before forced termination. This is a shutdown allowance,
+not proof of remote call termination.
 
 Run the standalone development identity with `JPCALL_DEV_DISCORD_TOKEN` and
 `JPCALL_DEV_GUILD_ID` supplied by the environment:

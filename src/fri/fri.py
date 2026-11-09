@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 import uuid
 from pathlib import Path
@@ -1725,7 +1726,12 @@ def main():
     configure()
     from .fri_instance import instance_lock
     with instance_lock(os.getenv('FRI_DATA', '/data')):
-        Fri().run(os.environ['DISCORD_TOKEN'], log_handler=None)  # configure() already set up logging.
+        # Docker stop must unwind Client.run's async context, including any active call.
+        previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
+        try:
+            Fri().run(os.environ['DISCORD_TOKEN'], log_handler=None)  # configure() already set up logging.
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ services:
       - ${FRI_AUTH_DIR:?Set the existing subscription directory}:/auth
     networks: [controller]
     restart: unless-stopped
+    stop_grace_period: 30s
     init: true
     read_only: true
     tmpfs: [/tmp]
