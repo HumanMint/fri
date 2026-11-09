@@ -34,6 +34,10 @@ class AttemptJournal:
             if not self._initialized.is_file() or self._initialized.is_symlink():
                 raise ValueError
             self.read()
+        except BlockingIOError:
+            os.close(fd)
+            self._lock = None
+            raise CallRejected('Calling is already in use; stop the calling runtime first.') from None
         except BaseException:
             os.close(fd)
             self._lock = None

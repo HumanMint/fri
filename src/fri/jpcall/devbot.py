@@ -92,8 +92,6 @@ class FakeSession:
         return True
 
     async def hang_up(self, reason='requested'):
-        self.publication_allowed = False
-        self.consent_generation += 1
         if self.task is not None and self.task is not asyncio.current_task():
             self.task.cancel()
             try:
@@ -119,8 +117,6 @@ class FakeSession:
             if self.ended:
                 return
             self.ended = True
-            self.publication_allowed = False
-            self.consent_generation += 1
             if self.question_open:
                 self.question_open = False
                 await self.emit(QuestionClosed, 'time', 'call_ended')

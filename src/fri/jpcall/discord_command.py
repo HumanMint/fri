@@ -308,7 +308,7 @@ class DiscordCall:
         self.pager = TranscriptPager(self.send, self.edit, allowed=self.text_allowed)
         self.cost = CostSummary(self.send, self.edit,
                                 http=self.text_channel._state.http,
-                                channel_id=self.text_channel.id, allowed=self.text_allowed)
+                                channel_id=self.text_channel.id)
         def capture_voice(client, channel):
             # Keep the client even if the handshake raises or is cancelled.
             self.voice = CallVoiceClient(client, channel)

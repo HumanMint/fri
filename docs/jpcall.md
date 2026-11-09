@@ -51,12 +51,13 @@ jpcall is Fri-only. It does not use the Gene controller.
   withdrawal. Live callee relay, new capture and new turns stop at once; text captured under
   consent, its final transcription (up to 2 s), its translations and queued transcript writes
   still finish inside the 8-second cleanup bound. A refusal, transfer or other withdrawal, even
-  while closing, still revokes queued text, translations and the summary, up to the final
-  report's actual send. Fri says exactly one goodbye: the one spoken with `end_call`, otherwise
+  while closing, still revokes queued text, translations and the summary before the final
+  report is built. Fri says exactly one goodbye: the one spoken with `end_call`, otherwise
   the fixed farewell (at most 5 s). A callee hang-up and failures end without one. The
-  requester's Stop says none and silences Fri at once, before the hang-up request: no further
-  Fri audio reaches the phone or the group, the phone buffer is cleared, and speech already
-  played stays in the transcript, marked interrupted.
+  requester's Stop says none and blocks new Fri audio to both destinations at once. It clears
+  the group's queue and starts clearing the phone buffer without waiting for the model's cancel.
+  Speech already played stays in the transcript, marked interrupted; actual phone cutoff latency
+  still needs live measurement.
 - Transcripts include third parties. By default they live only in Discord messages; jpcall
   persists no call content. The optional development timeline below retains text when enabled.
   Audio is never recorded or persisted. The usage ledger stores counts and costs only.
@@ -120,9 +121,9 @@ and channel behavior.
 The public final report has the call duration, a compact outcome and cost embed.
 The summary runs beside the goodbye and hang-up and must finish within the same cleanup bound.
 If it is unavailable, the outcome says `Summary unavailable; see the transcript.`, adding
-`end_call`'s own description only as `Fri’s unverified note`. An outcome built from call text
-carries its consent generation; the report checks it again before every send and retry, and
-withheld details are never restored. A transcript line whose English never arrived is marked
+`end_call`'s own description only as `Fri’s unverified note`. The summary is dropped if consent
+is withdrawn before the final report is built; the reader is then stopped, so consent cannot
+change during report delivery. A transcript line whose English never arrived is marked
 `translation unavailable` in the final transcript.
 The complete outcome/conditions/reference are attached as call-result.txt;
 persistent controls retain costs, not the outcome. Unknown phone termination is

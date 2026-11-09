@@ -377,8 +377,16 @@ def test_requester_stop_fences_active_speech_at_once_and_keeps_played_evidence(
             await settled(lambda: len(media.marks) == 2)
             await call.mark(media.marks.pop(0))  # The phone has played the first 20 ms only.
             gate, hangup = asyncio.Event(), engine._twilio.hang_up
+            cancel_gate, send = asyncio.Event(), peer.send_json
+
+            async def slow_cancel(event):
+                if event['type'] == EVENTS['response_cancel']:
+                    await cancel_gate.wait()
+                return await send(event)
+            peer.send_json = slow_cancel
 
             async def delayed_hangup(sid):
+                media.log.append('hangup')
                 await gate.wait()
                 return await hangup(sid)
             engine._twilio.hang_up = delayed_hangup
@@ -388,6 +396,9 @@ def test_requester_stop_fences_active_speech_at_once_and_keeps_played_evidence(
             assert call._ending and not rt._output_allowed({'response_id': response})
             sent = media.log.count('audio')
             chunk(peer, response, item)  # The model keeps generating after Stop.
+            await settled(lambda: 'hangup' in media.log)
+            cleared_before_cancel = 'clear' in media.log
+            cancel_gate.set()
             await settled(lambda: 'clear' in media.log)  # Phone cleared before the hang-up returns.
             assert media.log.count('audio') == sent and len(audio.frames) == pushed
             peer.feed({'type': EVENTS['output_transcript'], 'response_id': response, 'item_id': item,
@@ -400,6 +411,7 @@ def test_requester_stop_fences_active_speech_at_once_and_keeps_played_evidence(
             truncate = next(e for e in peer.sent if e['type'] == EVENTS['truncate'])
             assert truncate['item_id'] == item and truncate['audio_end_ms'] == 20
             assert farewells(engine, peer) == 0 and provider.hangups == 1
+            assert cleared_before_cancel  # Model backpressure cannot delay the phone clear.
         finally:
             await engine.close()
             await http.aclose()
@@ -494,7 +506,7 @@ def test_withdrawal_after_the_summary_completed_never_reaches_the_report(tmp_pat
             await asyncio.wait_for(call._finished.wait(), 5)
             finish = next(e for e in events.items if isinstance(e, CallFinished))
             assert 'Lunch' not in finish.outcome_en and 'Seven' not in finish.outcome_en
-            assert finish.consent_generation is None and not call._transcript
+            assert not call._transcript
             if when == 'while_translations_settle':  # Queued English is revoked too.
                 assert not any(isinstance(e, Translation) and e.item_id == 'private'
                                for e in events.items)
@@ -504,47 +516,48 @@ def test_withdrawal_after_the_summary_completed_never_reaches_the_report(tmp_pat
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('withdrawn', ['never', 'after_admission', 'before_retry', 'generic'])
-def test_final_report_rechecks_consent_at_the_actual_send(withdrawn):
+def test_consent_is_frozen_before_the_final_report_leaves_the_engine(tmp_path, monkeypatch):
+    async def run():
+        engine, provider, peer, http, clock, runner = await make_engine(tmp_path, monkeypatch)
+        try:
+            call, brief, audio, events = await dial(engine, provider)
+            await answer_phone(call)
+            rt, seen, deliver = call._rt, [], call._deliver_event
+
+            async def observe(event, generation=None):
+                if isinstance(event, CallFinished):
+                    assert rt._task is None and rt._on_tool_call is None
+                    seen.append((call.publication_allowed, call.consent_generation))
+                await deliver(event, generation)
+            call._deliver_event = observe
+            peer.tool('end_call', {'outcome_en': 'Done.'}, 'end1')
+            await asyncio.wait_for(call._finished.wait(), 5)
+            peer.tool('permission', {'decision': 'refused'}, 'late-withdrawal')
+            await asyncio.sleep(0)
+            assert seen == [(call.publication_allowed, call.consent_generation)]
+        finally:
+            await engine.close()
+            await http.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('ending', ['finish', 'hang_up'])
+def test_fake_engine_keeps_the_final_translation_on_ordinary_close(ending):
     from test_discord_command import Setup
 
-    from fri.jpcall.discord_cost import WITHHELD
+    from fri.jpcall.devbot import FakeSession
 
     async def run():
         setup = Setup()
         call = await setup.start()
-        session, rid = setup.session, call.request.request_id
-        sent, failed = [], []
-        original = setup.channel.send.side_effect
-
-        def withdraw():
-            session.publication_allowed, session.consent_generation = False, 2
-
-        async def send(content, **kwargs):
-            if withdrawn == 'before_retry' and content and 'call ended' in content and not failed:
-                failed.append(True)
-                withdraw()  # Consent changes while the first attempt fails.
-                raise RuntimeError('synthetic transient send failure')
-            body = kwargs.get('file')
-            sent.append((content or '') + (body.fp.getvalue().decode() if body else ''))
-            return await original(content, **kwargs)
-        setup.channel.send.side_effect = send
-        generation = None if withdrawn == 'generic' else 1
-        outcome = ('The business line was busy.' if withdrawn == 'generic'
-                   else 'Lunch is available at noon for two.')
-        await call.emit(CallFinished(rid, outcome, 61.0, termination_confirmed=True,
-                                     consent_generation=generation))
-        if withdrawn in ('after_admission', 'generic'):
-            withdraw()  # Admitted to the display queue, not yet sent.
+        fake = FakeSession(call.request, call.audio, call)
+        call.session = fake
+        await fake.speak('last', 'fri', 'ありがとうございました。', 'thank you.', 440)
+        await getattr(fake, ending)('fake call ended.')
         await call.flush_events()
-        await call.cost.flush()
-        report = '\n'.join(sent)
-        edits = '\n'.join(str(m.edits) for m in setup.messages)
-        if withdrawn in ('never', 'generic'):
-            assert outcome.lower()[:12] in report.lower()
-        else:
-            assert 'Lunch' not in report and 'Lunch' not in edits and WITHHELD in report
-            assert call.cost.finished.outcome_en == WITHHELD  # Not retained for later edits.
+        await call.pager.flush()
+        assert fake.publication_allowed and fake.consent_generation == 1
+        assert any('thank you.' in ''.join(row) for row in call.pager._rows)
     asyncio.run(run())
 
 
@@ -675,7 +688,7 @@ def test_stopped_runtime_reconcile_refuses_while_running_and_ends_a_known_call(
         call, brief, audio, events = await dial(engine, provider)
         await call.hang_up()
         assert engine.recovery_status()['sid_known'] and engine.recovery_status()['phase'] == 'uncertain'
-        with pytest.raises(CallRejected):  # The running runtime owns the journal lock.
+        with pytest.raises(CallRejected, match='already in use; stop the calling runtime first'):
             await engine_module.reconcile_stopped(config, http_client=http)
         await engine.close()
         try:
@@ -786,6 +799,33 @@ def test_prepermission_asr_recovery_repeats_the_notice_once_without_waiting_on_p
 
 
 # ---- 10: the result has its own bound; a missing summary never claims there were no facts ---
+
+def test_completed_summary_survives_a_later_transport_cleanup_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine_module, 'CLEANUP_S', 1.0)
+
+    async def run():
+        provider = Gated()
+        provider.summary_delay = .05
+        engine, provider, peer, http, clock, runner = await make_engine(tmp_path, monkeypatch, provider)
+        try:
+            call, brief, audio, events = await dial(engine, provider)
+            await answer_phone(call)
+            await callee_line(call, 'last', '七時なら二名様で空いています。')
+
+            async def stalled_close():
+                await asyncio.Event().wait()
+            call._rt._media.close = stalled_close
+            await call.status({'CallSid': SID, 'CallStatus': 'completed', 'SequenceNumber': '9'})
+            await asyncio.wait_for(call._finished.wait(), 2)
+            finish = next(e for e in events.items if isinstance(e, CallFinished))
+            assert provider.summaries and finish.termination_confirmed
+            assert finish.outcome_en == 'Lunch is available at noon. No reservation was confirmed.'
+            assert not engine._sessions and not call._transcript
+        finally:
+            await engine.close()
+            await http.aclose()
+    asyncio.run(run())
+
 
 def test_a_summary_slightly_over_two_seconds_is_used(tmp_path, monkeypatch):
     async def run():

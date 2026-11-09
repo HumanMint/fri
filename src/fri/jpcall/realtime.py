@@ -383,9 +383,9 @@ class RealtimeClient:
             responses = tuple(self._active_responses)
 
             async def cut():  # Clear the phone and truncate at the acknowledged played length.
+                await self._barge_in()
                 for response_id in responses:
                     await self._send('response_cancel', response_id=response_id)
-                await self._barge_in()
 
             self._background(cut())
 

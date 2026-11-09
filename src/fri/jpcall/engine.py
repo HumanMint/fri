@@ -988,6 +988,9 @@ class _Session:
                 self.engine._cleanup_failed |= bool(pending)
             self._tasks.clear()
             self._translations.clear()
+            if (summary is None and result is not None and result.done()
+                    and not result.cancelled() and result.exception() is None):
+                summary = result.result()  # Phone cleanup may time out after this result finished.
             reason = self._detail
             if not self._termination_confirmed and self._attempt:
                 with suppress(CallRejected):
@@ -1004,14 +1007,12 @@ class _Session:
                 async with asyncio.timeout(1):
                     self._state = CallState.FAILED if self._failed else CallState.ENDED
                     await self._deliver_event(StatusChanged(self._request_id, self._state, self._detail))
-                    # Final fence, at the last moment: a summary from withdrawn consent is dropped,
-                    # and the report carries the generation its content needs (checked at send).
+                    # The reader is stopped; consent is frozen before the report leaves the engine.
                     granted = self._publication_allowed
                     await self._deliver_event(CallFinished(self._request_id, self._outcome(
                         summary if granted and consent == self.consent_generation else None, reason),
                         duration, self._meter.lines(), usage_final=False,
-                        termination_confirmed=self._termination_confirmed,
-                        consent_generation=self.consent_generation if granted else None))
+                        termination_confirmed=self._termination_confirmed))
             self._transcript.clear()
             self._outcome_hint = ''
             self.request = replace(self.request, number_e164='', goal='', share=(), never=())

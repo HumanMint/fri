@@ -133,7 +133,6 @@ class CallFinished:
     usage: tuple[UsageLine, ...] = ()
     usage_final: bool = False   # False while late prices (Twilio) are still pending
     termination_confirmed: bool | None = None
-    consent_generation: int | None = None  # Set when the outcome carries consented call content.
 
 
 @dataclass(frozen=True)
