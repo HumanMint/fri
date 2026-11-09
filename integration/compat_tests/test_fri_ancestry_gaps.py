@@ -201,3 +201,59 @@ def test_a_reply_drawing_on_one_that_cant_be_told_still_cant_once_that_record_go
     assert int(first) not in turns.drawn
     assert turns.depends_on([later]) == ({first}, True)
     asyncio.run(fri.close())
+
+
+# Sol round 1 of #399.
+
+def chained(monkeypatch, tmp_path, most, length):
+    """`length` replies saved here, each drawing on the one before, with MOST records kept. Returns the records and
+    the newest reply's ID."""
+    monkeypatch.setattr('fri.fri_turn_withdrawal.MOST', most)
+    fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+    fri.capabilities = frozenset(asyncio.run(fri.api('GET', '/fri/contract'))['capabilities'])
+    turns, previous = agent.saved_turns, None
+    for n in range(length):
+        said = source(age=length+10-n, channel='1')
+        turns.kept({'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20',
+                    'revision': 0, 'source': said, 'drew_on': [previous] if previous else []}, {},
+                   (time.time(), time.monotonic()))
+        previous = said['id']
+    asyncio.run(fri.close())
+    return turns.drawn, previous
+
+
+@pytest.mark.parametrize('most', [2, 20000], ids=['two records kept', 'the default'])
+def test_a_long_chain_keeps_its_ancestry_bounded(monkeypatch, tmp_path, most):
+    """F2: 1,000 replies, each drawing on the one before. Pruning capped the records, but each kept all it inherited:
+    the newest held 999 ancestors with two records kept, and the default kept half a million references. A record
+    keeps all it drew on itself, and at most a hundred more it inherited; one that had to let some go says what it
+    drew on can't all be told."""
+    records, newest = chained(monkeypatch, tmp_path, most, 1000)
+    assert len(records) == min(most, 1000)
+    assert sum(len(entry[2]) for entry in records.values()) <= len(records)*101
+    assert records[int(newest)][3]  # Its ancestry was cut: what it drew on can't all be told.
+
+
+def test_a_short_chain_keeps_all_of_its_ancestry(monkeypatch, tmp_path):
+    """Under the cap, nothing is let go: the newest of 50 holds its 49 ancestors, and says it can tell."""
+    records, newest = chained(monkeypatch, tmp_path, 20000, 50)
+    assert len(records[int(newest)][2]) == 49 and not records[int(newest)][3]
+
+
+def test_a_summary_isnt_cleared_for_a_reply_held_back_only_for_what_cant_be_told(monkeypatch, tmp_path):
+    """F3: member 20's summary, and a saved reply of theirs this Fri can't trace, drawing on no summary. A withdrawal
+    waits whose message member 30 wrote, so it can't be one of the summary's sources. The reply stays out while it
+    waits (item 1), but the summary, which that withdrawal can't hold, stays as on main."""
+    fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+    fri.capabilities = frozenset(asyncio.run(fri.api('GET', '/fri/contract'))['capabilities'])
+    turns = agent.saved_turns
+    turns.kick = lambda: None
+    theirs = int(source(age=900, user='30', channel='1')['id'])
+    turns.withdraw([theirs], 123, deleted=True, authors={theirs: 30})
+    reply = {'input': 'and?', 'reply': 'and '+MARKER, 'burst': [],
+             'source': {'kind': 'discord_message', 'id': source(age=200, channel='1')['id']}}
+    summary = {'text': 'raids', 'refreshed': time.time()-3600}
+    context = {'turns': [reply], 'pending': None, 'elsewhere': [], 'member_summary': summary}
+    turns.withhold(context, member='20')
+    assert context['turns'] == [] and context['member_summary'] == summary
+    asyncio.run(fri.close())
