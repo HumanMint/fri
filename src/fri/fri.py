@@ -422,6 +422,10 @@ class Fri(discord.Client):
                 self.agent.channel_withdrawals.drop(context)
                 if fence.get('reread') is None or depth >= REREADS:
                     raise commands.UserFeedbackCheckFailure(CHANNELS_MOVED)
+                if fence.get('settlements', self.agent.saved_turns.settlements) != self.agent.saved_turns.settlements:
+                    if fence.get('settlement_reread'):
+                        raise commands.UserFeedbackCheckFailure(CHANNELS_MOVED)
+                    fence['settlement_reread'] = True
                 await fence['reread'](context)
                 return await ready(depth + 1)
             looked = [read['event'].id for read in context.get('image_reads', [])]
@@ -494,7 +498,8 @@ class Fri(discord.Client):
                 # A context a channel's withdrawal moved past is read again before the turn's check, which it would
                 # otherwise decide: a reply it holds may have drawn on a summary that went with the channel (Sol round
                 # 4 of #372, S1). Its earlier requests' dependencies stay in the fence.
-                if self.agent and self.agent.channel_withdrawals.moved(fence.get('channels')):
+                if self.agent and (self.agent.channel_withdrawals.moved(fence.get('channels')) or
+                                   fence.get('settlements', self.agent.saved_turns.settlements) != self.agent.saved_turns.settlements):
                     return await refreshed()
                 prospective = self.dependencies(self.standing(context))
                 try:
@@ -524,7 +529,8 @@ class Fri(discord.Client):
             # a take-back from here on withholds the answer, and keeps nothing at the save (fri #215).
             # And a context read before a channel's withdrawal was accepted, whole: what it held of the channel can't be
             # told from the rest, a note naming no message, say (fri #372 round 2, B3).
-            if self.agent and fence and self.agent.channel_withdrawals.moved(fence.get('channels')):
+            if self.agent and fence and (self.agent.channel_withdrawals.moved(fence.get('channels')) or
+                                         fence.get('settlements', self.agent.saved_turns.settlements) != self.agent.saved_turns.settlements):
                 return await refreshed()  # Accepted during the checks above (see refreshed).
             if self.agent:  # And what saved replies, and the member's summary, drew on (fri #332).
                 seen.update(int(i) for i in self.agent.saved_turns.withhold(
@@ -703,6 +709,7 @@ class Fri(discord.Client):
         try:
             async with self.chat_slots:
                 # Channel withdrawals accepted from here on drop this context whole (see ready, fri #372 round 2, B3).
+                settlements = self.agent.saved_turns.settlements if self.agent else None
                 channels = self.agent.channel_withdrawals.generation if self.agent else None
                 context = place_notes(self.get_channel, attributed(await self.api(
                     'POST', '/chat/context', profiled(self, scope, True))), scope['conversation_id'])
@@ -720,6 +727,7 @@ class Fri(discord.Client):
                 async def reread(into):
                     """What drop takes, read again into the request's context, as above, after a channel's withdrawal
                     was accepted past the read it came from (Sol round 3 of #372). Its fences run again (see ready)."""
+                    settled = self.agent.saved_turns.settlements
                     generation = self.agent.channel_withdrawals.generation  # Before the read, as above.
                     fresh = self.shaped(place_notes(self.get_channel, attributed(await self.api(
                         'POST', '/chat/context', profiled(self, scope, True))), scope['conversation_id']),
@@ -730,6 +738,7 @@ class Fri(discord.Client):
                     context.update(fresh)
                     into.update(fresh)
                     into['fence']['channels'] = generation
+                    into['fence']['settlements'] = settled
                 conversation, targets = {}, []
                 if self.agent and source.kind == 'discord_message':
                     from .fri_conversation import evidence
@@ -903,6 +912,7 @@ class Fri(discord.Client):
                                              'input': text, 'reply': '', 'model': context['model'],
                                              'effort': context['effort']},
                                     'actions': actions, 'shown': set(), 'began': began, 'channels': channels,
+                                    'settlements': settlements,
                                     'reread': reread if self.agent else None}
                 if self.agent and source.kind == 'discord_message':
                     context['fence']['commit'] = lambda: self.agent.commit(event)

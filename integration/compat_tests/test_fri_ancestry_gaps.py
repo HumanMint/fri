@@ -230,6 +230,7 @@ def test_a_long_chain_keeps_its_ancestry_bounded(monkeypatch, tmp_path, most):
     drew on can't all be told."""
     records, newest = chained(monkeypatch, tmp_path, most, 1000)
     assert len(records) == min(most, 1000)
+    assert all(len(entry[2]) <= 100 for entry in records.values())
     assert sum(len(entry[2]) for entry in records.values()) <= len(records)*101
     assert records[int(newest)][3]  # Its ancestry was cut: what it drew on can't all be told.
 
@@ -256,4 +257,20 @@ def test_a_summary_isnt_cleared_for_a_reply_held_back_only_for_what_cant_be_told
     context = {'turns': [reply], 'pending': None, 'elsewhere': [], 'member_summary': summary}
     turns.withhold(context, member='20')
     assert context['turns'] == [] and context['member_summary'] == summary
+    asyncio.run(fri.close())
+
+
+def test_truncated_ancestry_is_held_while_a_withdrawal_waits(monkeypatch, tmp_path):
+    records, newest = chained(monkeypatch, tmp_path, 20000, 150)
+    other = tmp_path/'second'
+    other.mkdir()
+    fri, agent, *_ = environment(monkeypatch, other, channel_id=1)
+    fri.capabilities = frozenset(asyncio.run(fri.api('GET', '/fri/contract'))['capabilities'])
+    turns = agent.saved_turns
+    turns.drawn = records
+    turns.kick = lambda: None
+    turns.withdraw([int(source(age=900, channel='1')['id'])], 123, deleted=True)
+    context = {'turns': [{'reply': MARKER, 'source': {'id': newest}}]}
+    turns.withhold(context)
+    assert context['turns'] == []
     asyncio.run(fri.close())
