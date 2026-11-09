@@ -32,9 +32,15 @@ jpcall is Fri-only. It does not use the Gene controller.
 - Calls open with a short AI-interpreter introduction and ask whether the callee will talk.
   The notice includes AI processing, group listening and retained transcription.
   Callee relay/text is suppressed until explicit permission; withdrawal fences
-  queued output. Permission recognition remains model inference, not a perfect detector.
+  queued output. Only a reply that begins after the complete notice was acknowledged
+  as played can be classified; cleared or interrupted audio never counts. Speech over
+  the notice or an unclear reply grants nothing and gets at most one repeat of the
+  notice per consent phase, within the existing deadlines.
+  Permission recognition remains model inference, not a perfect detector.
   A refusal ends the call with a plain decline outcome. Recording questions
   are answered truthfully: no audio is recorded, and the group gets a text transcript.
+- Twilio webhooks never decompress request bodies; encoded or undecodable status bodies
+  are refused before parsing and signature checks.
 - Only allowlisted members can start calls. Numbers must be Japanese (`+81`) unless listed as test numbers.
   Emergency and premium-rate prefixes are refused.
 - Fri only gathers information. It never books, pays, gives card numbers, or accepts fees or cancellation terms; group answers cannot expand that authority.
@@ -73,7 +79,10 @@ uv run python -m fri.jpcall.devbot --fake-engine --allow-user MEMBER_ID
 In fake mode, repeat `--allow-user` for each member who may start a call; the default
 allows nobody. The brief, transcript, questions, outcome and costs go in the channel where
 `/jpcall` was invoked (including a voice channel's own chat). Fri joins the requester's voice
-channel. Only the requester can confirm or cancel the brief. Only the requester may approve an answer; other members may suggest facts in chat.
+channel. Only the requester can confirm or cancel the brief. Only the requester answers a question, with its buttons;
+other members may suggest facts in chat. Chat isn't passed to the call. In main Fri, a reply to a running call's
+post isn't chat with Fri, and Fri's own chat channel stops answering unaddressed lines while a call posts there.
+Privacy controls ("forget me", "remember me again", "what do you remember about me?") keep their usual path.
 The bot needs guild and voice-state intents, the applications.commands scope, and view
 channel, send messages and embed links permissions in the invoking channel, plus connect
 and speak permissions in the test voice channel. It connects self-deafened and never receives or forwards member audio.
@@ -93,8 +102,8 @@ Ctrl-C and SIGTERM both unwind the client's call cleanup before the runner exits
 `register(tree, client, engine, guild_ids, limits=limits)` returns the Discord call
 manager; call its async `close()` on shutdown. Supply the configured `Limits` explicitly;
 the default is deny-all. Main Fri enables voice-state intent and opens/registers the engine
-only when its configuration is enabled. `/jpcall` and `jpcall:` component/modal IDs pass the
-usual channel filter into their own allowlist, requester and voice membership checks. Call
+only when its configuration is enabled. `/jpcall` skips the `/fri` panel's channel check and
+relies on its own allowlist, requester and voice membership checks, as every `jpcall:` control does. Call
 operations do not use the Gene controller. Disabled configuration keeps the existing command
 and channel behavior.
 
@@ -191,8 +200,10 @@ calls can append to the same file. Unsetting it disables writes for new sessions
 
 Events include VAD starts/stops, response creation/completion/cancellation, truncation with
 played milliseconds, tool arguments/results, final transcripts, echo drops, and hold
-start/check-in/answer. No audio bytes or API credentials are written. This file contains
-private conversation text, including dropped echoes; keep it outside the checkout, restrict
+start/check-in/answer. No audio bytes or API credentials are written. Text and tool
+content are written only when the consent captured with them is still current;
+pre-consent, refused and withdrawn speech keeps its timing event without content.
+This file still contains private conversation text; keep it outside the checkout, restrict
 access and delete it after diagnosis. It has no automatic retention policy. It is separate
 from the counts/costs-only usage ledger. A write failure logs a fixed message and does not
 end the call. Normal logs never include timeline transcripts or paths.
@@ -219,7 +230,7 @@ Confirmation uses the exact original goal and approved facts without a paid
 pre-call paraphrase. Request/brief equality and expiry still prevent stale
 confirmation. Ringing is bounded at 30 seconds and media readiness at 20 seconds.
 Notice delivery has a 30-second bound; the recipient then has 20 seconds to
-answer after phone playback drains. A transfer gets a new notice and response
+answer after the complete notice is acknowledged as played. A transfer gets a new notice and response
 deadline. The whole attempt remains bounded at at most 600 seconds. Stop works
 during connection.
 No verified dollar spending cap is claimed; estimates and actual posted prices

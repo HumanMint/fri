@@ -185,7 +185,7 @@ class QuestionView(Controls):
 
     async def interaction_check(self, interaction):
         if not self.call.requester(interaction) or not self.call.in_channel(interaction):
-            await tell(interaction, 'the requester approves answers; others can suggest them in chat.')
+            await tell(interaction, 'only the requester can answer; suggest it to them in chat.')
             return False
         return True
 
@@ -199,7 +199,7 @@ class QuestionView(Controls):
 
     async def submit(self, interaction, answer):
         if not self.call.requester(interaction) or not self.call.in_channel(interaction):
-            await tell(interaction, 'the requester approves answers; others can suggest them in chat.')
+            await tell(interaction, 'only the requester can answer; suggest it to them in chat.')
             return
         if not answer.strip():
             await tell(interaction, 'i need a few words to pass along.')
@@ -240,6 +240,7 @@ class DiscordCall:
         self.pager = self.cost = None
         self.hangup = self.hangup_message = None
         self.questions = {}
+        self.posts = set()  # IDs of this call's own posts: a reply to one is to the call, not to chat Fri.
         self.phase = 'planning'
         self._pending_events = deque()
         self._event_worker = None
@@ -278,7 +279,9 @@ class DiscordCall:
             del self.owner.active[self.request.guild_id]
 
     async def send(self, content, **kwargs):
-        return await self.text_channel.send(content, allowed_mentions=NO_MENTIONS, **kwargs)
+        message = await self.text_channel.send(content, allowed_mentions=NO_MENTIONS, **kwargs)
+        self.posts.add(getattr(message, 'id', None))
+        return message
 
     async def edit(self, message, content=discord.utils.MISSING, **kwargs):
         await message.edit(content=content, allowed_mentions=NO_MENTIONS, **kwargs)
@@ -524,7 +527,7 @@ class DiscordCall:
             question = (f'{event.text_original}\n↳ {event.text_en}'
                         if event.text_original else event.text_en)
             pages = chunks(f'a question for the requester · {question}{options}\n'
-                           'others may suggest answers in chat. information only; no commitments.')
+                           'answer with the buttons; chat isn\'t passed on. information only; no commitments.')
             for index, content in enumerate(pages):
                 if (not self.publication_allowed(generation)
                         or time.monotonic() >= view.deadline):
@@ -544,6 +547,13 @@ class DiscordCalls:
         self.limits = limits
         self.active = {}
         self._event_tasks = set()
+
+    def posted(self):
+        """The running calls' own posts, which chat Fri leaves to the call (see Agent.call_posts)."""
+        return frozenset(i for call in self.active.values() for i in call.posts)
+
+    def posting_in(self, channel_id):
+        return any(getattr(call.text_channel, 'id', None) == channel_id for call in self.active.values())
 
     def accepts(self, interaction):
         if interaction.guild_id not in self.guild_ids:

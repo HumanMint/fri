@@ -79,7 +79,8 @@ def interaction(kind=discord.InteractionType.application_command, *, data=None,
                 guild=1, channel=2):
     return SimpleNamespace(type=kind, data=data or {'name': 'jpcall'}, guild_id=guild,
                            channel_id=channel, channel=SimpleNamespace(id=channel, parent_id=None),
-                           user=SimpleNamespace(id=10, bot=False), message=None)
+                           user=SimpleNamespace(id=10, bot=False), message=None,
+                           response=SimpleNamespace(is_done=lambda: False, send_message=AsyncMock()))
 
 
 @pytest.mark.parametrize('enabled', [False, True])
@@ -115,38 +116,38 @@ def test_fri_lifecycle_registers_before_sync_only_when_enabled(monkeypatch, tmp_
 
 
 @pytest.mark.parametrize('enabled', [False, True])
-def test_dispatch_and_tree_route_only_narrow_jpcall_interactions(monkeypatch, tmp_path, enabled):
+def test_tree_routes_only_narrow_jpcall_interactions(monkeypatch, tmp_path, enabled):
+    """The command tree's own check is the gate (discord.py routes commands and controls before any dispatch). Out of
+    Fri's channels, in Fri's server, the member hears privately where /fri opens; another server hears nothing."""
     async def run():
-        cfg, events, forwarded = config(enabled), [], []
+        cfg, events = config(enabled), []
         bot = fri_bot(monkeypatch, tmp_path, cfg)
         engine_stub(monkeypatch, cfg, events)
         bot.tree.sync = AsyncMock()
         await bot.setup_hook()
-        monkeypatch.setattr(discord.Client, 'dispatch',
-                            lambda self, event, *args, **kwargs: forwarded.append((event, args)))
+        assert 'dispatch' not in vars(runtime.Fri)  # No interaction filter that discord.py never consults.
         cases = [
-            (interaction(), enabled),
-            (interaction(discord.InteractionType.component, data={'custom_id': 'jpcall:call'}), enabled),
+            (interaction(), enabled, not enabled),
+            (interaction(discord.InteractionType.component, data={'custom_id': 'jpcall:call'}), enabled, not enabled),
             (interaction(discord.InteractionType.modal_submit,
-                         data={'custom_id': 'jpcall:submit:test'}), enabled),
-            (interaction(data={'name': 'fri'}), False),
-            (interaction(data={'name': 'jpcall-extra'}), False),
-            (interaction(data={'name': 'jpcall'}, guild=8), False),
-            (interaction(data={'name': 'jpcall'}, guild=None), False),
+                         data={'custom_id': 'jpcall:submit:test'}), enabled, not enabled),
+            (interaction(data={'name': 'fri'}), False, True),
+            (interaction(data={'name': 'jpcall-extra'}), False, True),
+            (interaction(data={'name': 'jpcall'}, guild=8), False, False),
+            (interaction(data={'name': 'jpcall'}, guild=None), False, False),
             (interaction(discord.InteractionType.component,
-                         data={'custom_id': 'other:jpcall:call'}), False),
+                         data={'custom_id': 'other:jpcall:call'}), False, True),
             (interaction(discord.InteractionType.application_command,
-                         data={'custom_id': 'jpcall:call', 'name': 'fri'}), False),
-            (interaction(discord.InteractionType.component, data={'name': 'jpcall'}), False),
-            (interaction(data={'name': 'fri'}, channel=3), True),
+                         data={'custom_id': 'jpcall:call', 'name': 'fri'}), False, True),
+            (interaction(discord.InteractionType.component, data={'name': 'jpcall'}), False, True),
+            (interaction(data={'name': 'fri'}, channel=3), True, False),
         ]
-        for event, expected in cases:
-            before = len(forwarded)
-            bot.dispatch('interaction', event)
-            assert (len(forwarded) > before) is expected
+        for event, expected, told in cases:
             assert bool(await bot.tree.interaction_check(event)) is expected
-        bot.dispatch('ready')
-        assert forwarded[-1] == ('ready', ())
+            assert event.response.send_message.await_count == int(told)
+            if told:
+                text = event.response.send_message.await_args.kwargs['content']
+                assert '<#3>' in text and event.response.send_message.await_args.kwargs['ephemeral'] is True
         assert bot.api.await_count == 1
         await bot.close()
     asyncio.run(run())

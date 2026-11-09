@@ -87,6 +87,8 @@ class _Command:
     generation: int = 0
     consent_generation: int | None = None
     opener: bool = False
+    notice: int | None = None    # The notice sequence this command speaks.
+    reply_to: int | None = None  # The delivered notice current when this command was created.
 
 
 class RealtimeClient:
@@ -140,7 +142,15 @@ class RealtimeClient:
         self._input_context: dict[str, int | None] = {}
         # Notice replies need an epoch even before publication is permitted.
         self._input_generations: dict[str, int] = {}
+        # Consent is classified only for speech that began after the complete current notice
+        # was acknowledged as played (cleared or interrupted audio never counts).
+        self._input_notice: dict[str, int | None] = {}
+        self._notice_seq = 0
+        self._notice_response: str | None = None
+        self._notice_delivered = asyncio.Event()
+        self._renoticed: int | None = None
         self._response_context: dict[str, int | None] = {}
+        self._response_notice: dict[str, int | None] = {}  # The delivered notice it classifies.
         self._ends: dict[str, float] = {}
         self._asr_timers: dict[str, asyncio.Task] = {}
         self._asr_failed_items: set[str] = set()
@@ -235,7 +245,8 @@ class RealtimeClient:
                 self._ws = await self._session.ws_connect(
                     REALTIME_URL, params={'model': self.config.realtime_model},
                     headers={'Authorization': 'Bearer ' + self.config.openai_api_key},
-                    heartbeat=20, timeout=10, max_msg_size=4 * 1024 * 1024,
+                    heartbeat=20, timeout=aiohttp.ClientWSTimeout(ws_close=10),
+                    max_msg_size=4 * 1024 * 1024,
                 )
                 await self._ws.send_json(self.session_update())
                 async with asyncio.timeout(10):
@@ -275,12 +286,37 @@ class RealtimeClient:
             return
         self._opener_requested = True
         self._conversation_open = False
-        generated = await self.say(self.brief.opener_ja, _opener=True)
+        generated = await self.say(self.brief.opener_ja, _opener=True, _notice=True)
         if await generated != 'completed':
             raise RealtimeError('The voice service could not speak the opening.')
         if not self._silenced and not self._stopped:
             self._conversation_open = True
             self._schedule_reply()
+
+    @property
+    def notice_delivered(self) -> bool:
+        """The current notice completed and every byte was acknowledged as played."""
+        return self._notice_delivered.is_set()
+
+    async def notice_delivery(self, timeout_s: float) -> None:
+        async with asyncio.timeout(timeout_s):
+            await self._notice_delivered.wait()
+
+    def _current_notice(self, notice: int | None) -> bool:
+        return notice is not None and notice == self._notice_seq and self._notice_delivered.is_set()
+
+    def _claim_renotice(self) -> bool:
+        """One automatic repeat of the notice per consent generation, after it was generated."""
+        if (self._permission or not self._conversation_open or self._silenced or self._stopped
+                or self._renoticed == self._permission_generation):
+            return False
+        self._renoticed = self._permission_generation
+        return True
+
+    async def clarify_notice(self) -> None:
+        """An unclear reply hears the existing notice once more; it never grants anything."""
+        if self._claim_renotice():
+            await self.repeat_notice()
 
     def set_permission(self, granted: bool) -> None:
         """Fence queued speech before the caller awaits any consent cleanup."""
@@ -302,6 +338,7 @@ class RealtimeClient:
             return
         self._permission = False
         self._opener_requested = self._conversation_open = False
+        self._notice_delivered.clear()  # A new recipient or refusal needs a new complete notice.
         self._blocked_commands.update(self._commands)
         self._blocked_responses.update(self._active_responses)
         self._blocked_responses.update(self._allowed_responses)
@@ -352,7 +389,9 @@ class RealtimeClient:
                 await asyncio.shield(self._revocation)
             if (command.generation != self._permission_generation
                     or command.number in self._blocked_commands
-                    or (self._speech_pending and not command.opener)):
+                    or (self._speech_pending and not command.opener)
+                    or (not self._permission and not command.opener
+                        and not self._current_notice(command.reply_to))):
                 self._commands.pop(command.number, None)
                 if not command.done.done():
                     command.done.set_result('cancelled')
@@ -364,9 +403,9 @@ class RealtimeClient:
                     tool for tool in self._tools if tool.get('name') == 'permission'],
                     tool_choice={'type': 'function', 'name': 'permission'})
                 command.response['instructions'] = (
-                    'Use only permission(decision=granted/refused/transfer) to classify the '
-                    'callee reply to the notice. Ambiguous input grants nothing. Do not speak '
-                    'or start the inquiry.')
+                    'Use only permission(decision=granted/refused/transfer/unclear) to classify '
+                    'the callee reply to the notice. Anything not explicit is unclear. Do not '
+                    'speak or start the inquiry.')
             self._idle.clear()
             self._pending = command
             await self._send('response_create', event_id='jpcall-' + command.number,
@@ -384,7 +423,8 @@ class RealtimeClient:
         return task
 
     async def respond(self, *, instructions: str | None = None,
-                      out_of_band: bool = False, _opener: bool = False) -> asyncio.Future:
+                      out_of_band: bool = False, _opener: bool = False,
+                      _notice: bool = False) -> asyncio.Future:
         self._response_seq += 1
         number = str(self._response_seq)
         response = {'metadata': {'jpcall_command': number}}
@@ -392,10 +432,15 @@ class RealtimeClient:
             response['instructions'] = instructions
         if out_of_band:
             response.update(conversation='none', input=[], tools=[], tool_choice='none')
+        if _notice:  # Earlier notices and replies to them stop counting before any await.
+            self._notice_seq += 1
+            self._notice_response = None
+            self._notice_delivered.clear()
         command = _Command(number, response, asyncio.get_running_loop().create_future(),
                            self._permission_generation,
                            self._publication_context() if self._publication_context else None,
-                           _opener)
+                           _opener, self._notice_seq if _notice else None,
+                           self._notice_seq if self._notice_delivered.is_set() else None)
         self._commands[number] = command
 
         def cancelled(done):
@@ -426,11 +471,11 @@ class RealtimeClient:
         return command.done
 
     async def say(self, text_ja: str, *, out_of_band: bool = False,
-                  _opener: bool = False) -> asyncio.Future:
+                  _opener: bool = False, _notice: bool = False) -> asyncio.Future:
         return await self.respond(instructions=(
             self.config.language.instructions + '\n' + self.config.language.say_prefix
             + json.dumps(text_ja, ensure_ascii=False)), out_of_band=out_of_band,
-            _opener=_opener)
+            _opener=_opener, _notice=_notice)
 
     async def drain(self, timeout_s: float = 8) -> None:
         async with asyncio.timeout(timeout_s):
@@ -539,10 +584,16 @@ class RealtimeClient:
         self._utterances.add(key)
         if speaker == 'fri' and delivery == 'complete':
             self._remember_speech(item_id, text)
-        self.timeline.record('transcript', speaker=speaker, item_id=item_id, text=text)
+        self.timeline.record('transcript', speaker=speaker, item_id=item_id,
+                             **({'text': text} if self._admitted(consent_generation) else {}))
         await self.events.emit(Utterance(self.brief.request_id, item_id, speaker,
                                          text, started_at, ended_at, delivery,
                                          consent_generation=consent_generation))
+
+    def _admitted(self, generation: int | None) -> bool:
+        """Debug text needs consent at capture that is still current; otherwise timing only."""
+        current = self._publication_context() if self._publication_context else None
+        return generation is not None and generation == current
 
     @staticmethod
     def _normalized(text: str) -> str:
@@ -598,6 +649,8 @@ class RealtimeClient:
                             for part in parts):
             return
         self._delivered_responses.add(response_id)
+        if response_id == self._notice_response:
+            self._notice_delivered.set()
         if response_id not in self._opener_responses and self._on_callee_response:
             self._on_callee_response()
 
@@ -644,7 +697,7 @@ class RealtimeClient:
                         + ', briefly say you could not hear and ask the callee to repeat. '
                         'Do not state or confirm any inquiry facts.'))
                 else:
-                    done = await self.say(self.brief.opener_ja, _opener=True)
+                    done = await self.say(self.brief.opener_ja, _opener=True, _notice=True)
                 if await done != 'completed':
                     raise RealtimeError('The voice service could not clarify.')
                 await self.drain(timeout_s=ASR_TIMEOUT_S)
@@ -689,6 +742,8 @@ class RealtimeClient:
             command = self._commands.get(number)
             self._response_context.setdefault(response['id'],
                 command.consent_generation if command is not None else None)
+            self._response_notice.setdefault(response['id'], command.reply_to if (
+                command is not None and not command.opener) else None)
             if command is not None:
                 self._response_commands[response['id']] = number
             explicit = (command is not None and command.opener
@@ -696,6 +751,8 @@ class RealtimeClient:
                         and number not in self._blocked_commands)
             if explicit:
                 self._opener_responses.add(response['id'])
+                if command.notice == self._notice_seq:
+                    self._notice_response = response['id']
             if explicit or (self._permission and self._conversation_open and not self._speech_pending):
                 self._allowed_responses.add(response['id'])
             if (self._silenced or (not explicit and not self._conversation_open)
@@ -711,6 +768,8 @@ class RealtimeClient:
             self._input_context.setdefault(event['item_id'],
                 self._publication_context() if self._publication_context else None)
             self._input_generations.setdefault(event['item_id'], self._permission_generation)
+            self._input_notice.setdefault(
+                item, self._notice_seq if self._notice_delivered.is_set() else None)
             if not self._opener_requested:
                 self._preopening_items.add(event['item_id'])
             if (fresh and self._permission and self._conversation_open
@@ -783,7 +842,8 @@ class RealtimeClient:
                 return
             echo = self._is_echo(text)
             if echo:
-                self.timeline.record('echo_uncertain', item_id=item, text=text)
+                self.timeline.record('echo_uncertain', item_id=item, **(
+                    {'text': text} if self._admitted(self._input_context.get(item)) else {}))
             await self._utterance(item, 'callee', text,
                                   self._starts.get(item, self._clock() - self._answered_at),
                                   ended_at=self._ends.get(item),
@@ -798,12 +858,21 @@ class RealtimeClient:
                 if self._asr_recovery is not None:
                     self._asr_recovery.cancel()
                     self._asr_recovery = None
+                # Speech that began before the complete notice played is never classified.
+                # Recover it with one repeat of the notice; otherwise let the notice play on.
+                early = not self._permission and not self._current_notice(
+                    self._input_notice.get(item))
+                if early and not self._claim_renotice():
+                    return
                 if self._conversation_open and not interrupted_at_start:
                     # Pre-permission notice replies retain the existing ASR gate.
                     for response_id in tuple(self._active_responses):
                         self._blocked_responses.add(response_id)
                         await self._send('response_cancel', response_id=response_id)
                     await self._barge_in()
+                if early:
+                    self._background(self.repeat_notice())
+                    return
                 self._reply_generation = generation
                 self._schedule_reply()
         elif kind == EVENTS['output_audio']:
@@ -901,8 +970,9 @@ class RealtimeClient:
                     if call_id in self._tools_seen:
                         continue
                     self._tools_seen.add(call_id)
-                    self.timeline.record('tool_call', call_id=call_id, name=item['name'],
-                                         arguments=item.get('arguments'))
+                    self.timeline.record('tool_call', call_id=call_id, name=item['name'], **(
+                        {'arguments': item.get('arguments')}
+                        if self._admitted(self._response_context.get(response_id)) else {}))
                     try:
                         arguments = json.loads(item['arguments'])
                         if not isinstance(arguments, dict):
@@ -910,8 +980,10 @@ class RealtimeClient:
                     except (ValueError, TypeError):
                         self._background(self.tool_result(call_id, {'error': 'Invalid arguments'}))
                         continue
-                    if not self._permission and item['name'] != 'permission':
-                        continue
+                    notice = self._response_notice.get(response_id)
+                    if not self._permission and (item['name'] != 'permission'
+                                                 or not self._current_notice(notice)):
+                        continue  # Before consent only a reply classifier for this notice decides.
                     await self._on_tool_call(item['name'], arguments, call_id)
         elif kind == EVENTS['error']:
             code = self._log_error(event)
@@ -934,7 +1006,10 @@ class RealtimeClient:
             self._update_idle()
 
     async def tool_result(self, call_id: str, result: dict, *, respond: bool = True) -> None:
-        self.timeline.record('tool_result', call_id=call_id, result=result)
+        self.timeline.record('tool_result', call_id=call_id, **(
+            {'result': result} if self._admitted(
+                self._publication_context() if self._publication_context else None)
+            else {'keys': sorted(result)}))
         await self._send('item_create', item={'type': 'function_call_output',
                                              'call_id': call_id, 'output': json.dumps(result)})
         if respond:
@@ -991,9 +1066,12 @@ class RealtimeClient:
         self._ends.clear()
         self._input_context.clear()
         self._input_generations.clear()
+        self._input_notice.clear()
+        self._notice_delivered.clear()
         self._speech_pending.clear()
         self._reply_generation = None
         self._response_context.clear()
+        self._response_notice.clear()
         self._asr_timers.clear()
         self._asr_failed_items.clear()
         self._input_seen.clear()

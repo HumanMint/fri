@@ -1,6 +1,6 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock
 
 import discord
 
@@ -23,39 +23,13 @@ def event(user=10, channel=456, guild=123, name='member', kind='message', conten
                 channel=SimpleNamespace(id=channel), guild=SimpleNamespace(id=guild) if guild else None)
 
 
-def test_fri_dispatch_gates_other_servers_channels_and_dm_messages(monkeypatch):
+def test_fri_identity_keeps_its_intents_and_invisible_status(monkeypatch):
+    """Commands and controls each check their own server, channel and person (tests/test_interaction_routing.py):
+    discord.py routes them before any dispatch, so Fri keeps no interaction filter there."""
     async def scenario():
         fri = configured(monkeypatch)
         assert fri.intents.message_content is True
         assert fri._connection._status == 'invisible'
-        fri._connection.user = SimpleNamespace(id=99)
-        event = SimpleNamespace(guild_id=123, channel_id=456, channel=SimpleNamespace(id=456),
-            type=discord.InteractionType.component, user=SimpleNamespace(id=10),
-            message=SimpleNamespace(author=SimpleNamespace(id=99)),
-            data={'custom_id': 'fri:review:i:a:012345abcdef:' + 'a' * 64})
-        with patch.object(discord.Client, 'dispatch') as dispatch:
-            fri.dispatch('interaction', event)
-            assert dispatch.call_count == 1
-            event.guild_id = 999
-            fri.dispatch('interaction', event)
-            assert dispatch.call_count == 1
-            event.guild_id = None
-            fri.dispatch('interaction', event)
-            assert dispatch.call_count == 2
-            event.user.id = 20
-            fri.dispatch('interaction', event)
-            assert dispatch.call_count == 2
-            event.guild_id, event.channel_id = 123, 111
-            fri.dispatch('interaction', event)
-            assert dispatch.call_count == 2
-        fri.talk = AsyncMock()
-        message = SimpleNamespace(author=SimpleNamespace(bot=False), guild=None)
-        await fri.on_message(message)
-        message.guild = SimpleNamespace(id=123)
-        message.channel = SimpleNamespace(id=456)
-        message.mentions = []
-        message.content = 'just chatting'
-        await fri.on_message(message)
-        fri.talk.assert_not_awaited()
+        assert 'dispatch' not in vars(Fri)
         await fri.close()
     asyncio.run(scenario())

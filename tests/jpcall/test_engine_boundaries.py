@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from test_engine_flow import SID, answer_phone, dial, make_engine, request, settled
+from test_engine_permission import notice
 
 from fri.jpcall.contract import CallFinished, CallRejected, CallState, StatusChanged, Utterance
 from fri.jpcall.realtime import EVENTS
@@ -42,6 +43,9 @@ def test_permission_fences_callee_publication_and_requester_answers(tmp_path, mo
             assert not engine._server._status[routes.status_token].relay_allowed()
             await call.emit(Utterance(call.request.request_id, 'before', 'callee', 'private', 0))
             assert not call._transcript
+            await call._handle_tool('permission', {'decision': 'granted'}, 'before-notice')
+            assert not call.publication_allowed  # No complete notice has played yet.
+            await (await notice(call)).finish_playback()
             await call._handle_tool('permission', {'decision': 'granted'}, 'consent1')
             assert call.publication_allowed
             generation = call.consent_generation
@@ -71,9 +75,11 @@ def test_capture_and_engine_queue_never_acquire_new_consent(tmp_path, monkeypatc
         entered = asyncio.Event()
         try:
             call, brief, audio, events = await dial(engine, provider)
+            await (await notice(call)).finish_playback()
             await call._rt.handle_event({'type': EVENTS['speech_started'],
                                         'item_id': 'pregrant', 'audio_start_ms': 0})
             await call._handle_tool('permission', {'decision': 'granted'}, 'consent')
+            assert call.publication_allowed
             await settled(lambda: call._rt._idle.is_set())
             before = len(peer.responses)
             await call._rt.handle_event({'type': EVENTS['input_transcript'],

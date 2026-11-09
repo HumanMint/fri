@@ -37,14 +37,17 @@ def pinged(message, bot_id):
          any(getattr(getattr(r, 'tags', None), 'bot_id', None) == bot_id for r in roles))))
 
 
-async def addressed_text(message, bot_id):
+async def addressed_text(message, bot_id, calls=()):
+    """`calls`: a phone call's own posts (jpcall). A reply to one is to the call, whose requester answers with its
+    buttons, so it isn't said to chat Fri; Fri's name or a mention still is. Callers pass none for a privacy control
+    (see Agent.call_posts)."""
     content = message.content or ''
     explicit = explicit_mention(message, bot_id)
     # Quoted messages, code, URLs and Friday should not wake Fri by accident.
     name = named(content)
     reference = getattr(message, 'reference', None)
     responding = False
-    if not explicit and not name and reference and reference.message_id:
+    if not explicit and not name and reference and reference.message_id and reference.message_id not in calls:
         original = reference.resolved
         if original is None:
             try:

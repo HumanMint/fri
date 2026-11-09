@@ -5,6 +5,7 @@ import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import discord
 import pytest
 
 from compat_tests.test_fri_mentions import environment
@@ -124,34 +125,6 @@ def test_a_forget_me_said_to_someone_else_leaves_local_context_alone(monkeypatch
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('text', ['fri forget about me', 'fri forget me pls'])
-def test_the_no_agent_fallback_rechecks_a_memory_control_after_typing_starts(monkeypatch, tmp_path, text):
-    """Without the agent, a control edited while Fri started typing is read as it is now, not as it came in
-    (review of fri #195, round 3)."""
-    from contextlib import asynccontextmanager
-    async def scenario():
-        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
-        try:
-            await remembered(agent, store, message)
-            fri.agent = None
-            fri.workshop_id = 1
-            control = message(text)
-
-            @asynccontextmanager
-            async def typing():  # Edited into ordinary chat while typing starts.
-                edited = copy.copy(control)
-                edited.content = 'fri what about the game tonight'
-                rows[control.id] = edited
-                yield
-            channel.typing = typing
-            await fri.on_message(control)
-            assert memory(store) == (True, True)
-            assert not any(path == '/chat/memory/control' for path, _ in calls)
-        finally:
-            await fri.close()
-    asyncio.run(scenario())
-
-
 @pytest.mark.parametrize('text', ['forget about me', 'forget me pls'])
 def test_an_unaddressed_forget_me_outside_a_conversation_leaves_local_context_alone(monkeypatch, tmp_path, text):
     """In an ordinary watched channel, with no conversation going, a bare "forget me" isn't said to Fri: it's dropped
@@ -199,26 +172,6 @@ def test_a_reply_to_fri_found_on_a_second_look_is_still_a_memory_control(monkeyp
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('text', ['fri forget about me', 'fri forget me', 'fri remember me again'])
-def test_the_no_agent_fallback_leaves_memory_changes_to_the_panel(monkeypatch, tmp_path, text):
-    """Without the agent nothing can fence an edit or delete that takes a control back while it runs, and an erasure
-    can't be undone, so the fallback points to /fri instead of changing memory (review of fri #195, round 4)."""
-    async def scenario():
-        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
-        try:
-            await remembered(agent, store, message)
-            fri.agent = None
-            fri.workshop_id = 1
-            control = message(text)
-            await fri.on_message(control)
-            assert memory(store) == (True, True)
-            assert not any(path == '/chat/memory/control' for path, _ in calls)
-            assert '/fri' in control.reply.await_args.args[0]
-        finally:
-            await fri.close()
-    asyncio.run(scenario())
-
-
 @pytest.mark.parametrize('text', ['forget me', 'forget about me'])
 def test_a_control_withdrawn_during_its_last_reply_target_lookup_is_not_carried_out(monkeypatch, tmp_path, text):
     """The message is read again after every reply-target lookup, so an edit that lands during the last one, before
@@ -247,5 +200,142 @@ def test_a_control_withdrawn_during_its_last_reply_target_lookup_is_not_carried_
             assert memory(store) == (True, True)
             assert not any(path == '/chat/memory/control' for path, _ in calls)
         finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+async def on_a_call(fri, channel, message):
+    """/jpcall running in this channel, as main Fri sees it: the call manager's posts there, Fri's messages (see
+    DiscordCalls.posted and posting_in). The real manager records them in tests/jpcall; Gene's venv lacks its voice deps."""
+    post = message('a question for the requester · will you use the parking lot?', user=99)
+    fri.jpcall_calls = SimpleNamespace(posted=lambda: frozenset({post.id}), posting_in=lambda cid: cid == channel.id)
+    return fri.jpcall_calls, post
+
+
+def to(post):
+    return SimpleNamespace(message_id=post.id, channel_id=1, resolved=post)
+
+
+@pytest.mark.parametrize('text', ['forget me', 'forget about me'])
+def test_a_memory_control_replying_to_a_running_calls_post_is_still_one(monkeypatch, tmp_path, text):
+    """Ordinary replies to a call's posts are the call's, never chat Fri's; a privacy control said to that post of
+    Fri's keeps its usual path, rechecks and all, and so does "remember me again" (CORE-1 review)."""
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            agent.dedicated = 0
+            await remembered(agent, store, message)
+            agent.active.clear()
+            _, post = await on_a_call(fri, channel, message)
+            control = message(text)
+            control.reference = to(post)
+            await agent.handle(control)
+            assert memory(store) == (False, False)
+            assert 'erased' in control.reply.await_args.args[0]
+            again = message('remember me again')
+            again.reference = to(post)
+            await agent.handle(again)
+            assert memory(store)[0] is True
+        finally:
+            fri.jpcall_calls = None  # The call ended.
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['forget me', 'forget about me'])
+def test_a_plain_memory_control_in_fris_chat_channel_still_works_during_a_call(monkeypatch, tmp_path, text):
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            await remembered(agent, store, message)
+            agent.active.clear()  # Fri's channel itself lets it in, not a follow-up window.
+            await on_a_call(fri, channel, message)
+            control = message(text)
+            await agent.handle(control)
+            assert memory(store) == (False, False)
+            assert 'erased' in control.reply.await_args.args[0]
+        finally:
+            fri.jpcall_calls = None  # The call ended.
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_ordinary_lines_during_a_call_stay_with_the_call_but_explicit_chat_doesnt(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            await remembered(agent, store, message)
+            agent.active.clear()  # No follow-up window: a line right after chatting with Fri still is one, call or not.
+            fri.chat_once.reset_mock()
+            _, post = await on_a_call(fri, channel, message)
+            plain, answer = message('ask if they have parking'), message('yes, one car', user=30)
+            answer.reference = to(post)
+            for event in (plain, answer):
+                await agent.handle(event)
+                event.reply.assert_not_awaited()
+            fri.chat_once.assert_not_awaited()
+            assert memory(store) == (True, True)
+            await agent.handle(named := message('fri what do you think'))
+            fri.chat_once.assert_awaited()
+            named.reply.assert_awaited()
+        finally:
+            fri.jpcall_calls = None  # The call ended.
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_a_forget_me_said_to_someone_else_in_fris_chat_channel_during_a_call_still_isnt_one(monkeypatch, tmp_path):
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            await remembered(agent, store, message)
+            await on_a_call(fri, channel, message)
+            theirs = message('ugh this game', user=30)
+            control = message('forget me')
+            control.reference = SimpleNamespace(message_id=theirs.id, channel_id=1, resolved=theirs)
+            await agent.handle(control)
+            assert memory(store) == (True, True)
+            assert not any(path == '/chat/memory/control' for path, _ in calls)
+        finally:
+            fri.jpcall_calls = None  # The call ended.
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('change', ['edited', 'deleted'])
+def test_a_forget_me_to_a_call_post_taken_back_during_its_reply_target_lookup_is_not_carried_out(
+        monkeypatch, tmp_path, change):
+    """As for a reply to any of Fri's messages: the control is read again after the turn's last lookup of the post it
+    replies to, so one edited or deleted during it, before its gateway event, is not carried out."""
+    async def scenario():
+        fri, agent, store, channel, message, calls, rows = seeded(monkeypatch, tmp_path)
+        try:
+            agent.dedicated = 0
+            await remembered(agent, store, message)
+            agent.active.clear()
+            _, post = await on_a_call(fri, channel, message)
+            control = message('forget me')
+            control.reference = SimpleNamespace(message_id=post.id, channel_id=1, resolved=None)
+            original, lookups = channel.fetch_message.side_effect, []
+            def fetch(mid):
+                if mid == post.id:
+                    lookups.append(mid)
+                    if len(lookups) == 2:  # The last lookup, inside the turn.
+                        if change == 'edited':
+                            edited = copy.copy(control)
+                            edited.content = 'never mind'
+                            rows[control.id] = edited
+                        else:
+                            del rows[control.id]
+                if mid not in rows:
+                    raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+                return original(mid)
+            channel.fetch_message.side_effect = fetch
+            await agent.handle(control)
+            assert len(lookups) >= 2
+            assert memory(store) == (True, True)
+            assert not any(path == '/chat/memory/control' for path, _ in calls)
+        finally:
+            fri.jpcall_calls = None  # The call ended.
             await fri.close()
     asyncio.run(scenario())

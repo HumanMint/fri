@@ -305,6 +305,18 @@ class Agent:
         return str(getattr(channel, 'parent_id', None) or channel.id) in {
             str(self.fri.workshop_id), *self.state['channels']}
 
+    def call_posts(self, message):
+        """A running phone call's own posts (brief, transcript, questions, report), which `message` replying to one
+        doesn't say to chat Fri: the call's requester answers with its buttons (see fri_addressing.addressed_text).
+        None for a privacy control ("forget me"), which keeps its usual path as said to Fri, whose post it is."""
+        calls = getattr(self.fri, 'jpcall_calls', None)
+        return frozenset() if calls is None or self.memory_control(message, None) else calls.posted()
+
+    def calling(self, channel):
+        """A call is posting in this channel now: chat Fri answers there only what's said to it."""
+        calls = getattr(self.fri, 'jpcall_calls', None)
+        return calls is not None and calls.posting_in(channel)
+
     async def start(self):
         self.state = await self.fri.api('GET', '/agent/state')
         self.saved_turns.retry()  # Withdrawals the controller hadn't taken before a restart (fri #215).
@@ -750,8 +762,10 @@ class Agent:
             schedule = state.get('learning_schedule', {})
             if schedule.get('window'):
                 text += f"\nTemporary learning: every {schedule['minutes']} minutes until <t:{int(schedule['window']['until'])}:f>."
-            if any(self.config[k] for k in ('voice_notes', 'attention_notes', 'learning_notes')):
-                notes = {k: v for k, v in self.config.items() if k.endswith('_notes')}
+            notes = {k: v for k, v in self.config.items() if k.endswith('_notes')}
+            if any(notes.values()) and message.guild:  # They can name members: shown only in the owner's DM.
+                text += '\nThe notes themselves stay in DMs.'
+            if any(notes.values()) and not message.guild:
                 with io.BytesIO(json.dumps(notes, indent=2).encode()) as buffer, closing(
                         discord.File(buffer, filename='fri-behavior-notes.json')) as attachment:
                     await message.reply(text[:1950], file=attachment, allowed_mentions=NO_MENTIONS)
@@ -818,6 +832,9 @@ class Agent:
                 # The controller validates limits and version again when Apply is clicked.
                 if len(json.dumps(changes)) > 6000:
                     await message.reply('that change is too large for one preview. please change one behavior at a time.', allowed_mentions=NO_MENTIONS)
+                elif message.guild and any(key.endswith('_notes') for key in changes):
+                    # Its preview shows the notes' whole new text, which can name members: only in the owner's DM.
+                    await message.reply('dm me for that one.', allowed_mentions=NO_MENTIONS)
                 else:
                     view = BehaviorPreview(self, changes, state['version'])
 
@@ -1583,7 +1600,8 @@ class Agent:
         """A reply to, or a mention of, someone other than Fri, without Fri's name, mention or a reply to Fri. The
         dedicated channel answers plain chat too, but a memory control there is only one said to Fri: "forget me"
         said to someone else changes nothing. A reply whose target can't be read counts as someone else's."""
-        return self.points_elsewhere(message) and await addressed_text(message, self.fri.user.id) is None
+        return (self.points_elsewhere(message) and
+                await addressed_text(message, self.fri.user.id, self.call_posts(message)) is None)
 
     async def still_addressed(self, message, answering=False):
         """The message as Discord has it now: still there, never edited, and, before a reply, still addressed.
@@ -1610,7 +1628,8 @@ class Agent:
             self.saw_edit(message.id, getattr(current, 'edited_at', None))
             self.withdraw(message)  # Edited since Fri got it, maybe to take it back.
             return False
-        return answering or message.guild is None or await addressed_text(current, self.fri.user.id) is not None
+        return (answering or message.guild is None or
+                await addressed_text(current, self.fri.user.id, self.call_posts(current)) is not None)
 
     async def listen(self, message):
         """`receive`, plus the outage notice when a controller read fails before any reply has started."""
@@ -1692,6 +1711,9 @@ class Agent:
             return
         channel = message.channel.id
         parent = getattr(message.channel, 'parent_id', None) or channel
+        # Fri's own channel answers every line, except while a call posts there: the group's talk is about the call.
+        # A privacy control there keeps its usual path.
+        dedicated = channel == self.dedicated and (not self.calling(channel) or self.memory_control(message, None))
         if not dm and not message.author.bot:
             self.continuations.heard(message)  # Someone else's line here ends another's continuation window.
         if started_a_thread(message):  # Its text is the thread's name, not their words: not for the live view,
@@ -1717,10 +1739,10 @@ class Agent:
                         'at': time.time(), 'revision': profile.get('revision', 0), 'gene_error': False})
             self.forward_dropped(message, 'no text')
             return self.miss(message, 'no text')
-        directed = text if dm else await addressed_text(message, self.fri.user.id)
+        directed = text if dm else await addressed_text(message, self.fri.user.id, self.call_posts(message))
         if directed is not None:  # A reply that only this fetch of its reference showed is to Fri counts now.
             self.ledger.confirm(message.id)
-        owner_addressed = directed is not None or channel == self.dedicated or self.active.get((channel, message.author.id), 0) > time.time()
+        owner_addressed = directed is not None or dedicated or self.active.get((channel, message.author.id), 0) > time.time()
         control = (owner_addressed and message.author.id == self.fri.owner_id and
                    await self.owner_control(message, directed or text, erasures))
         if control == ERASED:
@@ -1732,7 +1754,7 @@ class Agent:
         privacy = memory_intent(text) or (memory_intent(directed) if directed else None)
         aimed = False
         if privacy and not dm and directed is None:
-            if (again := await addressed_text(message, self.fri.user.id)) is not None:
+            if (again := await addressed_text(message, self.fri.user.id, self.call_posts(message))) is not None:
                 directed = again  # A second look found its reply target is Fri: the first read can fail for a moment.
                 self.ledger.confirm(message.id)
             else:  # Said to someone else, it's no control, so it clears nothing (take_turn rechecks before one runs).
@@ -1753,7 +1775,7 @@ class Agent:
                 return
         # Showing their memory changes nothing, so drops nothing. One said to Fri (or in a DM or the dedicated channel)
         # clears local context now; another, e.g. a follow-up, once it's admitted below; one not said to Fri, never.
-        early = privacy in ('disable', 'enable') and (directed is not None or dm or channel == self.dedicated)
+        early = privacy in ('disable', 'enable') and (directed is not None or dm or dedicated)
         if early:
             self.forget(message.author.id, erased=privacy == 'disable')
             forgotten = self.forgotten.get(message.author.id, 0)  # Their own request isn't an erasure since.
@@ -1769,7 +1791,7 @@ class Agent:
             # Not if it was deleted or edited while its profile was read.
             if (profile['enabled'] and not privacy and not before_removal(message.id, profile) and
                     message.id not in self.unsent and not self.taken_back(message.id, self.arrived.get(message.id, sent))):
-                if directed is not None or channel == self.dedicated:
+                if directed is not None or dedicated:
                     self.answer_directly(message)
                 self.recent[channel].append({'id': str(message.id), 'user_id': str(message.author.id),
                     'name': clean(message.author.display_name, 60), 'text': text[:500], 'at': time.time(),
@@ -1830,9 +1852,9 @@ class Agent:
         if message.reference and directed is None:
             active = False
         continuing = None  # The explicit turn of theirs this line adds to, without Fri's name (see continuing).
-        if directed is None and not active and not dm and channel != self.dedicated:
+        if directed is None and not active and not dm and not dedicated:
             continuing = await self.continuing(message, text, arrived, (forgotten, observed))
-        if directed is None and not active and not continuing and channel != self.dedicated:
+        if directed is None and not active and not continuing and not dedicated:
             return self.miss(message, 'not a visible user mention')
         if privacy in ('disable', 'enable') and not early:  # Admitted only now, e.g. a follow-up in a conversation.
             self.forget(message.author.id, erased=privacy == 'disable')
@@ -2679,6 +2701,9 @@ class Agent:
         now = time.time()
         for channel_id in list(self.recent):
             self.progressed()
+            if self.calling(channel_id):  # The group is on a call there: what it says now is for the call.
+                self.seen[channel_id] = max([self.seen.get(channel_id, 0), *(int(r['id']) for r in self.recent[channel_id])])
+                continue
             if (running := self.ambient_replies.get(channel_id)) and not running.done():
                 continue  # Its last reply is still waiting on Discord; its fresh messages wait for the next pass.
             records = await self.context_messages(channel_id, raw_errors=True)

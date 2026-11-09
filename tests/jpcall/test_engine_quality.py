@@ -226,7 +226,7 @@ def test_exact_echo_is_retained_as_uncertain_without_automatic_inquiry(
         tmp_path, caplog, spoken, echo):
     async def run():
         path = tmp_path / 'debug.jsonl'
-        client, audio, events, meter, peer = bridge()
+        client, audio, events, meter, peer = bridge(publication_context=lambda: 1)  # Consented.
         client.timeline = DebugTimeline(path)
         media = Media()
         await attach_and_open(client, media)

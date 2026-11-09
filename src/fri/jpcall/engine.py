@@ -49,7 +49,7 @@ LOG = logging.getLogger(__name__)
 TOOLS = (
     {'type': 'function', 'name': 'permission',
      'parameters': {'type': 'object', 'properties': {
-         'decision': {'type': 'string', 'enum': ['granted', 'refused', 'transfer']}},
+         'decision': {'type': 'string', 'enum': ['granted', 'refused', 'transfer', 'unclear']}},
          'required': ['decision'], 'additionalProperties': False}},
     {'type': 'function', 'name': 'ask_group',
      'parameters': {'type': 'object', 'properties': {
@@ -696,7 +696,8 @@ class _Session:
 
     async def _notice_delivered(self, generation: int) -> None:
         try:
-            await self._rt.drain(timeout_s=30)
+            # Complete, uninterrupted playback acknowledged by the phone; cleared audio never counts.
+            await self._rt.notice_delivery(timeout_s=30)
         except TimeoutError:
             if not self._ending and generation == self.consent_generation:
                 self._begin_finish(failed=True, detail='The call notice could not be delivered.')
@@ -744,9 +745,14 @@ class _Session:
             return
         if name == 'permission':
             decision = arguments.get('decision')
-            if decision == 'granted':
+            if decision == 'granted' and (self._publication_allowed or self._rt.notice_delivered):
                 self._permission(True)
                 await self._rt.tool_result(call_id, {'permission': 'granted'})
+            elif decision == 'unclear':
+                # Grants nothing and keeps the existing deadline; at most one repeat of the notice.
+                await self._rt.tool_result(call_id, {'permission': 'unclear'}, respond=False)
+                with suppress(RealtimeError):
+                    await self._rt.clarify_notice()
             elif decision == 'refused':
                 self._begin_finish(detail='The recipient declined to share the call.')
             elif decision == 'transfer':
@@ -759,8 +765,9 @@ class _Session:
                 await self._rt.tool_result(call_id, {'permission': 'new notice required'}, respond=False)
                 await self._rt.repeat_notice()
                 await self._notice_delivered(generation)
-            else:
-                await self._rt.tool_result(call_id, {'error': 'Explicit permission is required'})
+            else:  # Includes a grant before the complete notice was played.
+                await self._rt.tool_result(call_id, {'error': 'Explicit permission is required'},
+                                           respond=False)
             return
         if not self.publication_allowed:
             await self._rt.tool_result(call_id, {'error': 'Explicit permission is required first'})

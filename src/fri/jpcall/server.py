@@ -1,6 +1,7 @@
 """Authenticated Twilio ingress. All callbacks run on the owning asyncio loop.
 
-Use ``listen`` to disable access logging: media/status URLs contain bearer tokens.
+Use ``listen`` to disable access logging (media/status URLs contain bearer tokens)
+and request-body decompression.
 The media token is consumed before the first await following authentication.
 """
 
@@ -156,7 +157,13 @@ class JpcallServer:
     async def _status_callback(self, request: web.Request) -> web.Response:
         if request.query_string or request.content_type != 'application/x-www-form-urlencoded':
             raise web.HTTPForbidden()
-        params = await request.post()
+        if 'Content-Encoding' in request.headers:
+            # Twilio sends plain forms; encoded bodies are refused before any parsing.
+            raise web.HTTPUnsupportedMediaType()
+        try:
+            params = await request.post()
+        except (ValueError, LookupError):  # Undecodable bytes or an unknown charset.
+            raise web.HTTPBadRequest() from None
         if not self._authenticated(request, params.items()):
             raise web.HTTPForbidden()
         if any(len(params.getall(key)) != 1 for key in params):
@@ -263,7 +270,8 @@ class JpcallServer:
     async def listen(self) -> web.AppRunner:
         if not self.config.enabled:
             raise RuntimeError('Calling is disabled until its configuration is complete.')
-        runner = web.AppRunner(self.app, access_log=None)
+        # Never inflate request bodies: decompression would run before signature checks.
+        runner = web.AppRunner(self.app, access_log=None, auto_decompress=False)
         await runner.setup()
         try:
             await web.TCPSite(runner, self.config.listen_host, self.config.listen_port).start()

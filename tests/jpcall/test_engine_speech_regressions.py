@@ -146,7 +146,7 @@ def test_valid_asr_after_clarification_recovers_without_ending(monkeypatch):
     asyncio.run(run())
 
 
-def test_reply_during_opening_is_released_but_initial_greeting_is_not():
+def test_reply_during_opening_is_not_classified_and_initial_greeting_is_ignored():
     async def run():
         client, audio, events, meter, peer = bridge()
         await client.start(Media())
@@ -175,6 +175,12 @@ def test_reply_during_opening_is_released_but_initial_greeting_is_not():
             await client.handle_event({'type': EVENTS['response_created'], 'response': response})
             await client.handle_event({'type': EVENTS['response_done'], 'response': response})
             await task
+            await output(client, response='opening', item='notice', text=client.brief.opener_ja,
+                         played=1)
+            await turns()
+            requests = [e for e in peer.sent if e['type'] == EVENTS['response_create']]
+            assert len(requests) == 1  # The reply made during the opening is never classified.
+            await callee(client, 'after-notice', 'はい、どうぞ。', start=5000, stop=5600)
             await turns()
             requests = [e for e in peer.sent if e['type'] == EVENTS['response_create']]
             assert len(requests) == 2
@@ -199,13 +205,16 @@ def test_pregrant_response_is_tool_only_and_inquiry_audio_and_tools_are_fenced()
         await client.start(Media())
         await client.open_conversation()
         try:
-            await callee(client, 'permission-reply', 'はい。')
+            await output(client, response='command-1', item='notice', text=client.brief.opener_ja,
+                         played=1)
+            notice_frames = len(audio.frames)
+            await callee(client, 'permission-reply', 'はい。', start=5000, stop=5600)
             await turns()
             request = [e for e in peer.sent if e['type'] == EVENTS['response_create']][-1]
             assert request['response']['output_modalities'] == ['text']
             assert [tool['name'] for tool in request['response']['tools']] == ['permission']
             await output(client, response='command-2', item='unauthorized')
-            assert not audio.frames
+            assert len(audio.frames) == notice_frames
             resource = {'id': 'command-2', 'status': 'completed', 'output': [
                 {'type': 'function_call', 'status': 'completed', 'name': name,
                  'call_id': name, 'arguments': '{"decision":"granted"}'}
@@ -214,7 +223,7 @@ def test_pregrant_response_is_tool_only_and_inquiry_audio_and_tools_are_fenced()
             assert calls == ['permission']
             client.set_permission(True)
             await output(client, response='command-2', item='still-unauthorized')
-            assert not audio.frames  # A pregrant response cannot gain audio authority later.
+            assert len(audio.frames) == notice_frames  # No audio authority gained later.
             await client.audio(ULAW)  # Permission recognition still receives callee audio.
             assert peer.sent[-1]['type'] == EVENTS['input_append']
         finally:
@@ -442,7 +451,10 @@ def test_pending_reply_does_not_cross_a_permission_change():
             await turns()
             assert sum(e['type'] == EVENTS['response_create'] for e in peer.sent) == before + 1
             assert not client._permission
-            await callee(client, 'new', 'はい、どうぞ。')
+            renewed = [e for e in peer.sent if e['type'] == EVENTS['response_create']][-1]
+            await output(client, response='command-' + renewed['response']['metadata'][
+                'jpcall_command'], item='renewed', text=client.brief.opener_ja, played=1)
+            await callee(client, 'new', 'はい、どうぞ。', start=5000, stop=5600)
             await turns()
             requests = [e for e in peer.sent if e['type'] == EVENTS['response_create']]
             assert len(requests) == before + 2
