@@ -226,8 +226,7 @@ def chained(monkeypatch, tmp_path, most, length):
 def test_a_long_chain_keeps_its_ancestry_bounded(monkeypatch, tmp_path, most):
     """F2: 1,000 replies, each drawing on the one before. Pruning capped the records, but each kept all it inherited:
     the newest held 999 ancestors with two records kept, and the default kept half a million references. A record
-    keeps all it drew on itself, and at most a hundred more it inherited; one that had to let some go says what it
-    drew on can't all be told."""
+    keeps at most a hundred dependency IDs; one that had to let some go says what it drew on can't all be told."""
     records, newest = chained(monkeypatch, tmp_path, most, 1000)
     assert len(records) == min(most, 1000)
     assert all(len(entry[2]) <= 100 for entry in records.values())
@@ -273,4 +272,34 @@ def test_truncated_ancestry_is_held_while_a_withdrawal_waits(monkeypatch, tmp_pa
     context = {'turns': [{'reply': MARKER, 'source': {'id': newest}}]}
     turns.withhold(context)
     assert context['turns'] == []
+    asyncio.run(fri.close())
+
+
+def test_saving_a_long_chain_reads_only_each_direct_parents_cache(monkeypatch, tmp_path):
+    class Counted(dict):
+        reads = 0
+
+        def __getitem__(self, key):
+            self.reads += 1
+            return super().__getitem__(key)
+
+        def get(self, key, default=None):
+            self.reads += 1
+            return super().get(key, default)
+
+    fri, agent, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+    fri.capabilities = frozenset(asyncio.run(fri.api('GET', '/fri/contract'))['capabilities'])
+    turns = agent.saved_turns
+    turns.drawn = Counted()
+    previous = None
+    for n in range(1000):
+        said = source(age=1100-n, channel='1')
+        before = turns.drawn.reads
+        turns.kept({'guild_id': '123', 'channel_id': '1', 'conversation_id': 'public:1', 'user_id': '20',
+                    'revision': 0, 'source': said, 'drew_on': [previous] if previous else []}, {},
+                   (time.time(), time.monotonic()))
+        assert turns.drawn.reads-before <= 1
+        previous = said['id']
+    assert turns.drawn.reads == 999
+    assert len(turns.drawn) == 1000
     asyncio.run(fri.close())

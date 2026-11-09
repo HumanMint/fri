@@ -182,22 +182,6 @@ class SavedTurns:
                 LOG.warning('%s pending withdrawals on disk were malformed, so their messages are held back unsent', held)
             if overflow.get('dropped'):
                 self.overflowed(overflow)
-            if path is not None:
-                tracking = path.with_name('withdrawals.tracked')
-                marker = path.with_name('withdrawals.saved')
-                if tracking.exists() and not marker.exists():
-                    self.unsaved = True
-                    self.closed_until = max(self.closed_until, time.time()+CLOSED_SECONDS)
-                    self.closed_for.add('unsaved')
-                    self.unwritten = not self.mark_closed(self.closed_until)
-                if not tracking.exists():
-                    try:
-                        private_json(marker, {})
-                        tracking.mkdir()
-                        from .fri_channel_withdrawal import synced
-                        synced(path.parent)
-                    except OSError:
-                        self.unsaved = True
             self.tidy()
             self.prune(time.time())
             now = time.time()
@@ -396,14 +380,7 @@ class SavedTurns:
                 return
             self.unwritten = False
             try:
-                from .fri_channel_withdrawal import synced
-                marker = path.with_name('withdrawals.saved')
-                path.with_name('withdrawals.tracked').mkdir(exist_ok=True)
-                marker.unlink(missing_ok=True)
-                synced(path.parent)
                 private_json(path, {'pending': {i: self.lasting(entry) for i, entry in pending.items()}})
-                private_json(marker, {})
-                synced(path.parent)
                 self.unsaved = False
             except OSError as exc:  # Still queued in memory; resent while Fri runs.
                 self.unsaved = True
@@ -451,9 +428,11 @@ class SavedTurns:
             # ANCESTRY IDs, the newest, so a long chain of replies doesn't grow every record; one that had to let
             # some go says what it drew on can't all be told (Sol round 1 of #399, F2).
             drew = {str(item) for item in drew if str(item).isdigit()}
-            known = [i for i in drew if int(i) in self.drawn]
-            further, unknowable = self.depends_on(known) if known else (set(), False)
-            further |= drew
+            further, unknowable = set(drew), False
+            for parent in drew:
+                if record := self.drawn.get(int(parent)):
+                    further.update(record[2])
+                    unknowable = unknowable or record[3]
             if len(further) > ANCESTRY:
                 further, unknowable = set(sorted(further, key=int, reverse=True)[:ANCESTRY]), True
             for i in [*own, *([int(reply)] if reply.isdigit() else [])]:
@@ -785,7 +764,7 @@ class SavedTurns:
         self.kick()
 
     def kick(self):
-        if any(not task.done() for task in self.tasks) or not (self.pending or self.unsaved):
+        if any(not task.done() for task in self.tasks) or not self.pending:
             return  # The running worker picks up what was just queued.
         try:
             task = asyncio.get_running_loop().create_task(self.drain())
@@ -806,8 +785,6 @@ class SavedTurns:
         sent for: one queued for the same message meanwhile is newer, so it stands and goes next. Everything is worked
         out again after each wait, and whatever stays is scheduled however the worker ends."""
         tried = set()
-        if self.unsaved:
-            self.persist()
         try:
             while True:
                 if not self.due(tried):
@@ -896,8 +873,6 @@ class SavedTurns:
             self.timer.cancel()
             self.timer = None
         due = [entry['due'] for entry in self.pending.values() if not entry.get('hold')]  # A hold is never sent.
-        if self.unsaved:
-            due.append(time.time()+RETRY_SECONDS[-1])
         if not due:
             return
         wait = max(0.0, min(due)-time.time())

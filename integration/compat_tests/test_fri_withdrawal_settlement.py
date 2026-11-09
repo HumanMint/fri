@@ -1,4 +1,4 @@
-"""Copied context and interrupted withdrawal writes stay private."""
+"""Copied context is refreshed after a withdrawal settles; write health reflects failures."""
 import asyncio
 
 import pytest
@@ -9,7 +9,6 @@ from compat_tests.test_fri_mentions import environment
 from compat_tests.test_fri_panel_and_learning_fences import panel
 from compat_tests.test_fri_panel_dependency_holds import MARKER
 from compat_tests.test_fri_rerun_fence import direct
-from fri.fri_turn_withdrawal import SavedTurns
 
 
 @pytest.mark.parametrize('where', ['panel', 'dm', 'channel'])
@@ -58,35 +57,25 @@ def test_context_read_before_settlement_is_refetched(monkeypatch, tmp_path, wher
     asyncio.run(scenario())
 
 
-def test_failed_withdrawal_write_is_visible_and_held_after_restart(monkeypatch, tmp_path):
-    async def scenario():
-        fri, agent, store, *_ = environment(monkeypatch, tmp_path, channel_id=1)
-        fri.capabilities = frozenset((await fri.api('GET', '/fri/contract'))['capabilities'])
-        fri.data = tmp_path
-        turns = agent.saved_turns
-        turns.kick = lambda: None
-        turns.persist()  # A healthy start, before the disk fills.
-        store.save_chat('123', 'private:456', '20', 0, 'repeat', MARKER, 'model', 'high',
-                        source=source(age=300, channel='456'), provenance=[])
-        from fri import fri_turn_withdrawal as module
-        write = module.private_json
+def test_failed_withdrawal_write_reports_unsaved_until_a_write_succeeds(monkeypatch, tmp_path):
+    fri, agent, *_ = environment(monkeypatch, tmp_path, channel_id=1)
+    fri.data = tmp_path
+    turns = agent.saved_turns
+    from fri import fri_turn_withdrawal as module
+    write = module.private_json
 
-        def full(*args, **kwargs):
-            raise OSError('disk full')
-        monkeypatch.setattr(module, 'private_json', full)
-        turns.withdraw([int(source(age=600, channel='1')['id'])], 123, deleted=True)
-        assert turns.status()['saved_to_disk'] is False
-        restarted = SavedTurns(agent)
-        context = {'turns': [{'reply': MARKER}], 'member_summary': {'text': MARKER}}
-        restarted.withhold(context, member='20')
-        assert not context['turns'] and context['member_summary'] is None
-        agent.saved_turns = restarted
-        carried = asking(fri, tmp_path, reply='okay')
-        await fri.chat_interaction(panel(fri), 'repeat')
-        assert carried and all(MARKER not in text for text in carried)
-        assert restarted.status()['saved_to_disk'] is False
-        monkeypatch.setattr(module, 'private_json', write)
-        await turns.drain()
-        assert turns.status()['saved_to_disk'] is True
-        await fri.close()
-    asyncio.run(scenario())
+    def full(*args, **kwargs):
+        raise OSError('disk full')
+    monkeypatch.setattr(module, 'private_json', full)
+    turns.persist()
+    assert turns.status()['saved_to_disk'] is False
+    assert turns.status()['unsaved_for'] == 'write'
+    assert not turns.closed()
+    monkeypatch.setattr(module, 'private_json', write)
+    turns.persist()
+    assert turns.status()['saved_to_disk'] is True
+    assert turns.status()['unsaved_for'] is None
+    assert not turns.closed()
+    assert not (tmp_path/'withdrawals.saved').exists()
+    assert not (tmp_path/'withdrawals.tracked').exists()
+    asyncio.run(fri.close())
