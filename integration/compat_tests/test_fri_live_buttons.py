@@ -210,7 +210,8 @@ class Paging(discord.ui.View):
 
 
 @pytest.mark.parametrize('custom_id', ['fri:behavior:next', 'fri:request:'+'b'*32+':next',
-                                       'fri:request:preview:'+'b'*32, 'fri:memory:choose:'+'c'*32])
+                                       'fri:request:preview:'+'b'*32, 'fri:memory:choose:'+'c'*32,
+                                       'fri:memory:previous:'+'d'*32, 'fri:memory:next:'+'e'*32])
 def test_a_live_view_answers_alone_and_an_ended_one_says_it_expired_and_comes_off(custom_id):
     async def scenario():
         state, views = store()
