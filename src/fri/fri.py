@@ -1683,6 +1683,7 @@ class Fri(discord.Client):
             'channel_withdrawals': self.agent.channel_withdrawals.status() if self.agent else None,
             'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
+            'jpcall_budget': self.jpcall_engine.budget_status() if self.jpcall_engine else {'admission': 'disabled'},
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,
             'test_scope': {**test, 'connected': bool(self.is_ready() and test_guild and not test_guild.unavailable),
                            'read_send_history': bool(test_permissions and test_permissions.view_channel and

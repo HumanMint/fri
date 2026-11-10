@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+from .budget import CONTEXT_TOKENS, MAX_INPUT_BYTES, OUTPUT_TOKENS
 from .config import JpcallConfig
 from .contract import AudioSink, CallBrief, EventSink, Utterance
 from .server import TwilioMedia, ulaw_to_pcm16
@@ -109,8 +110,11 @@ class RealtimeClient:
                  goal: str = '', timeline: DebugTimeline | None = None,
                  on_asr_failure: Callable[[], Awaitable[None]] | None = None,
                  on_callee_response: Callable[[], None] | None = None,
-                 publication_context: Callable[[], int | None] | None = None):
+                 publication_context: Callable[[], int | None] | None = None, budget=None):
         self.config, self.brief = config, brief
+        self._budget = budget
+        self._audio_bytes = 0
+        self._instruction_bytes = 0
         self.audio_sink, self.events, self.meter = audio, events, meter
         self._session = session
         self._owned = session is None
@@ -215,6 +219,13 @@ class RealtimeClient:
             },
             'tools': list(self._tools),
         }
+        if self._budget is not None:
+            self._instruction_bytes = len(json.dumps(session, ensure_ascii=False).encode())
+            if self._instruction_bytes > MAX_INPUT_BYTES:
+                raise RealtimeError('Call instructions exceed the budget bound.')
+            session['max_output_tokens'] = OUTPUT_TOKENS
+            session['truncation'] = {'type': 'retention_ratio', 'retention_ratio': .8,
+                                     'token_limits': {'post_instructions': CONTEXT_TOKENS}}
         if self.config.realtime_reasoning is not None:
             session['reasoning'] = {'effort': self.config.realtime_reasoning}
         return {'type': EVENTS['session_update'], 'session': session}
@@ -231,6 +242,13 @@ class RealtimeClient:
         try:
             if key == 'response_cancel':
                 self.timeline.record('response_cancel', **payload)
+            if self._budget is not None and key == 'response_create':
+                size = len(json.dumps(payload, ensure_ascii=False).encode())
+                if size > MAX_INPUT_BYTES:
+                    raise RealtimeError('Call response exceeds the budget bound.')
+                payload['response']['max_output_tokens'] = OUTPUT_TOKENS
+                self._budget.tokens(self.config, 'realtime',
+                    self._instruction_bytes + size + CONTEXT_TOKENS, OUTPUT_TOKENS)
             await self._ws.send_json({'type': EVENTS[key], **payload})
         except Exception:
             raise RealtimeError('The voice connection ended.') from None
@@ -572,6 +590,11 @@ class RealtimeClient:
             await self._task
 
     async def audio(self, ulaw: bytes) -> None:
+        if self._budget is not None:
+            self._budget.tariff(self.config)
+            self._audio_bytes += len(ulaw)
+            if self._audio_bytes > self.config.limits.attempt_s * 8000:
+                raise RealtimeError('Call audio exceeds its prepaid bound.')
         await self._send('input_append', audio=base64.b64encode(ulaw).decode())
 
     async def mark(self, name: str) -> None:
@@ -1089,6 +1112,7 @@ class RealtimeClient:
             with suppress(Exception):
                 response.close()
         self._ws = self._media = self._session = None
+        self._budget = None
         self.config = self.brief = self.events = self.audio_sink = None
         self._on_speech = self._on_tool_call = None
         self._on_asr_failure = self._on_callee_response = self._publication_context = None

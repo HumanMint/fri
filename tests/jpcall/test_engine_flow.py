@@ -14,6 +14,7 @@ from test_engine_transport import ULAW, Audio, Events, RealtimeHTTP, RealtimePee
 from test_engine_usage import realtime_usage
 
 import fri.jpcall.engine as engine_module
+from fri.jpcall.budget import MODELS, RATES, Budget
 from fri.jpcall.config import CALL_LANGUAGES, JpcallConfig
 from fri.jpcall.contract import (
     CallFinished,
@@ -228,6 +229,9 @@ async def make_engine(tmp_path, monkeypatch, provider=None, *, call_language='ja
                                                    'JPCALL_CALL_LANGUAGE': call_language})
     if not (tmp_path / 'jpcall' / 'recovery.initialized').exists():
         AttemptJournal.initialize(tmp_path / 'jpcall')
+    if not (tmp_path / 'jpcall' / 'budget.initialized').exists():
+        Budget.initialize(tmp_path / 'jpcall', spent_usd=0, tariff={
+            **{k: '0.000001' for k in RATES}, **{k: getattr(config, k) for k in MODELS}})
     http = httpx.AsyncClient(transport=httpx.MockTransport(provider.handle))
     engine = JpcallEngine(config, http_client=http)
     runner = Runner()
@@ -347,7 +351,8 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(
             files = list((tmp_path / 'jpcall').glob('*'))
             assert {path.name for path in files} == {
                 'daily-counts.lock', 'daily-counts.json', 'jpcall-usage.jsonl',
-                'recovery.json', 'recovery.lock', 'recovery.initialized'}
+                'recovery.json', 'recovery.lock', 'recovery.initialized',
+                'budget.json', 'budget.initialized'}
             data = '\n'.join(path.read_text() for path in files
                               if path.is_file())
             assert 'ランチ' not in data and request().goal not in data and '+8190' not in data

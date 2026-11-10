@@ -7,8 +7,9 @@ import json
 
 import httpx
 
+from .budget import MAX_INPUT_BYTES, TEXT_OUTPUT_TOKENS
 from .config import JpcallConfig
-from .contract import Translation, Utterance
+from .contract import CallRejected, Translation, Utterance
 from .usage import UsageMeter
 
 
@@ -17,17 +18,26 @@ class TextError(RuntimeError):
 
 
 class TextClient:
-    def __init__(self, config: JpcallConfig, client: httpx.AsyncClient):
+    def __init__(self, config: JpcallConfig, client: httpx.AsyncClient, *, budget=None):
         self.config, self.client = config, client
+        self.budget = budget
 
     async def generate(self, component: str, meter: UsageMeter, instructions: str,
                        data: dict) -> str:
         body = {
             'model': self.config.text_model, 'store': False,
-            'reasoning': {'effort': self.config.text_effort}, 'max_output_tokens': 1200,
+            'reasoning': {'effort': self.config.text_effort}, 'max_output_tokens': TEXT_OUTPUT_TOKENS,
             'input': [{'role': 'developer', 'content': instructions},
                       {'role': 'user', 'content': json.dumps(data, ensure_ascii=False)}],
         }
+        size = len(json.dumps(body, ensure_ascii=False).encode())
+        if self.budget is not None:
+            if size > MAX_INPUT_BYTES:
+                raise TextError("Call text exceeds its budget input bound.")
+            try:
+                self.budget.tokens(self.config, "text", size, TEXT_OUTPUT_TOKENS)
+            except CallRejected:
+                raise TextError("Calling budget unavailable.") from None
         accounted = False
         try:
             response = await self.client.post(

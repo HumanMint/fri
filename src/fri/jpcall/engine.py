@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 
+from .budget import Budget
 from .config import JpcallConfig
 from .contract import (
     AudioSink,
@@ -144,6 +145,7 @@ class JpcallEngine:
         self._directory = config.data_dir / 'jpcall'
         self._counts = _DailyCounts(self._directory)
         self._recovery = AttemptJournal(self._directory)
+        self._budget = Budget(self._recovery)
         self._server = JpcallServer(config)
         self._server.recovery_status = self._recovery_callback
         self._runner = None
@@ -174,7 +176,7 @@ class JpcallEngine:
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=20, follow_redirects=False)
         self._twilio, self._text = TwilioClient(self.config, self._http), TextClient(
-            self.config, self._http)
+            self.config, self._http, budget=self._budget)
         try:
             self._runner = await self._server.listen()
             self._opened = True
@@ -184,6 +186,9 @@ class JpcallEngine:
                 await self._http.aclose()
                 self._http = None
             raise
+
+    def budget_status(self) -> dict:
+        return self._budget.status(self.config)
 
     def _validate(self, request: CallRequest) -> str:
         if not self._opened or self._closing or self._cleanup_failed:
@@ -231,6 +236,7 @@ class JpcallEngine:
         self._counts.check(request.requester_id, self.config.limits.max_calls_per_user_per_day)
         if self._sessions or self._recovery.status()['admission'] != 'ready':
             raise CallRejected('Another telephone attempt is active or needs reconciliation.')
+        self._budget.call(self.config)
         self._counts.check(request.requester_id, self.config.limits.max_calls_per_user_per_day,
                            reserve=True)
         self._plans.pop(request.request_id)
@@ -382,7 +388,7 @@ class _Session:
                                   on_callee_response=self._callee_response,
                                   publication_context=lambda: (
                                       self.consent_generation if self._live else None),
-                                  timeline=timeline)
+                                  timeline=timeline, budget=engine._budget)
         self._timeline = timeline
         self._hold = self._new_hold()
         self._routes: CallRoutes | None = None
@@ -521,6 +527,8 @@ class _Session:
             await self._emit(event)
 
             async def translate():
+                if generation != self.consent_generation or not self.publication_allowed:
+                    return
                 result = await self.engine._text.translate(event, self._meter)
                 if generation != self.consent_generation or not self.publication_allowed:
                     return
@@ -889,8 +897,10 @@ class _Session:
 
     async def _summary(self, settled: asyncio.Task, deadline: float) -> str | None:
         """Summarize authorized text by the deadline; None means unavailable, never 'no facts'."""
+        generation = self.consent_generation
         await settled
-        if not self._transcript or self._voicemail:
+        if (not self.publication_allowed or generation != self.consent_generation
+                or not self._transcript or self._voicemail):
             return None
         try:
             async with asyncio.timeout_at(deadline):
@@ -907,7 +917,7 @@ class _Session:
                      'outcome_hint': self._outcome_hint, 'end_reason': self._detail})
         except (TextError, TimeoutError):
             return None
-        return summary
+        return summary if self.publication_allowed and generation == self.consent_generation else None
 
     def _outcome(self, summary: str | None, detail: str) -> str:
         if summary is None and self._transcript and not self._voicemail:
