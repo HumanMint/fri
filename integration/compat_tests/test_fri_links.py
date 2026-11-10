@@ -280,3 +280,38 @@ def test_a_linked_gif_post_is_looked_at_through_its_preview(monkeypatch, tmp_pat
         finally:
             await fri.close()
     asyncio.run(scenario())
+
+
+def test_direct_reply_model_reads_only_bounded_reaction_counts(monkeypatch, tmp_path):
+    import json
+
+    import httpx
+
+    from compat_tests.test_fri_chat import CONTEXT, response_event
+    from fri.fri_chat import Chat
+
+    async def scenario():
+        fri, agent, _, _, post, said = world(monkeypatch, tmp_path)
+        target = post(1, 'synthetic target')
+        target.reactions = [SimpleNamespace(emoji='😂', count=4, me=False),
+                            SimpleNamespace(emoji=SimpleNamespace(name='giggle'), count=2, me=True)]
+        message = said("fri why is everyone laughing?", reference=SimpleNamespace(
+            message_id=target.id, channel_id=1, type=discord.MessageReferenceType.default))
+        captured = []
+        async def transport(request):
+            captured.append(json.loads(request.content))
+            return httpx.Response(200, text='data: '+json.dumps(response_event())+'\n\n')
+        chat = Chat(SimpleNamespace(access_token=lambda: 'fictional'), httpx.MockTransport(transport))
+        try:
+            context = await evidence(agent, message, [])
+            await chat.respond(message.content, {**CONTEXT, **context})
+            row = json.loads(captured[0]['input'][-1]['content'])['reply_target'][0]
+            assert row['reactions'] == details(target)['reactions'] == [
+                {'emoji': '😂', 'count': 4}, {'emoji': ':giggle:', 'count': 2, 'fri': True}]
+            target.reactions[0].count += 1
+            assert await unchanged(agent, message, context)  # Count changes aren't edits or withdrawals.
+            agent.profile.return_value = {'enabled': False, 'revision': 1}
+            assert not (await evidence(agent, message, []))['reply_target']
+        finally:
+            await fri.close()
+    asyncio.run(scenario())

@@ -60,10 +60,8 @@ def details(message):
         extra['attachments'] = media(message)
     if cards := link_cards(message):
         extra['link_cards'] = cards
-    reactions = getattr(message, 'reactions', None)
-    if isinstance(reactions, (list, tuple)) and reactions:
-        extra['reactions'] = [{'emoji': label(r.emoji), 'count': r.count, **({'fri': True} if r.me is True else {})}
-                              for r in reactions[:6] if isinstance(getattr(r, 'count', None), int)]
+    if (found := reaction_counts(message)) is not None:
+        extra['reactions'] = found
     reference = getattr(message, 'reference', None)
     channel = getattr(message, 'channel', None)
     # A forward's reference names the post it copies, not one it answers.
@@ -75,6 +73,15 @@ def details(message):
     if getattr(message, 'pinned', None) is True:
         extra['pinned'] = True
     return extra
+
+
+def reaction_counts(message):
+    """The same bounded emoji counts for readers and reply targets; never reactor identities."""
+    reactions = getattr(message, 'reactions', None)
+    if not isinstance(reactions, (list, tuple)) or not reactions:
+        return None
+    return [{'emoji': label(r.emoji), 'count': r.count, **({'fri': True} if r.me is True else {})}
+            for r in reactions[:6] if isinstance(getattr(r, 'count', None), int)]
 
 
 def link_cards(message):

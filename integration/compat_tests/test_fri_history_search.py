@@ -23,7 +23,7 @@ def query(**changes):
             'after': '', 'before': '', 'has': '', 'cursor': '', **changes}
 
 
-def setup(monkeypatch, tmp_path, *, public=True, text='find old messages about what we played'):
+def setup(monkeypatch, tmp_path, *, public=True, text="fri find kev's meme from yesterday"):
     fri, agent, channels, _ = harness(monkeypatch, tmp_path)
     actions = Actions(agent, 20, 1 if public else 999, public)
     actions.event = event(user=20, channel=actions.channel, guild=123 if public else None, content=text)
@@ -274,4 +274,20 @@ def test_history_action_schema_and_runner_keep_one_refinement_and_remove_persist
         parsed = await model.respond(actions.message, {**CONTEXT, 'actions': offered})
         assert parsed.status == 'completed' and parsed.action == query()
         await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ["fri find kev's meme from yesterday",
+    'fri pull up that screenshot from yesterday', 'fri show me that clip from last night'])
+def test_plain_retrieval_offers_and_runs_bounded_search(monkeypatch, tmp_path, text):
+    async def scenario():
+        fri, _, actions, _, _, _ = setup(monkeypatch, tmp_path, text=text)
+        try:
+            assert 'history_search' in await actions.available()
+            result = await actions.execute(query())
+            assert len(result['messages']) == 5
+            assert actions.private_evidence
+            assert 'blocked' in await actions.execute(query(channel_id='2'))
+        finally:
+            await fri.close()
     asyncio.run(scenario())

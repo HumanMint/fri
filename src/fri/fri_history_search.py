@@ -135,12 +135,23 @@ def in_order(text, run):
     return True
 
 
+# A retrieval verb plus an archive/place/time cue is enough: no speaker grammar required.
+# Examples: "find kev's meme from yesterday", "pull up that screenshot from yesterday",
+# "show me that clip from last night", "look for that link in chat".
+ASK = r"^\s*(?:fri[,!]?\s+)?(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?"
+RETRIEVE = ASK+r"(?:find|search|pull\s+up|show\s+me|dig\s+up|look\s+(?:for|up|through|back))\b"
+RETRIEVAL = (
+    cues(RETRIEVE, r'(?:'+ARCHIVE+'|'+HERE+'|'+THEN+r')\b'),
+    cues(ASK+r'that\s+\w+(?:\s+\w+){0,3}\s+from\s+', THEN+r'(?='+END+')'),
+)
+
+
 def requested(text):
     visible = re.sub(r'```[\s\S]*?```|`[^`]*`|(?m:^>.*$)', '', text)
-    if re.search(r"(?i)\b(?:don't|do not|stop)\s+(?:search|look|read)", visible):
+    if re.search(r"(?i)\b(?:don't|do not|stop)\s+(?:search|look|read|find|pull|show|dig)\w*\b", visible):
         return False
     # A participle alone ("recommended settings") is not past attribution.
-    return any(in_order(visible, run) for run in RECALL) or bool(NAMED.search(visible))
+    return any(in_order(visible, run) for run in (*RECALL, *RETRIEVAL)) or bool(NAMED.search(visible))
 
 
 def valid_action(action):

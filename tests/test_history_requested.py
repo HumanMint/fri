@@ -15,7 +15,7 @@ LIMIT = 4000  # Discord's longest message.
 def test_a_long_repetitive_message_is_checked_quickly(unit):
     text = (unit*LIMIT)[:LIMIT]
     started = time.perf_counter()
-    assert not requested(text)
+    assert requested(text) is (unit == 'find clips posted in #a ')
     assert time.perf_counter()-started < 0.25  # Generous: unbounded scans took seconds.
 
 
@@ -62,3 +62,37 @@ def test_a_recall_question_at_the_end_of_a_long_message_still_counts(ask):
     started = time.perf_counter()
     assert requested(filler+' '+ask)
     assert time.perf_counter()-started < 0.25
+
+
+@pytest.mark.parametrize('text', [
+    "fri find kev's meme from yesterday", 'fri pull up that screenshot from yesterday',
+    'fri show me that clip from last night', 'fri dig up the photo from monday',
+    'fri look for that link in chat', 'fri that screenshot from yesterday?',
+])
+def test_ordinary_retrieval_phrasing(text):
+    assert requested(text)
+
+
+@pytest.mark.parametrize('text', [
+    'fri that screenshot was hilarious yesterday', 'fri show me how to draw',
+    'fri find me a good laptop', 'fri I found my keys yesterday', 'fri I could not find my keys yesterday',
+    'fri do not pull up that screenshot from yesterday',
+    "fri don't find kev's meme from yesterday", 'fri stop digging up chat',
+    '> fri pull up that screenshot from yesterday',
+    '`fri show me that clip from last night`',
+])
+def test_ordinary_non_retrieval_phrasing(text):
+    assert not requested(text)
+
+
+def test_shared_reaction_counts_are_bounded_and_never_enumerate_people():
+    from types import SimpleNamespace
+
+    from fri.fri_images import details
+
+    def forbidden():
+        raise AssertionError('reactor identities must never be read')
+
+    message = SimpleNamespace(reactions=[SimpleNamespace(emoji='😂', count=i, me=False, users=forbidden)
+                                         for i in range(8)])
+    assert details(message)['reactions'] == [{'emoji': '😂', 'count': i} for i in range(6)]

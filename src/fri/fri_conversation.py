@@ -618,11 +618,17 @@ def cards(posts):
 
 
 async def evidence(agent, message, burst, posts=None):
+    from .fri_images import reaction_counts
+
     rows = await live_rows(agent, message, burst) if len(burst) > 1 else []
     posts = [] if posts is None else posts
     target = await reply_target(agent, message, posts)
+    reply_id = getattr(getattr(message, 'reference', None), 'message_id', None)
+    reactions = {str(post.id): found for post in posts
+                 if post.id == reply_id and (found := reaction_counts(post))}
     return {'message_burst': rows, 'reply_target': target, 'target_versions': versions(posts),
-            **({'target_cards': found} if (found := cards(posts)) else {})}
+            **({'target_cards': found} if (found := cards(posts)) else {}),
+            **({'target_reactions': reactions} if reactions else {})}
 
 
 async def unchanged(agent, message, context):
