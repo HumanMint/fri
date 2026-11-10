@@ -325,7 +325,10 @@ def test_a_refetch_held_in_a_rate_limit_never_holds_the_heartbeat_or_a_later_opt
         for mid, author in ((100, 11), (101, 12)):
             memes.remember(post(mid, author), '🗿', 'a desk', 0)
         await asyncio.wait_for(agent.heartbeat.coro(agent), 1)
-        assert agent.stage.await_count == 13 and read == [100]  # Every stage ran (fri #358 added one); the read still waits.
+        assert agent.stage.await_count == 11 and read == [100]  # Optional stages ran while the read still waits.
+        await asyncio.wait_for(agent.delivery.coro(agent), 1)
+        assert [call.args[0] for call in agent.stage.await_args_list[-3:]] == ['delivery_state', 'posts', 'reminders']
+        assert read == [100]  # Confirmed delivery also runs without waiting for the meme read.
         allowed[12] = False  # Opted out outside Fri while Discord still holds the read.
         await asyncio.wait_for(memes.verify(now=time.time()+601), 1)
         assert set(memes.noted) == {100} and read == [100]  # Gone at its check, and no second pass.
