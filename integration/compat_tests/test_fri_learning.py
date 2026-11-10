@@ -14,6 +14,7 @@ from gene.config import Settings
 from gene.fri_agent_store import AgentStore, snowflake_floor
 from gene.store import Store
 
+from compat_tests.background import tick
 from compat_tests.test_api import headers
 from fri.fri_agent import Agent
 
@@ -299,9 +300,10 @@ def test_heartbeat_records_actual_tick_outcome(learning, failure, monkeypatch, t
         agent.send_reports = AsyncMock()
         agent.learn = AsyncMock(side_effect=ValueError('unavailable') if failure else None)
         agent.attend = AsyncMock()
-        await agent.heartbeat.coro(agent)
+        await tick(agent)
         assert agent.heartbeat_started == agent.heartbeat_finished == clock[0]
-        assert agent.heartbeat_status == ('deferred' if failure else 'ok')
+        assert agent.heartbeat_status == 'ok'
+        assert agent.background_status == ('deferred' if failure else 'ok')
         assert agent.stages['learning']['error'] == ('ValueError' if failure else None)
         agent.attend.assert_awaited_once()  # A failed stage no longer skips the ones after it.
     asyncio.run(scenario())

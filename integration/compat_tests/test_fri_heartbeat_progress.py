@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from gene.api import create_app
 
+from compat_tests.background import tick
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import response_event
 from compat_tests.test_fri_heartbeat import heartbeat as heartbeat  # noqa: F401
@@ -117,7 +118,7 @@ def test_a_model_call_after_long_reads_starts_its_own_clock_and_outside_calls_ne
         assert (await agent.run('attention', 'Decide.', {}, ATTENTION))[2] == 'completed'
         seen.append(watched(agent))
     agent.attend = attend
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     assert seen == ['ok', 'ok'] and agent.stages['attention']['error'] is None
 
     async def scenario():  # Stuck in memes, while a member's message gets a model call of its own.
@@ -126,16 +127,16 @@ def test_a_model_call_after_long_reads_starts_its_own_clock_and_outside_calls_ne
             entered.set()
             await release.wait()
         agent.attend, agent.check_memes = AsyncMock(), stuck
-        tick = asyncio.create_task(agent.heartbeat.coro(agent))
+        task = asyncio.create_task(tick(agent))
         await asyncio.wait_for(entered.wait(), 5)
-        moved = agent.heartbeat_progress
+        moved = agent.background_progress
         clock[0] += STALL
         await agent.run('attention', 'Decide.', {}, ATTENTION)
-        assert agent.heartbeat_progress == moved and watched(agent) == 'stalled'
+        assert agent.background_progress == moved and watched(agent) == 'stalled'
         agent.progressed()  # Outside the tick too: no mark.
-        assert agent.heartbeat_progress == moved
+        assert agent.background_progress == moved
         release.set()
-        await asyncio.wait_for(tick, 5)
+        await asyncio.wait_for(task, 5)
     asyncio.run(scenario())
 
 
@@ -168,7 +169,7 @@ def test_a_long_learning_batch_keeps_the_tick_moving_message_by_message(learning
     agent.profile = AsyncMock(side_effect=lambda channel, user: scheduler.context(str(channel), str(user)))
     agent.run = AsyncMock(return_value=({'summary': 'Music chat.', 'notes': []}, {}, 'completed'))
     agent.attend, agent.send_reports = AsyncMock(), AsyncMock()
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     assert agent.stages['learning']['error'] is None and len(agent.run.await_args.args[2]['messages']) == 12
     assert len(seen) == 12 and 12*100 > STALL and set(seen) == {'ok'}
 
@@ -185,7 +186,7 @@ def test_two_long_meme_inspections_keep_the_tick_moving(learning, tmp_path, monk
         return {'reaction': '💀', 'confidence': 'low', 'observation': ''}, {}, 'completed'
     h.agent.run = AsyncMock(side_effect=inspect)
     h.agent.learn, h.agent.attend, h.agent.send_reports = AsyncMock(), AsyncMock(), AsyncMock()
-    asyncio.run(Agent.heartbeat.coro(h.agent))
+    asyncio.run(tick(h.agent))
     assert h.agent.stages['memes']['error'] is None
     assert seen == ['ok', 'ok']
 
@@ -207,10 +208,10 @@ def test_a_tick_that_stops_moving_is_still_stuck(heartbeat, monkeypatch, where):
             transport = httpx.MockTransport(hung)
             heartbeat.fri.chat = Chat(SimpleNamespace(access_token=lambda: 'plan-auth'), transport)
             agent.attend = lambda: agent.run('attention', 'Decide.', {}, ATTENTION)
-        tick = asyncio.create_task(agent.heartbeat.coro(agent))
+        task = asyncio.create_task(tick(agent))
         await asyncio.wait_for(entered.wait(), 5)
         clock[0] += STALL
         assert watched(agent) == 'stalled'
         release.set()
-        await asyncio.wait_for(tick, 5)
+        await asyncio.wait_for(task, 5)
     asyncio.run(scenario())

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, Mock
 import discord
 import pytest
 
+from compat_tests.background import tick
 from compat_tests.test_fri_heartbeat import STATE
 from compat_tests.test_fri_member_profiles import (
     DM,
@@ -276,11 +277,11 @@ def test_rechecks_run_as_their_own_stage_whether_or_not_learning_is_on(monkeypat
                               {'member-summaries'}), data=tmp_path)
     agent = Agent(fri)
     agent.learn, agent.attend, agent.check_memes = AsyncMock(), AsyncMock(), AsyncMock()
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     passes.assert_not_awaited()
     fri.capabilities = frozenset({'member-summaries', RECHECKS})
     monkeypatch.setitem(STATE, 'config', {**STATE['config'], 'learning_enabled': False})
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     passes.assert_awaited_once_with(agent)
     assert agent.stages['summary_rechecks']['error'] is None
 

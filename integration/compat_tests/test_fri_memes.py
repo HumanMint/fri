@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 from gene.fri_agent_store import AgentStore
 
+from compat_tests.background import tick
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import response_event
 from compat_tests.test_fri_learning import learning as learning
@@ -261,7 +262,7 @@ def test_heartbeat_runs_meme_checks_independently_of_learning_and_does_not_die_o
         h.agent.attend = AsyncMock()
         h.agent.send_reports = AsyncMock()
         m = h.add()
-        await Agent.heartbeat.coro(h.agent)
+        await tick(h.agent)
         m.add_reaction.assert_awaited_once()
         h.agent.learn.assert_awaited_once()
         assert h.agent.heartbeat_status == 'ok'
@@ -272,7 +273,7 @@ def test_heartbeat_runs_meme_checks_independently_of_learning_and_does_not_die_o
 
         h.clock[0] += 1801
         h.channel.history = denied
-        await Agent.heartbeat.coro(h.agent)
+        await tick(h.agent)
         assert h.agent.memes.status()['channels']['3']['status'] == 'check_failed'
         assert h.agent.heartbeat_status == 'ok' and h.agent.learn.await_count == 2
     asyncio.run(scenario())

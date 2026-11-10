@@ -10,6 +10,7 @@ import aiohttp
 import discord
 import pytest
 
+from compat_tests.background import tick
 from compat_tests.test_api import actor, headers
 from compat_tests.test_fri_learning import dm_owner
 from compat_tests.test_fri_runtime import configured
@@ -48,26 +49,27 @@ def test_undeliverable_report_card_no_longer_silences_attention_or_memes(heartbe
     # A Gene/Fri skew in the report card raises KeyError on every tick; it used to skip everything after it.
     heartbeat.reports.append({'id': 'a'*32, 'body': 'Learning pass', 'card': {'historical_notes': 1}})
     agent = heartbeat.agent
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     heartbeat.owner.send.assert_not_awaited()
     agent.learn.assert_awaited_once()
     agent.attend.assert_awaited_once()
     agent.check_memes.assert_awaited_once()
     assert agent.heartbeat_status == 'deferred'
+    assert agent.background_status == 'ok'
     assert agent.stages['reports']['error'] == 'KeyError' and agent.stages['reports']['last_ok'] is None
-    assert all(agent.stages[name]['error'] is None for name in ('learning', 'attention', 'fixes', 'memes'))
+    assert all(agent.stages[name]['error'] is None for name in ('posts', 'reminders', 'learning', 'attention', 'fixes', 'memes'))
     assert ('POST', '/agent/reports/'+'a'*32+'/delivered') not in [c.args[:2] for c in heartbeat.fri.api.await_args_list]
 
 
 def test_meme_failure_is_recorded_and_the_next_tick_recovers(heartbeat):
     agent = heartbeat.agent
     agent.check_memes.side_effect = RuntimeError('unexpected')
-    asyncio.run(agent.heartbeat.coro(agent))
-    assert agent.heartbeat_status == 'deferred' and agent.stages['memes']['error'] == 'RuntimeError'
+    asyncio.run(tick(agent))
+    assert agent.background_status == 'deferred' and agent.stages['memes']['error'] == 'RuntimeError'
     agent.attend.assert_awaited_once()
     failed_at = agent.stages['memes']['at']
     agent.check_memes.side_effect = None
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     assert agent.heartbeat_status == 'ok' and agent.stages['memes']['error'] is None
     assert agent.stages['memes']['last_ok'] >= failed_at
 
@@ -81,10 +83,10 @@ def test_cut_off_requester_notice_sends_are_settled_whatever_fri_or_the_controll
         settled.append(agent)
 
     monkeypatch.setattr('fri.fri_fixes.settle', settle)
-    asyncio.run(agent.heartbeat.coro(agent))  # A controller without requester-notice-authorize.
+    asyncio.run(tick(agent))  # A controller without requester-notice-authorize.
     assert settled == [agent] and agent.stages['notices']['error'] is None
     monkeypatch.setitem(STATE, 'config', {**STATE['config'], 'enabled': False})
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     assert settled == [agent, agent]
 
 
@@ -98,17 +100,17 @@ def test_a_day_old_notice_note_is_dropped_while_the_controller_is_out(heartbeat)
         'b'*12: {'lease': 'e'*32, 'actor': '10', 'channel_id': '456', 'since': now, 'at': now}})
     heartbeat.fri.api.side_effect = ControllerUnavailable(UNREACHABLE)
     agent = heartbeat.agent
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     assert agent.heartbeat_status == 'deferred' and 'notices' not in agent.stages
     assert list(json.loads((heartbeat.fri.data/'requester-notices.json').read_text())) == ['b'*12]
 
 
 def test_disabled_stages_do_not_run_or_report(heartbeat, monkeypatch):
     agent = heartbeat.agent
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     assert 'memes' in agent.stages
     monkeypatch.setitem(STATE, 'config', {**STATE['config'], 'meme_enabled': False})
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     agent.check_memes.assert_awaited_once()
     assert 'memes' not in agent.stages and agent.heartbeat_status == 'ok'
 
@@ -119,14 +121,14 @@ def test_reply_checks_run_as_their_own_stage(heartbeat, monkeypatch):
     heartbeat.fri.capabilities = frozenset({'reply-checks'})
     monkeypatch.setitem(STATE, 'config', {**STATE['config'], 'reply_check_enabled': True})
     agent.check_memes.side_effect = KeyError('meme')
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     check.assert_awaited_once_with(agent)  # A broken meme check no longer skips it.
     assert agent.stages['reply_checks']['error'] == 'RuntimeError' and agent.stages['memes']['error'] == 'KeyError'
     agent.check_memes.side_effect = check.side_effect = None
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     assert agent.heartbeat_status == 'ok' and agent.stages['reply_checks']['error'] is None
     heartbeat.fri.capabilities = frozenset()  # The controller refused reply checks or predates them.
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     assert check.await_count == 2 and 'reply_checks' not in agent.stages
 
 
@@ -137,7 +139,7 @@ def test_a_controller_without_a_setting_treats_it_as_off(heartbeat, monkeypatch)
     heartbeat.fri.capabilities = frozenset({'reply-checks'})
     config = {k: v for k, v in STATE['config'].items() if not k.startswith('reply_check') and k != 'status_enabled'}
     monkeypatch.setitem(STATE, 'config', config)
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     check.assert_not_awaited()
     assert agent.heartbeat_status == 'ok' and 'reply_checks' not in agent.stages and agent.presence is None
     assert agent.stages['presence']['error'] is None
@@ -164,7 +166,7 @@ def test_unexpected_errors_never_end_the_heartbeat_loop(heartbeat, stage):
         assert agent.heartbeat.is_running() and not agent.heartbeat.failed()
         agent.heartbeat.cancel()
     asyncio.run(scenario())
-    assert agent.heartbeat_status == 'deferred'
+    assert (agent.heartbeat_status if stage == 'state' else agent.background_status) == 'deferred'
     assert (agent.stages == {}) if stage == 'state' else agent.stages['memes']['error'] == 'RuntimeError'
 
 
@@ -173,7 +175,7 @@ def test_heartbeat_cancellation_still_stops_a_stage():
         agent = Agent(SimpleNamespace(api=AsyncMock(return_value=STATE)))
         agent.check_presence = AsyncMock(side_effect=asyncio.CancelledError())
         with pytest.raises(asyncio.CancelledError):
-            await agent.heartbeat.coro(agent)
+            await tick(agent)
         assert agent.heartbeat_finished and agent.heartbeat_current is None and agent.heartbeat_ticking is None
     asyncio.run(scenario())
 
@@ -205,23 +207,23 @@ def test_a_stuck_stage_is_named_in_the_health_file_and_fri_health_until_its_tick
 
         async def written():
             await fri.health.coro(fri)
-            health = json.loads((tmp_path/'fri-health.json').read_text())
-            assert health['agent_delivery']['hold_timeouts'] == agent.delivery_hold_timeouts
-            return health['agent_heartbeat']
+            return json.loads((tmp_path/'fri-health.json').read_text())[
+                'agent_heartbeat' if stage == 'state' else 'agent_background']
 
         def me(report):
-            return next(line for line in report.splitlines() if line.startswith('- me:'))
+            return next(line for line in report.splitlines() if line.startswith('- me:' if stage == 'state' else '- background:'))
         try:
             assert (await written())['current'] is None
-            tick = asyncio.create_task(agent.heartbeat.coro(agent))
+            task = asyncio.create_task(tick(agent))
             await asyncio.wait_for(entered.wait(), 5)
-            agent.heartbeat_current['since'] -= 14*60  # As if it had hung that long.
+            current = agent.heartbeat_current if stage == 'state' else agent.background_current
+            current['since'] -= 14*60  # As if it had hung that long.
             beat = await written()
             assert beat['current']['stage'] == stage and 14*60 <= time.time()-beat['current']['since'] < 14*60+5
-            assert {'running', 'failed', 'started', 'finished', 'status', 'stages'} <= set(beat)  # Gene's readers.
+            assert {'running', 'started', 'finished', 'status', 'current'} <= set(beat)  # Gene's readers.
             assert me(await fri.watcher.report()).endswith(f'running {stage} for 14 min')
             release.set()
-            await asyncio.wait_for(tick, 5)
+            await asyncio.wait_for(task, 5)
             assert agent.heartbeat_current is None and agent.heartbeat_ticking is None
             assert (await written())['current'] is None
             assert 'running' not in me(await fri.watcher.report())
@@ -460,39 +462,3 @@ def test_client_level_refusals_keep_every_receipt_queued(client, tmp_path):
         asyncio.run(Fri.flush_usage(usage_runtime(client, tmp_path, token='fri-'+'y'*32)))
     assert refused.value.status == 401
     assert len(list(usage.glob('*.json'))) == 2 and not (usage/'rejected').exists()
-
-
-def test_delivery_errors_do_not_skip_reminders_or_mask_heartbeat(heartbeat, monkeypatch):
-    agent = heartbeat.agent
-    posts = AsyncMock(side_effect=OSError())
-    reminders = AsyncMock()
-    monkeypatch.setattr('fri.fri_workspace.deliver_one', posts)
-    monkeypatch.setattr('fri.fri_social.deliver_one', reminders)
-
-    async def scenario():
-        agent.running('learning')
-        current, progress = agent.heartbeat_current, agent.heartbeat_progress
-        await agent.delivery.coro(agent)
-        assert agent.delivery_status == 'deferred'
-        assert agent.stages['posts']['error'] == 'OSError'
-        assert agent.stages['reminders']['error'] is None
-        reminders.assert_awaited_once()
-        assert agent.heartbeat_current == current and agent.heartbeat_progress == progress
-        assert agent.delivery_current is None and agent.delivery_finished
-        posts.side_effect = None
-        await agent.delivery.coro(agent)
-        assert agent.delivery_status == 'ok' and agent.stages['posts']['error'] is None
-    asyncio.run(scenario())
-
-
-def test_delivery_cancellation_clears_health_and_stops_before_reminders(heartbeat, monkeypatch):
-    monkeypatch.setattr('fri.fri_workspace.deliver_one', AsyncMock(side_effect=asyncio.CancelledError()))
-    reminders = AsyncMock()
-    monkeypatch.setattr('fri.fri_social.deliver_one', reminders)
-
-    async def scenario():
-        with pytest.raises(asyncio.CancelledError):
-            await heartbeat.agent.delivery.coro(heartbeat.agent)
-        assert heartbeat.agent.delivery_current is None and heartbeat.agent.delivery_finished
-        reminders.assert_not_awaited()
-    asyncio.run(scenario())

@@ -9,6 +9,7 @@ import aiohttp
 import discord
 import pytest
 
+from compat_tests.background import tick
 from compat_tests.test_fri_learning import learning as learning  # noqa: F401
 from compat_tests.test_fri_looking import picture, read_harness
 from compat_tests.test_fri_memes import attachment
@@ -284,7 +285,7 @@ def test_the_heartbeat_expires_notes_even_when_gene_is_down(monkeypatch, tmp_pat
         agent = Agent(SimpleNamespace(data=tmp_path, api=down, guild_id=123, owner_id=10, workshop_id=456))
         agent.ensure_memes().noted[5] = {'at': time.time()-3*86400-1, 'channel': 3, 'author': '11', 'revision': 0,
                                          'emoji': '🗿', 'note': 'a desk', 'edited': None}
-        await agent.heartbeat.coro(agent)
+        await tick(agent)
         assert agent.heartbeat_status == 'deferred' and agent.memes.noted == {}
     asyncio.run(scenario())
 
@@ -320,15 +321,16 @@ def test_a_refetch_held_in_a_rate_limit_never_holds_the_heartbeat_or_a_later_opt
         async def profile(channel, user):
             return {'enabled': allowed[user], 'revision': 0}
         agent.profile = profile
-        agent.stage = AsyncMock(return_value=True)
+        async def stage(name, step, *args, **kwargs):
+            if name == 'background':
+                await step()
+            return True
+        agent.stage = AsyncMock(side_effect=stage)
         memes = agent.ensure_memes()
         for mid, author in ((100, 11), (101, 12)):
             memes.remember(post(mid, author), '🗿', 'a desk', 0)
-        await asyncio.wait_for(agent.heartbeat.coro(agent), 1)
-        assert agent.stage.await_count == 11 and read == [100]  # Optional stages ran while the read still waits.
-        await asyncio.wait_for(agent.delivery.coro(agent), 1)
-        assert [call.args[0] for call in agent.stage.await_args_list[-3:]] == ['delivery_state', 'posts', 'reminders']
-        assert read == [100]  # Confirmed delivery also runs without waiting for the meme read.
+        await asyncio.wait_for(tick(agent), 1)
+        assert agent.stage.await_count == 14 and read == [100]  # Mandatory and optional stages ran; the read still waits.
         allowed[12] = False  # Opted out outside Fri while Discord still holds the read.
         await asyncio.wait_for(memes.verify(now=time.time()+601), 1)
         assert set(memes.noted) == {100} and read == [100]  # Gone at its check, and no second pass.

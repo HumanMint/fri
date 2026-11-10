@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from gene.api import create_app
 from gene.fri_agent_store import AgentStore
 
+from compat_tests.background import tick
 from compat_tests.test_api import headers
 from compat_tests.test_fri_chat import response_event
 from compat_tests.test_fri_learning import learning as learning
@@ -260,7 +261,7 @@ def test_status_failure_does_not_stop_other_heartbeat_work(harness):
         h.agent.send_reports = AsyncMock()
         h.agent.learn = AsyncMock()
         h.agent.attend = AsyncMock()
-        await Agent.heartbeat.coro(h.agent)
+        await tick(h.agent)
         h.agent.run.assert_not_awaited()
         h.agent.send_reports.assert_awaited_once()
         h.agent.learn.assert_awaited_once()

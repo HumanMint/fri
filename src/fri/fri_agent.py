@@ -281,11 +281,11 @@ class Agent:
         self.presence = None
         self.heartbeat_started = self.heartbeat_finished = 0
         self.heartbeat_status = 'starting'
-        self.delivery_started = self.delivery_finished = 0
-        self.delivery_status = 'starting'
-        self.delivery_current = None
-        self.delivery_hold_timeouts = {'posts': 0, 'reminders': 0}
         self.stages = {}
+        self.background_task = None
+        self.background_started = self.background_finished = 0
+        self.background_status = 'starting'
+        self.background_current = self.background_ticking = self.background_progress = None
         self.heartbeat_current = None  # The tick's step now, {'stage', 'since'} by the wall clock; None between ticks.
         self.heartbeat_ticking = None  # time.monotonic() as the running tick began; None between ticks.
         # time.monotonic() at the tick's last step forward (a new stage, another channel's attention): the watch
@@ -351,11 +351,11 @@ class Agent:
         self.state = await self.fri.api('GET', '/agent/state')
         self.saved_turns.retry()  # Withdrawals the controller hadn't taken before a restart (fri #215).
         self.heartbeat.start()
-        self.delivery.start()
 
     def close(self):
         self.heartbeat.cancel()
-        self.delivery.cancel()
+        if self.background_task is not None:
+            self.background_task.cancel()
 
     async def record(self, role, model, effort, counters, status, purpose=None, deliver=True):
         attempt = uuid.uuid4().hex
@@ -3110,31 +3110,33 @@ class Agent:
             self.memes = Memes(self)
         return self.memes
 
-    async def stage(self, name, step, *switches, when=None, delivery=False):
-        """One background stage. A failure is logged by class and recorded, and never skips later stages."""
+    async def stage(self, name, step, *switches, when=None, background=False):
+        """One scheduled stage. A failure is logged by class and recorded, and never skips later stages."""
         now = time.time()
         try:
             # Older controllers send no reply_check_* settings; a missing switch is off.
             if not all(self.config.get(key) for key in switches) or (when and not when()):
                 self.stages.pop(name, None)
                 return True
-            if delivery:
-                self.delivery_current = {'stage': name, 'since': now}
-            else:
-                self.running(name)
+            self.running(name, background=background)
             await step()
         except Exception as exc:  # CancelledError is a BaseException, so stopping the loop still works.
-            LOG.warning('Fri heartbeat stage %s deferred: %s', name, type(exc).__name__)
+            LOG.warning('Fri %s stage %s deferred: %s',
+                        'background' if background else 'heartbeat', name, type(exc).__name__)
             self.stages[name] = {'at': now, 'last_ok': self.stages.get(name, {}).get('last_ok'),
                                  'error': type(exc).__name__}
             return False
         self.stages[name] = {'at': now, 'last_ok': now, 'error': None}
         return True
 
-    def running(self, name):
+    def running(self, name, *, background=False):
         """The tick's step now running, which the health file and the owner's report name while it lasts."""
-        self.heartbeat_current = {'stage': name, 'since': time.time()}
-        self.heartbeat_progress = time.monotonic()
+        if background:
+            self.background_current = {'stage': name, 'since': time.time()}
+            self.background_progress = time.monotonic()
+        else:
+            self.heartbeat_current = {'stage': name, 'since': time.time()}
+            self.heartbeat_progress = time.monotonic()
 
     def progressed(self):
         """A long stage moved on: attention reached another channel, a learning message or meme post is done, or a
@@ -3142,9 +3144,12 @@ class Agent:
         from .fri_agent_model import progress
         progress()
 
-    def mark(self, tick):
+    def mark(self, tick, *, background=False):
         """The progress mark of tick `tick`, its monotonic start: work it left running can't mark a later tick."""
-        if tick is not None and tick == self.heartbeat_ticking:
+        if background:
+            if tick is not None and tick == self.background_ticking:
+                self.background_progress = time.monotonic()
+        elif tick is not None and tick == self.heartbeat_ticking:
             self.heartbeat_progress = time.monotonic()
 
     @tasks.loop(seconds=30)
@@ -3168,35 +3173,23 @@ class Agent:
         else:
             from .fri_fixes import check as check_fixes
             from .fri_fixes import settle as settle_notices
-            from .fri_member_summary import CAPABILITY as SUMMARIES
-            from .fri_member_summary import RECHECKS
-            from .fri_member_summary import build as build_summary
-            from .fri_member_summary import recheck as recheck_summaries
-            from .fri_reply_checks import CAPABILITY
-            from .fri_reply_checks import check as check_replies
+            from .fri_social import deliver_one as deliver_reminder
+            from .fri_workspace import deliver_one as deliver_post
             # An undeliverable owner report or a broken meme check must not silence attention.
             self.running('meme_notes')
             try:  # Meme notes follow their authors' privacy even while meme checks are off.
                 await self.ensure_memes().verify()
             except Exception as exc:  # Never at the cost of the stages below.
                 LOG.warning('Meme notes not verified this tick: %s', type(exc).__name__)
-            results = [await self.stage('presence', self.check_presence),
-                       # Whatever learning or memory does: a deleted channel's saves go (fri #358).
-                       await self.stage('channel_withdrawals', self.channel_withdrawals.settle),
+            results = [await self.stage('channel_withdrawals', self.channel_withdrawals.settle),
+                       await self.stage('posts', lambda: deliver_post(self.fri),
+                                        when=lambda: not self.saved_turns.closed()),
+                       await self.stage('reminders', lambda: deliver_reminder(self.fri),
+                                        when=lambda: not self.saved_turns.closed()),
                        await self.stage('reports', self.send_reports),
-                       await self.stage('learning', self.learn, 'enabled'),
-                       await self.stage('attention', self.attend, 'enabled'),
                        await self.stage('fixes', lambda: check_fixes(self), 'enabled'),
-                       await self.stage('notices', lambda: settle_notices(self)),
-                       await self.stage('memes', self.check_memes, 'enabled', 'meme_enabled'),
-                       await self.stage('reply_checks', lambda: check_replies(self), 'enabled', 'reply_check_enabled',
-                                        when=lambda: CAPABILITY in self.fri.capabilities),
-                       await self.stage('member_summaries', lambda: build_summary(self), 'enabled', 'learning_enabled',
-                                        when=lambda: SUMMARIES in getattr(self.fri, 'capabilities', ())),
-                       # Kept summaries shown in requests whatever learning does, so rechecked whatever it does too
-                       # (fri #349): Discord reads, no model call.
-                       await self.stage('summary_rechecks', lambda: recheck_summaries(self),
-                                        when=lambda: {SUMMARIES, RECHECKS} <= set(getattr(self.fri, 'capabilities', ())))]
+                       await self.stage('notices', lambda: settle_notices(self))]
+            self.kick_background()
             self.heartbeat_status = 'ok' if all(results) else 'deferred'
         finally:
             PROGRESS.reset(marking)
@@ -3207,36 +3200,38 @@ class Agent:
     async def before_heartbeat(self):
         await self.fri.wait_until_ready()
 
-    @tasks.loop(seconds=30)
-    async def delivery(self):
-        """Confirmed delivery on its own schedule; never waits for optional model work.
+    def kick_background(self):
+        if self.background_task is None or self.background_task.done():
+            self.background_task = asyncio.create_task(self.background())
 
-        Controller claims/sending fences and durable receipts remain the delivery authority.
-        """
-        from .fri_delivery import DeliveryFence
-        from .fri_social import deliver_one as deliver_reminder
-        from .fri_workspace import deliver_one as deliver_post
-        before = DeliveryFence.mark(self)
-        self.delivery_started = time.time()
+    async def background(self):
+        from .fri_agent_model import PROGRESS
+        self.background_started, self.background_ticking = time.time(), time.monotonic()
+        marking = PROGRESS.set(lambda tick=self.background_ticking: self.mark(tick, background=True))
         try:
-            # Read switches without replacing the state an in-flight model stage is using.
-            config = {}
-
-            async def read_switches():
-                config.update((await self.fri.api('GET', '/agent/state'))['config'])
-
-            if not await self.stage('delivery_state', read_switches, delivery=True):
-                self.delivery_status = 'deferred'
-                return
-            results = [await self.stage('posts', lambda: deliver_post(
-                           self.fri, config=config, fence=DeliveryFence(self, before, 'posts')), delivery=True),
-                       await self.stage('reminders', lambda: deliver_reminder(
-                           self.fri, config=config, fence=DeliveryFence(self, before, 'reminders')), delivery=True)]
-            self.delivery_status = 'ok' if all(results) else 'deferred'
+            if not await self.stage('background', self.background_pass, background=True):
+                self.background_status = 'deferred'
         finally:
-            self.delivery_finished = time.time()
-            self.delivery_current = None
+            PROGRESS.reset(marking)
+            self.background_finished = time.time()
+            self.background_current = self.background_ticking = self.background_progress = None
 
-    @delivery.before_loop
-    async def before_delivery(self):
-        await self.fri.wait_until_ready()
+    async def background_pass(self):
+        from .fri_member_summary import CAPABILITY as SUMMARIES
+        from .fri_member_summary import RECHECKS
+        from .fri_member_summary import build as build_summary
+        from .fri_member_summary import recheck as recheck_summaries
+        from .fri_reply_checks import CAPABILITY
+        from .fri_reply_checks import check as check_replies
+        results = [await self.stage('presence', self.check_presence, background=True),
+                   await self.stage('learning', self.learn, 'enabled', background=True),
+                   await self.stage('attention', self.attend, 'enabled', background=True),
+                   await self.stage('memes', self.check_memes, 'enabled', 'meme_enabled', background=True),
+                   await self.stage('reply_checks', lambda: check_replies(self), 'enabled', 'reply_check_enabled',
+                                    when=lambda: CAPABILITY in self.fri.capabilities, background=True),
+                   await self.stage('member_summaries', lambda: build_summary(self), 'enabled', 'learning_enabled',
+                                    when=lambda: SUMMARIES in getattr(self.fri, 'capabilities', ()), background=True),
+                   await self.stage('summary_rechecks', lambda: recheck_summaries(self),
+                                    when=lambda: {SUMMARIES, RECHECKS} <= set(getattr(self.fri, 'capabilities', ())),
+                                    background=True)]
+        self.background_status = 'ok' if all(results) else 'deferred'

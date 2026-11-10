@@ -9,6 +9,7 @@ import discord
 import httpx
 import pytest
 
+from compat_tests.background import tick
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_heartbeat import STATE
 from compat_tests.test_fri_member_profiles import (
@@ -326,15 +327,15 @@ def test_the_builder_runs_as_its_own_stage_only_against_a_capable_controller(mon
                           data=tmp_path)
     agent = Agent(fri)
     agent.learn, agent.attend, agent.check_memes = AsyncMock(), AsyncMock(), AsyncMock()
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     built.assert_not_awaited()
     assert 'member_summaries' not in agent.stages and agent.heartbeat_status == 'ok'
     fri.capabilities = frozenset({'member-summaries'})
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     built.assert_awaited_once_with(agent)
     assert agent.stages['member_summaries']['error'] is None
     monkeypatch.setitem(STATE, 'config', {**STATE['config'], 'learning_enabled': False})
-    asyncio.run(agent.heartbeat.coro(agent))
+    asyncio.run(tick(agent))
     assert built.await_count == 1 and 'member_summaries' not in agent.stages
 
 

@@ -16,6 +16,7 @@ from gene.api import create_app
 from gene.config import Settings
 from gene.store import Store
 
+from compat_tests.background import tick
 from compat_tests.test_api import headers
 from fri import fri_fixes
 from fri.fri_agent import Agent
@@ -780,7 +781,7 @@ def test_a_hung_mark_never_holds_up_the_heartbeat(world, monkeypatch):
         agent.check_presence, agent.send_reports, agent.learn = AsyncMock(), AsyncMock(), AsyncMock()
         later = agent.check_memes = AsyncMock()
         agent.config['meme_enabled'] = True
-        await asyncio.wait_for(agent.heartbeat.coro(agent), 2)
+        await asyncio.wait_for(tick(agent), 2)
         assert blocked.is_set() and (world.fri.data / fri_fixes.FILE).exists()
         later.assert_awaited_once()
         gene_error.add_reaction.assert_not_awaited()

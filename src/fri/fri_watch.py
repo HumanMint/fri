@@ -86,7 +86,10 @@ def down(kind, detail, since):
     if kind == 'stopped':
         return f'gene’s command runner has been dead since {at}, so nobody’s touching the music. {fix}'
     if kind == 'stalled':
-        return (f'my heartbeat’s been stuck in {detail["stage"]} since {at}, so reminders, posts and attention are '
+        if detail.get('loop') == 'background':
+            return (f'my background worker’s been stuck in {detail["stage"]} since {at}, so background checks are '
+                    'on hold. a restart clears it, and i can’t restart myself.')
+        return (f'my heartbeat’s been stuck in {detail["stage"]} since {at}, so reminders and posts are '
                 'on hold. a restart clears it, and i can’t restart myself.')
     beat = f'last heartbeat {span(detail["age"])} ago' if detail.get('age') is not None else 'no heartbeat on record'
     release = f', release {detail["sha"]}' if detail.get('sha') else ''
@@ -162,16 +165,18 @@ class Watch:
         return assess(health)
 
     def stalled(self):
-        """Fri's own heartbeat, once Gene and its controller read fine: a tick that hasn't moved forward for STALL or
+        """Fri's heartbeat and optional worker, once Gene and its controller read fine: a tick that hasn't moved forward for STALL or
         longer, by the monotonic clock, is stuck in the step it's on. A long tick that keeps reaching new stages or
         channels isn't. The time since it last moved dates the start, as Gene's heartbeat does, and a step forward
         ends the stall, so the DM never names a stage the tick has left. `moved`, that last progress mark, tells one
         stall from the next even when no read saw the tick moving in between (see observe)."""
         agent = self.fri.agent
-        moved, current = (getattr(agent, 'heartbeat_progress', None), agent.heartbeat_current) if agent else (None, None)
-        if moved is None or current is None or (age := time.monotonic()-moved) < STALL:
-            return 'ok', {}
-        return 'stalled', {'age': age, 'stage': current['stage'], 'moved': moved}
+        for loop in ('heartbeat', 'background'):
+            moved = getattr(agent, loop+'_progress', None) if agent else None
+            current = getattr(agent, loop+'_current', None) if agent else None
+            if moved is not None and current is not None and (age := time.monotonic()-moved) >= STALL:
+                return 'stalled', {'age': age, 'stage': current['stage'], 'moved': moved, 'loop': loop}
+        return 'ok', {}
 
     @staticmethod
     def recovered(alert, at):
@@ -207,13 +212,14 @@ class Watch:
         state['checked'], self.read_at = now, time.monotonic()
         alert = state['alert']
         if kind == 'stalled':
-            if alert and alert['open'] and alert['kind'] == 'stalled' and detail['moved'] != self.stall:
+            moved = (detail.get('loop', 'heartbeat'), detail['moved'])
+            if alert and alert['open'] and alert['kind'] == 'stalled' and moved != self.stall:
                 # The tick moved on since the stall the DM names (or Fri restarted), unseen, and is stuck again: that
                 # stall ended when it moved, as an `ok` read would have said, and this one starts a streak of its own.
                 # The DM keeps its nonce and delivery state, so the new stall edits it as any relapse would.
                 self.recovered(alert, now-detail['age'])
                 state['bad'] = 0
-            self.stall = detail['moved']
+            self.stall = moved
         if kind == 'ok':
             state.update(bad=0, kind='')
             self.recovered(alert, now)
@@ -357,14 +363,16 @@ class Watch:
                 me += f", running {current['stage']} for {span(now-current['since'])}"
         lines.append(me)
         if agent:
-            delivery = f'- delivery: {agent.delivery_status}'
-            if current := agent.delivery_current:
-                delivery += f", running {current['stage']} for {span(now-current['since'])}"
-            lines.append(delivery)
-        loops = {'heartbeat': agent.heartbeat if agent else None,
-                 'delivery': agent.delivery if agent else None, 'owner dms': fri.owner_reviews,
+            background = f'- background: {agent.background_status}'
+            if current := agent.background_current:
+                background += f", running {current['stage']} for {span(now-current['since'])}"
+            lines.append(background)
+        loops = {'heartbeat': agent.heartbeat if agent else None, 'owner dms': fri.owner_reviews,
                  'health file': fri.health}
         loops = {name: (loop.is_running(), loop.failed()) for name, loop in loops.items() if loop}
+        task = agent.background_task if agent else None
+        loops['background'] = (bool(task and not task.done()),
+                               bool(task and task.done() and not task.cancelled() and task.exception()))
         task = fri.watching  # A plain task, not a tasks.loop.
         loops['watch'] = (bool(task and not task.done()),
                           bool(task and task.done() and not task.cancelled() and task.exception()))

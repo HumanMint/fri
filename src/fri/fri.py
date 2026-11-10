@@ -1678,10 +1678,9 @@ class Fri(discord.Client):
                 'started': self.agent.heartbeat_started, 'finished': self.agent.heartbeat_finished,
                 'status': self.agent.heartbeat_status, 'stages': self.agent.stages,
                 'current': self.agent.heartbeat_current} if self.agent else None,
-            'agent_delivery': {'running': self.agent.delivery.is_running(), 'failed': self.agent.delivery.failed(),
-                'started': self.agent.delivery_started, 'finished': self.agent.delivery_finished,
-                'status': self.agent.delivery_status, 'current': self.agent.delivery_current,
-                'hold_timeouts': self.agent.delivery_hold_timeouts} if self.agent else None,
+            'agent_background': {'running': bool(self.agent.background_task and not self.agent.background_task.done()),
+                'started': self.agent.background_started, 'finished': self.agent.background_finished,
+                'status': self.agent.background_status, 'current': self.agent.background_current} if self.agent else None,
             'outcomes': self.agent.ledger.snapshot() if self.agent else None,
             'withdrawals': self.agent.saved_turns.status() if self.agent else None,
             'channel_withdrawals': self.agent.channel_withdrawals.status() if self.agent else None,
@@ -1712,6 +1711,8 @@ class Fri(discord.Client):
         finally:
             if self.agent:
                 self.agent.close()
+                if (worker := getattr(self.agent, 'background_task', None)) is not None:
+                    await asyncio.gather(worker, return_exceptions=True)
             self.health.cancel()
             self.owner_reviews.cancel()
             if self.watching:
