@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from compat_tests.test_fri_actions import harness
+from compat_tests.test_fri_agent import setup_agent as setup_agent
 from compat_tests.test_fri_chat import CONTEXT, response_event
 from compat_tests.test_fri_runtime import event
 from fri.fri_actions import Actions
@@ -288,6 +289,54 @@ def test_plain_retrieval_offers_and_runs_bounded_search(monkeypatch, tmp_path, t
             assert len(result['messages']) == 5
             assert actions.private_evidence
             assert 'blocked' in await actions.execute(query(channel_id='2'))
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('text', ['fri show me how to mute someone in this chat',
+                                'fri show me a workout for monday'])
+def test_help_does_not_offer_or_run_history_search(monkeypatch, tmp_path, text):
+    async def scenario():
+        fri, _, actions, _, _, _ = setup(monkeypatch, tmp_path,
+            text=text)
+        try:
+            assert 'history_search' not in await actions.available()
+            assert 'blocked' in await actions.execute(query())
+            fri.http.request.assert_not_awaited()
+        finally:
+            await fri.close()
+    asyncio.run(scenario())
+
+
+def test_search_after_disable_and_reenable_excludes_pre_removal_posts(monkeypatch, tmp_path, setup_agent):
+    from gene.fri_agent_store import AgentStore
+    from gene.store import Store
+
+    async def scenario():
+        store, settings, _ = setup_agent
+        fri, agent, actions, _, rows, messages = setup(monkeypatch, tmp_path,
+            text='what did Dipper say yesterday?')  # Main admits this too.
+        cutoff = time.time()-20
+        old_id = rows[0]['id']
+        at = time.time()-5
+        rows[0]['id'] = snowflake(at)
+        recent = messages.pop(int(old_id))
+        recent.id = int(rows[0]['id'])
+        recent.created_at = dt.datetime.fromtimestamp(at, dt.timezone.utc)
+        recent.jump_url = 'https://discord.com/channels/123/1/'+rows[0]['id']
+        messages[recent.id] = recent
+        store.personal_control('30', 'disable', discord_at=cutoff)
+        store.personal_control('30', 'enable')
+        # Reopen durable state, rather than keeping a synthetic enabled flag.
+        controller = AgentStore(Store(settings.db), settings)
+        profile = controller.context('1', '30', '123')
+        assert profile['enabled'] and profile['removed_at_discord'] == cutoff
+        agent.profile = AsyncMock(return_value=profile)
+        try:
+            result = await actions.execute(query())
+            assert [row['id'] for row in result['messages']] == [rows[0]['id']]
+            assert set(actions.history.evidence) == {('1', int(rows[0]['id']))}
         finally:
             await fri.close()
     asyncio.run(scenario())

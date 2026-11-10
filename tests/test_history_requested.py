@@ -15,7 +15,7 @@ LIMIT = 4000  # Discord's longest message.
 def test_a_long_repetitive_message_is_checked_quickly(unit):
     text = (unit*LIMIT)[:LIMIT]
     started = time.perf_counter()
-    assert requested(text) is (unit == 'find clips posted in #a ')
+    assert not requested(text)
     assert time.perf_counter()-started < 0.25  # Generous: unbounded scans took seconds.
 
 
@@ -67,7 +67,8 @@ def test_a_recall_question_at_the_end_of_a_long_message_still_counts(ask):
 @pytest.mark.parametrize('text', [
     "fri find kev's meme from yesterday", 'fri pull up that screenshot from yesterday',
     'fri show me that clip from last night', 'fri dig up the photo from monday',
-    'fri look for that link in chat', 'fri that screenshot from yesterday?',
+    'fri look for that link someone shared in chat', 'fri that screenshot from yesterday?',
+    'fri show me that image someone sent', 'fri pull up the file you shared in chat',
 ])
 def test_ordinary_retrieval_phrasing(text):
     assert requested(text)
