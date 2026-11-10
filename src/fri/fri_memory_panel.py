@@ -13,7 +13,7 @@ from .fri_reports import privacy_change
 
 NO_MENTIONS = discord.AllowedMentions.none()
 SHOWN = 25  # Discord's limit for one select menu.
-COMPONENT = re.compile(r'^fri:memory:(?:(?:open|choose|remove|replace|edit|share|confirm|keep|summary|clear|rewrite):'
+COMPONENT = re.compile(r'^fri:memory:(?:(?:open|choose|remove|replace|edit|share|confirm|keep|summary|clear|rewrite|previous|next):'
                        r'[a-f0-9]{32}|open:[0-9]{1,20})$')
 OPEN = r'fri:memory:open:(?P<member>[0-9]{1,20})'
 
@@ -92,7 +92,7 @@ def withdrawals(cog):
 
 
 async def show(cog, interaction, scope=None, *, state=None, selected=None, notice='', confirm=False, erased=None,
-               channels=None):
+               channels=None, page=0):
     """My memory, as Gene lists it. `state`: the listing as an earlier answer read it, with `erased`, every member's
     "forget me"s here (see forgets), and `channels`, where channel withdrawals stood (see channel_generation), from
     before that read, so one taken in since still counts (fri #315; Sol round 3 of #372)."""
@@ -119,17 +119,22 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
         lines.append(f"**My summary of what we’ve talked about lately** (from channels everyone in the server can "
                      f"read; updated <t:{int(summary['refreshed'])}:d>, expires <t:{int(summary['expires_at'])}:d>)\n"
                      + discord.utils.escape_markdown(summary['text']))
+    view = MemoryView(cog, scope, state, selected, confirm=confirm, page=page)
+    page_entries = state['entries'][view.page*SHOWN:(view.page+1)*SHOWN]
+    lines.append(f"page {view.page+1} of {max(1, (len(state['entries'])+SHOWN-1)//SHOWN)}")
     listed = []
-    for entry in state['entries'][:SHOWN]:
+    for entry in page_entries:
         where = f" · {place(cog, scope, entry)}" if profiles and 'scope' in entry else ''
         line = (f"• {entry['category']}{where}: {discord.utils.escape_markdown(entry['evidence'])} "
                 f"(expires <t:{int(entry['expires_at'])}:d>)")
-        if units('\n\n'.join(lines+listed+[line])) > 3500:  # Room for the footer inside an embed's 4096.
+        if units('\n\n'.join(lines+listed+[line])) > 3000:  # Room for the selected note and footer inside an embed's 4096.
             break
         listed.append(line)
     lines += listed
-    if len(listed) < len(state['entries']):
-        lines.append(f"…and {len(state['entries'])-len(listed)} more. Remove some to see the rest.")
+    if len(listed) < len(page_entries):
+        lines.append('choose a note below to see or edit it.')
+    if view.selected and view.selected not in page_entries[:len(listed)]:
+        lines.append('selected: '+discord.utils.escape_markdown(view.selected['evidence']))
     if not state['entries']:
         lines.append('No saved preferences.' if profiles else 'No saved preferences in this conversation.')
     lines.append('Editing or removing one clears recent saved chats where it showed, everywhere in the server for a '
@@ -181,7 +186,6 @@ async def show(cog, interaction, scope=None, *, state=None, selected=None, notic
         if not stood:
             moved.append(True)
         return stood
-    view = MemoryView(cog, scope, state, selected, confirm=confirm)
     await reply(cog, interaction, embed=card('My memory', '\n\n'.join(lines)), view=view, still=still)
     if moved:  # Nothing of it shown: they ask again, and it's read as it is now.
         from .fri import PANEL_SKIPPED
@@ -251,10 +255,11 @@ class MemoryLauncher(discord.ui.View):
 
 
 class MemoryView(discord.ui.View):
-    def __init__(self, cog, scope, state, selected=None, *, confirm=False):
+    def __init__(self, cog, scope, state, selected=None, *, confirm=False, page=0):
         super().__init__(timeout=600)
         self.cog, self.scope = cog, scope
         self.state = state
+        self.page = max(0, min(page, (len(state['entries'])-1)//SHOWN))
         self.selected = next((row for row in state['entries'] if row['id'] == selected), None)
         if state['entries']:
             choose = discord.ui.Select(placeholder='Choose a saved preference',
@@ -262,10 +267,10 @@ class MemoryView(discord.ui.View):
                     label=clip(row['evidence'], 100), value=str(row['id']),
                     description=clip(row['category']+(' · '+place(cog, scope, row) if getattr(cog, 'profiles', False)
                                                       and 'scope' in row else ''), 100),
-                    default=row['id'] == selected) for row in state['entries'][:SHOWN]])
+                    default=row['id'] == selected) for row in state['entries'][self.page*SHOWN:(self.page+1)*SHOWN]])
             async def choose_entry(interaction):
                 if await self.interaction_check(interaction):
-                    await show(cog, interaction, scope, selected=int(choose.values[0]))
+                    await show(cog, interaction, scope, selected=int(choose.values[0]), page=self.page)
             choose.callback = choose_entry
             self.add_item(choose)
         if state.get('summary') and scope['conversation_id'].startswith('private:'):
@@ -297,6 +302,17 @@ class MemoryView(discord.ui.View):
                 move.callback = {'keep': self.keep, 'share': self.ask_share, 'confirm': self.share}[action]
                 self.add_item(move)
 
+        if len(state['entries']) > SHOWN:
+            for label, offset in (('previous', -1), ('next', 1)):
+                turn = discord.ui.Button(label=label, custom_id=f'fri:memory:{label}:'+uuid.uuid4().hex,
+                                         disabled=self.page+offset < 0 or (self.page+offset)*SHOWN >= len(state['entries']))
+
+                async def turn_page(interaction, offset=offset):
+                    if await self.interaction_check(interaction):
+                        await show(cog, interaction, scope, page=self.page+offset)
+                turn.callback = turn_page
+                self.add_item(turn)
+
     async def interaction_check(self, interaction):
         from .fri_buttons import answers
         if not answers(interaction, 'view'):  # The ended-view fallback took this click (fri_buttons.Ended).
@@ -313,13 +329,13 @@ class MemoryView(discord.ui.View):
                     **self.scope, 'source': discord_source(interaction).model_dump(),
                     'revision': self.state['revision'], 'action': 'remove'})
             self.cog.agent.forget(interaction.user.id)
-            await show(self.cog, interaction, self.scope, state=state, notice='Removed that preference.', erased=erased, channels=channels)
+            await show(self.cog, interaction, self.scope, state=state, notice='Removed that preference.', erased=erased, channels=channels, page=self.page)
         except commands.UserFeedbackCheckFailure as exc:
-            await show(self.cog, interaction, self.scope, notice=str(exc))
+            await show(self.cog, interaction, self.scope, notice=str(exc), page=self.page)
 
     async def ask_share(self, interaction):
         if await self.interaction_check(interaction):
-            await show(self.cog, interaction, self.scope, selected=self.selected['id'], confirm=True,
+            await show(self.cog, interaction, self.scope, selected=self.selected['id'], confirm=True, page=self.page,
                        notice='Share it server-wide? Fri could then bring it up in any channel of the server, '
                               'where others can read it. Press Yes, share server-wide to go ahead.')
 
@@ -340,9 +356,9 @@ class MemoryView(discord.ui.View):
                     'revision': self.state['revision'], 'action': action})
             if action == 'keep':  # It no longer shows in the server, so nothing Fri holds there may keep it.
                 self.cog.agent.forget(interaction.user.id)
-            await show(self.cog, interaction, self.scope, state=state, notice=notice, erased=erased, channels=channels)
+            await show(self.cog, interaction, self.scope, state=state, notice=notice, erased=erased, channels=channels, page=self.page)
         except commands.UserFeedbackCheckFailure as exc:
-            await show(self.cog, interaction, self.scope, notice=str(exc))
+            await show(self.cog, interaction, self.scope, notice=str(exc), page=self.page)
 
     async def replace(self, interaction):
         if await self.interaction_check(interaction):
@@ -366,9 +382,9 @@ async def summarized(view, interaction, action, text, notice):
                 **view.scope, 'source': discord_source(interaction).model_dump(), 'revision': view.state['revision'],
                 'action': action, 'text': text})
         view.cog.agent.forget(interaction.user.id)
-        await show(view.cog, interaction, view.scope, state=state, notice=notice, erased=erased, channels=channels)
+        await show(view.cog, interaction, view.scope, state=state, notice=notice, erased=erased, channels=channels, page=view.page)
     except commands.UserFeedbackCheckFailure as exc:
-        await show(view.cog, interaction, view.scope, notice=str(exc))
+        await show(view.cog, interaction, view.scope, notice=str(exc), page=view.page)
 
 
 class EditSummary(discord.ui.Modal):
@@ -410,6 +426,6 @@ class EditMemory(discord.ui.Modal):
                     **view.scope, 'source': discord_source(interaction).model_dump(),
                     'revision': view.state['revision'], 'action': 'replace', 'evidence': self.preference.value})
             view.cog.agent.forget(interaction.user.id)
-            await show(view.cog, interaction, view.scope, state=state, notice='Updated that preference.', erased=erased, channels=channels)
+            await show(view.cog, interaction, view.scope, state=state, notice='Updated that preference.', erased=erased, channels=channels, page=view.page)
         except commands.UserFeedbackCheckFailure as exc:
-            await show(view.cog, interaction, view.scope, notice=str(exc))
+            await show(view.cog, interaction, view.scope, notice=str(exc), page=view.page)

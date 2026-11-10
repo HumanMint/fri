@@ -10,7 +10,7 @@ UNCHECKED = 'couldn’t check you’re still here. try again.'
 # modals aren't matched: those keep working on their own.
 ENDED = (r'fri:(?:request:(?:preview:[a-f0-9]{32}|[a-f0-9]{32}:(?:back|next|submit|cancel))|'
          r'behavior:(?:back|next|submit|cancel)|'
-         r'memory:(?:open|choose|remove|replace|share|confirm|keep|summary|clear):[a-f0-9]{32})')
+         r'memory:(?:open|choose|remove|replace|share|confirm|keep|summary|clear|previous|next):[a-f0-9]{32})')
 ANSWERED = 'fri:answered'  # In a click's Interaction.extras: who answers it, Ended or the view it stands in for.
 
 
