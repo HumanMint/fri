@@ -3,5 +3,5 @@
   "contract": "gene-fri/1",
   "minimum_controller_commit": "2336d2d59f79d8a35b8ba96bbe5f64b94c4b43f1",
   "baseline_fixture_commit": "7bdf6af858a5231c6e6af0e10662aa126aa4eb2a",
-  "verified_controller_commit": "4b849a8baca4ae9e238692874370a844792f8f57"
+  "verified_controller_commit": "6f8ad8a4307c04b4bebfbb50a425be68f8778cb1"
 }
