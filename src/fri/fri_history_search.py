@@ -135,12 +135,26 @@ def in_order(text, run):
     return True
 
 
+# Retrieve a particular past post, not advice that merely mentions a channel or a day.
+# "find kev's meme from yesterday", "pull up that screenshot from yesterday",
+# "show me that clip someone shared in chat".
+ASK = r"^\s*(?:fri[,!]?\s+)?(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?"
+RETRIEVE = r"(?:find|search|pull\s+up|show\s+me|dig\s+up|look\s+(?:for|up|through|back))\s+"
+POST_KIND = (r'(?:memes?|pics?|pictures?|images?|photos?|screenshots?|gifs?|videos?|clips?|links?|files?|'
+             r'posts?|messages?|songs?|recipes?)\b')
+POST = r"(?:that|the|those|these|\w+['’]s)\s+"+POST_KIND
+PAST_POST = (POST+r'(?:\s+from\s+'+THEN+r'(?='+END+r')|\s+'+WHO+
+             r'\s+(?:posted|sent|shared|dropped|uploaded|linked)\b'+AFTER+')')
+RETRIEVAL = re.compile(ASK+r'(?:'+RETRIEVE+PAST_POST+r'|that\s+'+POST_KIND+r'\s+from\s+'
+                       +THEN+r'(?='+END+r'))', re.I)
+
+
 def requested(text):
     visible = re.sub(r'```[\s\S]*?```|`[^`]*`|(?m:^>.*$)', '', text)
-    if re.search(r"(?i)\b(?:don't|do not|stop)\s+(?:search|look|read)", visible):
+    if re.search(r"(?i)\b(?:don't|do not|stop)\s+(?:search|look|read|find|pull|show|dig)\w*\b", visible):
         return False
     # A participle alone ("recommended settings") is not past attribution.
-    return any(in_order(visible, run) for run in RECALL) or bool(NAMED.search(visible))
+    return any(in_order(visible, run) for run in RECALL) or bool(RETRIEVAL.search(visible)) or bool(NAMED.search(visible))
 
 
 def valid_action(action):
@@ -294,6 +308,7 @@ class HistorySearch:
         from discord.http import Route
 
         from .fri_images import image_context, look, media, started_a_thread
+        from .fri_memory import before_removal
 
         a = self.actions
         permissions = channel.permissions_for(channel.guild.me)
@@ -335,7 +350,7 @@ class HistorySearch:
                 continue
             self.seen.add(row['id'])
             profile = await a.agent.profile(scope, int(row['author']['id']))
-            if not profile['enabled']:
+            if not profile['enabled'] or before_removal(row['id'], profile):
                 continue
             try:
                 message = await channel.fetch_message(int(row['id']))

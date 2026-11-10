@@ -452,10 +452,12 @@ def shows_links(context):
         [context.get(key) for key in ('invited_context', 'action_result', 'action_results', 'inspected_images')])
 
 
-def carded(row, cards):
-    """A reply target with its link cards, which are kept beside the rows (see fri_conversation.cards)."""
+def carded(row, cards, reactions=None):
+    """A reply target with its ephemeral link cards and reaction counts, kept beside the evidence rows."""
     found = (cards or {}).get(str((row.get('source') or {}).get('id'))) if isinstance(row, dict) else None
-    return {**row, 'link_cards': found} if found else row
+    view = {**row, 'link_cards': found} if found else row
+    counts = (reactions or {}).get(str((row.get('source') or {}).get('id'))) if isinstance(row, dict) else None
+    return {**view, 'reactions': counts} if counts else view
 
 
 def iso(value):
@@ -629,7 +631,7 @@ class Chat:
                if context.get('member_summary') else {}),
             'recent_channel_context': [recent_view(row) for row in context.get('recent', [])],
             'message_burst': [posted_view(row) for row in context.get('message_burst', [])],
-            'reply_target': [posted_view(carded(row, context.get('target_cards'))) for row in context.get('reply_target', [])],
+            'reply_target': [posted_view(carded(row, context.get('target_cards'), context.get('target_reactions'))) for row in context.get('reply_target', [])],
             'invited_channel_context': context.get('invited_context', []),
             'inspected_image_source': context.get('image_provenance'),
             'inspected_images': context.get('inspected_images', []),
