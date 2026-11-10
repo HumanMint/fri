@@ -14,6 +14,7 @@ from test_engine_transport import ULAW, Audio, Events, RealtimeHTTP, RealtimePee
 from test_engine_usage import realtime_usage
 
 import fri.jpcall.engine as engine_module
+from fri.jpcall.budget import MODELS, RATES, Budget
 from fri.jpcall.config import CALL_LANGUAGES, JpcallConfig
 from fri.jpcall.contract import (
     CallFinished,
@@ -82,7 +83,14 @@ class ModelPeer(RealtimePeer):
 
     async def send_json(self, event):
         self.sent.append(event)
-        if event['type'] == EVENTS['session_update']:
+        if event['type'] == EVENTS['input_clear']:
+            self.feed({'type': EVENTS['input_cleared']})
+        elif event['type'] == EVENTS['item_delete']:
+            self.feed({'type': EVENTS['item_deleted'], 'item_id': event['item_id']})
+        elif event['type'] == EVENTS['item_create']:
+            self.feed({'type': 'conversation.item.added', 'item': {
+                **event['item'], 'id': 'tool-output-' + event['item']['call_id']}})
+        elif event['type'] == EVENTS['session_update']:
             transcription = event['session']['audio']['input'].get('transcription')
             if transcription:
                 self.language = CALL_LANGUAGES[transcription['language']]
@@ -100,6 +108,9 @@ class ModelPeer(RealtimePeer):
             resource = {'id': 'response' + str(self.counter), 'metadata': response['metadata'],
                         'status': 'completed', 'output': [], 'usage': realtime_usage()}
             self.feed({'type': EVENTS['response_created'], 'response': resource})
+            if response.get('conversation') != 'none':
+                self.feed({'type': 'conversation.item.added', 'item': {
+                    'id': item_id, 'type': 'message', 'role': 'assistant'}})
             self.feed({'type': EVENTS['output_audio'], 'response_id': resource['id'],
                        'item_id': item_id, 'content_index': 0,
                        'delta': base64.b64encode(ULAW).decode()})
@@ -228,6 +239,9 @@ async def make_engine(tmp_path, monkeypatch, provider=None, *, call_language='ja
                                                    'JPCALL_CALL_LANGUAGE': call_language})
     if not (tmp_path / 'jpcall' / 'recovery.initialized').exists():
         AttemptJournal.initialize(tmp_path / 'jpcall')
+    if not (tmp_path / 'jpcall' / 'budget.initialized').exists():
+        Budget.initialize(tmp_path / 'jpcall', spent_usd=0, tariff={
+            **{k: '0.000001' for k in RATES}, **{k: getattr(config, k) for k in MODELS}})
     http = httpx.AsyncClient(transport=httpx.MockTransport(provider.handle))
     engine = JpcallEngine(config, http_client=http)
     runner = Runner()
@@ -347,7 +361,8 @@ def test_whole_flow_plan_hold_answer_finish_and_late_price(
             files = list((tmp_path / 'jpcall').glob('*'))
             assert {path.name for path in files} == {
                 'daily-counts.lock', 'daily-counts.json', 'jpcall-usage.jsonl',
-                'recovery.json', 'recovery.lock', 'recovery.initialized'}
+                'recovery.json', 'recovery.lock', 'recovery.initialized',
+                'budget.json', 'budget.initialized'}
             data = '\n'.join(path.read_text() for path in files
                               if path.is_file())
             assert 'ランチ' not in data and request().goal not in data and '+8190' not in data

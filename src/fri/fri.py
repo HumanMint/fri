@@ -1671,6 +1671,13 @@ class Fri(discord.Client):
         test_channel = self.get_channel(int(test['channel_id'])) if test.get('channel_id', '').isdigit() else None
         test_permissions = test_channel.permissions_for(test_guild.me) if (
             test_channel and test_guild and test_guild.me and test_channel.guild.id == test_guild.id) else None
+        budget = {'admission': 'disabled'}
+        if self.jpcall_engine is not None:
+            try:
+                budget = self.jpcall_engine.budget_status()
+            except Exception:
+                budget = {'admission': 'blocked', 'ledger_state': 'unreadable',
+                          'remaining_usd': None, 'open_reservations': None}
         private_json(self.data / 'fri-health.json', {'at': time.time(),
             'rotating_status': self.agent.presence.receipt if self.agent and self.agent.presence else None,
             'meme_attention': self.agent.memes.status() if self.agent and self.agent.memes else None,
@@ -1683,6 +1690,7 @@ class Fri(discord.Client):
             'channel_withdrawals': self.agent.channel_withdrawals.status() if self.agent else None,
             'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
+            'jpcall_budget': budget,
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,
             'test_scope': {**test, 'connected': bool(self.is_ready() and test_guild and not test_guild.unavailable),
                            'read_send_history': bool(test_permissions and test_permissions.view_channel and

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+from .budget import CONTEXT_TOKENS, MAX_INPUT_BYTES, OUTPUT_TOKENS
 from .config import JpcallConfig
 from .contract import AudioSink, CallBrief, EventSink, Utterance
 from .server import TwilioMedia, ulaw_to_pcm16
@@ -49,6 +50,9 @@ EVENTS = {
     'truncate': 'conversation.item.truncate',
     'item_create': 'conversation.item.create',
     'item_delete': 'conversation.item.delete',
+    'item_deleted': 'conversation.item.deleted',
+    'input_clear': 'input_audio_buffer.clear',
+    'input_cleared': 'input_audio_buffer.cleared',
     'function_arguments_done': 'response.function_call_arguments.done',
     'error': 'error',
 }
@@ -109,8 +113,11 @@ class RealtimeClient:
                  goal: str = '', timeline: DebugTimeline | None = None,
                  on_asr_failure: Callable[[], Awaitable[None]] | None = None,
                  on_callee_response: Callable[[], None] | None = None,
-                 publication_context: Callable[[], int | None] | None = None):
+                 publication_context: Callable[[], int | None] | None = None, budget=None):
         self.config, self.brief = config, brief
+        self._budget = budget
+        self._audio_bytes = 0
+        self._instruction_bytes = 0
         self.audio_sink, self.events, self.meter = audio, events, meter
         self._session = session
         self._owned = session is None
@@ -129,6 +136,11 @@ class RealtimeClient:
         self._recent_speech: deque[tuple[float, str, str]] = deque(maxlen=64)
         self._partial_transcripts: dict[str, str] = {}
         self._input_seen: set[str] = set()
+        self._send_lock = asyncio.Lock()
+        self._context_items: set[str] = set()
+        self._deleted_items: set[str] = set()
+        self._context_changed = asyncio.Event()
+        self._input_cleared = asyncio.Event()
         self._preopening_items: set[str] = set()
         self._turn_pending = False
         self._reply_generation: int | None = None
@@ -215,6 +227,13 @@ class RealtimeClient:
             },
             'tools': list(self._tools),
         }
+        if self._budget is not None:
+            self._instruction_bytes = len(json.dumps(session, ensure_ascii=False).encode())
+            if self._instruction_bytes > MAX_INPUT_BYTES:
+                raise RealtimeError('Call instructions exceed the budget bound.')
+            session['max_output_tokens'] = OUTPUT_TOKENS
+            session['truncation'] = {'type': 'retention_ratio', 'retention_ratio': .8,
+                                     'token_limits': {'post_instructions': CONTEXT_TOKENS}}
         if self.config.realtime_reasoning is not None:
             session['reasoning'] = {'effort': self.config.realtime_reasoning}
         return {'type': EVENTS['session_update'], 'session': session}
@@ -228,12 +247,23 @@ class RealtimeClient:
     async def _send(self, key: str, **payload) -> None:
         if self._ws is None or self._stopped:
             raise RealtimeError('The voice connection is unavailable.')
-        try:
-            if key == 'response_cancel':
-                self.timeline.record('response_cancel', **payload)
-            await self._ws.send_json({'type': EVENTS[key], **payload})
-        except Exception:
-            raise RealtimeError('The voice connection ended.') from None
+        generation = self._permission_generation
+        async with self._send_lock:
+            if key in ('input_append', 'item_create', 'response_create') and generation != self._permission_generation:
+                raise RealtimeError('Revoked call data cannot be sent.')
+            try:
+                if key == 'response_cancel':
+                    self.timeline.record('response_cancel', **payload)
+                if self._budget is not None and key == 'response_create':
+                    size = len(json.dumps(payload, ensure_ascii=False).encode())
+                    if size > MAX_INPUT_BYTES:
+                        raise RealtimeError('Call response exceeds the budget bound.')
+                    payload['response']['max_output_tokens'] = OUTPUT_TOKENS
+                    self._budget.tokens(self.config, 'realtime',
+                        self._instruction_bytes + size + CONTEXT_TOKENS, OUTPUT_TOKENS)
+                await self._ws.send_json({'type': EVENTS[key], **payload})
+            except Exception:
+                raise RealtimeError('The voice connection ended.') from None
 
     async def connect(self) -> None:
         """Pre-warm without generating a response or sending any call content audio."""
@@ -289,7 +319,7 @@ class RealtimeClient:
             return
         self._opener_requested = True
         self._conversation_open = False
-        generated = await self.say(self.brief.opener_ja, _opener=True, _notice=True)
+        generated = await self.say(self.brief.opener_ja, out_of_band=True, _opener=True, _notice=True)
         if await generated != 'completed':
             raise RealtimeError('The voice service could not speak the opening.')
         if not self._silenced and not self._stopped:
@@ -347,7 +377,7 @@ class RealtimeClient:
         self._allowed_responses.clear()
         self._marks.clear()
         self.audio_sink.clear('fri')
-        if not self._stopped and self._media is not None:
+        if not self._stopped and self._ws is not None:
             responses = tuple(self._active_responses)
             previous = self._revocation
 
@@ -357,6 +387,24 @@ class RealtimeClient:
                 for response_id in responses:
                     await self._send('response_cancel', response_id=response_id)
                 await self._barge_in()
+                async with asyncio.timeout(5):
+                    self._input_cleared.clear()
+                    await self._send('input_clear')
+                    await self._input_cleared.wait()
+                    while set(responses) & self._active_responses:
+                        self._context_changed.clear()
+                        await self._context_changed.wait()
+                    # Ordered buffer-clear/response-done acks precede the item snapshot.
+                    while self._context_items:
+                        revoked = set(self._context_items)
+                        for item in revoked:
+                            await self._send('item_delete', item_id=item)
+                        while revoked & self._context_items:
+                            self._context_changed.clear()
+                            await self._context_changed.wait()
+                    self._recent_speech.clear()
+                    self._transcripts.clear()
+                    self._partial_transcripts.clear()
 
             self._revocation = self._background(revoke())
 
@@ -572,6 +620,13 @@ class RealtimeClient:
             await self._task
 
     async def audio(self, ulaw: bytes) -> None:
+        if self._revocation is not None:
+            await asyncio.shield(self._revocation)
+        if self._budget is not None:
+            self._budget.tariff(self.config)
+            self._audio_bytes += len(ulaw)
+            if self._audio_bytes > self.config.limits.attempt_s * 8000:
+                raise RealtimeError('Call audio exceeds its prepaid bound.')
         await self._send('input_append', audio=base64.b64encode(ulaw).decode())
 
     async def mark(self, name: str) -> None:
@@ -768,7 +823,19 @@ class RealtimeClient:
         if self._stopped:
             return
         kind = event.get('type')
-        if kind == EVENTS['response_created']:
+        if kind in ('conversation.item.created', 'conversation.item.added', 'conversation.item.done'):
+            if event['item']['id'] not in self._deleted_items:
+                self._context_items.add(event['item']['id'])
+        elif kind == 'input_audio_buffer.committed':
+            if event['item_id'] not in self._deleted_items:
+                self._context_items.add(event['item_id'])
+        elif kind == EVENTS['item_deleted']:
+            self._deleted_items.add(event['item_id'])
+            self._context_items.discard(event['item_id'])
+            self._context_changed.set()
+        elif kind == EVENTS['input_cleared']:
+            self._input_cleared.set()
+        elif kind == EVENTS['response_created']:
             response = event['response']
             self.timeline.record('response_created', response_id=response['id'],
                                  status=response.get('status'))
@@ -987,6 +1054,7 @@ class RealtimeClient:
                 self._completed_responses.add(response_id)
                 self._confirm_response(response_id)
             self._active_responses.discard(response_id)
+            self._context_changed.set()
             self._busy_unknown = False
             number = (response.get('metadata') or {}).get('jpcall_command')
             command = self._commands.pop(number, None)
@@ -1052,6 +1120,11 @@ class RealtimeClient:
             self._update_idle()
 
     async def tool_result(self, call_id: str, result: dict, *, respond: bool = True) -> None:
+        generation = self._permission_generation
+        if self._revocation is not None:
+            await asyncio.shield(self._revocation)
+        if generation != self._permission_generation:
+            return
         self.timeline.record('tool_result', call_id=call_id, **(
             {'result': result} if self._admitted(
                 self._publication_context() if self._publication_context else None)
@@ -1089,6 +1162,7 @@ class RealtimeClient:
             with suppress(Exception):
                 response.close()
         self._ws = self._media = self._session = None
+        self._budget = None
         self.config = self.brief = self.events = self.audio_sink = None
         self._on_speech = self._on_tool_call = None
         self._on_asr_failure = self._on_callee_response = self._publication_context = None
@@ -1123,6 +1197,8 @@ class RealtimeClient:
         self._asr_timers.clear()
         self._asr_failed_items.clear()
         self._input_seen.clear()
+        self._context_items.clear()
+        self._deleted_items.clear()
         self._preopening_items.clear()
         self._transcripts.clear()
         self._recent_speech.clear()

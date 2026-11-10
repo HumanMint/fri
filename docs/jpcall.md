@@ -330,3 +330,89 @@ into a new private directory outside Git, and offers separate manual stop/deleti
 Provider-side media is not proof of handset audibility; Stream channel contents need a
 controlled check. Recording/storage add costs; the helper does not enforce a total dollar
 budget. A supplied number or recording consent alone never authorizes starting a call.
+
+### Prepaid trial budget
+
+Calling additionally requires `budget.json` in the existing private calling directory.
+Missing, unreadable, duplicate-key or incompatible state blocks admission. The budget
+is cumulative across callers and restarts, capped at $5, and never resets with the day.
+Initialize it only while calling is stopped, after recovery initialization:
+
+```sh
+python -m fri.jpcall.budget PRIVATE_CALL_DIRECTORY --spent-usd PRIOR_TOTAL --tariff APPROVED_TARIFF_JSON
+```
+
+`PRIOR_TOTAL` must include previous trial consumption and outstanding charges. Unknown
+prior consumption is not zero. Initialization refuses an existing budget or installation
+marker; deleting the ledger cannot reset it. Preserve both files through rollback, and
+keep calling disabled on an older artifact that cannot enforce them.
+
+The operator-approved tariff JSON binds exact `text_model`, `realtime_model` and
+`transcribe_model` names. It requires positive decimal USD ceilings for `text_input`,
+`text_output`, `realtime_input`, `realtime_output` (per million tokens), `phone_minute`,
+`transcription_minute` and `phone_attempt`. Realtime ceilings must cover **both** text
+and audio at the highest applicable rate, including uncached inputs. Phone ceilings
+must cover every admitted destination, stream charges, rounding, fees and account
+pricing; attempt charges include detection fees. Do not use an unverified list estimate
+as an account ceiling. Unknown rates, billing minima or model changes block enablement
+until an approved covering tariff is supplied. This command does not verify a provider's
+account rates or authorize spending.
+
+Before dialing, reserve rounded whole-attempt phone/transcription exposure plus an extra
+billing minute. Input audio is byte-limited to the prepaid PCMU duration. Every Responses
+request and Realtime response reserves its worst-case tokens synchronously before send.
+Text inputs and voice instructions/overrides are limited to 32 KiB of serialized UTF-8;
+bytes conservatively bound text tokens, with another 1,024 tokens of framing margin.
+Realtime post-instruction context is capped at 4,096 tokens and output at 512 tokens per
+response; text output is capped at 1,200. The current
+[Realtime schema](https://developers.openai.com/api/reference/resources/realtime/client-events)
+defines these output and truncation limits. They can shorten long conversations; exhaustion
+stops new paid work rather than silently extending exposure. No paid retry is automatic.
+Cleanup/status/hang-up remain available without a new paid model request.
+
+Reservations are fsynced before action and are never refunded, even on cancellation,
+timeout or a lost acknowledgment. This may exhaust the trial allowance before actual
+invoices reach $5; it prevents uncertain work being spent twice. Metered Discord costs
+remain separate from these upper bounds. Health exposes `jpcall_budget` admission,
+reserved USD and the cap; it reports blocked on corrupt or unknown state. No dialogue,
+destination or credentials enter the budget ledger. Provider adherence to approved
+rates, maximum tokens, truncation and call time limits remains a live prerequisite.
+
+Seeding is a **production change**, performed only in the maintainer maintenance window
+and as part of the owner's explicit decision to enable a trial. This PR ships no seeded
+ledger or tariff. Merely enabling the feature cannot admit a call without seeded state.
+The stopped-runtime operator sequence is: verify the approved remaining allowance and
+account/destination rate ceilings; initialize recovery only for a genuinely new install;
+run the budget command above with the actual prior consumption and approved tariff;
+then check health before admitting the explicitly authorized trial. Never initialize or
+reset state as a workaround for an unreadable ledger.
+
+Health distinguishes `unseeded`, `seeded` and `unreadable` ledger state. Remaining funds
+and reservations are `null` for unknown state, never a fabricated zero. `open_reservations`
+shows counts and upper-bound USD by call, text and Realtime component. These are funds
+still encumbered by the conservative policy, including completed work: there is no
+automatic invoice settlement or release. Prior seeded consumption is excluded from
+those reservation counts, and all encumbered funds remain deducted after restart.
+
+A revoked model completion is discarded before event publication and cannot reach
+Discord, call evidence, memory or learning. The private append-only debug timeline
+never records Responses completion text. Previously authorized timeline entries may
+remain: each carries its consent generation, and withdrawal appends a content-free
+`consent_revoked` marker identifying the revoked generation. Matching earlier entries within that call
+are revoked evidence, not current facts; this marker is not a promise of deletion.
+
+Budget reads are capped at 64 KiB and reject non-regular files, non-object JSON,
+excessive nesting and other malformed state. The health writer also contains an
+unexpected budget-contribution failure, reports unreadable/blocked state and continues
+its ordinary heartbeat instead of leaving stale health.
+
+On permission revocation, Realtime cancels old generation work, clears the input buffer,
+and waits for the buffer-clear and outstanding-response acknowledgments. It then deletes
+all tracked default-conversation items (audio, text and tool items), waiting for deletion
+acknowledgments before any subsequent response. Incoming audio and tool results wait for
+that barrier; send ordering prevents a delayed old write overtaking the clear. Failure to
+confirm cleanup blocks inference and follows bounded call cleanup. Only content-free
+item tombstones remain locally to reject late events; transcript/echo caches are cleared.
+Notices use an out-of-band response with empty input and no tools, never the prior
+conversation. Spoken notice wording is unchanged. These use the documented
+[Realtime deletion and response events](https://developers.openai.com/api/reference/resources/realtime/client-events).
