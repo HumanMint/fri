@@ -632,7 +632,7 @@ def test_panel_labels_notes_and_stays_inside_discords_limits(monkeypatch, tmp_pa
             monkeypatch.setattr('fri.fri_memory_panel.allowed', AsyncMock(return_value=True))
             await show(w.fri, interaction, scope, state=state)
             body = shown.await_args.kwargs['embed'].description
-            assert len(body) <= 4096 and 'games · across the server' in body and 'more. Remove some' in body
+            assert len(body) <= 4096 and 'games · across the server' in body and 'page 1 of 2' in body
         finally:
             await w.fri.close()
     run(scenario)
@@ -1038,6 +1038,42 @@ def test_a_reply_drawn_from_a_profile_note_is_withheld_if_its_channel_closes_mea
             with pytest.raises(commands.UserFeedbackCheckFailure):
                 await w.say(GAMING, 'fri what should i listen to')
             assert not any('private jazz' in (turn['reply'] or '') for turn in turns(w))
+        finally:
+            await w.fri.close()
+    run(scenario)
+
+
+def test_private_listing_pages_all_scopes_and_removes_note_26(monkeypatch, tmp_path):
+    async def scenario():
+        w = world(monkeypatch, tmp_path)
+        try:
+            with w.store.connection() as db:
+                for channel in range(1, 11):
+                    for index in range(3):
+                        save(db, '123', f'public:{channel}', '20',
+                             ('games', f'I like synthetic game {channel} {index}'), time.time())
+            scope = profiled(w.fri, {'guild_id': '123', 'user_id': '20', 'channel_id': '456',
+                                     'conversation_id': 'private:900'})
+            state = await w.fri.api('POST', '/chat/memory/notes', scope)
+            assert len(state['entries']) == 30  # Gene already lists every manageable scope.
+            click = Mock(spec=discord.Interaction, id=int(dm_control()['id']), guild_id=None, channel_id=DM,
+                         user=SimpleNamespace(id=20, display_name='friend'), message=SimpleNamespace(author=w.fri.user))
+            with patch('fri.fri_panel.reply', new=AsyncMock()) as reply:
+                await show(w.fri, click, scope)
+                view = reply.await_args.kwargs['view']
+                await next(b for b in view.children if getattr(b, 'label', None) == 'next').callback(click)
+                view = reply.await_args.kwargs['view']
+                identifier = view.children[0].options[0].value
+                assert int(identifier) == state['entries'][25]['id']
+                view.children[0]._values = [identifier]
+                await view.children[0].callback(click)
+                view = reply.await_args.kwargs['view']
+                await view.remove(click)
+                updated = reply.await_args.kwargs['view']
+                assert updated.page == 1
+                assert len(updated.state['entries']) == 29
+                assert int(identifier) not in [row['id'] for row in updated.state['entries']]
+                assert await reply.await_args.kwargs['still']()
         finally:
             await w.fri.close()
     run(scenario)
