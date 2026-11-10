@@ -284,6 +284,7 @@ class Agent:
         self.delivery_started = self.delivery_finished = 0
         self.delivery_status = 'starting'
         self.delivery_current = None
+        self.delivery_hold_timeouts = {'posts': 0, 'reminders': 0}
         self.stages = {}
         self.heartbeat_current = None  # The tick's step now, {'stage', 'since'} by the wall clock; None between ticks.
         self.heartbeat_ticking = None  # time.monotonic() as the running tick began; None between ticks.
@@ -3208,13 +3209,14 @@ class Agent:
 
     @tasks.loop(seconds=30)
     async def delivery(self):
-        """Single consumer of confirmed delivery; never waits for optional model work.
+        """Confirmed delivery on its own schedule; never waits for optional model work.
 
         Controller claims/sending fences and durable receipts remain the delivery authority.
-        This loop alone drains receipts, so it cannot race another tick's receipt unlink.
         """
+        from .fri_delivery import DeliveryFence
         from .fri_social import deliver_one as deliver_reminder
         from .fri_workspace import deliver_one as deliver_post
+        before = DeliveryFence.mark(self)
         self.delivery_started = time.time()
         try:
             # Read switches without replacing the state an in-flight model stage is using.
@@ -3226,8 +3228,10 @@ class Agent:
             if not await self.stage('delivery_state', read_switches, delivery=True):
                 self.delivery_status = 'deferred'
                 return
-            results = [await self.stage('posts', lambda: deliver_post(self.fri), delivery=True),
-                       await self.stage('reminders', lambda: deliver_reminder(self.fri, config=config), delivery=True)]
+            results = [await self.stage('posts', lambda: deliver_post(
+                           self.fri, config=config, fence=DeliveryFence(self, before, 'posts')), delivery=True),
+                       await self.stage('reminders', lambda: deliver_reminder(
+                           self.fri, config=config, fence=DeliveryFence(self, before, 'reminders')), delivery=True)]
             self.delivery_status = 'ok' if all(results) else 'deferred'
         finally:
             self.delivery_finished = time.time()

@@ -205,7 +205,9 @@ def test_a_stuck_stage_is_named_in_the_health_file_and_fri_health_until_its_tick
 
         async def written():
             await fri.health.coro(fri)
-            return json.loads((tmp_path/'fri-health.json').read_text())['agent_heartbeat']
+            health = json.loads((tmp_path/'fri-health.json').read_text())
+            assert health['agent_delivery']['hold_timeouts'] == agent.delivery_hold_timeouts
+            return health['agent_heartbeat']
 
         def me(report):
             return next(line for line in report.splitlines() if line.startswith('- me:'))

@@ -10,6 +10,7 @@ import httpx
 
 from . import feedback as commands
 from .fri_context import discord_source
+from .fri_delivery import DeliveryFence, DeliveryHoldTimeout
 from .fri_errors import HELD, ControllerRejected
 from .guild_channels import guild_channels
 from .privacy import clean
@@ -30,10 +31,11 @@ def taken_back(actions):
     return any(int(i) in agent.unsent or agent.taken_back(i, since) for i in own)
 
 
-async def capabilities(fri, target_id=''):
+async def capabilities(fri, target_id='', *, config=None):
     """Fresh roles, member state and channel overwrites; never use model claims."""
     guild = fri.get_guild(fri.guild_id)
-    if not guild or not fri.agent.config['enabled']:
+    config = fri.agent.config if config is None else config
+    if not guild or not config['enabled']:
         return {}
     members = [await guild.fetch_member(user) for user in (fri.owner_id, fri.user.id)]
     fresh_guild = copy.copy(guild)
@@ -157,11 +159,11 @@ class PostButton(discord.ui.DynamicItem[discord.ui.Button], template=POST_ID):
             await interaction.edit_original_response(content='post '+result['state']+'.', view=None,
                                                      allowed_mentions=NO_MENTIONS)
             if result['state'] == 'authorized':
-                await deliver_one(fri)
+                await deliver_one(fri, fence=DeliveryFence(fri.agent, DeliveryFence.mark(fri.agent), 'posts'))
                 result = await fri.api('GET', '/workspace/posts/'+self.post_id)
                 await interaction.edit_original_response(content=delivery_text(result), view=None,
                                                          allowed_mentions=NO_MENTIONS)
-        except (commands.UserFeedbackCheckFailure, discord.HTTPException, ValueError):
+        except (commands.UserFeedbackCheckFailure, discord.HTTPException, ValueError, DeliveryHoldTimeout):
             await interaction.followup.send('i couldn’t confirm that action. ask for the saved post status before retrying.',
                                              ephemeral=True, allowed_mentions=NO_MENTIONS)
 
@@ -193,7 +195,7 @@ async def show_preview(fri, message, post, delivered=None):
     await fri.api('POST', f"/workspace/posts/{post['id']}/bind", {'message_id': str(preview.id)})
 
 
-async def deliver_one(fri):
+async def deliver_one(fri, *, config=None, fence=None):
     """No model involved. Persist before sending; ambiguous outcomes never auto-retry."""
     directory = fri.data/'post-receipts'
     for path in sorted(directory.glob('*.json')):
@@ -206,29 +208,52 @@ async def deliver_one(fri):
         except ControllerRejected:
             pass  # Erased or invalidated grants cannot be resurrected by a local receipt.
         path.unlink(missing_ok=True)
+    if fence is not None:
+        config = await fence.available()
+        if config is None:
+            return
+    if config is not None and not config['enabled']:
+        return
+    if fence is not None:
+        fence.claiming()
     post = await fri.api('POST', '/workspace/outbox/claim')
     if not post:
         return
     state, message_id, sending = 'failed', '', False
     try:
-        if str(fri.owner_id) != post['user_id'] or str(fri.guild_id) != post['guild_id']:
-            raise ValueError('Owner or server changed')
-        targets = await capabilities(fri, post['target_id'])
-        if not targets.get(post['target_id'], {}).get('one_off_post'):
-            raise ValueError('Permissions changed')
-        # Deletion/edit of the originating owner request revokes pending delivery.
-        dm = await fri.fetch_channel(int(post['dm_id']))
-        source = json.loads(post['source'])
-        original = await dm.fetch_message(int(source['id']))
-        if original.author.id != fri.owner_id or original.edited_at is not None:
-            raise ValueError('Original request changed')
-        try:
-            await fri.api('POST', f"/workspace/posts/{post['id']}/sending", {'lease': post['lease']})
-        except ControllerRejected as exc:
-            if getattr(exc, 'status', None) == HELD:  # Put back unsent until its draft's summary checks out:
-                return  # it's claimed and sent then, so nothing is recorded (fri #355).
-            raise
-        sending = True
+        async def check(current_config):
+            nonlocal sending
+            if current_config is not None and not current_config['enabled']:
+                raise ValueError('Fri switched off')
+            if str(fri.owner_id) != post['user_id'] or str(fri.guild_id) != post['guild_id']:
+                raise ValueError('Owner or server changed')
+            targets = await capabilities(fri, post['target_id'], config=current_config)
+            if not targets.get(post['target_id'], {}).get('one_off_post'):
+                raise ValueError('Permissions changed')
+            # Deletion/edit of the originating owner request revokes pending delivery.
+            dm = await fri.fetch_channel(int(post['dm_id']))
+            source = json.loads(post['source'])
+            original = await dm.fetch_message(int(source['id']))
+            if original.author.id != fri.owner_id or original.edited_at is not None:
+                raise ValueError('Original request changed')
+            if fence is not None and not fence.current():
+                return True
+            if sending:
+                current = await fri.api('GET', f"/workspace/posts/{post['id']}")
+                if current['state'] != 'sending' or current['lease'] != post['lease'] or current['body'] != post['body']:
+                    raise ValueError('Delivery changed during withdrawal hold')
+            else:
+                try:
+                    await fri.api('POST', f"/workspace/posts/{post['id']}/sending", {'lease': post['lease']})
+                except ControllerRejected as exc:
+                    if getattr(exc, 'status', None) == HELD:  # Put back unsent until its draft's summary checks out:
+                        return False  # it's claimed and sent then, so nothing is recorded (fri #355).
+                    raise
+                sending = True
+            return True
+
+        if not (await fence.run(check) if fence is not None else await check(config)):
+            return
         result = await send_once(fri, post)
         message_id, state = str(int(result['id'])), 'sent'
     except (commands.UserFeedbackCheckFailure, discord.HTTPException, httpx.HTTPError, ValueError, KeyError, OSError, TimeoutError):

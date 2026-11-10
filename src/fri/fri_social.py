@@ -318,7 +318,7 @@ async def show_preview(fri, message, preview, delivered=None):
     await fri.api('POST', route, {**scope, 'message_id': str(posted.id)})
 
 
-async def deliver_one(fri, *, config=None):
+async def deliver_one(fri, *, config=None, fence=None):
     """A confirmed reminder can attempt exactly one bounded HTTP send, without a model."""
     directory = fri.data/'reminder-receipts'
     for path in sorted(directory.glob('*.json')):
@@ -331,27 +331,50 @@ async def deliver_one(fri, *, config=None):
         except ControllerRejected:
             pass
         path.unlink(missing_ok=True)
+    if fence is not None:
+        config = await fence.available()
+        if config is None:
+            return
     config = fri.agent.config if config is None else config
     if not config['enabled'] or not config['support_dms']:
         return
+    if fence is not None:
+        fence.claiming()
     row = await fri.api('POST', '/social/reminders/claim')
     if not row:
         return
     state, message_id, sending = 'failed', '', False
     try:
-        if str(fri.guild_id) != row['guild_id'] or not await fri.agent.member(int(row['user_id']), fresh=True):
-            raise ValueError('Current server membership could not be verified')
-        dm = await fri.fetch_channel(int(row['dm_id']))
-        if not isinstance(dm, discord.DMChannel) or not dm.recipient or str(dm.recipient.id) != row['user_id']:
-            raise ValueError('The reminder DM no longer matches its author')
+        async def check(current_config):
+            nonlocal sending
+            if not current_config['enabled'] or not current_config['support_dms']:
+                raise ValueError('Reminder delivery switched off')
+            if str(fri.guild_id) != row['guild_id'] or not await fri.agent.member(int(row['user_id']), fresh=True):
+                raise ValueError('Current server membership could not be verified')
+            dm = await fri.fetch_channel(int(row['dm_id']))
+            if not isinstance(dm, discord.DMChannel) or not dm.recipient or str(dm.recipient.id) != row['user_id']:
+                raise ValueError('The reminder DM no longer matches its author')
+            if fence is not None and not fence.current():
+                return True
+            if sending:
+                current = await fri.api('POST', '/social/reminders/'+row['id']+'/read', {
+                    'guild_id': row['guild_id'], 'user_id': row['user_id'], 'channel_id': str(fri.workshop_id),
+                    'conversation_id': 'private:'+row['dm_id']})
+                if current['state'] != 'sending' or current['lease'] != row['lease'] or current['body'] != row['body']:
+                    raise ValueError('Delivery changed during withdrawal hold')
+            else:
+                try:
+                    await fri.api('POST', '/social/reminders/'+row['id']+'/sending', {'lease': row['lease']})
+                except ControllerRejected as exc:
+                    if getattr(exc, 'status', None) == HELD:  # Put back unsent until a summary it depends on checks out:
+                        return False  # it's claimed and sent then, so nothing is recorded (fri #355).
+                    raise
+                sending = True
+            return True
+
+        if not (await fence.run(check) if fence is not None else await check(config)):
+            return
         embed = reminder_embed(row)
-        try:
-            await fri.api('POST', '/social/reminders/'+row['id']+'/sending', {'lease': row['lease']})
-        except ControllerRejected as exc:
-            if getattr(exc, 'status', None) == HELD:  # Put back unsent until a summary it depends on checks out:
-                return  # it's claimed and sent then, so nothing is recorded (fri #355).
-            raise
-        sending = True
         result = await send_once(fri, {'id': row['id'], 'target_id': row['dm_id'],
             'body': f"Reminder\nScheduled for <t:{int(row['due'])}:F>."}, embed=embed.to_dict() if embed else None)
         message_id, state = str(int(result['id'])), 'sent'
