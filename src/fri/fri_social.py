@@ -318,7 +318,7 @@ async def show_preview(fri, message, preview, delivered=None):
     await fri.api('POST', route, {**scope, 'message_id': str(posted.id)})
 
 
-async def deliver_one(fri):
+async def deliver_one(fri, *, config=None):
     """A confirmed reminder can attempt exactly one bounded HTTP send, without a model."""
     directory = fri.data/'reminder-receipts'
     for path in sorted(directory.glob('*.json')):
@@ -331,7 +331,8 @@ async def deliver_one(fri):
         except ControllerRejected:
             pass
         path.unlink(missing_ok=True)
-    if not fri.agent.config['enabled'] or not fri.agent.config['support_dms']:
+    config = fri.agent.config if config is None else config
+    if not config['enabled'] or not config['support_dms']:
         return
     row = await fri.api('POST', '/social/reminders/claim')
     if not row:

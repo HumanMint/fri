@@ -55,7 +55,7 @@ def test_undeliverable_report_card_no_longer_silences_attention_or_memes(heartbe
     agent.check_memes.assert_awaited_once()
     assert agent.heartbeat_status == 'deferred'
     assert agent.stages['reports']['error'] == 'KeyError' and agent.stages['reports']['last_ok'] is None
-    assert all(agent.stages[name]['error'] is None for name in ('posts', 'reminders', 'learning', 'attention', 'fixes', 'memes'))
+    assert all(agent.stages[name]['error'] is None for name in ('learning', 'attention', 'fixes', 'memes'))
     assert ('POST', '/agent/reports/'+'a'*32+'/delivered') not in [c.args[:2] for c in heartbeat.fri.api.await_args_list]
 
 
@@ -458,3 +458,39 @@ def test_client_level_refusals_keep_every_receipt_queued(client, tmp_path):
         asyncio.run(Fri.flush_usage(usage_runtime(client, tmp_path, token='fri-'+'y'*32)))
     assert refused.value.status == 401
     assert len(list(usage.glob('*.json'))) == 2 and not (usage/'rejected').exists()
+
+
+def test_delivery_errors_do_not_skip_reminders_or_mask_heartbeat(heartbeat, monkeypatch):
+    agent = heartbeat.agent
+    posts = AsyncMock(side_effect=OSError())
+    reminders = AsyncMock()
+    monkeypatch.setattr('fri.fri_workspace.deliver_one', posts)
+    monkeypatch.setattr('fri.fri_social.deliver_one', reminders)
+
+    async def scenario():
+        agent.running('learning')
+        current, progress = agent.heartbeat_current, agent.heartbeat_progress
+        await agent.delivery.coro(agent)
+        assert agent.delivery_status == 'deferred'
+        assert agent.stages['posts']['error'] == 'OSError'
+        assert agent.stages['reminders']['error'] is None
+        reminders.assert_awaited_once()
+        assert agent.heartbeat_current == current and agent.heartbeat_progress == progress
+        assert agent.delivery_current is None and agent.delivery_finished
+        posts.side_effect = None
+        await agent.delivery.coro(agent)
+        assert agent.delivery_status == 'ok' and agent.stages['posts']['error'] is None
+    asyncio.run(scenario())
+
+
+def test_delivery_cancellation_clears_health_and_stops_before_reminders(heartbeat, monkeypatch):
+    monkeypatch.setattr('fri.fri_workspace.deliver_one', AsyncMock(side_effect=asyncio.CancelledError()))
+    reminders = AsyncMock()
+    monkeypatch.setattr('fri.fri_social.deliver_one', reminders)
+
+    async def scenario():
+        with pytest.raises(asyncio.CancelledError):
+            await heartbeat.agent.delivery.coro(heartbeat.agent)
+        assert heartbeat.agent.delivery_current is None and heartbeat.agent.delivery_finished
+        reminders.assert_not_awaited()
+    asyncio.run(scenario())

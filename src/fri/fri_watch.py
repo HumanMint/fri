@@ -356,7 +356,13 @@ class Watch:
             if current := agent.heartbeat_current:  # A tick that started and hasn't finished: which step it's on.
                 me += f", running {current['stage']} for {span(now-current['since'])}"
         lines.append(me)
-        loops = {'heartbeat': agent.heartbeat if agent else None, 'owner dms': fri.owner_reviews,
+        if agent:
+            delivery = f'- delivery: {agent.delivery_status}'
+            if current := agent.delivery_current:
+                delivery += f", running {current['stage']} for {span(now-current['since'])}"
+            lines.append(delivery)
+        loops = {'heartbeat': agent.heartbeat if agent else None,
+                 'delivery': agent.delivery if agent else None, 'owner dms': fri.owner_reviews,
                  'health file': fri.health}
         loops = {name: (loop.is_running(), loop.failed()) for name, loop in loops.items() if loop}
         task = fri.watching  # A plain task, not a tasks.loop.

@@ -281,6 +281,9 @@ class Agent:
         self.presence = None
         self.heartbeat_started = self.heartbeat_finished = 0
         self.heartbeat_status = 'starting'
+        self.delivery_started = self.delivery_finished = 0
+        self.delivery_status = 'starting'
+        self.delivery_current = None
         self.stages = {}
         self.heartbeat_current = None  # The tick's step now, {'stage', 'since'} by the wall clock; None between ticks.
         self.heartbeat_ticking = None  # time.monotonic() as the running tick began; None between ticks.
@@ -347,9 +350,11 @@ class Agent:
         self.state = await self.fri.api('GET', '/agent/state')
         self.saved_turns.retry()  # Withdrawals the controller hadn't taken before a restart (fri #215).
         self.heartbeat.start()
+        self.delivery.start()
 
     def close(self):
         self.heartbeat.cancel()
+        self.delivery.cancel()
 
     async def record(self, role, model, effort, counters, status, purpose=None, deliver=True):
         attempt = uuid.uuid4().hex
@@ -3104,15 +3109,18 @@ class Agent:
             self.memes = Memes(self)
         return self.memes
 
-    async def stage(self, name, step, *switches, when=None):
-        """One heartbeat stage. A failure is logged by class and recorded, and never skips later stages."""
+    async def stage(self, name, step, *switches, when=None, delivery=False):
+        """One background stage. A failure is logged by class and recorded, and never skips later stages."""
         now = time.time()
         try:
             # Older controllers send no reply_check_* settings; a missing switch is off.
             if not all(self.config.get(key) for key in switches) or (when and not when()):
                 self.stages.pop(name, None)
                 return True
-            self.running(name)
+            if delivery:
+                self.delivery_current = {'stage': name, 'since': now}
+            else:
+                self.running(name)
             await step()
         except Exception as exc:  # CancelledError is a BaseException, so stopping the loop still works.
             LOG.warning('Fri heartbeat stage %s deferred: %s', name, type(exc).__name__)
@@ -3165,8 +3173,6 @@ class Agent:
             from .fri_member_summary import recheck as recheck_summaries
             from .fri_reply_checks import CAPABILITY
             from .fri_reply_checks import check as check_replies
-            from .fri_social import deliver_one as deliver_reminder
-            from .fri_workspace import deliver_one as deliver_post
             # An undeliverable owner report or a broken meme check must not silence attention.
             self.running('meme_notes')
             try:  # Meme notes follow their authors' privacy even while meme checks are off.
@@ -3176,8 +3182,6 @@ class Agent:
             results = [await self.stage('presence', self.check_presence),
                        # Whatever learning or memory does: a deleted channel's saves go (fri #358).
                        await self.stage('channel_withdrawals', self.channel_withdrawals.settle),
-                       await self.stage('posts', lambda: deliver_post(self.fri)),
-                       await self.stage('reminders', lambda: deliver_reminder(self.fri)),
                        await self.stage('reports', self.send_reports),
                        await self.stage('learning', self.learn, 'enabled'),
                        await self.stage('attention', self.attend, 'enabled'),
@@ -3200,4 +3204,35 @@ class Agent:
 
     @heartbeat.before_loop
     async def before_heartbeat(self):
+        await self.fri.wait_until_ready()
+
+    @tasks.loop(seconds=30)
+    async def delivery(self):
+        """Single consumer of confirmed delivery; never waits for optional model work.
+
+        Controller claims/sending fences and durable receipts remain the delivery authority.
+        This loop alone drains receipts, so it cannot race another tick's receipt unlink.
+        """
+        from .fri_social import deliver_one as deliver_reminder
+        from .fri_workspace import deliver_one as deliver_post
+        self.delivery_started = time.time()
+        try:
+            # Read switches without replacing the state an in-flight model stage is using.
+            config = {}
+
+            async def read_switches():
+                config.update((await self.fri.api('GET', '/agent/state'))['config'])
+
+            if not await self.stage('delivery_state', read_switches, delivery=True):
+                self.delivery_status = 'deferred'
+                return
+            results = [await self.stage('posts', lambda: deliver_post(self.fri), delivery=True),
+                       await self.stage('reminders', lambda: deliver_reminder(self.fri, config=config), delivery=True)]
+            self.delivery_status = 'ok' if all(results) else 'deferred'
+        finally:
+            self.delivery_finished = time.time()
+            self.delivery_current = None
+
+    @delivery.before_loop
+    async def before_delivery(self):
         await self.fri.wait_until_ready()
