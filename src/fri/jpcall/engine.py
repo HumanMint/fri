@@ -445,7 +445,10 @@ class _Session:
         return self._publication_allowed and not self._ending
 
     def _permission(self, allowed: bool) -> None:
+        if not allowed:
+            self._timeline.record('consent_revoked', revoked_generation=self.consent_generation)
         self.consent_generation += 1
+        self._timeline.consent_generation = self.consent_generation
         self._publication_allowed = allowed
         self._rt.set_permission(allowed)
         if not allowed:  # A withdrawal, refusal or transfer, also while closing.

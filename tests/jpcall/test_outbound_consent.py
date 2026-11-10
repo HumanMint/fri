@@ -67,3 +67,71 @@ def test_summary_rechecks_permission_after_settling(tmp_path, monkeypatch):
             await http.aclose()
     asyncio.run(run())
 
+
+
+def test_revoked_completion_has_no_discord_memory_learning_or_timeline_trace(tmp_path, monkeypatch):
+    async def run():
+        import httpx
+        from test_call_text_and_report import discord_call
+        from test_engine_closing import callee_line
+        from test_engine_flow import settled
+
+        import fri.jpcall.engine as engine_module
+        from fri.jpcall.contract import Translation
+        from fri.jpcall.timeline import DebugTimeline
+
+        marker = 'REVOKED_COMPLETION_SHOULD_NEVER_ESCAPE'
+        path = tmp_path / 'private-debug.jsonl'
+        timeline = DebugTimeline(path)
+        monkeypatch.setattr(engine_module, 'DebugTimeline', lambda *args, **kwargs: timeline)
+        engine, provider, peer, http, clock, setup, call = await discord_call(tmp_path, monkeypatch)
+        session = call.session
+        entered, release = asyncio.Event(), asyncio.Event()
+        try:
+            await answer_phone(session)
+            await settled(lambda: session._rt._idle.is_set() and not session._translations)
+            original = provider.handle
+
+            async def response(request):
+                result = await original(request)
+                if request.url.host == 'api.openai.com':
+                    data = result.json()
+                    data['output'][0]['content'][0]['text'] = marker
+                    entered.set()
+                    await release.wait()
+                    return httpx.Response(200, json=data)
+                return result
+            http._transport.handler = response
+            # Observe attempted engine publication as well as the real Discord adapter.
+            delivered = []
+            emit = session._emit
+
+            async def observe(event):
+                delivered.append(event)
+                await emit(event)
+            monkeypatch.setattr(session, '_emit', observe)
+            await callee_line(session, 'private', '料金は千二百円です。')
+            await asyncio.wait_for(entered.wait(), 2)
+            generation = session.consent_generation
+            session._permission(False)
+            release.set()
+            await settled(lambda: not session._translations)
+            await session.hang_up()
+            await setup.calls.flush_events()
+            # No completion event means neither Discord nor downstream history/learning can ingest it.
+            assert not any(isinstance(e, Translation) and marker in e.text_en for e in delivered)
+            assert marker not in repr([(m.content, m.kwargs, m.edits) for m in setup.messages])
+            assert not session._transcript and not session._outcome_hint
+            assert all(r.url.host in ('api.openai.com', 'api.twilio.com') for r in provider.requests)
+            for file in tmp_path.rglob('*'):
+                if file.is_file():
+                    assert marker.encode() not in file.read_bytes()  # Includes all local evidence/usage/debug files.
+            entries = [json.loads(line) for line in path.read_text().splitlines()]
+            assert any(e['event'] == 'consent_revoked' and e['revoked_generation'] == generation for e in entries)
+            assert any(e['event'] == 'transcript' and e['item_id'] == 'private'
+                       and e['consent_generation'] == generation for e in entries)
+        finally:
+            release.set()
+            await engine.close()
+            await http.aclose()
+    asyncio.run(run())

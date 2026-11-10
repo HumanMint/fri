@@ -19,6 +19,7 @@ class DebugTimeline:
         self._path, self._clock = path, clock
         self._call_id = uuid.uuid4().hex
         self._started = clock()
+        self.consent_generation = None
 
     def record(self, event: str, **fields) -> None:
         if self._path is None:
@@ -26,7 +27,7 @@ class DebugTimeline:
         try:
             line = json.dumps({'call': self._call_id, 'at': datetime.now(UTC).isoformat(),
                                'elapsed_s': self._clock() - self._started,
-                               'event': event, **fields}, ensure_ascii=False) + '\n'
+                               'event': event, 'consent_generation': self.consent_generation, **fields}, ensure_ascii=False) + '\n'
             self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
                          | os.O_NONBLOCK, 0o600)

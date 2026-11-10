@@ -377,3 +377,26 @@ remain separate from these upper bounds. Health exposes `jpcall_budget` admissio
 reserved USD and the cap; it reports blocked on corrupt or unknown state. No dialogue,
 destination or credentials enter the budget ledger. Provider adherence to approved
 rates, maximum tokens, truncation and call time limits remains a live prerequisite.
+
+Seeding is a **production change**, performed only in the maintainer maintenance window
+and as part of the owner's explicit decision to enable a trial. This PR ships no seeded
+ledger or tariff. Merely enabling the feature cannot admit a call without seeded state.
+The stopped-runtime operator sequence is: verify the approved remaining allowance and
+account/destination rate ceilings; initialize recovery only for a genuinely new install;
+run the budget command above with the actual prior consumption and approved tariff;
+then check health before admitting the explicitly authorized trial. Never initialize or
+reset state as a workaround for an unreadable ledger.
+
+Health distinguishes `unseeded`, `seeded` and `unreadable` ledger state. Remaining funds
+and reservations are `null` for unknown state, never a fabricated zero. `open_reservations`
+shows counts and upper-bound USD by call, text and Realtime component. These are funds
+still encumbered by the conservative policy, including completed work: there is no
+automatic invoice settlement or release. Prior seeded consumption is excluded from
+those reservation counts, and all encumbered funds remain deducted after restart.
+
+A revoked model completion is discarded before event publication and cannot reach
+Discord, call evidence, memory or learning. The private append-only debug timeline
+never records Responses completion text. Previously authorized timeline entries may
+remain: each carries its consent generation, and withdrawal appends a content-free
+`consent_revoked` marker identifying the revoked generation. Matching earlier entries within that call
+are revoked evidence, not current facts; this marker is not a promise of deletion.

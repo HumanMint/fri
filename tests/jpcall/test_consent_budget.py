@@ -48,14 +48,21 @@ def test_unknown_ledger_blocks_requests(tmp_path, damage):
         journal.close()
 
 
-def test_budget_failure_prevents_dial_and_text_api(tmp_path, monkeypatch):
+@pytest.mark.parametrize('state', ['exhausted', 'unseeded', 'unreadable'])
+def test_budget_failure_prevents_dial_and_text_api(tmp_path, monkeypatch, state):
     async def run():
         engine, provider, peer, http, *_ = await make_engine(tmp_path, monkeypatch)
         try:
             from test_engine_flow import request
             req = request()
             brief = await engine.plan(req)
-            engine._budget.reserve(5_000_000)
+            if state == 'exhausted':
+                engine._budget.reserve(5_000_000)
+            elif state == 'unseeded':
+                engine._budget.path.unlink()
+                (engine._directory / 'budget.initialized').unlink()
+            else:
+                engine._budget.path.write_text('{')
             with pytest.raises(CallRejected):
                 await engine.start(brief, req, None, None)
             from fri.jpcall.translate import TextError
@@ -143,3 +150,45 @@ def test_changed_model_is_unknown_to_the_approved_tariff(tmp_path, monkeypatch):
             await engine.close()
             await http.aclose()
     asyncio.run(run())
+
+
+def test_health_distinguishes_unseeded_unreadable_and_open_reservations(tmp_path):
+    from types import SimpleNamespace
+
+    from fri.fri import Fri
+
+    def health():
+        client = SimpleNamespace(agent=None, guild_id=1, data=tmp_path, get_guild=lambda _: None,
+            is_ready=lambda: False, _connection=SimpleNamespace(_status='offline'),
+            jpcall_engine=SimpleNamespace(budget_status=budget.status))
+        asyncio.run(Fri.health.coro(client))
+        import json
+        return json.loads((tmp_path / 'fri-health.json').read_text())['jpcall_budget']
+
+    journal = AttemptJournal(tmp_path)
+    budget = Budget(journal)
+    assert budget.status() == {'admission': 'blocked', 'ledger_state': 'unseeded',
+                               'limit_usd': 5, 'remaining_usd': None,
+                               'reserved_usd': None, 'open_reservations': None}
+    assert health() == budget.status()
+    journal, budget = ledger(tmp_path)
+    try:
+        budget.reserve(250_000, 'text')
+        status = budget.status()
+        assert health() == status
+        assert status['ledger_state'] == 'seeded' and status['remaining_usd'] == 4.75
+        assert status['open_reservations']['text'] == {'count': 1, 'upper_usd': .25}
+        assert status['open_reservations']['call'] == {'count': 0, 'upper_usd': 0}
+    finally:
+        journal.close()
+    journal = AttemptJournal(tmp_path)
+    journal.open()
+    try:
+        budget = Budget(journal)
+        assert budget.status() == status
+        budget.path.write_text('{')
+        assert budget.status()['ledger_state'] == 'unreadable'
+        assert budget.status()['remaining_usd'] is None
+        assert health() == budget.status()
+    finally:
+        journal.close()

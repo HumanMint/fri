@@ -45,12 +45,22 @@ class Budget:
 
     @staticmethod
     def _validate(data):
-        if (set(data) != {'version', 'limit', 'reserved', 'tariff'} or type(data['version']) is not int or data['version'] != 1
+        if (set(data) != {'version', 'limit', 'reserved', 'tariff', 'seeded_spent', 'reservations'} or type(data['version']) is not int or data['version'] != 1
                 or type(data['limit']) is not int or not 0 < data['limit'] <= 5_000_000
                 or type(data['reserved']) is not int or not 0 <= data['reserved'] <= data['limit']
                 or set(data['tariff']) != RATES | MODELS
                 or any(type(data['tariff'][k]) is not int or data['tariff'][k] <= 0 for k in RATES)
                 or any(not isinstance(data['tariff'][k], str) or not data['tariff'][k] for k in MODELS)):
+            raise ValueError
+        if (type(data['seeded_spent']) is not int or not 0 <= data['seeded_spent'] <= data['reserved']
+                or not isinstance(data['reservations'], dict)
+                or set(data['reservations']) != {'call', 'text', 'realtime', 'other'}):
+            raise ValueError
+        for value in data['reservations'].values():
+            if (not isinstance(value, dict) or set(value) != {'count', 'amount'}
+                    or any(type(value[k]) is not int or value[k] < 0 for k in ('count', 'amount'))):
+                raise ValueError
+        if sum(v['amount'] for v in data['reservations'].values()) != data['reserved'] - data['seeded_spent']:
             raise ValueError
 
     def _write(self, data):
@@ -60,11 +70,15 @@ class Budget:
         writer._lock = self.journal._lock
         writer._write(data)
 
-    def reserve(self, amount):
+    def reserve(self, amount, component='other'):
         data = self.read()
         if type(amount) is not int or amount < 0 or data['reserved'] + amount > data['limit']:
             raise CallRejected('Calling budget exhausted; no paid request was sent.')
+        if component not in data['reservations']:
+            raise CallRejected('Unknown budget reservation component.')
         data['reserved'] += amount
+        data['reservations'][component]['count'] += 1
+        data['reservations'][component]['amount'] += amount
         self._write(data)
 
     def tariff(self, config):
@@ -76,30 +90,44 @@ class Budget:
     def call(self, config):
         t = self.tariff(config)
         minutes = math.ceil(config.limits.attempt_s / 60) + 1
-        self.reserve(minutes * (t['phone_minute'] + t['transcription_minute']) + t['phone_attempt'])
+        self.reserve(minutes * (t['phone_minute'] + t['transcription_minute']) + t['phone_attempt'], 'call')
 
     def tokens(self, config, component, input_tokens, output_tokens):
         t = self.tariff(config)
         kind = 'text' if component == 'text' else 'realtime'
         amount = (((input_tokens + 1024) * t[kind + '_input'] + output_tokens * t[kind + '_output'])
                   + 999_999) // 1_000_000
-        self.reserve(amount)
+        self.reserve(amount, kind)
 
     def status(self, config=None):
         try:
             data = self.read()
+        except CallRejected:
+            unseeded = not any(p.exists() or p.is_symlink() for p in (
+                self.path, self.journal.directory / 'budget.initialized'))
+            return {'admission': 'blocked', 'ledger_state': 'unseeded' if unseeded else 'unreadable',
+                    'limit_usd': 5, 'remaining_usd': None, 'reserved_usd': None,
+                    'open_reservations': None}
+        result = {'admission': 'ready' if data['reserved'] < data['limit'] else 'blocked',
+                  'ledger_state': 'seeded', 'limit_usd': data['limit'] / 1_000_000,
+                  'remaining_usd': (data['limit'] - data['reserved']) / 1_000_000,
+                  'reserved_usd': data['reserved'] / 1_000_000,
+                  'open_reservations': {k: {'count': v['count'], 'upper_usd': v['amount'] / 1_000_000}
+                                        for k, v in data['reservations'].items()}}
+        try:
             if config is not None:
                 self.tariff(config)
-            return {'admission': 'ready' if data['reserved'] < data['limit'] else 'blocked',
-                    'limit_usd': data['limit'] / 1_000_000,
-                    'reserved_usd': data['reserved'] / 1_000_000}
         except CallRejected:
-            return {'admission': 'blocked', 'reason': 'budget unavailable'}
+            result.update(admission='blocked', reason='unapproved model tariff')
+        return result
 
     @classmethod
     def initialize(cls, directory: Path, *, spent_usd, tariff):
         record = {'version': 1, 'limit': 5_000_000, 'reserved': micros(spent_usd),
                   'tariff': {k: micros(v) if k in RATES else v for k, v in tariff.items()}}
+        record['seeded_spent'] = record['reserved']
+        record['reservations'] = {k: {'count': 0, 'amount': 0}
+                                  for k in ('call', 'text', 'realtime', 'other')}
         cls._validate(record)
         journal = AttemptJournal(directory)
         journal.open()  # Also excludes an active engine or concurrent initialization.
