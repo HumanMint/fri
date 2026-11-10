@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import time
 import uuid
@@ -149,7 +150,7 @@ def attributed(context):
     It may quote other members with no record of whom, so nothing may inherit it as complete.
     """
     context['turns'] = [turn if turn.get('attributed') or not turn.get('reply')
-                        else {**turn, 'reply': LEGACY, 'provenance': []} for turn in context.get('turns', [])]
+                        else {**turn, 'reply': LEGACY, 'answer_id': None, 'provenance': []} for turn in context.get('turns', [])]
     if context.get('pending') and 'provenance' not in context['pending']:
         context['pending'] = None
     return context
@@ -1227,6 +1228,13 @@ class Fri(discord.Client):
         carries drew on, from here to its save, so Gene refuses it once one goes, and retires its saved reply then, and
         its echo is rechecked like theirs (fri #193). One that dropped out before the request (deleted meanwhile, say)
         doesn't count. Kept with the fence, which tool steps share: an earlier request's still count."""
+        if 'saved-answer-ids' in self.capabilities and context.get('fence'):
+            # Called after withholding, immediately before every request; tool follow-ups share the fence.
+            answers = context['fence'].setdefault('carried_answers', set())
+            for turn in context.get('turns', []):
+                answer = turn.get('answer_id')
+                if isinstance(answer, str) and re.fullmatch(r'(?:[0-9]{1,25}|turn:[0-9a-f]{32})', answer) and turn.get('reply'):
+                    answers.add(answer)
         if found := self.dependencies(context):
             context['fence'].setdefault('summary_dependencies', set()).update(found)
 
@@ -1236,10 +1244,12 @@ class Fri(discord.Client):
         list where they carried nothing else, or for a reply Fri made itself (not derived), as the controller's default
         is: said, so this Fri knows the reply drew on nothing (see SavedTurns.kept; fri #382's round 1, S1). Never
         dropped to fit: too many refuse it, as too many people do. Nothing for an older controller."""
+        answers = ({'carried_answers': sorted((context.get('fence') or {}).get('carried_answers', ()))
+                    if derived else []} if 'saved-answer-ids' in self.capabilities else {})
         if SOURCES not in self.capabilities:
-            return {}
+            return answers
         if not derived:
-            return {'drew_on': []}
+            return {**answers, 'drew_on': []}
         if not context.get('fence'):
             return {}
         own = {str((context['fence'].get('turn') or {}).get('source', {}).get('id', '')),
@@ -1248,7 +1258,7 @@ class Fri(discord.Client):
         if len(ids) > MAX_DRAWN:
             raise commands.UserFeedbackCheckFailure('that drew on too many messages for me to keep track of safely. '
                                                     'ask again in a bit.')
-        return {'drew_on': ids}
+        return {**answers, 'drew_on': ids}
 
     async def memory_overview(self, scope, context, private):
         """Everything for the member's own eyes in private; in public, only what that channel can see. Neither shows
