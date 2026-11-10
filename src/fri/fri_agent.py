@@ -3165,33 +3165,48 @@ class Agent:
             from .fri_member_summary import recheck as recheck_summaries
             from .fri_reply_checks import CAPABILITY
             from .fri_reply_checks import check as check_replies
-            from .fri_social import deliver_one as deliver_reminder
-            from .fri_workspace import deliver_one as deliver_post
             # An undeliverable owner report or a broken meme check must not silence attention.
             self.running('meme_notes')
             try:  # Meme notes follow their authors' privacy even while meme checks are off.
                 await self.ensure_memes().verify()
             except Exception as exc:  # Never at the cost of the stages below.
                 LOG.warning('Meme notes not verified this tick: %s', type(exc).__name__)
-            results = [await self.stage('presence', self.check_presence),
-                       # Whatever learning or memory does: a deleted channel's saves go (fri #358).
-                       await self.stage('channel_withdrawals', self.channel_withdrawals.settle),
-                       await self.stage('posts', lambda: deliver_post(self.fri)),
-                       await self.stage('reminders', lambda: deliver_reminder(self.fri)),
-                       await self.stage('reports', self.send_reports),
-                       await self.stage('learning', self.learn, 'enabled'),
-                       await self.stage('attention', self.attend, 'enabled'),
-                       await self.stage('fixes', lambda: check_fixes(self), 'enabled'),
-                       await self.stage('notices', lambda: settle_notices(self)),
-                       await self.stage('memes', self.check_memes, 'enabled', 'meme_enabled'),
-                       await self.stage('reply_checks', lambda: check_replies(self), 'enabled', 'reply_check_enabled',
-                                        when=lambda: CAPABILITY in self.fri.capabilities),
-                       await self.stage('member_summaries', lambda: build_summary(self), 'enabled', 'learning_enabled',
-                                        when=lambda: SUMMARIES in getattr(self.fri, 'capabilities', ())),
-                       # Kept summaries shown in requests whatever learning does, so rechecked whatever it does too
-                       # (fri #349): Discord reads, no model call.
-                       await self.stage('summary_rechecks', lambda: recheck_summaries(self),
-                                        when=lambda: {SUMMARIES, RECHECKS} <= set(getattr(self.fri, 'capabilities', ())))]
+            results = [await self.stage('presence', self.check_presence)]
+            # A tick always polls once; extra checkpoints poll at most every 30 seconds.
+            # Keep settlement and delivery serial, ahead of every reader they preceded.
+            polled = None
+
+            async def checkpoint():
+                nonlocal polled
+                if polled is not None and time.monotonic()-polled < 30:
+                    return
+                polled = time.monotonic()
+                from .fri_social import deliver_one as deliver_reminder
+                from .fri_workspace import deliver_one as deliver_post
+                results.extend([
+                    await self.stage('channel_withdrawals', self.channel_withdrawals.settle),
+                    await self.stage('posts', lambda: deliver_post(self.fri)),
+                    await self.stage('reminders', lambda: deliver_reminder(self.fri))])
+
+            await checkpoint()
+            results.append(await self.stage('reports', self.send_reports))
+            for name, step, switches, when in (
+                ('learning', self.learn, ('enabled',), None),
+                ('attention', self.attend, ('enabled',), None),
+                ('fixes', lambda: check_fixes(self), ('enabled',), None),
+                ('notices', lambda: settle_notices(self), (), None),
+                ('memes', self.check_memes, ('enabled', 'meme_enabled'), None),
+                ('reply_checks', lambda: check_replies(self), ('enabled', 'reply_check_enabled'),
+                 lambda: CAPABILITY in self.fri.capabilities),
+                ('member_summaries', lambda: build_summary(self), ('enabled', 'learning_enabled'),
+                 lambda: SUMMARIES in getattr(self.fri, 'capabilities', ())),
+                # Kept summaries are rechecked even with learning off (fri #349); no model call.
+                ('summary_rechecks', lambda: recheck_summaries(self), (),
+                 lambda: {SUMMARIES, RECHECKS} <= set(getattr(self.fri, 'capabilities', ())))):
+                await checkpoint()
+                results.append(await self.stage(name, step, *switches, when=when))
+            # Also drain after the last stage, rather than waiting for the next tick.
+            await checkpoint()
             self.heartbeat_status = 'ok' if all(results) else 'deferred'
         finally:
             PROGRESS.reset(marking)
