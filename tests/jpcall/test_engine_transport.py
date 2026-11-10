@@ -77,7 +77,14 @@ class RealtimePeer:
 
     async def send_json(self, event):
         self.sent.append(event)
-        if event['type'] == EVENTS['session_update']:
+        if event['type'] == EVENTS['input_clear']:
+            self.feed({'type': EVENTS['input_cleared']})
+        elif event['type'] == EVENTS['item_delete']:
+            self.feed({'type': EVENTS['item_deleted'], 'item_id': event['item_id']})
+        elif event['type'] == EVENTS['item_create']:
+            self.feed({'type': 'conversation.item.added', 'item': {
+                **event['item'], 'id': 'tool-output-' + event['item']['call_id']}})
+        elif event['type'] == EVENTS['session_update']:
             self.feed({'type': EVENTS['session_updated']})
         if event['type'] == EVENTS['response_create']:
             response = {'id': 'command-' + event['response']['metadata']['jpcall_command'],

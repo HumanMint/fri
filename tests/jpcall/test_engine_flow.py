@@ -83,7 +83,14 @@ class ModelPeer(RealtimePeer):
 
     async def send_json(self, event):
         self.sent.append(event)
-        if event['type'] == EVENTS['session_update']:
+        if event['type'] == EVENTS['input_clear']:
+            self.feed({'type': EVENTS['input_cleared']})
+        elif event['type'] == EVENTS['item_delete']:
+            self.feed({'type': EVENTS['item_deleted'], 'item_id': event['item_id']})
+        elif event['type'] == EVENTS['item_create']:
+            self.feed({'type': 'conversation.item.added', 'item': {
+                **event['item'], 'id': 'tool-output-' + event['item']['call_id']}})
+        elif event['type'] == EVENTS['session_update']:
             transcription = event['session']['audio']['input'].get('transcription')
             if transcription:
                 self.language = CALL_LANGUAGES[transcription['language']]
@@ -101,6 +108,9 @@ class ModelPeer(RealtimePeer):
             resource = {'id': 'response' + str(self.counter), 'metadata': response['metadata'],
                         'status': 'completed', 'output': [], 'usage': realtime_usage()}
             self.feed({'type': EVENTS['response_created'], 'response': resource})
+            if response.get('conversation') != 'none':
+                self.feed({'type': 'conversation.item.added', 'item': {
+                    'id': item_id, 'type': 'message', 'role': 'assistant'}})
             self.feed({'type': EVENTS['output_audio'], 'response_id': resource['id'],
                        'item_id': item_id, 'content_index': 0,
                        'delta': base64.b64encode(ULAW).decode()})

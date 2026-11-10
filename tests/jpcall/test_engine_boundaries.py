@@ -167,7 +167,7 @@ def test_transfer_renews_notice_and_closes_the_old_group_question(tmp_path, monk
             assert len(requests) == 1
             assert brief.opener_ja in requests[0]['instructions']
             assert requests[0].get('output_modalities') != ['text']
-            assert any(e.get('item', {}).get('call_id') == 'transfer'
+            assert not any(e.get('item', {}).get('call_id') == 'transfer'
                        for e in peer.sent if e['type'] == EVENTS['item_create'])
             await call._rt.handle_event({'type': EVENTS['speech_started'],
                                         'item_id': 'new-person', 'audio_start_ms': 1000})

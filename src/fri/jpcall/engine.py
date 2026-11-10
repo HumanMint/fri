@@ -807,7 +807,6 @@ class _Session:
                     return
                 self._hold = self._new_hold()
                 self._spawn(self._notice_limit(generation))
-                await self._rt.tool_result(call_id, {'permission': 'new notice required'}, respond=False)
                 await self._rt.repeat_notice()
                 await self._notice_delivered(generation)
             else:  # Includes a grant before the complete notice was played.

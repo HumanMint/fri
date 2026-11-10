@@ -400,3 +400,19 @@ never records Responses completion text. Previously authorized timeline entries 
 remain: each carries its consent generation, and withdrawal appends a content-free
 `consent_revoked` marker identifying the revoked generation. Matching earlier entries within that call
 are revoked evidence, not current facts; this marker is not a promise of deletion.
+
+Budget reads are capped at 64 KiB and reject non-regular files, non-object JSON,
+excessive nesting and other malformed state. The health writer also contains an
+unexpected budget-contribution failure, reports unreadable/blocked state and continues
+its ordinary heartbeat instead of leaving stale health.
+
+On permission revocation, Realtime cancels old generation work, clears the input buffer,
+and waits for the buffer-clear and outstanding-response acknowledgments. It then deletes
+all tracked default-conversation items (audio, text and tool items), waiting for deletion
+acknowledgments before any subsequent response. Incoming audio and tool results wait for
+that barrier; send ordering prevents a delayed old write overtaking the clear. Failure to
+confirm cleanup blocks inference and follows bounded call cleanup. Only content-free
+item tombstones remain locally to reject late events; transcript/echo caches are cleared.
+Notices use an out-of-band response with empty input and no tools, never the prior
+conversation. Spoken notice wording is unchanged. These use the documented
+[Realtime deletion and response events](https://developers.openai.com/api/reference/resources/realtime/client-events).

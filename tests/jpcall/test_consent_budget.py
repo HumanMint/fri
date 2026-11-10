@@ -192,3 +192,75 @@ def test_health_distinguishes_unseeded_unreadable_and_open_reservations(tmp_path
         assert health() == budget.status()
     finally:
         journal.close()
+
+
+@pytest.mark.parametrize('payload', ['[' * 2000 + ']' * 2000, '[]', 'null', '1', ' ' * 1000000],
+                         ids=['deep', 'array', 'null', 'scalar', 'oversize'])
+def test_bad_budget_cannot_stop_health_or_admit_spend(tmp_path, payload):
+    import json
+    from types import SimpleNamespace
+
+    from fri.fri import Fri
+
+    journal, budget = ledger(tmp_path)
+    try:
+        budget.path.write_text(payload)
+        client = SimpleNamespace(agent=None, guild_id=1, data=tmp_path, get_guild=lambda _: None,
+            is_ready=lambda: False, _connection=SimpleNamespace(_status='offline'),
+            jpcall_engine=SimpleNamespace(budget_status=budget.status))
+        for _ in range(2):  # The real health coroutine still runs and updates after corrupt input.
+            asyncio.run(Fri.health.coro(client))
+            status = json.loads((tmp_path / 'fri-health.json').read_text())['jpcall_budget']
+            assert status['ledger_state'] == 'unreadable' and status['admission'] == 'blocked'
+        with pytest.raises(CallRejected):
+            budget.reserve(1)
+    finally:
+        journal.close()
+
+
+def test_health_survives_an_unexpected_budget_contribution_failure(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from fri.fri import Fri
+
+    def broken():
+        raise RecursionError('synthetic budget implementation failure')
+    client = SimpleNamespace(agent=None, guild_id=1, data=tmp_path, get_guild=lambda _: None,
+        is_ready=lambda: False, _connection=SimpleNamespace(_status='offline'),
+        jpcall_engine=SimpleNamespace(budget_status=broken))
+    asyncio.run(Fri.health.coro(client))
+    assert json.loads((tmp_path / 'fri-health.json').read_text())['jpcall_budget'] == {
+        'admission': 'blocked', 'ledger_state': 'unreadable',
+        'remaining_usd': None, 'open_reservations': None}
+
+
+def test_ledger_reader_never_requests_unbounded_bytes(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    import fri.jpcall.budget as module
+
+    journal, budget = ledger(tmp_path)
+    original = module.os.fdopen
+    reads = []
+    try:
+        budget.path.write_bytes(b' ' * 1000000)
+
+        @contextmanager
+        def bounded(fd, *args, **kwargs):
+            with original(fd, *args, **kwargs) as source:
+                class Reader:
+                    def fileno(self):
+                        return source.fileno()
+
+                    def read(self, size=-1):
+                        reads.append(size)
+                        assert 0 < size <= 65537
+                        return source.read(size)
+                yield Reader()
+        monkeypatch.setattr(module.os, 'fdopen', bounded)
+        with pytest.raises(CallRejected):
+            budget.read()
+        assert reads == [65537]
+    finally:
+        journal.close()

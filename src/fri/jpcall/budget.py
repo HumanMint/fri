@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import stat
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 
@@ -13,6 +14,7 @@ CONTEXT_TOKENS = 4096
 OUTPUT_TOKENS = 512
 TEXT_OUTPUT_TOKENS = 1200
 MAX_INPUT_BYTES = 32768
+MAX_LEDGER_BYTES = 65536
 RATES = {'text_input', 'text_output', 'realtime_input', 'realtime_output',
          'phone_minute', 'transcription_minute', 'phone_attempt'}
 MODELS = {'text_model', 'realtime_model', 'transcribe_model'}
@@ -35,17 +37,22 @@ class Budget:
             marker = self.journal.directory / 'budget.initialized'
             if not marker.is_file() or marker.is_symlink():
                 raise ValueError
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(fd) as source:
-                data = json.load(source, object_pairs_hook=AttemptJournal._unique)
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError
+                raw = source.read(MAX_LEDGER_BYTES + 1)
+            if len(raw) > MAX_LEDGER_BYTES:
+                raise ValueError
+            data = json.loads(raw, object_pairs_hook=AttemptJournal._unique)
             self._validate(data)
             return data
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, RecursionError, OverflowError):
             raise CallRejected('Calling budget is missing, corrupt or incompatible.') from None
 
     @staticmethod
     def _validate(data):
-        if (set(data) != {'version', 'limit', 'reserved', 'tariff', 'seeded_spent', 'reservations'} or type(data['version']) is not int or data['version'] != 1
+        if (not isinstance(data, dict) or set(data) != {'version', 'limit', 'reserved', 'tariff', 'seeded_spent', 'reservations'} or type(data['version']) is not int or data['version'] != 1
                 or type(data['limit']) is not int or not 0 < data['limit'] <= 5_000_000
                 or type(data['reserved']) is not int or not 0 <= data['reserved'] <= data['limit']
                 or set(data['tariff']) != RATES | MODELS
@@ -103,8 +110,11 @@ class Budget:
         try:
             data = self.read()
         except CallRejected:
-            unseeded = not any(p.exists() or p.is_symlink() for p in (
-                self.path, self.journal.directory / 'budget.initialized'))
+            try:
+                unseeded = not any(p.exists() or p.is_symlink() for p in (
+                    self.path, self.journal.directory / 'budget.initialized'))
+            except OSError:
+                unseeded = False
             return {'admission': 'blocked', 'ledger_state': 'unseeded' if unseeded else 'unreadable',
                     'limit_usd': 5, 'remaining_usd': None, 'reserved_usd': None,
                     'open_reservations': None}
