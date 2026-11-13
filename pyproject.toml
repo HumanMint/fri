@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest==8.4.2", "ruff==0.17.1"]
+dev = ["pytest==9.0.3", "ruff==0.17.1"]
 
 [project.scripts]
 fri = "fri.fri:main"
