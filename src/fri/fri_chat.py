@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -765,10 +766,12 @@ class Chat:
 
     async def claude(self, payload, context, key):
         """The same request on Claude. Any failure looks like the plan's rate limit, which is why it's here."""
-        import anthropic  # Only when it's needed: the SDK costs memory, and most processes never fall back.
         result = ChatResult(status='failed', error=RATE_LIMITED, model=CLAUDE_MODEL, effort=CLAUDE_EFFORT)
         try:
-            async with asyncio.timeout(MODEL_DEADLINE), anthropic.AsyncAnthropic(api_key=key) as client:
+            # Only when it's needed (the SDK costs memory), and off the event loop: the first import takes ~0.4 s.
+            anthropic = await asyncio.to_thread(importlib.import_module, 'anthropic')
+            async with asyncio.timeout(MODEL_DEADLINE), anthropic.AsyncAnthropic(
+                    api_key=key, http_client=anthropic.DefaultAsyncHttpxClient(trust_env=False)) as client:
                 for flat in (False, True):
                     try:
                         async with client.beta.messages.stream(
@@ -785,7 +788,7 @@ class Chat:
                     except anthropic.BadRequestError as exc:  # The offered actions' grammar is too large: flat, once.
                         if flat or not ('grammar is too large' in str(exc) or 'too complex' in str(exc)):
                             raise
-        except (TimeoutError, anthropic.AnthropicError):  # AnthropicError: API, connection, or no key at all.
+        except Exception:  # Any failure (API, a dropped or malformed stream, no SDK) is a failed reply, never a dead turn.
             return result
         data = message.usage
         cached, created = data.cache_read_input_tokens or 0, data.cache_creation_input_tokens or 0

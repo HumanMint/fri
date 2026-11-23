@@ -34,7 +34,7 @@ class FakeClaude:
     requests, keys = [], []
     outcome = None
 
-    def __init__(self, api_key):
+    def __init__(self, api_key, **options):
         FakeClaude.keys.append(api_key)
         self.beta = SimpleNamespace(messages=SimpleNamespace(stream=self.stream))
 
@@ -125,7 +125,9 @@ def test_without_a_usable_key_a_429_fails_as_before(claude, content):
 
 @pytest.mark.parametrize('outcome', [
     message(stop_reason='refusal'), message(stop_reason='max_tokens'), message(text='not json'),
-    anthropic.APIConnectionError(request=httpx.Request('POST', 'https://api.example')), TimeoutError()])
+    anthropic.APIConnectionError(request=httpx.Request('POST', 'https://api.example')), TimeoutError(),
+    # What the SDK itself can raise on a dropped or malformed stream, outside AnthropicError (review of #417).
+    json.JSONDecodeError('bad', '', 0), IndexError(), AssertionError(), OSError('read error')])
 def test_claude_failures_fail_like_the_rate_limit(claude, outcome):
     FakeClaude.outcome = outcome
     result = asyncio.run(chat().respond('hi', context()))
