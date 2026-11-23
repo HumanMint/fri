@@ -46,7 +46,8 @@ A Python 3.11 package with one process per installation (`fri`, or `python -m fr
 - **Model access.** `fri_chat.Chat` calls the Responses API with a Sign in with ChatGPT plan token
   (`subscription.py` renews and rotates it under a file lock). There is no API-key path. The models are
   controller settings: conversation uses the owner-selected chat model (`gpt-6.2-sol` at high effort on a
-  fresh install), `gpt-6-luna` for background work. Fri's own diagnosis and review calls use `gpt-6.2-sol`.
+  fresh install with a current Gene), `gpt-6-luna` for background work. Fri's own diagnosis and owner
+  settings previews use `gpt-6.2-sol`.
 - **Voice.** `VOICE` and `INSTRUCTIONS` in `fri_chat.py` define the persona: casual, lowercase,
   deadpan, sassy; earnest and result-first when someone is working on a project; serious when the
   moment is. The owner can add voice notes as a controller setting, through a preview and Apply.

@@ -21,7 +21,7 @@ authorize a self-hosted agent this way isn't established. If yours can't, the sc
 nothing and says so. Without a sign-in Fri still logs in, reaches the controller and answers
 `fri show settings`, but every reply that needs the model fails: members get a short notice, and the
 owner gets one DM. Fri asks for the controller's chat model for conversation (`gpt-6.2-sol` on a fresh
-install), `gpt-6.2-sol` for its own diagnosis calls and `gpt-6-luna` for background work, so your plan
+install with a current Gene), `gpt-6.2-sol` for its own diagnosis calls and `gpt-6-luna` for background work, so your plan
 has to offer those models.
 
 ## 1. Create Fri's Discord application
