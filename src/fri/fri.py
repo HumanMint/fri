@@ -646,7 +646,7 @@ class Fri(discord.Client):
         result.channels = (context.get('fence') or {}).get('channels')  # As its last read was (see ready).
         attempt = uuid.uuid4().hex
         private_json(self.data / 'usage' / (attempt + '.json'), {
-            'attempt_id': attempt, 'model': context['model'], 'effort': context['effort'],
+            'attempt_id': attempt, 'model': result.model or context['model'], 'effort': result.effort or context['effort'],
             'status': result.status, 'counters': result.counters})
         try:
             await self.flush_usage()
@@ -1041,7 +1041,8 @@ class Fri(discord.Client):
                         return ChatResult(reply=unrecorded(receipts), status='completed')
                     result.turn = {**scope, 'revision': context['revision'], 'source': source.model_dump(),
                         'input': clean(event.content, 4000) if result.clarification or context.get('message_burst') else text,
-                        'reply': stored, 'model': context['model'], 'effort': context['effort'], 'notes': [],
+                        'reply': stored, 'model': result.model or context['model'],
+                        'effort': result.effort or context['effort'], 'notes': [],
                         'web_receipt': research, 'clarification': result.clarification,
                         'burst': context.get('message_burst', []),
                         'allow_closing': result.allow_closing and not bool(result.draft or result.settings_preview or
@@ -1108,7 +1109,7 @@ class Fri(discord.Client):
         result.turn = {**scope, 'revision': context['revision'], 'source': source.model_dump(), 'input': text,
             'reply': reply, 'response_kind': result.response_kind, 'reaction': result.reaction,
             'allow_closing': result.allow_closing, 'burst': context.get('message_burst', []),
-            'model': model or context['model'], 'effort': '' if model else context['effort'],
+            'model': model or result.model or context['model'], 'effort': '' if model else result.effort or context['effort'],
             'notes': result.notes, 'input_tokens': 0 if model else result.counters.get('input_tokens'),
             'output_tokens': 0 if model else result.counters.get('output_tokens'), 'provenance': provenance,
             'verbatim': result.response_kind == 'reply' and reply == result.reply,
@@ -1474,7 +1475,7 @@ class Fri(discord.Client):
                 # The controller stores only a neutral placeholder for outside invitations.
                 result.turn = {**scope, 'revision': context['revision'],
                     'input': text, 'reply': result.reply, 'source': invitation.source,
-                    'model': context['model'], 'effort': context['effort'], 'notes': [],
+                    'model': result.model or context['model'], 'effort': result.effort or context['effort'], 'notes': [],
                     'burst': [], 'clarification': None,
                     'response_kind': 'reply', 'reaction': None, 'allow_closing': False,
                     'input_tokens': result.counters.get('input_tokens'), 'output_tokens': result.counters.get('output_tokens'),

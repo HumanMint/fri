@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 
 from .fri_agent_model import STRING, analyze, obj
-from .fri_chat import Chat, ChatResult
+from .fri_chat import Chat, ChatResult, claude_key
 from .fri_image_eval import cases as image_cases
 from .fri_image_eval import link_cases
 from .privacy import model_json
@@ -684,13 +684,16 @@ def ascii_baseline():
         module.model_json = json.dumps
 
 
-async def main(suite='voice', baseline=False):
+async def main(suite='voice', baseline=False, claude=False):
     """Only controller status/settings reads and anonymous usage writes are permitted here."""
     if baseline:
         ascii_baseline()
     url = os.environ['GENE_CONTROLLER_URL']
     headers = {'Authorization': 'Bearer '+os.environ['GENE_FRI_TOKEN']}
     chat = Chat(Subscription(os.getenv('FRI_CHATGPT_AUTH', '/auth/session.json')))
+    if claude and not claude_key():
+        raise SystemExit('No Claude key file (FRI_ANTHROPIC_KEY_FILE)')
+    chat.force_claude = claude  # Replies only; graders still use the ChatGPT plan.
     async with httpx.AsyncClient(timeout=30, trust_env=False, headers=headers) as client:
         status = await client.get(url+'/status')
         status.raise_for_status()
@@ -703,8 +706,8 @@ async def main(suite='voice', baseline=False):
         async for case, result in evaluate(chat, status['chat_model'], status['chat_effort'], notes, suite, background=config):
             if case.get('model_calls') != 0:  # A case Fri answers locally used nothing to report.
                 attempt = uuid.uuid4().hex
-                report = {'attempt_id': attempt, 'model': case.get('model', status['chat_model']),
-                    'effort': case.get('effort', status['chat_effort']),
+                report = {'attempt_id': attempt, 'model': result.model or case.get('model', status['chat_model']),
+                    'effort': result.effort or case.get('effort', status['chat_effort']),
                     'status': result.status, 'counters': result.counters, 'role': 'evaluation'}
                 path = Path(os.getenv('FRI_DATA', '/data'))/'usage'/(attempt+'.json')
                 private_json(path, report)
@@ -728,5 +731,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'loops', 'times', 'memory', 'recall', 'stills', 'sass', 'friend', 'model-text'), default='voice')
     parser.add_argument('--baseline', action='store_true', help='ASCII-escape model input, for comparison')
+    parser.add_argument('--claude', action='store_true', help='Answer on the Claude fallback, skipping ChatGPT')
     args = parser.parse_args()
-    asyncio.run(main(args.suite, args.baseline))
+    asyncio.run(main(args.suite, args.baseline, args.claude))
