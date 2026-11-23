@@ -138,6 +138,28 @@ def test_claude_failures_fail_like_the_rate_limit(claude, outcome):
     assert result.model == CLAUDE_MODEL
 
 
+def failed_stream(code, output=()):
+    """The plan's answer when its usage is used up: 200, then a failed response (seen live 2026-11-23)."""
+    final = {'type': 'response.failed', 'response': {'status': 'failed', 'output': list(output),
+             'error': {'type': 'invalid_request_error', 'code': code, 'message': 'limit'}}}
+    body = ''.join(f'data: {json.dumps(event)}\n\n' for event in (
+        {'type': 'response.created', 'response': {}}, {'type': 'error'}, final))
+    return Chat(SimpleNamespace(access_token=lambda: 'fictional-token'),
+                httpx.MockTransport(lambda request: httpx.Response(200, text=body)))
+
+
+def test_a_usage_limit_failed_stream_answers_through_claude(claude):
+    result = asyncio.run(failed_stream('subscription_sharing_usage_limit_exceeded').respond('hi', context()))
+    assert (result.status, result.reply, result.model) == ('completed', 'eh, works', CLAUDE_MODEL)
+    assert len(FakeClaude.requests) == 1
+
+
+@pytest.mark.parametrize('code,output', [('server_error', ()), ('usage_limit_reached', [{'type': 'message'}])])
+def test_other_failed_streams_and_ones_with_output_never_fall_back(claude, code, output):
+    result = asyncio.run(failed_stream(code, output).respond('hi', context()))
+    assert result.status == 'failed' and result.error != RATE_LIMITED and FakeClaude.requests == []
+
+
 @pytest.mark.parametrize('status', [401, 403, 500])
 def test_other_failures_never_fall_back(claude, status):
     result = asyncio.run(chat(status).respond('hi', context()))

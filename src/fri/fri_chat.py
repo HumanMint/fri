@@ -929,6 +929,10 @@ class Chat:
                         result.counters = usage(final)
                         result.status = event['type'].split('.')[1]
                         if result.status != 'completed':
+                            # A used-up plan answers 200, then fails the stream with a usage-limit code (2026-11-23).
+                            if not produced and 'usage_limit' in str((final.get('error') or {}).get('code') or ''):
+                                exempt, result.error = True, RATE_LIMITED
+                                raise RateLimited()
                             result.error = 'big ai didn’t finish that reply. check usage or try again in a bit.'
                             return result
                         output = ''.join(part.get('text', '') for item in final.get('output', [])
