@@ -46,7 +46,7 @@ class FakeClaude:
 
     def stream(self, **request):
         FakeClaude.requests.append(request)
-        outcome = FakeClaude.outcome
+        outcome = FakeClaude.outcome.pop(0) if isinstance(FakeClaude.outcome, list) else FakeClaude.outcome
 
         class Stream:
             async def __aenter__(self):
@@ -167,3 +167,54 @@ def test_claude_schema_lists_only_offered_actions_and_parse_still_refuses_others
     FakeClaude.outcome = message(text=json.dumps({**REPLY, 'reply': '', 'action': {'kind': 'web_search', 'query': 'x'}}))
     result = asyncio.run(chat().respond('hi', context(actions=offered)))
     assert result.status == 'completed' and result.action == {'kind': 'web_search', 'query': 'x'}
+
+
+def bad_request(text):
+    response = httpx.Response(400, request=httpx.Request('POST', 'https://api.example'))
+    return anthropic.BadRequestError(text, response=response, body=None)
+
+
+def test_same_named_action_fields_agree_so_a_flat_action_can_hold_them():
+    seen = {}
+    for branch in SCHEMA['properties']['action']['anyOf'][1:]:
+        for key, value in branch['properties'].items():
+            if key != 'kind':
+                assert seen.setdefault(key, fri_chat.claude_clean(value)) == fri_chat.claude_clean(value), key
+
+
+def test_a_too_large_grammar_retries_once_flat_and_keeps_only_the_kinds_fields(claude):
+    offered = {'read_recent': {}, 'gene_command': {}, 'history_search': {}}
+    flat_reply = {**REPLY, 'reply': '', 'action': {'kind': 'read_recent', 'channel_id': '5', 'window': 'pins',
+                                                   'action': '', 'argument': '', 'query': '', 'author': '', 'after': '',
+                                                   'before': '', 'has': '', 'cursor': ''}}
+    FakeClaude.outcome = [bad_request('The compiled grammar is too large, which would cause performance issues.'),
+                          message(text=json.dumps(flat_reply))]
+    result = asyncio.run(chat().respond('whats pinned', context(actions=offered)))
+    assert result.status == 'completed' and result.action == {'kind': 'read_recent', 'channel_id': '5', 'window': 'pins'}
+    first, second = [request['output_config']['format']['schema']['properties']['action'] for request in FakeClaude.requests]
+    assert len(first['anyOf']) == 4
+    null, flat = second['anyOf']
+    assert null == {'type': 'null'} and flat['additionalProperties'] is False
+    assert flat['properties']['kind']['enum'] == ['read_recent', 'gene_command', 'history_search']
+    assert set(flat['required']) == set(flat['properties']) and 'channel_id' in flat['properties']
+    assert flat['properties']['window'] == {'type': 'string', 'enum': ['recent', 'since_my_last_message', 'pins']}
+    assert not any(isinstance(field.get('type'), list) or 'anyOf' in field for field in flat['properties'].values())
+
+
+@pytest.mark.parametrize('action', [{'kind': 'read_recent', 'channel_id': '5'}, {'kind': 'unknown', 'channel_id': '5'}])
+def test_a_flat_action_missing_its_own_field_or_of_an_unknown_kind_is_still_refused(claude, action):
+    FakeClaude.outcome = [bad_request('Schema is too complex.'), message(text=json.dumps({**REPLY, 'reply': '', 'action': action}))]
+    result = asyncio.run(chat().respond('whats pinned', context(actions={'read_recent': {}})))
+    assert result.status == 'invalid_output' and len(FakeClaude.requests) == 2
+
+
+def test_other_bad_requests_and_a_second_grammar_failure_do_not_retry_again(claude):
+    FakeClaude.outcome = [bad_request('messages: invalid image'), message()]
+    assert asyncio.run(chat().respond('hi', context())).error == RATE_LIMITED and len(FakeClaude.requests) == 1
+    FakeClaude.requests, FakeClaude.outcome = [], [bad_request('grammar is too large')] * 2 + [message()]
+    assert asyncio.run(chat().respond('hi', context())).error == RATE_LIMITED and len(FakeClaude.requests) == 2
+
+
+def test_flat_action_keeps_a_reply_without_an_action_and_leaves_bad_json_alone():
+    assert json.loads(fri_chat.flat_action(json.dumps(REPLY))) == REPLY
+    assert fri_chat.flat_action('not json') == 'not json'

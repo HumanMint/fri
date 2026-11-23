@@ -687,14 +687,45 @@ def claude_key():
         return None
 
 
-def claude_schema(schema, offered):
+def claude_schema(schema, offered, flat=False):
     """The reply schema as Claude's structured outputs take it. Every action's grammar together is too large there, so
-    only the actions offered this turn are listed; parse_reply refuses any other anyway."""
+    only the actions offered this turn are listed; parse_reply refuses any other anyway.
+
+    flat: for a turn offering so many that even those are too large (an owner's turn offers about 20), one action object
+    instead, with kind and every field the offered kinds use, all required. Nullable or optional fields break the API's
+    union and complexity limits there. flat_action then keeps only the chosen kind's own fields."""
     null, *branches = schema['properties']['action']['anyOf']
     branches = [{**branch, 'properties': {**branch['properties'], 'kind': {**branch['properties']['kind'], 'enum': kinds}}}
                 for branch in branches if (kinds := [k for k in branch['properties']['kind']['enum'] if k in offered])]
+    if flat and branches:
+        fields = {key: value for branch in branches for key, value in branch['properties'].items() if key != 'kind'}
+        branches = [{'type': 'object', 'description': FLAT_NOTE, 'additionalProperties': False,
+                     'properties': {'kind': {'type': 'string', 'enum': [kind for branch in branches
+                                                                         for kind in branch['properties']['kind']['enum']]},
+                                    **fields}, 'required': ['kind', *fields]}]
     return claude_clean({**schema, 'properties': {**schema['properties'],
                                                   'action': {'anyOf': [null, *branches]} if branches else null}})
+
+
+FLAT_NOTE = ('Fill the fields your chosen kind uses. Every other field is ignored: give it an empty string, 0 or its '
+             'first option.')
+# Each action kind's own fields, the only ones a flat action keeps.
+ACTION_FIELDS = {kind: set(branch['properties']) for branch in SCHEMA['properties']['action']['anyOf'][1:]
+                 for kind in branch['properties']['kind']['enum']}
+
+
+def flat_action(output):
+    """A flat-schema reply with its action cut to its kind's own fields, so parse_reply's exact key check still decides.
+    An unknown kind keeps every field and fails there; output that isn't JSON is left for parse_reply to refuse."""
+    try:
+        parsed = json.loads(output)
+        action = parsed['action']
+        if isinstance(action, dict):
+            parsed['action'] = {key: value for key, value in action.items()
+                                if key in ACTION_FIELDS.get(action.get('kind'), action)}
+        return json.dumps(parsed)
+    except (ValueError, KeyError, TypeError):
+        return output
 
 
 def claude_clean(value):
@@ -738,16 +769,22 @@ class Chat:
         result = ChatResult(status='failed', error=RATE_LIMITED, model=CLAUDE_MODEL, effort=CLAUDE_EFFORT)
         try:
             async with asyncio.timeout(MODEL_DEADLINE), anthropic.AsyncAnthropic(api_key=key) as client:
-                async with client.beta.messages.stream(
-                        model=CLAUDE_MODEL, max_tokens=16000, system=payload['instructions'],
-                        messages=[{'role': message['role'], 'content': claude_content(message['content'])}
-                                  for message in payload['input']],
-                        output_config={'effort': CLAUDE_EFFORT, 'format': {
-                            'type': 'json_schema', 'schema': claude_schema(payload['text']['format']['schema'], context.get('actions', {}))}},
-                        cache_control={'type': 'ephemeral'},
-                        # A refusal is retried on the model the API picks for it; usage names who answered.
-                        betas=['server-side-fallback-2026-07-01'], fallbacks='default') as stream:
-                    message = await stream.get_final_message()
+                for flat in (False, True):
+                    try:
+                        async with client.beta.messages.stream(
+                                model=CLAUDE_MODEL, max_tokens=16000, system=payload['instructions'],
+                                messages=[{'role': message['role'], 'content': claude_content(message['content'])}
+                                          for message in payload['input']],
+                                output_config={'effort': CLAUDE_EFFORT, 'format': {'type': 'json_schema', 'schema': claude_schema(
+                                    payload['text']['format']['schema'], context.get('actions', {}), flat)}},
+                                cache_control={'type': 'ephemeral'},
+                                # A refusal is retried on the model the API picks for it; usage names who answered.
+                                betas=['server-side-fallback-2026-07-01'], fallbacks='default') as stream:
+                            message = await stream.get_final_message()
+                        break
+                    except anthropic.BadRequestError as exc:  # The offered actions' grammar is too large: flat, once.
+                        if flat or not ('grammar is too large' in str(exc) or 'too complex' in str(exc)):
+                            raise
         except (TimeoutError, anthropic.AnthropicError):  # AnthropicError: API, connection, or no key at all.
             return result
         data = message.usage
@@ -758,7 +795,8 @@ class Chat:
         if message.stop_reason in ('refusal', 'max_tokens'):
             return result
         result.status, result.error = 'completed', ''
-        return parse_reply(result, ''.join(block.text for block in message.content if block.type == 'text'), context)
+        output = ''.join(block.text for block in message.content if block.type == 'text')
+        return parse_reply(result, flat_action(output) if flat else output, context)
 
     async def headers(self):
         token = await asyncio.to_thread(self.subscription.access_token)
