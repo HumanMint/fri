@@ -7,6 +7,7 @@ import logging
 import discord
 
 from . import feedback as commands
+from .fri_chat import CLAUDE_MODEL, claude_key
 from .fri_notices import notice_text
 from .fri_requests import DraftView as DraftView
 from .panels import PrivatePanels, defer_panel
@@ -334,6 +335,8 @@ class SettingsView(ScopedView):
         coding = await self.cog.api('POST', '/usage', actor(interaction))
         chatting = await self.cog.api('POST', '/chat/usage', actor(interaction))
         text = 'Uses your ChatGPT plan. No app token budget. Counts are recorded usage, not remaining quota.\n'
+        if claude_key():
+            text += f'When the plan is rate limited, replies fall back to Claude ({CLAUDE_MODEL}, API billed).\n'
         def count(value):
             return 'unknown' if value is None else f'{value:,}'
         for label, rows in [('Chat', chatting), ('Development', coding)]:
@@ -458,7 +461,9 @@ async def show_chat_models(cog, interaction, refresh=False, page=0):
         await cog.api('POST', '/chat/models/update', {**actor(interaction), 'models': models})
     state = await cog.api('POST', '/chat/models', actor(interaction))
     text = f"Selected: **{state['selected']}** · **{state['effort']}**\nUses your ChatGPT subscription."
-    text += '\nRefresh to discover available models. There is no automatic model fallback.'
+    text += '\nRefresh to discover available models. ' + (
+        f'Replies fall back to Claude ({CLAUDE_MODEL}) when the plan is rate limited.' if claude_key()
+        else 'There is no automatic model fallback.')
     await reply(cog, interaction, embed=card('Fri’s chat model', text),
                 view=ChatModelsView(cog, interaction.user.id, state, page))
 
