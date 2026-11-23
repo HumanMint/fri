@@ -45,7 +45,7 @@ A Python 3.11 package with one process per installation (`fri`, or `python -m fr
   outage when Gene or the controller is down.
 - **Model access.** `fri_chat.Chat` calls the Responses API with a Sign in with ChatGPT plan token
   (`subscription.py` renews and rotates it under a file lock). There is no API-key path. The models are
-  controller settings: `gpt-6.1-sol` at high effort for conversation, `gpt-6-luna` for background
+  controller settings: `gpt-6.2-sol` at high effort for conversation, `gpt-6-luna` for background
   work.
 - **Voice.** `VOICE` and `INSTRUCTIONS` in `fri_chat.py` define the persona: casual, lowercase,
   deadpan, sassy; earnest and result-first when someone is working on a project; serious when the

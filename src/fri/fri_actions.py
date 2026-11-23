@@ -750,8 +750,8 @@ class Actions:
             'tests/features/, docs/features/. Flag infrastructure, dependencies and controller issues as maintainer '
             'work. An eligible existing-feature fault can be sent to independent verification; do not promise '
             'a fix or grant approval yourself. New features and protected changes need the owner. At most 2500 characters total.',
-            evidence, DIAGNOSIS, model='gpt-6.1-sol', effort='xhigh', erased=moved)
-        result.update(diagnosis_status=state, diagnosis_model='gpt-6.1-sol', diagnosis_effort='xhigh')
+            evidence, DIAGNOSIS, model='gpt-6.2-sol', effort='xhigh', erased=moved)
+        result.update(diagnosis_status=state, diagnosis_model='gpt-6.2-sol', diagnosis_effort='xhigh')
         if state == 'completed':
             result.update(assessment=clean(diagnosis.get('summary', ''), 1500),
                           proposed_request=clean(diagnosis.get('proposed_request', ''), 4000))
