@@ -543,7 +543,7 @@ def test_investigation_escalates_to_sol_xhigh_and_attributes_report_to_fri():
         agent.gene_id = 88
         agent.run = AsyncMock(return_value=({'summary': 'Evidence uncertain', 'proposed_request': 'Add diagnostics'}, {}, 'completed'))
         await agent.investigate(456, {'id': '100', 'text': 'Track Stuck'})
-        assert agent.run.await_args.kwargs == {'model': 'gpt-6.1-sol', 'effort': 'xhigh'}
+        assert agent.run.await_args.kwargs == {'model': 'gpt-6.2-sol', 'effort': 'xhigh'}
         payload = fri.api.await_args.args[2]
         assert payload['user_id'] == '99' and payload['source_id'] == 'gene-error:100'
         assert 'xhigh' in payload['body'] and 'approved' not in payload

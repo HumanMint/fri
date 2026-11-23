@@ -130,7 +130,7 @@ def test_settings_request_or_failed_check_still_reaches_the_sol_preview(monkeypa
         message = owner_message()
         assert await agent.owner_control(message, 'set heartbeat to 10 minutes')
         kwargs = agent.run.await_args.kwargs
-        assert len(calls) == 1 and (kwargs['model'], kwargs['effort']) == ('gpt-6.1-sol', 'high')
+        assert len(calls) == 1 and (kwargs['model'], kwargs['effort']) == ('gpt-6.2-sol', 'high')
         message.channel.typing.assert_called_once()
         assert message.reply.await_args.kwargs['view'].changes == {'heartbeat_seconds': 600}
         await fri.close()
@@ -202,7 +202,7 @@ def test_an_owner_line_erased_while_it_waits_gets_no_reply_or_preview(monkeypatc
         else:
             assert await agent.owner_control(message, text) == ERASED
         message.reply.assert_not_awaited()  # No preview, busy note or error about the erased line.
-        assert sol == (['gpt-6.1-sol'] if when == 'settings call' else [])
+        assert sol == (['gpt-6.2-sol'] if when == 'settings call' else [])
         assert agent.control_queue == ([1] if when == 'busy' else [])
         await fri.close()
     asyncio.run(scenario())
@@ -454,7 +454,7 @@ def test_a_slow_usage_report_does_not_hold_up_the_settings_preview(monkeypatch, 
             fri.flush_usage.assert_not_awaited()  # The usage loop delivers both saved receipts.
             saved = [json.loads(path.read_text()) for path in (tmp_path/'usage').glob('*.json')]
             assert sorted((r['role'], r['model'], r['status']) for r in saved) == [
-                ('owner_settings', 'gpt-6-luna', 'interrupted'), ('owner_settings', 'gpt-6.1-sol', 'completed')]
+                ('owner_settings', 'gpt-6-luna', 'interrupted'), ('owner_settings', 'gpt-6.2-sol', 'completed')]
         finally:
             reporting.set()
             await fri.close()

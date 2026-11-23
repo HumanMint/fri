@@ -143,7 +143,7 @@ KEYWORDS = Scenario(
            lambda r: route(r, 'tone')['kind'] == 'owner-control'
            and not any(d.view for d in r.step('tone').deliveries)
            and any(d.text == 'dm me for that one.' for d in r.step('tone').deliveries)
-           and [m['model'] for m in r.step('tone').model] == ['gpt-6-luna', 'gpt-6.1-sol']),
+           and [m['model'] for m in r.step('tone').model] == ['gpt-6-luna', 'gpt-6.2-sol']),
      Check('owner banter with a settings word costs one cheap check, not the Sol settings call',
            lambda r: route(r, 'banter')['kind'] == 'model'
            and [m['model'] for m in r.step('banter').model if m['kind'] == 'internal'] == ['gpt-6-luna'])])

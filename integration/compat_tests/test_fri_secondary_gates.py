@@ -465,7 +465,7 @@ def test_gene_diagnosis_never_asks_its_models_once_the_turns_fence_moved(monkeyp
         try:
             if moved in ('someone else', 'web lookups off'):
                 result = await actions.execute({'kind': 'gene_diagnose', 'channel_id': ''})
-                assert asked == ['gpt-6-luna', 'gpt-6.1-sol'] and result['diagnosis_status'] == 'completed'
+                assert asked == ['gpt-6-luna', 'gpt-6.2-sol'] and result['diagnosis_status'] == 'completed'
                 return
             with pytest.raises(STOPS[moved]):
                 await actions.execute({'kind': 'gene_diagnose', 'channel_id': ''})
@@ -491,7 +491,7 @@ def test_diagnosis_after_an_unconfirmed_gene_command_is_fenced_too(monkeypatch, 
                 else:
                     result = await actions.execute({'kind': 'gene_command', 'action': 'play',
                                                     'argument': 'Sad Machine'})
-                    assert result['uncertain'] and asked == ['gpt-6-luna', 'gpt-6.1-sol']
+                    assert result['uncertain'] and asked == ['gpt-6-luna', 'gpt-6.2-sol']
         finally:
             await fri.close()
     asyncio.run(scenario())
