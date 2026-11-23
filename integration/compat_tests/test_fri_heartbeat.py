@@ -433,7 +433,7 @@ def test_a_receipt_that_cannot_be_set_aside_waits_without_blocking_later_ones(cl
 
 
 def test_a_usage_delivery_failure_never_discards_a_finished_reply(tmp_path):
-    result = SimpleNamespace(status='completed', counters={'input_tokens': 1}, error=None)
+    result = SimpleNamespace(status='completed', counters={'input_tokens': 1}, error=None, model=None, effort=None)
     fri = SimpleNamespace(chat=SimpleNamespace(respond=AsyncMock(return_value=result)), data=tmp_path,
                           flush_usage=AsyncMock(side_effect=PermissionError(13, 'private')))
     assert asyncio.run(Fri.chat_once(fri, 'hi', {'model': 'gpt-6-luna', 'effort': 'low'})) is result
