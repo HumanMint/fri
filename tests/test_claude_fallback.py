@@ -154,7 +154,7 @@ def test_a_usage_limit_failed_stream_answers_through_claude(claude):
     assert len(FakeClaude.requests) == 1
 
 
-@pytest.mark.parametrize('code,output', [('server_error', ()), ('usage_limit_reached', [{'type': 'message'}])])
+@pytest.mark.parametrize('code,output', [('server_error', ()), ('usage_limit_reached', [{'type': 'message'}]), (None, ())])
 def test_other_failed_streams_and_ones_with_output_never_fall_back(claude, code, output):
     result = asyncio.run(failed_stream(code, output).respond('hi', context()))
     assert result.status == 'failed' and result.error != RATE_LIMITED and FakeClaude.requests == []
