@@ -78,7 +78,7 @@ def review_message(notice, tell=False):
         if job.get('model'):
             model, effort = job['model'], job.get('effort') or 'model default'
             if job.get('kind') == 'repair' and job.get('progress') in ('Verifying fault', 'Independent review'):
-                model, effort = 'gpt-6.1-sol', 'xhigh'
+                model, effort = 'Sol', 'xhigh'  # Gene picks the version for these stages; Fri can't know it.
             embed.set_footer(text=f"{model} · {effort}")
         attachment = discord.File(io.BytesIO(job['body'].encode()), filename=f"request-{job['id']}.txt")
         view = discord.ui.View(timeout=None)
