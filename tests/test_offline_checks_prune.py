@@ -77,3 +77,38 @@ def test_a_bad_keep_value_warns_and_never_fails_setup(tmp_path):
     current, old = entry(root, 1, time.time()), entry(root, 2, OLD)
     result = prune(root, current.name, keep='ten')
     assert result.returncode == 0 and 'not pruning' in result.stderr and old.exists()
+
+
+def test_a_symlinked_ready_marker_never_makes_a_folder_removable(tmp_path):
+    root = tmp_path / 'cache'
+    current = entry(root, 1, time.time())
+    real = entry(tmp_path / 'elsewhere', 2, OLD)
+    impostor = root / real.name
+    (impostor / 'data').mkdir(parents=True)
+    (impostor / '.ready').symlink_to(real / '.ready')
+    os.utime(impostor, (OLD, OLD))
+    assert prune(root, current.name, keep='0').returncode == 0
+    assert impostor.exists() and real.exists()
+
+
+def test_a_huge_keep_value_warns_and_keeps_everything(tmp_path):
+    root = tmp_path / 'cache'
+    current, old = entry(root, 1, time.time()), entry(root, 2, OLD)
+    result = prune(root, current.name, keep='9223372036854775808')
+    assert result.returncode == 0 and 'too large' in result.stderr and old.exists()
+
+
+def test_a_folder_whose_marker_cannot_be_removed_is_left_whole(tmp_path):
+    root = tmp_path / 'cache'
+    current = entry(root, 1, time.time())
+    locked = entry(root, 2, OLD)
+    (locked / 'venv' / 'python').write_text('')
+    os.utime(locked, (OLD, OLD))
+    locked.chmod(0o555)
+    try:
+        if os.access(locked, os.W_OK):  # Running as root: permissions don't apply.
+            return
+        assert prune(root, current.name, keep='0').returncode == 0
+        assert (locked / '.ready').exists() and (locked / 'venv' / 'python').exists()
+    finally:
+        locked.chmod(0o755)

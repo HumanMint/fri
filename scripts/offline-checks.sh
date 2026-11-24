@@ -45,7 +45,7 @@ setup() {
   (cd "$FRI" && UV_PROJECT_ENVIRONMENT="$FRI_VENV" uv sync --frozen)
   git -C "$GENE_REPO" cat-file -e "$GENE_SHA^{commit}" 2>/dev/null ||
     die "Gene commit $GENE_SHA is not in $GENE_REPO; fetch it first: git -C $GENE_REPO fetch origin"
-  if [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ]; then
+  if [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ] && [ -x "$GENE_VENV/bin/python" ]; then
     echo "setup: Gene $GENE_SHA already prepared in $GENE_DIR"
     touch "$GENE_DIR" 2>/dev/null || :
     prune
@@ -68,14 +68,15 @@ prune() {
   # unused for 7 days and starts during this prune can fail. Rerun setup; add locking if it bites.
   keep=${FRI_OFFLINE_KEEP:-10}
   case $keep in
-    '' | *[!0-9]*) echo "setup: FRI_OFFLINE_KEEP must be a whole number, got: $keep; not pruning" >&2; return 0 ;;
+    '' | *[!0-9]*) echo "setup: FRI_OFFLINE_KEEP must be a whole number, got: $keep; not pruning" >&2 || :; return 0 ;;
   esac
+  [ ${#keep} -le 6 ] || { echo "setup: FRI_OFFLINE_KEEP is too large: $keep; not pruning" >&2 || :; return 0; }
   entries=()
   for dir in "$CACHE_ROOT"/*; do  # A glob, not parsed ls output: odd names stay one path.
     sha=${dir##*/}
     case $sha in *[!0-9a-f]* | '') continue ;; esac
     [ ${#sha} -eq 40 ] && [ "$sha" != "$GENE_SHA" ] && [ -d "$dir" ] && [ ! -L "$dir" ] || continue
-    [ -f "$dir/.ready" ] && [ "$(cat "$dir/.ready" 2>/dev/null)" = "$sha" ] || continue
+    [ -f "$dir/.ready" ] && [ ! -L "$dir/.ready" ] && [ "$(cat "$dir/.ready" 2>/dev/null)" = "$sha" ] || continue
     entries+=("$dir")
   done
   for dir in ${entries[@]+"${entries[@]}"}; do
@@ -87,7 +88,9 @@ prune() {
     done
     [ "$newer" -ge "$keep" ] || continue
     [ -n "$(find "$dir" -maxdepth 0 -mtime +6 2>/dev/null)" ] || continue
-    rm -rf "$dir" && echo "setup: removed cached Gene ${dir##*/} (not among the $keep most recently used)" || :
+    rm -f "$dir/.ready" 2>/dev/null || continue  # First, so a half-removed folder is never "prepared".
+    rm -rf "$dir" 2>/dev/null || :
+    echo "setup: removed cached Gene ${dir##*/} (not among the $keep most recently used)" || :
   done
 }
 
