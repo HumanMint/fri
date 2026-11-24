@@ -8,7 +8,8 @@
 # The paired controller is the exact Gene commit in docs/integration-pair.json
 # (verified_controller_commit), extracted with `git archive` and given its own venv from that
 # commit's uv.lock. Environment overrides: GENE_SHA, GENE_REPO (default ../gene),
-# FRI_OFFLINE_CACHE, FRI_VENV (default .venv), OFFLINE_ISOLATION=python to accept the Python-only
+# FRI_OFFLINE_CACHE, FRI_OFFLINE_KEEP (cached Gene commits kept besides the current one, default 10;
+# setup removes older ones unused for 7 days), FRI_VENV (default .venv), OFFLINE_ISOLATION=python to accept the Python-only
 # guard (best effort) inside an outer network-denied sandbox. Bash 3.2 compatible (macOS /bin/bash).
 # Nothing runs Python with the caller's environment before `check` clears it.
 set -euo pipefail
@@ -44,8 +45,11 @@ setup() {
   (cd "$FRI" && UV_PROJECT_ENVIRONMENT="$FRI_VENV" uv sync --frozen)
   git -C "$GENE_REPO" cat-file -e "$GENE_SHA^{commit}" 2>/dev/null ||
     die "Gene commit $GENE_SHA is not in $GENE_REPO; fetch it first: git -C $GENE_REPO fetch origin"
-  if [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ]; then
+  [ ! -L "$READY" ] || die "$READY is a symlink, which setup never makes; check $GENE_DIR and remove it by hand"
+  if [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ] && [ -x "$GENE_VENV/bin/python" ]; then
     echo "setup: Gene $GENE_SHA already prepared in $GENE_DIR"
+    touch "$GENE_DIR" 2>/dev/null || :
+    prune
     return
   fi
   rm -rf "$GENE_DIR"  # A partial earlier build has no .ready marker; rebuild it in place.
@@ -54,6 +58,44 @@ setup() {
   UV_PROJECT_ENVIRONMENT="$GENE_VENV" uv sync --frozen --extra red --project "$GENE_SRC"
   echo "$GENE_SHA" > "$READY"
   echo "setup: Gene $GENE_SHA prepared in $GENE_DIR"
+  prune
+}
+
+prune() {
+  # Each prepared Gene commit is a source copy plus a full venv. Keep the current one and the
+  # FRI_OFFLINE_KEEP (default 10) most recently used others (setup and check touch the folder).
+  # Only folders setup made (a .ready holding their own commit) unused for 7 days are removed.
+  # shortcut: no lock against a check running in another checkout; one that targets a commit
+  # unused for 7 days and starts during this prune can fail. Rerun setup; add locking if it bites.
+  keep=${FRI_OFFLINE_KEEP:-10}
+  case $keep in
+    '' | *[!0-9]*) echo "setup: FRI_OFFLINE_KEEP must be a whole number, got: $keep; not pruning" >&2 || :; return 0 ;;
+  esac
+  [ ${#keep} -le 6 ] || { echo "setup: FRI_OFFLINE_KEEP is too large: $keep; not pruning" >&2 || :; return 0; }
+  entries=()
+  for dir in "$CACHE_ROOT"/*; do  # A glob, not parsed ls output: odd names stay one path.
+    sha=${dir##*/}
+    case $sha in *[!0-9a-f]* | '') continue ;; esac
+    [ ${#sha} -eq 40 ] && [ "$sha" != "$GENE_SHA" ] && [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    [ -f "$dir/.ready" ] && [ ! -L "$dir/.ready" ] && [ "$(cat "$dir/.ready" 2>/dev/null)" = "$sha" ] || continue
+    entries+=("$dir")
+  done
+  for dir in ${entries[@]+"${entries[@]}"}; do
+    newer=0  # Rank by mtime; equal times rank by name, so the cap holds.
+    for other in "${entries[@]}"; do
+      if [ "$other" -nt "$dir" ] || { [ ! "$dir" -nt "$other" ] && [[ "$other" > "$dir" ]]; }; then
+        newer=$((newer + 1))
+      fi
+    done
+    [ "$newer" -ge "$keep" ] || continue
+    [ -n "$(find "$dir" -maxdepth 0 -mtime +6 2>/dev/null)" ] || continue
+    rm -f "$dir/.ready" 2>/dev/null || continue  # First, so a half-removed folder is never "prepared".
+    if rm -rf "$dir" 2>/dev/null; then
+      echo "setup: removed cached Gene ${dir##*/} (not among the $keep most recently used)" || :
+    else
+      echo "setup: could not fully remove cached Gene ${dir##*/}; it will be rebuilt if used" >&2 || :
+    fi
+  done
 }
 
 write_guard() {
@@ -221,6 +263,7 @@ canaries() {
 check() {
   [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ] ||
     die "Gene $GENE_SHA is not prepared; run: scripts/offline-checks.sh setup"
+  touch "$GENE_DIR" 2>/dev/null || :  # Marks it recently used for prune.
   [ -x "$FRI_VENV/bin/python" ] || die "no Fri environment at $FRI_VENV; run: scripts/offline-checks.sh setup"
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/fri-offline.XXXXXX")
   trap 'rm -rf "$WORK"' EXIT
