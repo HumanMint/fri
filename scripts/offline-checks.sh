@@ -9,7 +9,7 @@
 # (verified_controller_commit), extracted with `git archive` and given its own venv from that
 # commit's uv.lock. Environment overrides: GENE_SHA, GENE_REPO (default ../gene),
 # FRI_OFFLINE_CACHE, FRI_OFFLINE_KEEP (cached Gene commits kept besides the current one, default 10;
-# setup removes older ones unused for a day), FRI_VENV (default .venv), OFFLINE_ISOLATION=python to accept the Python-only
+# setup removes older ones unused for 7 days), FRI_VENV (default .venv), OFFLINE_ISOLATION=python to accept the Python-only
 # guard (best effort) inside an outer network-denied sandbox. Bash 3.2 compatible (macOS /bin/bash).
 # Nothing runs Python with the caller's environment before `check` clears it.
 set -euo pipefail
@@ -45,8 +45,7 @@ setup() {
   (cd "$FRI" && UV_PROJECT_ENVIRONMENT="$FRI_VENV" uv sync --frozen)
   git -C "$GENE_REPO" cat-file -e "$GENE_SHA^{commit}" 2>/dev/null ||
     die "Gene commit $GENE_SHA is not in $GENE_REPO; fetch it first: git -C $GENE_REPO fetch origin"
-  # A folder another setup began evicting counts as unprepared and is rebuilt.
-  if [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ] && [ ! -e "$GENE_DIR/.evicting" ]; then
+  if [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ]; then
     echo "setup: Gene $GENE_SHA already prepared in $GENE_DIR"
     touch "$GENE_DIR" 2>/dev/null || :
     prune
@@ -61,23 +60,12 @@ setup() {
   prune
 }
 
-in_use() {  # A live check's marker in folder $1; markers of dead processes are cleared.
-  for mark in "$1"/.in-use.*; do
-    [ -e "$mark" ] || continue
-    pid=${mark##*.in-use.}
-    case $pid in '' | *[!0-9]*) continue ;; esac
-    if kill -0 "$pid" 2>/dev/null; then return 0; fi
-    rm -f "$mark"
-  done
-  return 1
-}
-
 prune() {
   # Each prepared Gene commit is a source copy plus a full venv. Keep the current one and the
-  # FRI_OFFLINE_KEEP (default 10) most recently used others. Only folders setup made (a .ready
-  # holding their own commit) are removed, never one used in the last day, and never one a
-  # running check holds: check writes its marker, then looks for .evicting; eviction writes
-  # .evicting, then looks for markers, so at least one of them backs off.
+  # FRI_OFFLINE_KEEP (default 10) most recently used others (setup and check touch the folder).
+  # Only folders setup made (a .ready holding their own commit) unused for 7 days are removed.
+  # shortcut: no lock against a check running in another checkout; one that targets a commit
+  # unused for 7 days and starts during this prune can fail. Rerun setup; add locking if it bites.
   keep=${FRI_OFFLINE_KEEP:-10}
   case $keep in
     '' | *[!0-9]*) echo "setup: FRI_OFFLINE_KEEP must be a whole number, got: $keep; not pruning" >&2; return 0 ;;
@@ -91,15 +79,14 @@ prune() {
     entries+=("$dir")
   done
   for dir in ${entries[@]+"${entries[@]}"}; do
-    newer=0
+    newer=0  # Rank by mtime; equal times rank by name, so the cap holds.
     for other in "${entries[@]}"; do
-      if [ "$other" -nt "$dir" ]; then newer=$((newer + 1)); fi
+      if [ "$other" -nt "$dir" ] || { [ ! "$dir" -nt "$other" ] && [[ "$other" > "$dir" ]]; }; then
+        newer=$((newer + 1))
+      fi
     done
     [ "$newer" -ge "$keep" ] || continue
-    [ -n "$(find "$dir" -maxdepth 0 -mtime +0 2>/dev/null)" ] || continue
-    in_use "$dir" && continue
-    mkdir "$dir/.evicting" 2>/dev/null || continue
-    if in_use "$dir"; then rmdir "$dir/.evicting" 2>/dev/null || :; continue; fi
+    [ -n "$(find "$dir" -maxdepth 0 -mtime +6 2>/dev/null)" ] || continue
     rm -rf "$dir" && echo "setup: removed cached Gene ${dir##*/} (not among the $keep most recently used)" || :
   done
 }
@@ -269,16 +256,10 @@ canaries() {
 check() {
   [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ] ||
     die "Gene $GENE_SHA is not prepared; run: scripts/offline-checks.sh setup"
-  MARK=$GENE_DIR/.in-use.$$  # Held for the whole check, so another checkout's setup won't prune it.
-  : > "$MARK" 2>/dev/null || die "Gene $GENE_SHA cache can't be marked in use; run: scripts/offline-checks.sh setup"
-  if [ -e "$GENE_DIR/.evicting" ]; then
-    rm -f "$MARK"
-    die "Gene $GENE_SHA cache is being pruned by another setup; run: scripts/offline-checks.sh setup"
-  fi
-  touch "$GENE_DIR" 2>/dev/null || :
-  [ -x "$FRI_VENV/bin/python" ] || { rm -f "$MARK"; die "no Fri environment at $FRI_VENV; run: scripts/offline-checks.sh setup"; }
+  touch "$GENE_DIR" 2>/dev/null || :  # Marks it recently used for prune.
+  [ -x "$FRI_VENV/bin/python" ] || die "no Fri environment at $FRI_VENV; run: scripts/offline-checks.sh setup"
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/fri-offline.XXXXXX")
-  trap 'rm -rf "$WORK"; rm -f "$MARK"' EXIT
+  trap 'rm -rf "$WORK"' EXIT
   mkdir -p "$WORK/home" "$WORK/tmp" "$WORK/config" "$WORK/cache" "$WORK/guard" "$WORK/logs"
   write_guard "$WORK/guard"
   choose_isolation

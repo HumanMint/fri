@@ -7,12 +7,12 @@ import time
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'offline-checks.sh'
-OLD = time.time() - 3 * 86400
+OLD = time.time() - 10 * 86400  # Past the 7-day floor.
 
 
 def functions():
     text = SCRIPT.read_text()
-    return ''.join(re.search(rf'^{name}\(\) {{.*?^}}\n', text, re.M | re.S).group(0) for name in ('in_use', 'prune'))
+    return re.search(r'^prune\(\) {.*?^}\n', text, re.M | re.S).group(0)
 
 
 def prune(root, current, keep=None, cwd=None):
@@ -56,29 +56,20 @@ def test_an_odd_name_never_reaches_a_path_outside_the_cache(tmp_path):
     assert outside.exists() and current.exists()
 
 
-def test_a_live_check_keeps_its_folder_and_a_dead_ones_marker_is_cleared(tmp_path):
+def test_a_folder_used_within_the_week_stays_even_past_the_cap(tmp_path):
     root = tmp_path / 'cache'
     current = entry(root, 1, time.time())
-    held, stale = entry(root, 2, OLD), entry(root, 3, OLD)
-    (held / f'.in-use.{os.getpid()}').write_text('')
-    dead = subprocess.Popen(['true'])
-    dead.wait()
-    (stale / f'.in-use.{dead.pid}').write_text('')
-    for folder in (held, stale):  # Writing a marker refreshes the folder's time; make both old again.
-        os.utime(folder, (OLD, OLD))
+    recent = entry(root, 2, time.time() - 3 * 86400)
     assert prune(root, current.name, keep='0').returncode == 0
-    assert held.exists() and not (held / '.evicting').exists()
-    assert not stale.exists()
+    assert recent.exists()
 
 
-def test_a_folder_already_claimed_for_eviction_is_left_to_its_claimer(tmp_path):
+def test_equal_times_still_respect_the_cap(tmp_path):
     root = tmp_path / 'cache'
-    current = entry(root, 1, time.time())
-    claimed = entry(root, 2, OLD)
-    (claimed / '.evicting').mkdir()
-    os.utime(claimed, (OLD, OLD))
-    assert prune(root, current.name, keep='0').returncode == 0
-    assert claimed.exists()
+    current = entry(root, 99, time.time())
+    folders = [entry(root, n, OLD) for n in range(1, 12)]
+    assert prune(root, current.name, keep='1').returncode == 0
+    assert sum(f.exists() for f in folders) == 1
 
 
 def test_a_bad_keep_value_warns_and_never_fails_setup(tmp_path):
@@ -86,13 +77,3 @@ def test_a_bad_keep_value_warns_and_never_fails_setup(tmp_path):
     current, old = entry(root, 1, time.time()), entry(root, 2, OLD)
     result = prune(root, current.name, keep='ten')
     assert result.returncode == 0 and 'not pruning' in result.stderr and old.exists()
-
-
-def test_check_backs_off_from_a_folder_being_evicted(tmp_path):
-    root = tmp_path / 'cache'
-    folder = entry(root, 1, time.time())
-    (folder / '.evicting').mkdir()
-    env = {'PATH': os.environ['PATH'], 'FRI_OFFLINE_CACHE': str(root), 'GENE_SHA': folder.name}
-    result = subprocess.run(['bash', str(SCRIPT), 'check'], env=env, capture_output=True, text=True)
-    assert result.returncode != 0 and 'being pruned' in result.stderr
-    assert not list(folder.glob('.in-use.*'))
