@@ -45,6 +45,7 @@ setup() {
   (cd "$FRI" && UV_PROJECT_ENVIRONMENT="$FRI_VENV" uv sync --frozen)
   git -C "$GENE_REPO" cat-file -e "$GENE_SHA^{commit}" 2>/dev/null ||
     die "Gene commit $GENE_SHA is not in $GENE_REPO; fetch it first: git -C $GENE_REPO fetch origin"
+  [ ! -L "$READY" ] || die "$READY is a symlink, which setup never makes; check $GENE_DIR and remove it by hand"
   if [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ] && [ -x "$GENE_VENV/bin/python" ]; then
     echo "setup: Gene $GENE_SHA already prepared in $GENE_DIR"
     touch "$GENE_DIR" 2>/dev/null || :
@@ -89,8 +90,11 @@ prune() {
     [ "$newer" -ge "$keep" ] || continue
     [ -n "$(find "$dir" -maxdepth 0 -mtime +6 2>/dev/null)" ] || continue
     rm -f "$dir/.ready" 2>/dev/null || continue  # First, so a half-removed folder is never "prepared".
-    rm -rf "$dir" 2>/dev/null || :
-    echo "setup: removed cached Gene ${dir##*/} (not among the $keep most recently used)" || :
+    if rm -rf "$dir" 2>/dev/null; then
+      echo "setup: removed cached Gene ${dir##*/} (not among the $keep most recently used)" || :
+    else
+      echo "setup: could not fully remove cached Gene ${dir##*/}; it will be rebuilt if used" >&2 || :
+    fi
   done
 }
 

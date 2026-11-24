@@ -112,3 +112,25 @@ def test_a_folder_whose_marker_cannot_be_removed_is_left_whole(tmp_path):
         assert (locked / '.ready').exists() and (locked / 'venv' / 'python').exists()
     finally:
         locked.chmod(0o755)
+
+
+def test_setup_refuses_a_current_folder_with_a_symlinked_marker(tmp_path):
+    gene = tmp_path / 'gene'
+    subprocess.run(['git', 'init', '-q', str(gene)], check=True)
+    subprocess.run(['git', '-C', str(gene), '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q',
+                    '--allow-empty', '-m', 'x'], check=True)
+    sha = subprocess.run(['git', '-C', str(gene), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
+    root = tmp_path / 'cache'
+    folder = root / sha
+    (folder / 'keep').mkdir(parents=True)
+    (tmp_path / 'marker').write_text(sha + '\n')
+    (folder / '.ready').symlink_to(tmp_path / 'marker')
+    stub = tmp_path / 'bin'
+    stub.mkdir()
+    (stub / 'uv').write_text('#!/bin/sh\nexit 0\n')
+    (stub / 'uv').chmod(0o755)
+    env = {'PATH': f"{stub}:{os.environ['PATH']}", 'FRI_OFFLINE_CACHE': str(root), 'GENE_SHA': sha,
+           'GENE_REPO': str(gene), 'HOME': str(tmp_path)}
+    result = subprocess.run(['bash', str(SCRIPT), 'setup'], env=env, capture_output=True, text=True)
+    assert result.returncode != 0 and 'is a symlink' in result.stderr
+    assert (folder / 'keep').exists()
