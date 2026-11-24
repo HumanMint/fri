@@ -6,6 +6,13 @@ The companion has no shell, SSH, Docker, GitHub or worker/deployer credentials.
 - Python 3.11; `uv sync --frozen`, `uv run pytest`, `uv run ruff check .`.
 - Full offline verification (unit, real-controller integration, replay, ruff): `scripts/offline-checks.sh setup`
   once, then `scripts/offline-checks.sh`. Reviewers use the same script.
+- Scratch space (owner, 2026-11-24): remove each review or experiment worktree or clone when its task
+  ends, keeping only logs, results and evidence. Share one dependency cache (uv's default cache;
+  reuse an existing environment through `UV_PROJECT_ENVIRONMENT` when the lockfile matches) instead
+  of a full venv per worktree. Don't keep pytest caches, test databases or other generated test
+  output after a run (`-p no:cacheprovider`). Check free disk space before large runs (full suites,
+  offline-checks setup, image builds) and don't start one with under 20 GB free. The offline-checks
+  cache keeps the current Gene commit plus `FRI_OFFLINE_KEEP` (default 10) recently used ones.
 - Runtime lives in `src/fri`; no Gene or Red imports or database persistence code.
 - Keep tokens, subscription auth, raw member context, state, and databases out of Git.
 - Existing `GENE_*` identity variables are intentional compatibility names. They do not change permissions.

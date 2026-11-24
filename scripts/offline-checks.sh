@@ -8,7 +8,8 @@
 # The paired controller is the exact Gene commit in docs/integration-pair.json
 # (verified_controller_commit), extracted with `git archive` and given its own venv from that
 # commit's uv.lock. Environment overrides: GENE_SHA, GENE_REPO (default ../gene),
-# FRI_OFFLINE_CACHE, FRI_VENV (default .venv), OFFLINE_ISOLATION=python to accept the Python-only
+# FRI_OFFLINE_CACHE, FRI_OFFLINE_KEEP (cached Gene commits kept besides the current one, default 10;
+# setup removes older ones unused for a day), FRI_VENV (default .venv), OFFLINE_ISOLATION=python to accept the Python-only
 # guard (best effort) inside an outer network-denied sandbox. Bash 3.2 compatible (macOS /bin/bash).
 # Nothing runs Python with the caller's environment before `check` clears it.
 set -euo pipefail
@@ -46,6 +47,8 @@ setup() {
     die "Gene commit $GENE_SHA is not in $GENE_REPO; fetch it first: git -C $GENE_REPO fetch origin"
   if [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ]; then
     echo "setup: Gene $GENE_SHA already prepared in $GENE_DIR"
+    touch "$GENE_DIR"
+    prune
     return
   fi
   rm -rf "$GENE_DIR"  # A partial earlier build has no .ready marker; rebuild it in place.
@@ -54,6 +57,26 @@ setup() {
   UV_PROJECT_ENVIRONMENT="$GENE_VENV" uv sync --frozen --extra red --project "$GENE_SRC"
   echo "$GENE_SHA" > "$READY"
   echo "setup: Gene $GENE_SHA prepared in $GENE_DIR"
+  prune
+}
+
+prune() {
+  # Each prepared Gene commit is a source copy plus a full venv. Keep the current one and the
+  # FRI_OFFLINE_KEEP (default 10) most recently used others; never remove one used in the last
+  # day, since another checkout's run may be using it. Use = setup or check touching the folder.
+  keep=${FRI_OFFLINE_KEEP:-10}
+  case $keep in '' | *[!0-9]*) die "FRI_OFFLINE_KEEP must be a whole number, got: $keep" ;; esac
+  n=0
+  ls -1td "$CACHE_ROOT"/*/ 2>/dev/null | while IFS= read -r dir; do
+    dir=${dir%/}
+    sha=${dir##*/}
+    case $sha in *[!0-9a-f]* | '') continue ;; esac
+    [ ${#sha} -eq 40 ] && [ "$sha" != "$GENE_SHA" ] || continue
+    n=$((n + 1))
+    [ "$n" -gt "$keep" ] || continue
+    [ -n "$(find "$dir" -maxdepth 0 -mtime +0)" ] || continue
+    rm -rf "$dir" && echo "setup: removed cached Gene $sha (not among the $keep most recently used)"
+  done || :  # Pruning only saves space; a failure here never fails setup.
 }
 
 write_guard() {
@@ -221,6 +244,7 @@ canaries() {
 check() {
   [ -f "$READY" ] && [ "$(cat "$READY")" = "$GENE_SHA" ] ||
     die "Gene $GENE_SHA is not prepared; run: scripts/offline-checks.sh setup"
+  touch "$GENE_DIR"  # Marks it recently used, so another checkout's setup won't prune it mid-run.
   [ -x "$FRI_VENV/bin/python" ] || die "no Fri environment at $FRI_VENV; run: scripts/offline-checks.sh setup"
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/fri-offline.XXXXXX")
   trap 'rm -rf "$WORK"' EXIT
