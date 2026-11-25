@@ -433,10 +433,18 @@ def test_a_receipt_that_cannot_be_set_aside_waits_without_blocking_later_ones(cl
 
 
 def test_a_usage_delivery_failure_never_discards_a_finished_reply(tmp_path):
-    result = SimpleNamespace(status='completed', counters={'input_tokens': 1}, error=None, model=None, effort=None)
-    fri = SimpleNamespace(chat=SimpleNamespace(respond=AsyncMock(return_value=result)), data=tmp_path,
-                          flush_usage=AsyncMock(side_effect=PermissionError(13, 'private')))
-    assert asyncio.run(Fri.chat_once(fri, 'hi', {'model': 'gpt-6-luna', 'effort': 'low'})) is result
+    result = SimpleNamespace(status='completed', counters={'input_tokens': 1}, error=None, model=None, effort=None,
+                             failover=None, cost_micros=None, provider=None)
+    fri = SimpleNamespace(chat=SimpleNamespace(respond=AsyncMock(return_value=result)), data=tmp_path, capabilities=frozenset(),
+                          usage_deliveries=set(), flush_usage=AsyncMock(side_effect=PermissionError(13, 'private')))
+    fri.deliver_usage = lambda: Fri.deliver_usage(fri)
+
+    async def turn():
+        answer = await Fri.chat_once(fri, 'hi', {'model': 'gpt-6-luna', 'effort': 'low'})
+        await asyncio.gather(*fri.usage_deliveries)  # Its delivery runs after the reply, and fails there.
+        return answer
+    assert asyncio.run(turn()) is result
+    fri.flush_usage.assert_awaited_once()
     agent = Agent(fri)
     asyncio.run(agent.record('attention', 'gpt-6-luna', 'low', {'input_tokens': 1}, 'completed'))
     assert len(list((tmp_path/'usage').glob('*.json'))) == 2  # Both stay queued for the next flush.

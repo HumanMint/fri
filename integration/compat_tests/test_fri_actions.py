@@ -476,7 +476,8 @@ def test_two_stage_reply_counts_both_calls_and_keeps_only_safe_breadcrumb(monkey
             assert 'music' not in turns[0]['reply'] and 'trance' not in turns[0]['reply']
         else:
             assert not turns
-        assert [body['counters']['input_tokens'] for path, body in calls if path == '/chat/usage/report'] == [10, 20]
+        await asyncio.gather(*fri.usage_deliveries)  # Off the reply's path, so two may go out together, in any order.
+        assert sorted(body['counters']['input_tokens'] for path, body in calls if path == '/chat/usage/report') == [10, 20]
         assert not list((tmp_path/'usage').glob('*.json'))
         await fri.close()
     asyncio.run(scenario())

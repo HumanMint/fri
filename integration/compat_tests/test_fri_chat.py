@@ -146,7 +146,7 @@ def test_plan_stream_uses_text_events_when_terminal_output_is_empty():
 
 def test_context_is_separated_and_clear_prevents_inflight_resurrection(tmp_path):
     store = Store(tmp_path / 'chat.sqlite3')
-    assert store.status()['chat_model'] == 'gpt-6.1-sol'
+    assert store.status()['chat_model'] == 'gpt-6.2-sol'  # Gene's default since be1d406.
     assert store.status()['effort'] == 'high'
     store.save_chat('guild', 'private:1', 'person', 0, 'secret', 'reply', 'model', 'high')
     assert store.chat_context('guild', 'private:1', 'person')['turns']

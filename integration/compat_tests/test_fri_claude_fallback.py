@@ -1,11 +1,12 @@
 """A reply the Claude fallback wrote is saved and counted under Claude, not the configured ChatGPT model."""
 
 import asyncio
-from unittest.mock import AsyncMock
 
 from compat_tests.test_fri_reply_retention import reply_workflow
 from compat_tests.test_gene_controls import controls_api  # noqa: F401
-from fri.fri_chat import CLAUDE_EFFORT, CLAUDE_MODEL, ChatResult
+from fri.fri_chat import CLAUDE_MODEL, ChatResult
+
+CLAUDE_EFFORT = 'high'
 
 
 def test_claude_answer_is_recorded_under_claude(monkeypatch, tmp_path, controls_api):  # noqa: F811
@@ -14,12 +15,18 @@ def test_claude_answer_is_recorded_under_claude(monkeypatch, tmp_path, controls_
             monkeypatch, tmp_path, controls_api)
         message.reference = None
         message.content = 'fri you awake'
-        fri.chat.respond = AsyncMock(return_value=ChatResult(
+        answer = ChatResult(
             status='completed', reply='unfortunately', model=CLAUDE_MODEL, effort=CLAUDE_EFFORT,
             counters={'input_tokens': 12, 'output_tokens': 3, 'cached_input_tokens': 0,
-                      'reasoning_output_tokens': None}))
+                      'reasoning_output_tokens': None})
+
+        async def respond(text, context, *, ready=None):
+            context['fence']['record']('claude', CLAUDE_MODEL, CLAUDE_EFFORT, answer, None)  # As Chat.respond reports each attempt.
+            return answer
+        fri.chat.respond = respond
         try:
             result = await fri.talk(123, 1, 20, message.content, 'public', event=message)
+            await asyncio.gather(*fri.usage_deliveries)  # Delivered off the reply's path.
             assert (result.turn['model'], result.turn['effort']) == (CLAUDE_MODEL, CLAUDE_EFFORT)
             await fri.record_turn(result)
             reports = [body for path, body in requests if path == '/chat/usage/report']

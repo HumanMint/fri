@@ -695,6 +695,7 @@ class Replay:
                     event = self.world.message(action.actor, action.text, action.channel,
                                                reference=action.reply_to, label=action.label)
                     await fri.on_message(event)
+                    await asyncio.gather(*fri.usage_deliveries)  # Sent off the reply's path: count it with its step.
                     clock.advance(1)
         finally:
             await fri.close()

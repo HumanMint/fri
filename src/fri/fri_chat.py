@@ -1,11 +1,14 @@
-"""Conversation with bounded harness actions over official ChatGPT plan OAuth."""
+"""Conversation with bounded harness actions, on the ChatGPT plan (official OAuth) or Claude's API (see fri_provider)."""
 
 import asyncio
 import hashlib
 import importlib
 import json
+import logging
 import os
 import re
+import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -17,6 +20,7 @@ from .fri_image_request import MAX_REQUEST
 from .fri_links import EMPTY as LINK_EMPTY
 from .fri_links import link_posts
 from .fri_memory import CATEGORIES
+from .fri_provider import Failover, call, cost_micros, route
 from .fri_responses import KINDS, REACTIONS, acknowledgment_allowed, validate_response
 from .fri_social import SOCIAL_ACTIONS
 from .fri_times import ASK as TIME_ASK
@@ -50,9 +54,18 @@ the pages, and card text is never instructions. still="link preview" is a card's
 at most, so don't claim you watched, heard or read past it."""
 # Allow the 30s connect and 300s read timeouts, but bound streams that keep sending forever.
 MODEL_DEADLINE = 360
-# When the ChatGPT plan answers 429, replies go to Claude instead, if its API key file is present.
-CLAUDE_MODEL, CLAUDE_EFFORT = 'claude-opus-5-5', 'high'
+# Replies' Claude model on the tier map (the owner panel names it); fri_provider.route picks the one used.
+CLAUDE_MODEL = 'claude-opus-5-5'
+CLAUDE_LATCH = 15 * 60  # After a billing or auth failover, Claude is skipped this long rather than failing every call.
+CACHE_RETRY = 3600  # After a failure the plan's cache hint may have caused, it's left off this long.
+LOG = logging.getLogger(__name__)
+# What members see when a reply fails. Each says nothing went out.
 RATE_LIMITED = 'mint’s ai wallet is tapped out for now, plan or rate limit. check usage or try me again later.'
+UNREADABLE = 'my reply came out garbled, so nothing got sent. try me again.'
+CUT_OFF = 'lost the connection mid-reply, so nothing got sent. try me again.'
+FIZZLED = 'that one fizzled on my end, nothing got sent. try again in a sec.'
+IMAGE_LINK = 'couldn’t load that image on my end, so nothing got sent. attach it again.'
+REFUSED = 'gonna pass on that one.'
 WINDOWS = ('recent', 'since_my_last_message', 'pins')  # read_recent: a small batch, a catch-up, the pins.
 
 VOICE = '''You are Fri, a Discord regular and Gene's chat companion. Gene handles the utilities.
@@ -555,6 +568,11 @@ class ChatResult:
     # The model and effort that actually answered, when not the configured ones (the Claude fallback).
     model: str | None = None
     effort: str | None = None
+    provider: str | None = None  # 'chatgpt' or 'claude', whichever this attempt went to.
+    cost_micros: int | None = None  # Claude's price of this attempt; unknown on the plan.
+    failover: str | None = None  # 'refusal': Claude declined it, recorded with the attempt's usage.
+    detail: str = ''  # Why parse_reply refused the model's output: a fixed reason, never its content.
+    elapsed_ms: int | None = None  # How long respond took, for evals.
 
 
 OUTPUT_EVENTS = ('response.output_', 'response.content_part.', 'response.reasoning', 'response.refusal.',
@@ -621,9 +639,10 @@ def parse_reply(result, output, context):
                     action['kind'] not in context.get('actions', {}) or
                     (work and not valid_work_action(action)) or
                     (recent and action['window'] not in WINDOWS) or
-                    (not clarify and not control and not work and (not isinstance(action[parameter], str) or len(action[parameter]) > (1500 if voice else MAX_REQUEST if image else 240 if web else 25))) or
-                    reply or draft is not None or parsed.get('notes', [])):
+                    (not clarify and not control and not work and (not isinstance(action[parameter], str) or len(action[parameter]) > (1500 if voice else MAX_REQUEST if image else 240 if web else 25)))):
                 raise ValueError('Invalid or unavailable action')
+            if reply or draft is not None or parsed.get('notes', []):
+                raise ValueError('An action with a reply, draft or notes')
         if (not isinstance(reply, str) or len(reply) > 1800 or
                 (draft is not None and (not isinstance(draft, str) or not 5 <= len(draft) <= 4000))):
             raise ValueError('Invalid reply shape')
@@ -669,14 +688,13 @@ def parse_reply(result, output, context):
         result.reply, result.draft, result.notes, result.action = reply, draft, notes, action
         result.response_kind, result.reaction = response_kind, reaction
         result.allow_closing = allow_closing
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError) as exc:
         result.status = 'invalid_output'
-        result.error = 'Fri received an unreadable reply. Please try again.'
+        result.error = UNREADABLE
+        # Only parse_reply's own fixed reasons; other errors (JSON, pydantic, a missing key) may quote the output.
+        result.detail = str(exc) if type(exc) is ValueError else type(exc).__name__
+        LOG.info('Model output refused: %s', result.detail)
     return result
-
-
-class RateLimited(Exception):
-    """The ChatGPT plan answered 429, or failed its stream on a usage limit, before any output."""
 
 
 def claude_key():
@@ -694,22 +712,26 @@ def claude_schema(schema, offered, flat=False):
 
     flat: for a turn offering so many that even those are too large (an owner's turn offers about 20), one action object
     instead, with kind and every field the offered kinds use, all required. Nullable or optional fields break the API's
-    union and complexity limits there. flat_action then keeps only the chosen kind's own fields."""
+    union and complexity limits there. flat_action then keeps only the chosen kind's own fields. Its first kind, "none",
+    is no action: with every field required, a plain reply or a draft needs a way to say so (fri #422)."""
     null, *branches = schema['properties']['action']['anyOf']
     branches = [{**branch, 'properties': {**branch['properties'], 'kind': {**branch['properties']['kind'], 'enum': kinds}}}
                 for branch in branches if (kinds := [k for k in branch['properties']['kind']['enum'] if k in offered])]
     if flat and branches:
         fields = {key: value for branch in branches for key, value in branch['properties'].items() if key != 'kind'}
         branches = [{'type': 'object', 'description': FLAT_NOTE, 'additionalProperties': False,
-                     'properties': {'kind': {'type': 'string', 'enum': [kind for branch in branches
-                                                                         for kind in branch['properties']['kind']['enum']]},
+                     'properties': {'kind': {'type': 'string', 'enum': ['none', *(kind for branch in branches
+                                                                                 for kind in branch['properties']['kind']['enum'])]},
                                     **fields}, 'required': ['kind', *fields]}]
-    return claude_clean({**schema, 'properties': {**schema['properties'],
+    # Claude's schema carries no length limits (claude_clean), so the draft's bounds are said in words (fri #422).
+    draft = {**schema['properties']['request_draft'], 'description': DRAFT_NOTE}
+    return claude_clean({**schema, 'properties': {**schema['properties'], 'request_draft': draft,
                                                   'action': {'anyOf': [null, *branches]} if branches else null}})
 
 
-FLAT_NOTE = ('Fill the fields your chosen kind uses. Every other field is ignored: give it an empty string, 0 or its '
-             'first option.')
+FLAT_NOTE = ('Kind "none" is no action: choose it for a plain reply or a request_draft. Otherwise fill the fields your '
+             'chosen kind uses. Every other field is ignored: give it an empty string, 0 or its first option.')
+DRAFT_NOTE = 'null, or a self-contained request of 5 to 4000 characters; null whenever action is set.'
 # Each action kind's own fields, the only ones a flat action keeps.
 ACTION_FIELDS = {kind: set(branch['properties']) for branch in SCHEMA['properties']['action']['anyOf'][1:]
                  for kind in branch['properties']['kind']['enum']}
@@ -721,7 +743,9 @@ def flat_action(output):
     try:
         parsed = json.loads(output)
         action = parsed['action']
-        if isinstance(action, dict):
+        if isinstance(action, dict) and action.get('kind') == 'none':  # The flat schema's way to say no action.
+            parsed['action'] = None
+        elif isinstance(action, dict):
             parsed['action'] = {key: value for key, value in action.items()
                                 if key in ACTION_FIELDS.get(action.get('kind'), action)}
         return json.dumps(parsed)
@@ -742,7 +766,8 @@ def claude_clean(value):
 
 
 def claude_content(content):
-    """A Responses API message's content as Claude content blocks: text, and images as data or https URLs."""
+    """A Responses API message's content as Claude content blocks: text, and images as base64 data only. Anthropic never
+    fetches a URL for Fri: an image that isn't inline data refuses the request (ValueError) before it is sent."""
     if isinstance(content, str):
         return content
     blocks = []
@@ -754,52 +779,61 @@ def claude_content(content):
             blocks.append({'type': 'image', 'source': {'type': 'base64', 'media_type': head[5:].split(';')[0],
                                                        'data': data}})
         else:
-            blocks.append({'type': 'image', 'source': {'type': 'url', 'url': part['image_url']}})
+            raise ValueError('An image that is not inline data')
     return blocks
+
+
+def claude_request(payload, context, model, effort, flat=False):
+    """The plan request as a Messages request, laid out for the prompt cache: the constant INSTRUCTIONS as system block 1
+    (breakpoint 1), the turn's variable rules in block 2, then history with breakpoint 2 on the last saved turn's
+    assistant message, and the final user message (context and images) uncached."""
+    messages = [{'role': message['role'], 'content': claude_content(message['content'])} for message in payload['input']]
+    if len(messages) >= 2 and messages[-2]['role'] == 'assistant' and isinstance(messages[-2]['content'], str) and \
+            messages[-2]['content']:
+        messages[-2] = {'role': 'assistant', 'content': [{'type': 'text', 'text': messages[-2]['content'],
+                                                          'cache_control': {'type': 'ephemeral'}}]}
+    request = {'model': model, 'max_tokens': 16000, 'messages': messages,
+               'system': [{'type': 'text', 'text': INSTRUCTIONS, 'cache_control': {'type': 'ephemeral'}},
+                          {'type': 'text', 'text': payload['instructions'][len(INSTRUCTIONS):]}],
+               'output_config': {'effort': effort, 'format': {'type': 'json_schema', 'schema': claude_schema(
+                   payload['text']['format']['schema'], context.get('actions', {}), flat)}}}
+    if 'haiku' not in model:  # A refusal is retried on the model the API picks for it; Haiku has no such fallback.
+        request.update(betas=['server-side-fallback-2026-07-01'], fallbacks='default')
+    return request
+
+
+def claude_failover(anthropic, exc):
+    """The Failover reason for a Claude error raised before any output, or None when the plan would fail alike."""
+    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+        return 'auth'
+    if isinstance(exc, anthropic.APIStatusError) and (
+            exc.status_code == 402 or getattr(exc, 'type', None) == 'billing_error'
+            or 'spend_limit' in str(getattr(exc, 'error_code', None) or '')
+            or re.search(r'credit balance|spend(ing)? limit', str(exc), re.I)):
+        return 'billing'  # The account's credit or spending limit: nothing on Claude works until it's raised.
+    if isinstance(exc, anthropic.RateLimitError):
+        return 'rate_limited'
+    if isinstance(exc, anthropic.APIStatusError) and exc.status_code >= 500:
+        return 'overloaded'
+    if isinstance(exc, (anthropic.APIConnectionError, TimeoutError)):
+        return 'connection'
+    return None
 
 
 class Chat:
     def __init__(self, subscription, transport=None):
         self.subscription, self.transport = subscription, transport
-        self.cache_keys = True
-        self.force_claude = False  # Evals only (fri_eval --claude): skip the ChatGPT call.
+        self.cache_off = 0.0  # Monotonic time the plan's prompt_cache_key hint is sent again after a failure.
+        self.claude_off = None  # (monotonic until, reason, since): Claude skipped after a billing or auth failover.
+        self.force_provider = None  # Evals only (fri_eval --provider): that provider alone answers, no failover.
+        self.claude_chat_model = ''  # Evals only: the controller's Claude reply model, which contexts there lack.
 
-    async def claude(self, payload, context, key):
-        """The same request on Claude. Any failure looks like the plan's rate limit, which is why it's here."""
-        result = ChatResult(status='failed', error=RATE_LIMITED, model=CLAUDE_MODEL, effort=CLAUDE_EFFORT)
-        try:
-            # Only when it's needed (the SDK costs memory), and off the event loop: the first import takes ~0.4 s.
-            anthropic = await asyncio.to_thread(importlib.import_module, 'anthropic')
-            async with asyncio.timeout(MODEL_DEADLINE), anthropic.AsyncAnthropic(
-                    api_key=key, http_client=anthropic.DefaultAsyncHttpxClient(trust_env=False)) as client:
-                for flat in (False, True):
-                    try:
-                        async with client.beta.messages.stream(
-                                model=CLAUDE_MODEL, max_tokens=16000, system=payload['instructions'],
-                                messages=[{'role': message['role'], 'content': claude_content(message['content'])}
-                                          for message in payload['input']],
-                                output_config={'effort': CLAUDE_EFFORT, 'format': {'type': 'json_schema', 'schema': claude_schema(
-                                    payload['text']['format']['schema'], context.get('actions', {}), flat)}},
-                                cache_control={'type': 'ephemeral'},
-                                # A refusal is retried on the model the API picks for it; usage names who answered.
-                                betas=['server-side-fallback-2026-07-01'], fallbacks='default') as stream:
-                            message = await stream.get_final_message()
-                        break
-                    except anthropic.BadRequestError as exc:  # The offered actions' grammar is too large: flat, once.
-                        if flat or not ('grammar is too large' in str(exc) or 'too complex' in str(exc)):
-                            raise
-        except Exception:  # Any failure (API, a dropped or malformed stream, no SDK) is a failed reply, never a dead turn.
-            return result
-        data = message.usage
-        cached, created = data.cache_read_input_tokens or 0, data.cache_creation_input_tokens or 0
-        result.counters = {'input_tokens': data.input_tokens + cached + created, 'output_tokens': data.output_tokens,
-                           'cached_input_tokens': cached, 'reasoning_output_tokens': None}
-        result.model = message.model or CLAUDE_MODEL
-        if message.stop_reason in ('refusal', 'max_tokens'):
-            return result
-        result.status, result.error = 'completed', ''
-        output = ''.join(block.text for block in message.content if block.type == 'text')
-        return parse_reply(result, flat_action(output) if flat else output, context)
+    def latched(self):
+        """Why Claude is skipped right now, and until when (wall clock), or None."""
+        if self.claude_off and time.monotonic() < self.claude_off[0]:
+            return {'reason': self.claude_off[1], 'since': self.claude_off[2],
+                    'until': time.time() + self.claude_off[0] - time.monotonic()}
+        return None
 
     async def headers(self):
         token = await asyncio.to_thread(self.subscription.access_token)
@@ -814,19 +848,41 @@ class Chat:
 
     async def respond(self, text, context, *, ready=None):
         """ready: the caller's last checks, run once signed in so nothing waits between them and the request.
+        The turn's fence may add `recheck`, the non-waiting ones, run again right before a second provider's request
+        (either refusing sends nothing), and `record(provider, model, effort, result, failover)`, told of each attempt
+        that sent something as it ends.
 
-        The request is built after them, from the context they leave. A refusal there sends nothing.
+        The request is built after them, from the context they leave.
         """
-        headers = None
-        if ready:
-            try:
-                headers = await self.headers()
-            except SubscriptionError as exc:
-                return ChatResult(status='failed', error=str(exc))
-            await ready()
+        began = time.monotonic()
+        pending = [ready] if ready else []
+
+        async def cleared(gate):
+            if pending:  # The caller's full checks go before whichever request is sent first.
+                await pending.pop()()
+            elif gate:
+                await gate()
+            return self.payload(text, context)
+
+        async def attempt(provider, model, effort, gate):
+            if provider == 'claude':
+                return await self.claude(context, model, effort, lambda: cleared(gate))
+            return await self.plan(context, lambda: cleared(gate))
+
+        config = {'claude_chat_model': self.claude_chat_model, **context}
+        order = route(config, context['model'], context['effort'])
+        if self.force_provider:
+            order = route({**config, 'provider': self.force_provider}, context['model'], context['effort'])[:1]
+        fence = context.get('fence') or {}
+        result, _ = await call(order, attempt, fence.get('recheck'), fence.get('record'))
+        if result is None:  # Nothing was sent: Claude alone was asked, and it's unavailable.
+            result = ChatResult(status='failed', error=RATE_LIMITED)
+        result.elapsed_ms = round((time.monotonic()-began)*1000)
+        return result
+
+    def payload(self, text, context):
+        """The plan's request for this turn; Claude's is laid out from it (claude_request)."""
         text = clean(text, 4000)
-        result = ChatResult()
-        text_parts = {}
         messages = []
         for turn in context['turns']:
             response = turn['reply'] if turn.get('response_kind', 'reply') == 'reply' else model_json({
@@ -891,26 +947,37 @@ class Chat:
         if shows_links(context):  # Right after the base rules, as SUMMARY_RULE is; every other request is as before.
             payload['instructions'] = INSTRUCTIONS + CARDS_RULE + payload['instructions'][len(INSTRUCTIONS):]
         key = cache_key(context.get('source'))
-        if key and self.cache_keys:
+        if key and time.monotonic() >= self.cache_off:
             payload['prompt_cache_key'] = key
-        if self.force_claude:
-            return await self.claude(payload, context, claude_key())
-        answered, produced, exempt, limited = False, False, False, False
+        return payload
+
+    async def plan(self, context, cleared):
+        """One request on the ChatGPT plan. Failover when it answered nothing it could: a rate or usage limit, sign-in,
+        a server error, or a connection lost before any response."""
+        result = ChatResult(provider='chatgpt')
+        try:
+            headers = await self.headers()
+        except SubscriptionError as exc:
+            result.error, result.status = str(exc), 'failed'
+            raise Failover('auth', result) from None
+        payload = await cleared()
+        text_parts = {}
+        answered, produced, exempt = False, False, False
         try:
             async with asyncio.timeout(MODEL_DEADLINE), httpx.AsyncClient(
                     timeout=httpx.Timeout(300, connect=30), trust_env=False,
                     transport=self.transport) as client:
-                async with client.stream('POST', RESOURCE + '/responses', json=payload,
-                                         headers=headers or await self.headers()) as response:
+                async with client.stream('POST', RESOURCE + '/responses', json=payload, headers=headers) as response:
                     answered = True
                     if response.status_code != 200:
                         exempt = response.status_code in (401, 403, 429)
                         result.status = 'failed'
                         if response.status_code == 429:
                             result.error = RATE_LIMITED
-                            raise RateLimited()
-                        else:
-                            result.error = 'big ai didn’t take that request. the owner can check my subscription connection and model setting.'
+                            raise Failover('rate_limited', result)
+                        result.error = 'big ai didn’t take that request. the owner can check my subscription connection and model setting.'
+                        if response.status_code >= 500:
+                            raise Failover('overloaded', result)
                         return result
                     async for event in events(response.aiter_lines()):
                         kind = event.get('type')
@@ -933,7 +1000,7 @@ class Chat:
                             error = final.get('error')
                             if not produced and 'usage_limit' in str(error.get('code') if isinstance(error, dict) else ''):
                                 exempt, result.error = True, RATE_LIMITED
-                                raise RateLimited()
+                                raise Failover('usage_limit', result)
                             result.error = 'big ai didn’t finish that reply. check usage or try again in a bit.'
                             return result
                         output = ''.join(part.get('text', '') for item in final.get('output', [])
@@ -943,20 +1010,77 @@ class Chat:
                         # Only use accumulated text once response.completed confirms success.
                         output = output or ''.join(text_parts[key] for key in sorted(text_parts))
                         return parse_reply(result, output, context)
-        except RateLimited:
-            limited = True
-        except SubscriptionError as exc:
-            result.error, result.status, exempt = str(exc), 'failed', True
-        except (TimeoutError, httpx.HTTPError, ValueError, KeyError, TypeError):
-            result.error = 'The connection ended before Fri completed their reply. Please try again.'
+        except (TimeoutError, httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            result.error = CUT_OFF
+            if not answered and isinstance(exc, (TimeoutError, httpx.HTTPError)):  # Before any response at all.
+                raise Failover('connection', result) from None
         finally:
             # The hint only saves tokens. If it breaks a request, the server answers and fails it before any
             # output, in whatever error format, so any such failure except auth and rate limits drops it for
-            # later calls. The failed reply is never replayed; a needless drop costs tokens until restart.
+            # an hour. The failed reply is never replayed; a needless drop costs tokens for that hour.
             if ('prompt_cache_key' in payload and answered and not produced and not exempt
                     and result.status != 'completed'):
-                self.cache_keys = False
-        if limited and (key := claude_key()):
-            return await self.claude(payload, context, key)
-        result.error = result.error or 'The connection ended before Fri completed their reply. Please try again.'
+                self.cache_off = time.monotonic() + CACHE_RETRY
+        result.error = result.error or CUT_OFF
         return result
+
+    async def claude(self, context, model, effort, cleared):
+        """The same request on Claude's API. Failover on a limit, an outage, a lost connection before any output, or a
+        key that's missing or refused; billing and auth also skip Claude for CLAUDE_LATCH seconds."""
+        if latch := self.latched():
+            raise Failover(latch['reason'])
+        key = claude_key()
+        if key is None:
+            raise Failover('auth')
+        try:  # Only when it's needed (the SDK costs memory), and off the event loop: the first import takes ~0.4 s.
+            anthropic = sys.modules.get('anthropic') or await asyncio.to_thread(importlib.import_module, 'anthropic')
+        except Exception:
+            raise Failover('connection') from None
+        payload = await cleared()
+        result = ChatResult(status='failed', error=FIZZLED, model=model, effort=effort, provider='claude')
+        try:
+            claude_request(payload, context, model, effort)
+        except ValueError:
+            result.error = IMAGE_LINK
+            return result
+        opened, message = False, None
+        try:
+            async with asyncio.timeout(MODEL_DEADLINE), anthropic.AsyncAnthropic(
+                    api_key=key, max_retries=0,
+                    http_client=anthropic.DefaultAsyncHttpxClient(trust_env=False)) as client:
+                for flat in (False, True):
+                    try:
+                        async with client.beta.messages.stream(**claude_request(payload, context, model, effort,
+                                                                                flat)) as stream:
+                            opened = True
+                            message = await stream.get_final_message()
+                        break
+                    except anthropic.BadRequestError as exc:  # The offered actions' grammar is too large: flat, once.
+                        if flat or not ('grammar is too large' in str(exc) or 'too complex' in str(exc)):
+                            raise
+        except Exception as exc:  # Any failure (API, a dropped or malformed stream) is a failed reply, never a dead turn.
+            reason = None if opened else claude_failover(anthropic, exc)
+            LOG.info('Claude attempt: model=%s stop_reason=None cache_read=0 failover=%s', model, reason)
+            if reason in ('billing', 'auth'):
+                self.claude_off = (time.monotonic() + CLAUDE_LATCH, reason, time.time())
+            if reason:
+                result.error = RATE_LIMITED if reason in ('rate_limited', 'billing') else CUT_OFF
+                raise Failover(reason, result) from None
+            return result
+        data = message.usage
+        cached, created = data.cache_read_input_tokens or 0, data.cache_creation_input_tokens or 0
+        result.counters = {'input_tokens': data.input_tokens + cached + created, 'output_tokens': data.output_tokens,
+                           'cached_input_tokens': cached, 'reasoning_output_tokens': None}
+        # shortcut: priced as the model asked for, even when the server's refusal fallback answered on another.
+        result.cost_micros = cost_micros(model, data.input_tokens, data.output_tokens, cached, created)
+        result.model = message.model or model
+        LOG.info('Claude attempt: model=%s stop_reason=%s cache_read=%s failover=None', result.model,
+                 message.stop_reason, cached)
+        if message.stop_reason == 'refusal':  # A content decision, even after the server's fallback: never retried.
+            result.error, result.failover = REFUSED, 'refusal'
+            return result
+        if message.stop_reason == 'max_tokens':
+            return result
+        result.status, result.error = 'completed', ''
+        output = ''.join(block.text for block in message.content if block.type == 'text')
+        return parse_reply(result, flat_action(output) if flat else output, context)

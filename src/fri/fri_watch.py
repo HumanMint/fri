@@ -356,6 +356,9 @@ class Watch:
             if current := agent.heartbeat_current:  # A tick that started and hasn't finished: which step it's on.
                 me += f", running {current['stage']} for {span(now-current['since'])}"
         lines.append(me)
+        latched = getattr(getattr(fri, 'chat', None), 'latched', None)
+        if latched and (latch := latched()):  # A billing or auth failover: replies stay on the plan meanwhile.
+            lines.append(f"- claude: skipped after a {latch['reason']} failure, until <t:{int(latch['until'])}:T>")
         loops = {'heartbeat': agent.heartbeat if agent else None, 'owner dms': fri.owner_reviews,
                  'health file': fri.health}
         loops = {name: (loop.is_running(), loop.failed()) for name, loop in loops.items() if loop}

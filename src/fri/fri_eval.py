@@ -684,20 +684,23 @@ def ascii_baseline():
         module.model_json = json.dumps
 
 
-async def main(suite='voice', baseline=False, claude=False):
+async def main(suite='voice', baseline=False, provider=None):
     """Only controller status/settings reads and anonymous usage writes are permitted here."""
     if baseline:
         ascii_baseline()
     url = os.environ['GENE_CONTROLLER_URL']
     headers = {'Authorization': 'Bearer '+os.environ['GENE_FRI_TOKEN']}
     chat = Chat(Subscription(os.getenv('FRI_CHATGPT_AUTH', '/auth/session.json')))
-    if claude and not claude_key():
-        raise SystemExit('No Claude key file (FRI_ANTHROPIC_KEY_FILE)')
-    chat.force_claude = claude  # Replies only; graders still use the ChatGPT plan.
     async with httpx.AsyncClient(timeout=30, trust_env=False, headers=headers) as client:
         status = await client.get(url+'/status')
         status.raise_for_status()
         status = status.json()
+        # Replies only, on the provider asked for or the controller's (an older one names none: the plan, as before).
+        # Graders still use the ChatGPT plan.
+        chat.force_provider = provider or status.get('provider')
+        chat.claude_chat_model = status.get('claude_chat_model') or ''
+        if chat.force_provider == 'claude' and not claude_key():
+            raise SystemExit('No Claude key file (FRI_ANTHROPIC_KEY_FILE)')
         settings = await client.get(url+'/agent/state')
         settings.raise_for_status()
         config = settings.json()['config']
@@ -709,6 +712,8 @@ async def main(suite='voice', baseline=False, claude=False):
                 report = {'attempt_id': attempt, 'model': result.model or case.get('model', status['chat_model']),
                     'effort': result.effort or case.get('effort', status['chat_effort']),
                     'status': result.status, 'counters': result.counters, 'role': 'evaluation'}
+                if 'provider' in status:  # A controller that keeps provider and cost (model-provider).
+                    report.update(provider=result.provider or 'chatgpt', cost_micros=result.cost_micros)
                 path = Path(os.getenv('FRI_DATA', '/data'))/'usage'/(attempt+'.json')
                 private_json(path, report)
                 posted = await client.post(url+'/chat/usage/report', json=report)
@@ -718,7 +723,8 @@ async def main(suite='voice', baseline=False, claude=False):
                 'action': result.action, 'draft': result.draft, 'status': result.status,
                 'response_kind': result.response_kind, 'reaction': result.reaction,
                 'allow_closing': result.allow_closing,
-                'error': result.error, 'counters': result.counters,
+                'error': result.error, 'detail': result.detail, 'counters': result.counters,
+                'provider': result.provider, 'elapsed_ms': result.elapsed_ms,
                 **{k: case[k] for k in ('passed', 'evidence', 'message', 'keep', 'proposed') if k in case}}), flush=True)
             if case.get('passed') is False:
                 failed.append(case['name'])
@@ -726,11 +732,17 @@ async def main(suite='voice', baseline=False, claude=False):
             raise SystemExit('Evaluation failed: '+', '.join(failed))
 
 
-if __name__ == '__main__':
+def arguments(argv=None):
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--suite', choices=('voice', 'controls', 'diagnosis', 'settings', 'pronouns', 'foundation', 'continuity', 'endings', 'images', 'image-sharing', 'image-sharing-detailed', 'requests', 'loops', 'times', 'memory', 'recall', 'stills', 'sass', 'friend', 'model-text'), default='voice')
     parser.add_argument('--baseline', action='store_true', help='ASCII-escape model input, for comparison')
-    parser.add_argument('--claude', action='store_true', help='Answer on the Claude fallback, skipping ChatGPT')
-    args = parser.parse_args()
-    asyncio.run(main(args.suite, args.baseline, args.claude))
+    parser.add_argument('--provider', choices=('claude', 'chatgpt'),
+                        help="Answer replies on this provider alone (default: the controller's model_provider)")
+    parser.add_argument('--claude', dest='provider', action='store_const', const='claude', help='Same as --provider claude')
+    return parser.parse_args(argv)
+
+
+if __name__ == '__main__':
+    args = arguments()
+    asyncio.run(main(args.suite, args.baseline, args.provider))

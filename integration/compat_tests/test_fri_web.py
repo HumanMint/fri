@@ -152,8 +152,10 @@ def test_web_reply_preserves_sources_and_retains_the_delivered_answer(monkeypatc
         # The delivered public answer is retained for follow-ups; the raw research stays in its receipt.
         assert saved['reply'] == result.reply and 'public evidence' not in saved['reply']
         assert saved['web_receipt'] == {k: receipt[k] for k in ('query', 'answer', 'sources', 'checked_at')}
+        await asyncio.gather(*fri.usage_deliveries)
         roles = [body.get('role', 'conversation') for path, body in calls if path == '/chat/usage/report']
-        assert roles == ['conversation', 'web_search', 'conversation']
+        # Reply receipts go out off the reply's path, so after the lookup's own.
+        assert sorted(roles) == ['conversation', 'conversation', 'web_search']
         assert not list((tmp_path/'usage').glob('*.json'))
         await fri.close()
     asyncio.run(scenario())

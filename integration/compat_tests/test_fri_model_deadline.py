@@ -72,7 +72,7 @@ def test_endless_streams_release_both_slots_and_serve_next_member(monkeypatch, t
             assert log.count('typing') == log.count('stopped') == 2
             for event in events[:2]:
                 event.reply.assert_awaited_once()
-                assert 'connection ended' in event.reply.await_args.args[0]
+                assert 'lost the connection' in event.reply.await_args.args[0]
                 assert 'unchecked' not in event.reply.await_args.args[0]
             assert not any(path in ('/chat/turn', '/chat/pending') for path, _ in calls)
             assert not agent.saved_turns.saved
