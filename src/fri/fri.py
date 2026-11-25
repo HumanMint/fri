@@ -51,6 +51,7 @@ from .fri_memory import (
 from .fri_notices import Busy, ReplyInProgress, WaitingNotices
 from .fri_panel import DraftView, HomeView, authorized, card, reply, sessions
 from .fri_protocol import PROTOCOL, compatible
+from .fri_provider import CAPABILITY as MODEL_PROVIDER
 from .fri_reports import ReportButton
 from .fri_responses import quick_closure
 from .fri_reviews import ReviewButton, notify_owner
@@ -64,6 +65,8 @@ LOG = logging.getLogger('fri')
 NO_MENTIONS = discord.AllowedMentions.none()
 SIGN_IN_NOTICE = ('heads up: my chatgpt sign-in stopped working, so every reply fails until you reconnect me. '
                   'steps are in fri’s docs/operations.md under “New installations”.')
+CLAUDE_NOTICE = ('heads up: claude’s api refused me ({}), so replies skip it for 15 minutes at a time and stay on the '
+                 'chatgpt plan. check the api key and the console’s spending limit.')
 FIRST_MEMORY = ('\n\n-# i kept a small note from this, something you like or are working on. ask “what do you '
                 'remember about me?” or say “forget me” any time.')
 FIRST_PROFILE = ('\n\n-# i kept a small note from this, and it follows you around the server. what you’re working '
@@ -273,8 +276,10 @@ class Fri(discord.Client):
         self.busy = Busy()
         self.waiting_notices = WaitingNotices(self.busy)
         self.usage_lock = asyncio.Lock()
+        self.usage_deliveries = set()
         self.chat_slots = asyncio.Semaphore(2)
         self.noticed_refusal = None
+        self.noticed_latch = None  # The UTC day the owner last heard Claude is skipped.
         self.sign_in_notice = None
         self.session = None
         self.agent = None
@@ -389,6 +394,17 @@ class Fri(discord.Client):
         except (aiohttp.ClientError, TimeoutError):
             raise ControllerUnavailable(UNREACHABLE) from None
 
+    def deliver_usage(self):
+        """Send the receipts on disk in the background, held until it finishes so it isn't collected."""
+        async def deliver():
+            try:
+                await self.flush_usage()
+            except Exception as exc:  # The receipt is on disk; a delivery problem must not discard a finished reply.
+                LOG.warning('Usage is saved locally; controller delivery will retry: %s', type(exc).__name__)
+        task = asyncio.create_task(deliver())
+        self.usage_deliveries.add(task)
+        task.add_done_callback(self.usage_deliveries.discard)
+
     async def flush_usage(self):
         async with self.usage_lock:
             for path in sorted((self.data / 'usage').glob('*.json')):
@@ -422,6 +438,44 @@ class Fri(discord.Client):
         LOG.warning('Usage receipt set aside in usage/rejected: %s', cause)
 
     async def chat_once(self, text, context):
+        def held(context):
+            """The turn's own messages, the posts it looked at, and the ones it quotes or replies to."""
+            source = context.get('source') or {}
+            asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),
+                     *(row['source']['id'] for row in context.get('message_burst', []))]
+            looked = [read['event'].id for read in context.get('image_reads', [])]
+            if context.get('image_event') is not None:
+                looked.append(context['image_event'].id)
+            quoted = [int(row['source']['id']) for row in context.get('reply_target', []) + context.get('invited_context', [])
+                      if str(row.get('source', {}).get('id', '')).isdigit()]
+            return asked, looked, quoted
+
+        async def recheck():
+            """ready's last checks, the ones that wait on nothing; run again right before a second provider's request
+            (fri #418), so what was taken back during the first one never reaches the other."""
+            fence = context.get('fence')
+            if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
+                asked, looked, quoted = held(context)
+                if any(int(mid) in self.agent.unsent for mid in asked):
+                    raise GateClosed('message deleted')
+                # A post Fri looked at, deleted during the last waits (the gate, Gene's check): its image stays out.
+                if any(mid in self.agent.unsent for mid in looked):
+                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
+                # So does one it quotes or replies to: the answer would be about words taken back.
+                if any(mid in self.agent.unsent for mid in quoted):
+                    raise commands.UserFeedbackCheckFailure(WITHDRAWN)
+            # The DM switch again, with nothing to wait on between it and the request: the checks before it
+            # wait on Discord and Gene, and the owner can turn DMs off meanwhile.
+            if fence and fence.get('dms') and not fence['dms']():
+                raise GateClosed('dms off')
+            # Their own erasures here, after every wait before it, Gene's turn check included (fri #265). It reads nothing.
+            if fence and fence.get('erased') and await fence['erased']():
+                raise AuthorErased()
+            # Last, with nothing to wait on before the request: a short line from the member that joined the turn
+            # by now is answered with it instead, and one after this is answered on its own (see Continuation).
+            if fence and fence.get('commit') and not fence['commit']():
+                raise Continued()
+
         async def ready(depth=0):  # Signed in by now, so nothing waits between these checks and the request they clear.
             fence = context.get('fence')
 
@@ -439,14 +493,10 @@ class Fri(discord.Client):
                     fence['settlement_reread'] = True
                 await fence['reread'](context)
                 return await ready(depth + 1)
-            looked = [read['event'].id for read in context.get('image_reads', [])]
-            if context.get('image_event') is not None:
-                looked.append(context['image_event'].id)
+            _, looked, quoted = held(context)
             # Every message this request carries: the live view's rows, what it quotes or replies to, the turn's
             # own burst, the posts it looked at and the posts a read showed. One place, so a delete of any of
             # them is marked even once it leaves the live view (see unsend), and delivery refuses after it.
-            quoted = [int(row['source']['id']) for row in context.get('reply_target', []) + context.get('invited_context', [])
-                      if str(row.get('source', {}).get('id', '')).isdigit()]
             read = [mid for entry in getattr((fence or {}).get('actions'), 'reads', ()) for mid in entry['shown']]
             carried = [*looked, *quoted, *read, *(int(row['id']) for row in context.get('recent', [])
                                                   if not row.get('gene_error') and str(row.get('id', '')).isdigit())]
@@ -592,36 +642,16 @@ class Fri(discord.Client):
                     fence.setdefault('summarized', set()).update(origins)  # What the reply drew on (see stage_turn).
                     if GENERATIONS in self.capabilities:  # The one this request carries (see summary_generation).
                         fence.setdefault('summary_generation', context['member_summary'].get('generation'))
-            if self.agent:  # Taken back by now: the turn's own message stops it, anyone else's leaves its view.
-                source = context.get('source') or {}
-                asked = [*([source['id']] if source.get('kind') == 'discord_message' else []),
-                         *(row['source']['id'] for row in context.get('message_burst', []))]
-                if any(int(mid) in self.agent.unsent for mid in asked):
-                    raise GateClosed('message deleted')
-                # A post Fri looked at, deleted during the last waits (the gate, Gene's check): its image stays out.
-                if any(mid in self.agent.unsent for mid in looked):
-                    raise commands.UserFeedbackCheckFailure(IMAGES_CHANGED)
-                # So does one it quotes or replies to: the answer would be about words taken back.
-                if any(mid in self.agent.unsent for mid in quoted):
-                    raise commands.UserFeedbackCheckFailure(WITHDRAWN)
-                # And a delete before delivery withholds what the model made of any of it: what it carries, that is,
-                # so a live-view row dropped just below (deleted before this request) doesn't count.
+            if self.agent:
+                # A delete before delivery withholds what the model made of what it carries, that is, so a live-view
+                # row dropped just below (deleted before this request) doesn't count.
                 seen.update([*looked, *quoted, *read])
                 if 'recent' in context:
                     context['recent'] = [row for row in context['recent']
                                          if row.get('gene_error') or int(row['id']) not in self.agent.unsent]
                     seen.update(int(row['id']) for row in context['recent'] if not row.get('gene_error'))
-            # The DM switch again, with nothing to wait on between it and the request: the checks above
-            # wait on Discord and Gene, and the owner can turn DMs off meanwhile.
-            if fence and fence.get('dms') and not fence['dms']():
-                raise GateClosed('dms off')
-            # Their own erasures here, after every wait above, Gene's turn check included (fri #265). It reads nothing.
-            if fence and fence.get('erased') and await fence['erased']():
-                raise AuthorErased()
-            # Last, with nothing to wait on before the request: a short line from the member that joined the turn
-            # by now is answered with it instead, and one after this is answered on its own (see Continuation).
-            if fence and fence.get('commit') and not fence['commit']():
-                raise Continued()
+            # Then what's taken back by now, the DM switch, their erasures and a continuation, waiting on nothing.
+            await recheck()
             self.depend(context)  # What the request carries now drew on those summaries (fri #193).
         # Every model call of a turn adds to one set, so a delete before delivery withholds it (see reply_once).
         seen = context['fence'].setdefault('messages', set()) if context.get('fence') else set()
@@ -629,7 +659,29 @@ class Fri(discord.Client):
         # (fri #332). See SavedTurns.dependencies and taken_since. Each model call of a turn adds to it.
         depends = (context['fence'].setdefault('dependencies', {'messages': set(), 'unknown': False, 'summary': None})
                    if context.get('fence') else {'messages': set(), 'unknown': False, 'summary': None})
-        result = await self.chat.respond(text, context, ready=ready)
+        if MODEL_PROVIDER not in self.capabilities:  # An older controller: the plan first, as before.
+            context.pop('provider', None)
+
+        recorded = []
+
+        def record(provider, model, effort, attempt, failover):
+            """One usage receipt per attempt, written as it ends; a stop before the next one still keeps it."""
+            recorded.append(attempt)
+            report = {'attempt_id': uuid.uuid4().hex, 'model': attempt.model or model, 'effort': attempt.effort or effort,
+                      'status': attempt.status, 'counters': attempt.counters}
+            if MODEL_PROVIDER in self.capabilities:
+                report.update(provider=provider, cost_micros=attempt.cost_micros,
+                              **({'failover': failover or attempt.failover} if failover or attempt.failover else {}))
+            private_json(self.data / 'usage' / (report['attempt_id'] + '.json'), report)
+
+        try:
+            if context.get('fence') is not None:  # Chat.respond's hooks for each attempt (see fri_provider.call).
+                context['fence'].update(recheck=recheck, record=record)
+            result = await self.chat.respond(text, context, ready=ready)
+            if not recorded:  # No attempt told of (none sent, or no fence): one receipt for the result, as before.
+                record(result.provider or 'chatgpt', context['model'], context['effort'], result, None)
+        finally:  # Off the reply's path: delivery waits for nothing, and the outbox retries what's left (owner_reviews).
+            self.deliver_usage()
         if getattr(self, 'agent', None):  # As the request carried it: `ready` withholds what it may not, right before it.
             found, unknown = self.agent.saved_turns.dependencies(context)
             depends['messages'] |= found
@@ -644,14 +696,6 @@ class Fri(discord.Client):
                 depends['summary'] = UNDATED
         result.shown, result.dependencies = seen, depends
         result.channels = (context.get('fence') or {}).get('channels')  # As its last read was (see ready).
-        attempt = uuid.uuid4().hex
-        private_json(self.data / 'usage' / (attempt + '.json'), {
-            'attempt_id': attempt, 'model': result.model or context['model'], 'effort': result.effort or context['effort'],
-            'status': result.status, 'counters': result.counters})
-        try:
-            await self.flush_usage()
-        except Exception as exc:  # The receipt is on disk; a delivery problem must not discard a finished reply.
-            LOG.warning('Usage is saved locally; controller delivery will retry: %s', type(exc).__name__)
         if result.error or result.status != 'completed':
             raise commands.UserFeedbackCheckFailure(result.error or 'that one fizzled on my end. try again in a sec.')
         if agent := getattr(self, 'agent', None):  # What stops it from here was withheld after composing.
@@ -1628,6 +1672,12 @@ class Fri(discord.Client):
                 channel = await owner.create_dm()  # Opened here, so a failure to open it retries next tick.
                 self.noticed_refusal = refused  # At most once: a send whose response was lost isn't repeated.
                 await channel.send(SIGN_IN_NOTICE, allowed_mentions=NO_MENTIONS)
+            day = time.strftime('%Y-%m-%d', time.gmtime())
+            if (latch := self.chat.latched()) and self.noticed_latch != day:  # Once a day while Claude is skipped.
+                owner = self.get_user(self.owner_id) or await self.fetch_user(self.owner_id)
+                channel = await owner.create_dm()
+                self.noticed_latch = day
+                await channel.send(CLAUDE_NOTICE.format(latch['reason']), allowed_mentions=NO_MENTIONS)
         except Exception as exc:  # A failed lookup retries next tick; a failed send waits for the next refusal.
             LOG.warning('Owner sign-in notice not sent: %s', type(exc).__name__)
 
@@ -1700,6 +1750,7 @@ class Fri(discord.Client):
             'withdrawals': self.agent.saved_turns.status() if self.agent else None,
             'channel_withdrawals': self.agent.channel_withdrawals.status() if self.agent else None,
             'rejected_usage': len(list((self.data / 'usage' / 'rejected').glob('*.json'))),
+            'claude_skipped': self.chat.latched(),  # After a billing or auth failover: why and until when.
             'guild_connected': bool(self.is_ready() and guild and not guild.unavailable),
             'jpcall_budget': budget,
             'sha': os.getenv('FRI_RELEASE_SHA', 'development'), 'guild_id': self.guild_id,

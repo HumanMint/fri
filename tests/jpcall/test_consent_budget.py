@@ -158,7 +158,7 @@ def test_health_distinguishes_unseeded_unreadable_and_open_reservations(tmp_path
     from fri.fri import Fri
 
     def health():
-        client = SimpleNamespace(agent=None, guild_id=1, data=tmp_path, get_guild=lambda _: None,
+        client = SimpleNamespace(agent=None, guild_id=1, data=tmp_path, get_guild=lambda _: None, chat=SimpleNamespace(latched=lambda: None),
             is_ready=lambda: False, _connection=SimpleNamespace(_status='offline'),
             jpcall_engine=SimpleNamespace(budget_status=budget.status))
         asyncio.run(Fri.health.coro(client))
@@ -205,7 +205,7 @@ def test_bad_budget_cannot_stop_health_or_admit_spend(tmp_path, payload):
     journal, budget = ledger(tmp_path)
     try:
         budget.path.write_text(payload)
-        client = SimpleNamespace(agent=None, guild_id=1, data=tmp_path, get_guild=lambda _: None,
+        client = SimpleNamespace(agent=None, guild_id=1, data=tmp_path, get_guild=lambda _: None, chat=SimpleNamespace(latched=lambda: None),
             is_ready=lambda: False, _connection=SimpleNamespace(_status='offline'),
             jpcall_engine=SimpleNamespace(budget_status=budget.status))
         for _ in range(2):  # The real health coroutine still runs and updates after corrupt input.
@@ -226,7 +226,7 @@ def test_health_survives_an_unexpected_budget_contribution_failure(tmp_path):
 
     def broken():
         raise RecursionError('synthetic budget implementation failure')
-    client = SimpleNamespace(agent=None, guild_id=1, data=tmp_path, get_guild=lambda _: None,
+    client = SimpleNamespace(agent=None, guild_id=1, data=tmp_path, get_guild=lambda _: None, chat=SimpleNamespace(latched=lambda: None),
         is_ready=lambda: False, _connection=SimpleNamespace(_status='offline'),
         jpcall_engine=SimpleNamespace(budget_status=broken))
     asyncio.run(Fri.health.coro(client))
